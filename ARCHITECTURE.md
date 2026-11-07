@@ -555,6 +555,8 @@ If coming back after a long time, this order should restore the mental model qui
    Rebuild device discovery and session/device access.
 13. `src/x11/` and sections 19 and 20
    The X11 codec, the sans-IO connection, startup, and the io_uring driver. Section 20 is the XWM that owns them.
+14. `src/xwayland/xwm/` and section 21
+    When a normal X window becomes a tema window, how the layout drives `ConfigureWindow`, and how an override-redirect window stays above that content.
 
 ## 14. Vocabulary
 
@@ -621,7 +623,8 @@ If coming back after a long time, this order should restore the mental model qui
 - atom: a numeric id for a string. `NAMES` are interned at startup. `PREDEFINED` are fixed values from the generated constants
 - XWM: the window manager in section 20. It owns the X connection for one Xwayland run and claims `WM_S0`
 - check window: the 10×10 window created when the XWM claims its role. It owns `WM_S0` and `_NET_WM_CM_S0`. Its id is `_NET_SUPPORTING_WM_CHECK` on the root and on itself, and its `_NET_WM_NAME` is `tema`
-- `WM_STATE`: the ICCCM property, type `WM_STATE`, format 32, two CARD32s `[state, icon_window]`. Normal is `[1, 0]`. Withdrawn is `[0, 0]`
+- `WM_STATE`: the ICCCM property, type `WM_STATE`, format 32, two CARD32s `[state, icon_window]`. Normal is `[1, 0]`. Iconic is `[3, 0]`. Withdrawn is `[0, 0]`
+- managed X window: a normal X window that section 21 has turned into a `WindowId`. An override-redirect window is not one
 - `xwayland_surface_v1`: the role object that links one `wl_surface` to an X window. The X role remains after the object is destroyed
 - serial: the non-zero `u64` from `set_serial`, low half in `serial_lo` and high half in `serial_hi`. It is pending until `wl_surface.commit`, then stored on the current Xwayland run
 
@@ -831,7 +834,7 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 
 1. `ls /tmp/.X11-unix/XN /tmp/.XN-lock` shows both files. `pgrep -x Xwayland` prints nothing.
 2. Spawn a terminal with the usual keybinding. `echo $DISPLAY` prints `:N`.
-3. `Xwayland -version` reports 24.1 or newer. Run `xterm` with `RUST_LOG=debug` on the compositor. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, `Xwayland ready on :N`, `bound xwayland_shell_v1`, and `XWM ready on :N`. The window checks are in section 20.
+3. `Xwayland -version` reports 24.1 or newer. Run `xterm` with `RUST_LOG=debug` on the compositor. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, `Xwayland ready on :N`, `bound xwayland_shell_v1`, and `XWM ready on :N`. The window checks are in sections 20 and 21.
 4. `kill -9 $(pgrep -x Xwayland)`. The log shows `Xwayland exited with signal 9`. A new `xterm` starts Xwayland again on the same `:N`, and both files are still there. A signal within ten seconds of becoming ready counts as an early failure, so one kill relaunches, and a third early failure gives up.
 5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
 6. `[xwayland] enabled = false`, then start tema. The log says `Xwayland disabled`. Neither file exists, and a spawned terminal has an empty `DISPLAY`.
@@ -840,7 +843,7 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 
 ## 18. Windows
 
-A managed toplevel is a window. The layout, workspaces, grabs, closing snapshots, keybindings, and capture talk about a `WindowId` and reach shell behavior through the `Toplevel` trait. `XdgToplevel` is the only implementor. The types live in `src/window.rs`. The layout tree lives in `src/tiling.rs`.
+A managed toplevel is a window. The layout, workspaces, grabs, closing snapshots, keybindings, and capture talk about a `WindowId` and reach shell behavior through the `Toplevel` trait. `XdgToplevel` and `XToplevel` implement it. `XToplevel` is section 21. The types live in `src/window.rs`. The layout tree lives in `src/tiling.rs`.
 
 ### Lifetime
 
@@ -860,7 +863,7 @@ Destroying the `xdg_toplevel` drops the window and frees the root. The next `get
 
 `State::toplevel` and `toplevel_mut` read `window_role_object`, then downcast through `Object::as_toplevel`. They panic when that role object is already grabbed. A request handler that holds the role uses `self`. `window_role_object` only reads the map, so it stays safe during the grab. Capture updates that only touch the capture registry are safe from inside the handler. `map_window` calls `state.toplevel`, so it runs from the `wl_surface` commit, where the toplevel is free.
 
-The trait covers the title, the app id, the parent window, size limits, the maximize and fullscreen requests, the decoration mode, close, interactive resize, and a fullscreen request made by the compositor. The xdg protocol actions that still name an `xdg_toplevel` are close, interactive resize configure, and the move and resize requests.
+The trait covers the title, the app id, the parent window, size limits, the maximize and fullscreen requests, the decoration mode, close, interactive resize, a fullscreen request made by the compositor, and `position_changed`. The xdg protocol actions that still name an `xdg_toplevel` are close, interactive resize configure, and the move and resize requests. `position_changed` is a no-op for xdg.
 
 ### What stays on the surface
 
@@ -872,7 +875,7 @@ These maps stay keyed by the root surface: the geometry cache, output membership
 
 ### X windows
 
-M6 adds X windows on this same path. The X role object stays in `state.objects` and implements `Toplevel`. Creating the window calls `insert_window`. Destroying it calls `destroy_window`. Layout, grabs, snapshots, keybindings, and capture then see it as a window.
+A managed X window uses this same `WindowId`, `ManagedWindowState`, and `Toplevel` path. The role object is an `XToplevel` created with `insert_object`. It is not in any client's id map. `insert_window` runs when the window becomes managed. `destroy_window` runs on unmap, on `DestroyNotify`, and when the WM stops. The next map allocates a new `WindowId`. Section 21 is that path.
 
 ## 19. The X11 connection
 
@@ -985,7 +988,7 @@ A missing image, an image with no pixels, a missing format, a request that does 
 
 `CreateNotify` records a window other than the check window and other than an id already recorded. A duplicate does not reset the record. The event rectangle is both `geometry` and `pending`. The window then gets `PropertyChange` and `FocusChange`. `override_redirect` is stored from the event.
 
-`MapRequest` on a known window writes `WM_STATE` Normal, which is `[1, 0]`. When `pending` has a positive width and height, it configures the window to 1×1 at (0, 0) and then to `pending`. It then writes `_NET_WM_STATE` from the stored flags and sends `MapWindow`. An unknown window sends nothing.
+`MapRequest` on a known window writes `WM_STATE` Normal, which is `[1, 0]`. When `pending` has a positive width and height, it configures the window to 1×1 at (0, 0) and then to `pending`. It then writes `_NET_WM_STATE` from the stored flags and sends `MapWindow`. An unknown window sends nothing. A normal window is also recorded in the client lists, as section 21 describes.
 
 `MapNotify` sets `mapped` and refreshes `override_redirect`. `UnmapNotify` clears `mapped` and writes `WM_STATE` Withdrawn, which is `[0, 0]`.
 
@@ -1001,9 +1004,9 @@ A missing image, an image with no pixels, a missing format, a request that does 
 
 ### Showing
 
-A window is shown when it has a paired surface and `mapped` is set. Showing places the root at `geometry.x`, `geometry.y`, sets `xwayland_shown`, marks the root geometry dirty, and damages the old rectangle and the new one. Hiding clears the flag, with `try_grab` because the surface may already be gone, and damages the old rectangle. The scene, pointer picking, and output assignment use `is_hidden_xwayland_surface`, so a shown X root is an unmanaged root and a hidden one is skipped. The committed buffer supplies the surface size. The X position is the compositor's global logical position. Keyboard focus still skips every X-role surface.
+A window is shown when it has a paired surface and `mapped` is set. An override-redirect window is placed at its X geometry and stays an unmanaged root. A normal window waits for the property batch in section 21 and then becomes a managed window. The layout owns that root's position. `xwayland_shown` stays set for both, so the scene, picking, and output assignment see them. Hiding clears the flag, with `try_grab` because the surface may already be gone, and damages the old rectangle. A hidden X root is skipped. The committed buffer supplies the surface size.
 
-`ConfigureNotify` on a shown window updates that position. `ConfigureRequest` on a shown window is ignored, so a client cannot drag a window that is already on screen. M6 is what moves a managed window into the layout. Until then every shown window, including an override-redirect menu, stays an unmanaged root at its X geometry.
+`ConfigureNotify` on an unmanaged window updates that position. `ConfigureRequest` is ignored once the window is shown or managed, so a client cannot drag a window that is already on screen. A click on a managed X window focuses its root. Mapping one does not take keyboard focus, and focus is not sent to X yet. Restoring focus after a disconnect skips an X-role surface.
 
 ### Properties
 
@@ -1023,9 +1026,95 @@ A UTF-8 title, from `WM_NAME` or `_NET_WM_NAME`, replaces `title` and sets `utf8
 
 Run a normal session from a terminal, with `RUST_LOG=debug`. Note `:N` in `Allocated display :N`.
 
-1. Run `xterm`. The log shows `Xwayland ready on :N` and `XWM ready on :N`. The window appears at the position X gave it.
-2. Run `xterm -geometry 80x24+200+100`. That window appears at X position (200, 100).
-3. Ctrl+click in an xterm. The override-redirect menu appears at the pointer.
-4. `xprop -root _NET_SUPPORTING_WM_CHECK` prints a window id. `xprop -id <that id> _NET_WM_NAME` prints `tema`. `xprop -root _NET_SUPPORTED` lists the eleven atoms from the claim, in that order. `xprop WM_STATE` on the xterm prints `window state: Normal` and icon window `0x0`.
-5. Close the xterm. The window leaves the screen.
-6. `kill -9 $(pgrep -x Xwayland)`. A new `xterm` starts Xwayland again on the same `:N`, logs `XWM ready on :N`, and shows a window. A signal within ten seconds of becoming ready still counts as an early failure, as section 17 describes.
+1. `xprop -root _NET_SUPPORTING_WM_CHECK` prints a window id. `xprop -id <that id> _NET_WM_NAME` prints `tema`. `xprop -root _NET_SUPPORTED` lists the eleven atoms from the claim, in that order. `xprop WM_STATE` on an xterm prints `window state: Normal` and icon window `0x0`.
+2. `kill -9 $(pgrep -x Xwayland)`. A new `xterm` starts Xwayland again on the same `:N`, logs `XWM ready on :N`, and shows a window. A signal within ten seconds of becoming ready still counts as an early failure, as section 17 describes.
+
+The managed-window checks are in section 21.
+
+## 21. Managed X windows
+
+A normal X window becomes a tema window. An override-redirect window does not. The code is `src/xwayland/xwm/`, on top of the lifetime in section 20 and the `WindowId` in section 18.
+
+### The three states
+
+`sync_presence` chooses one state. Not paired, or not mapped, stays hidden. Override-redirect, once paired and mapped, is unmanaged: the root is placed at the X geometry and `xwayland_shown` is set. A normal window stays hidden until its first property batch has arrived, and then becomes managed.
+
+Managed means a `WindowId`, an `XToplevel`, and `xwayland_shown`. The layout owns the root position. Unmap runs `sync_presence`, which leaves managed and destroys the window. `DestroyNotify` and stopping the WM release the window directly. The next map allocates a new `WindowId`. A re-pair keeps `props_loaded`, so the window does not wait for another batch.
+
+### `XToplevel`
+
+`enter_managed` builds an `XToplevel` and inserts it with `insert_object`. It is not in any client's id map. `wl_surface` is a poor host: a commit grabs it, and `State::toplevel` panics when the role object is grabbed. `xwayland_surface_v1` can be destroyed while the X window lives. The WM reads the object with `try_get_mut` and `downcast_mut`. It never grabs it.
+
+The title is `props.title`, or `""`. The app id is `props.class`, or `""`. Maximized means both maximized flags. Fullscreen requested is `props.fullscreen`. Minimum and maximum sizes come from `WM_NORMAL_HINTS`: flags at index 0, minimum at 5 and 6, maximum at 7 and 8. `P_MIN_SIZE` is bit 4 and `P_MAX_SIZE` is bit 5. A pair is used only when its flag is set, the vector is long enough, and both values are positive. Decorations are always `ServerSide`. Motif hints are stored and ignored. `set_requested_fullscreen` does nothing, so a compositor fullscreen toggle is never written back to X. `id` returns `WaylandId` 0. `on` accepts every request.
+
+`request_close` queues `WmEvent::Close`. `interactive_resize` queues `WmEvent::Resize` and ignores the resizing flag. `position_changed` queues `XwaylandAction::Reconfigure`.
+
+### The property gate
+
+Pairing fetches the properties in section 20. Each send increments `props_outstanding`. Each reply decrements it, including an error. A reply for a destroyed window is dropped and does not decrement. A reply that arrives when the count is already 0 does not decrement. The first time the count reaches 0, `props_loaded` becomes true and stays true, and `sync_presence` runs. A later `PropertyNotify` refreshes the `XToplevel`. A new minimum size on a tiled or fullscreen window marks the workspace dirty and dispatches `WorkspaceStateChanged`.
+
+### The layout gate
+
+`is_managed_root_surface_candidate_common` accepts an X role as well as an xdg surface. The window is live once that root has a committed buffer and a toplevel, the same check as xdg.
+
+On a `wl_surface` commit, a mapped change of an X root that already has a window confirms the map, relayouts inside `with_ungrabbed`, and kicks the animation pump when that opens surfaces. Map and unmap both mark the workspace dirty and dispatch `WorkspaceStateChanged`. There is no `FocusNewToplevel` and no `capture::map_window`. Entering or leaving managed does the same dirty, relayout, pump, and dispatch when the window has a workspace.
+
+### `ConfigureWindow`
+
+`reconfigure_mapped_toplevels` ends by dispatching `XwaylandAction::Reconfigure`. For each managed window whose root has a committed buffer and protocol visibility:
+
+- Tiled or fullscreen uses `content_rect_global`. Width and height are at least 1.
+- Floating uses the root position. The size is the floating restore's configure size, then `floating_size`, then the X geometry. Width and height are at least 1.
+
+A hidden workspace has no protocol visibility, so nothing is sent. When the target differs from the stored `configured` rect, one `ConfigureWindow` carries x, y, width, height, and `border_width` 0. There is no sibling, no stack mode, and no synthetic `ConfigureNotify`. `ConfigureRequest` is ignored once the window is shown or managed.
+
+### Placement
+
+The decision is made once, in `enter_managed`. The window floats when it is modal, its type contains dialog, utility, toolbar, or splash, its minimum and maximum sizes are set and equal, or `WM_TRANSIENT_FOR` is set. Otherwise it tiles. A later property change does not move it between tiled and floating.
+
+A floating window is centered on its `WM_TRANSIENT_FOR` parent when that parent is managed, mapped, and on the same workspace. Otherwise it is centered on the output's usable bounds, or the output bounds when those are missing. The frame is the X content size plus the decoration insets. A side larger than the anchor shrinks to that side, and the origin stays at the anchor's origin. The result is clamped into the bounds. The root position is the frame origin plus the left and top insets. When the placed content size differs from the X geometry, that size is stored as `floating_size`.
+
+`_NET_WM_STATE_FULLSCREEN` at map makes a tiled window fullscreen. It does not make a floating window fullscreen.
+
+### Close
+
+`WmEvent::Close` on an unknown window sends nothing. When `WM_PROTOCOLS` contains `WM_DELETE_WINDOW`, the WM sends `SendEvent` with propagate 0, destination the X window, and event mask 0. The event is a `ClientMessage` with the send-event bit set, format 32, type `WM_PROTOCOLS`, and data `[WM_DELETE_WINDOW, 0, 0, 0, 0]`. The second word is `CurrentTime`. Otherwise it sends `KillClient` with the X window id. The Close keybinding reaches this through `request_window_close` once the root has keyboard focus.
+
+### `_NET_WM_STATE` and `WM_CHANGE_STATE`
+
+A `ClientMessage` whose format is not 32, or whose window is unknown, is ignored. The other types stay `WL_SURFACE_SERIAL`, `_NET_WM_STATE`, and `WM_CHANGE_STATE`. `_NET_WM_MOVERESIZE` is advertised and ignored. Only a compositor grab moves or resizes an X window.
+
+`_NET_WM_STATE` data `[0]` is 0 remove, 1 add, or 2 toggle. Any other action is ignored. Data `[1]` and `[2]` are atoms. Only modal, fullscreen, maximized vertically, maximized horizontally, and hidden are honored. When nothing changes, the WM stops. A fullscreen change on a managed window calls `set_window_fullscreen` and dispatches `WorkspaceStateChanged`. Hidden going from false to true goes through `request_iconify`. The `XToplevel` is then refreshed and `_NET_WM_STATE` is written from the flags. Modal and maximize are stored only.
+
+`WM_CHANGE_STATE` data `[0]` of 3 is Iconic and calls `request_iconify`. Data `[0]` of 1 is Normal: it clears hidden, writes `WM_STATE` Normal, and rewrites `_NET_WM_STATE`. Any other value is ignored.
+
+`request_iconify` refuses when the seat's keyboard focus is that window's root. It writes `WM_STATE` Normal and leaves hidden false. Otherwise it writes `WM_STATE` Iconic, `[3, 0]`, and sets hidden. Either way it rewrites `_NET_WM_STATE`. The window stays mapped and in the layout.
+
+### Stacking and the client lists
+
+`stack` is bottom to top. `map_order` is map order. Both hold normal windows only. `MapRequest` appends a missing window to `map_order`, moves it to the top of `stack`, and writes `_NET_CLIENT_LIST`. `MapNotify` of a window in `stack` restacks it and writes `_NET_CLIENT_LIST_STACKING`. A window with one below it is `ConfigureWindow` above that sibling. With none below and one above, it is below that sibling. Alone, the stack mode is Above. `UnmapNotify` removes the window from `map_order` and writes `_NET_CLIENT_LIST`. `DestroyNotify` removes it from both lists and writes each list that changed. Both properties are on the root, type `WINDOW`, format 32, mode Replace.
+
+`move_to_top` moves a normal window to the top of `stack` and sends nothing. Raising on activation will call it later.
+
+### Override-redirect order
+
+Unmanaged roots are drawn in the content tier after workspace roots, so they sit above managed content and below the layer-shell top and overlay layers. Each time a window enters unmanaged, the WM stamps `xwayland_shown_order` with the next counter value. `collect_unmanaged_scene_entries` keeps non-X roots in their current order, then appends the X roots sorted by that stamp. A later window is higher. Pick walks the scene from the top, so the later menu is hit first.
+
+### Grabs
+
+`WmEvent::Resize` stores `floating_size`, each side at least 1, and reconfigures that window from its current root position. A left or top edge resize has already moved the root, so one `ConfigureWindow` carries the new origin and the new size.
+
+`position_changed` runs after `set_root_position` in the floating-move correction, in the tiled-drag pickup, and in `place_grabbed_root`. For an X window that dispatches `Reconfigure`, which sends the new x and y. A tiled resize dispatches `WorkspaceStateChanged`. The following `Reconfigure` configures both neighbors.
+
+### Manual check
+
+Run a normal session from a terminal, with `RUST_LOG=debug`. Note `:N` in `Allocated display :N`. The claim and the restart check are in section 20.
+
+1. `xterm` tiles next to a Wayland window.
+2. A second `xterm` splits the workspace.
+3. `zenity --info` with `GDK_BACKEND=x11` floats, centered over its parent or on the output.
+4. The Close keybinding closes `xterm` with `WM_DELETE_WINDOW`. `xeyes` falls back to `KillClient`.
+5. `wmctrl -r :ACTIVE: -b toggle,fullscreen`, or F11 in a GTK app, makes the window fullscreen.
+6. `xprop -root _NET_CLIENT_LIST _NET_CLIENT_LIST_STACKING` lists the windows.
+7. An `xterm` Ctrl+click menu shows above the window, at the pointer.
+8. After a floating move and resize, a menu opens at the new position.

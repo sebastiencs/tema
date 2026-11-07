@@ -4,9 +4,12 @@
 //! or a failed startup ends the run.
 
 mod cursor;
+#[cfg(test)]
+mod manage_tests;
 mod props;
 mod setup;
 mod tests;
+mod toplevel;
 mod window;
 
 use std::{
@@ -38,6 +41,12 @@ pub(super) struct Wm {
     windows: BTreeMap<Window, window::XWindow>,
     by_serial: BTreeMap<u64, Window>,
     last_serial: u64,
+    /// Normal windows, bottom to top.
+    stack: Vec<Window>,
+    /// Normal windows in map order.
+    map_order: Vec<Window>,
+    /// Increments each time an override-redirect window is shown. Later is higher.
+    shown_order: u64,
 }
 
 enum WmPhase {
@@ -68,11 +77,35 @@ impl Display for WmFailure {
 }
 
 pub(crate) enum WmEvent {
-    Read { generation: u64, read: RingId, result: Completion },
-    Written { generation: u64, token: u64, result: Completion },
+    Read {
+        generation: u64,
+        read: RingId,
+        result: Completion,
+    },
+    Written {
+        generation: u64,
+        token: u64,
+        result: Completion,
+    },
     Startup(StartupEvent),
     PictFormats(Result<RenderQueryPictFormatsReply, XReplyError>),
-    Property { window: Window, atom: crate::x11::Atom, result: Result<Property, PropertyError> },
+    Property {
+        window: Window,
+        atom: crate::x11::Atom,
+        result: Result<Property, PropertyError>,
+    },
+    /// Ask the X client to close. Applied in a later phase.
+    Close {
+        window: Window,
+    },
+    /// The size of an interactive resize. Applied in a later phase.
+    Resize {
+        window: Window,
+        width: i32,
+        height: i32,
+    },
+    /// Send `ConfigureWindow` for each managed window whose layout rect changed.
+    Reconfigure,
 }
 
 pub(super) struct WmCtx<'a> {
@@ -113,6 +146,9 @@ impl Wm {
             windows: BTreeMap::new(),
             by_serial: BTreeMap::new(),
             last_serial: 0,
+            stack: Vec::new(),
+            map_order: Vec::new(),
+            shown_order: 0,
         }
     }
 
@@ -140,16 +176,26 @@ impl Wm {
                 WmEvent::Startup(event) => self.on_startup(event, ctx),
                 WmEvent::PictFormats(result) => self.on_pict_formats(result),
                 WmEvent::Property { window, atom, result } => {
-                    self.on_property_reply(window, atom, result)
+                    self.on_property_reply(window, atom, result, ctx)
                 }
+                WmEvent::Close { window } => self.close(window),
+                WmEvent::Resize { window, width, height } => {
+                    self.resize(window, width, height, ctx)
+                }
+                WmEvent::Reconfigure => self.reconfigure(ctx),
             }
         };
         self.io.flush(&mut self.conn, ctx.dispatcher);
         outcome
     }
 
-    /// Cancels the armed read. The caller drops the `-wm` fd.
-    pub(super) fn stop(&mut self, dispatcher: &mut Dispatcher) {
+    pub(super) fn flush_outgoing(&mut self, dispatcher: &mut Dispatcher) {
+        self.io.flush(&mut self.conn, dispatcher);
+    }
+
+    /// Cancels the armed read and releases managed windows. The caller drops the `-wm` fd.
+    pub(super) fn stop(&mut self, state: &mut State, dispatcher: &mut Dispatcher) {
+        self.release_managed(state, dispatcher);
         self.io.stop(dispatcher);
         self.phase = WmPhase::Failed;
     }

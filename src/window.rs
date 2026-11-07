@@ -74,7 +74,7 @@ pub enum ToplevelDecorationMode {
 
 /// Shell-neutral view of one managed toplevel.
 ///
-/// `XdgToplevel` is the only implementor. An X window will implement the same trait.
+/// `XdgToplevel` and the X window's `XToplevel` implement this trait.
 pub trait Toplevel {
     /// Window this role object belongs to.
     fn window(&self) -> WindowId;
@@ -98,6 +98,8 @@ pub trait Toplevel {
     fn request_close(&self, dispatcher: &mut Dispatcher);
     /// Send the size for an interactive resize.
     fn interactive_resize(&self, dispatcher: &mut Dispatcher, size: (i32, i32), resizing: bool);
+    /// The compositor moved this window's root. X windows reconfigure from the new position.
+    fn position_changed(&self, _dispatcher: &mut Dispatcher) {}
     /// Record a fullscreen request made by the compositor.
     fn set_requested_fullscreen(&mut self, fullscreen: bool);
 }

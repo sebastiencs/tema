@@ -90,14 +90,41 @@ enum Pipe {
 pub(crate) enum XwaylandAction {
     Start,
     Stop,
-    ListenReadable { result: std::io::Result<PollCompleted> },
-    Process { run: u64, event: ProcessEvent },
-    ClientAdopted { run: u64, id: ClientId },
-    ClientClosed { run: u64, id: ClientId },
-    DisplayReady { run: u64, read: RingId, result: std::io::Result<ReadWriteCompleted> },
-    Stderr { run: u64, read: RingId, result: std::io::Result<ReadWriteCompleted> },
-    Surface { client: ClientId, event: SurfaceEvent },
-    Wm { run: u64, event: xwm::WmEvent },
+    ListenReadable {
+        result: std::io::Result<PollCompleted>,
+    },
+    Process {
+        run: u64,
+        event: ProcessEvent,
+    },
+    ClientAdopted {
+        run: u64,
+        id: ClientId,
+    },
+    ClientClosed {
+        run: u64,
+        id: ClientId,
+    },
+    DisplayReady {
+        run: u64,
+        read: RingId,
+        result: std::io::Result<ReadWriteCompleted>,
+    },
+    Stderr {
+        run: u64,
+        read: RingId,
+        result: std::io::Result<ReadWriteCompleted>,
+    },
+    Surface {
+        client: ClientId,
+        event: SurfaceEvent,
+    },
+    Wm {
+        run: u64,
+        event: xwm::WmEvent,
+    },
+    /// Send `ConfigureWindow` for managed windows whose layout rect changed.
+    Reconfigure,
 }
 
 impl Xwayland {
@@ -251,8 +278,8 @@ impl Xwayland {
         self.decide(false, None, ran_for, dispatcher, "repeated early failures");
     }
 
-    fn on_exited(&mut self, exit: ChildExit, dispatcher: &mut Dispatcher) {
-        let Some(finished) = self.take_child(dispatcher) else { return };
+    fn on_exited(&mut self, exit: ChildExit, state: &mut State, dispatcher: &mut Dispatcher) {
+        let Some(finished) = self.take_child(state, dispatcher) else { return };
         cancel_reads(&finished.reads, dispatcher);
         let ran_for = finished.started.elapsed();
         match exit {
@@ -266,11 +293,11 @@ impl Xwayland {
         self.decide(finished.ready, Some(exit), ran_for, dispatcher, "repeated early failures");
     }
 
-    fn on_lost(&mut self, dispatcher: &mut Dispatcher) {
+    fn on_lost(&mut self, state: &mut State, dispatcher: &mut Dispatcher) {
         match &mut self.phase {
             Phase::Running(run) => {
                 if let Some(wm) = run.wm.as_mut() {
-                    wm.stop(dispatcher);
+                    wm.stop(state, dispatcher);
                 }
                 let reads = run.reads.clone();
                 let pidfd = Rc::clone(&run.pidfd);
@@ -323,7 +350,7 @@ impl Xwayland {
             log::error!("XWM failed: {failure}");
             if let Phase::Running(running) = &mut self.phase {
                 if let Some(mut wm) = running.wm.take() {
-                    wm.stop(dispatcher);
+                    wm.stop(state, dispatcher);
                 }
                 let pidfd = Rc::clone(&running.pidfd);
                 self.kill(&pidfd);
@@ -336,14 +363,14 @@ impl Xwayland {
         running.surfaces.get(serial)
     }
 
-    fn take_child(&mut self, dispatcher: &mut Dispatcher) -> Option<Finished> {
+    fn take_child(&mut self, state: &mut State, dispatcher: &mut Dispatcher) -> Option<Finished> {
         if !matches!(self.phase, Phase::Running(_) | Phase::Launching { .. }) {
             return None;
         }
         match std::mem::replace(&mut self.phase, Phase::Disabled) {
             Phase::Running(mut run) => {
                 if let Some(wm) = run.wm.as_mut() {
-                    wm.stop(dispatcher);
+                    wm.stop(state, dispatcher);
                 }
                 Some(Finished { ready: run.ready, started: run.started, reads: run.reads })
             }
@@ -357,7 +384,7 @@ impl Xwayland {
         }
     }
 
-    fn stop(&mut self, dispatcher: &mut Dispatcher) {
+    fn stop(&mut self, state: &mut State, dispatcher: &mut Dispatcher) {
         self.stopped = true;
         match std::mem::replace(&mut self.phase, Phase::Disabled) {
             Phase::Waiting { poll } => {
@@ -365,7 +392,7 @@ impl Xwayland {
             }
             Phase::Running(mut run) => {
                 if let Some(wm) = run.wm.as_mut() {
-                    wm.stop(dispatcher);
+                    wm.stop(state, dispatcher);
                 }
                 cancel_reads(&run.reads, dispatcher);
                 self.kill(&run.pidfd);
@@ -499,7 +526,7 @@ impl Xwayland {
             log::error!("XWM failed: {failure}");
             if let Phase::Running(running) = &mut self.phase {
                 if let Some(mut wm) = running.wm.take() {
-                    wm.stop(dispatcher);
+                    wm.stop(state, dispatcher);
                 }
                 let pidfd = Rc::clone(&running.pidfd);
                 self.kill(&pidfd);
@@ -558,8 +585,8 @@ impl Model for Xwayland {
                         self.on_spawned(run, pid, pidfd, dispatcher)
                     }
                     ProcessEvent::Failed { error } => self.on_failed(error, dispatcher),
-                    ProcessEvent::Exited { exit } => self.on_exited(exit, dispatcher),
-                    ProcessEvent::Lost => self.on_lost(dispatcher),
+                    ProcessEvent::Exited { exit } => self.on_exited(exit, state, dispatcher),
+                    ProcessEvent::Lost => self.on_lost(state, dispatcher),
                 }
             }
             XwaylandAction::ClientAdopted { run, id } => self.on_adopted(run, id),
@@ -570,11 +597,14 @@ impl Model for Xwayland {
             XwaylandAction::Stderr { run, read, result } => {
                 self.on_stderr(dispatcher, run, read, result)
             }
-            XwaylandAction::Stop => self.stop(dispatcher),
+            XwaylandAction::Stop => self.stop(state, dispatcher),
             XwaylandAction::Surface { client, event } => {
                 self.on_surface(client, event, state, dispatcher)
             }
             XwaylandAction::Wm { run, event } => self.on_wm(run, event, state, dispatcher),
+            XwaylandAction::Reconfigure => {
+                self.on_wm(self.run, xwm::WmEvent::Reconfigure, state, dispatcher)
+            }
         }
         Ok(())
     }

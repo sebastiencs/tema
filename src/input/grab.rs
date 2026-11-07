@@ -69,7 +69,7 @@ pub(crate) fn apply_interaction_intent(
                     );
                 }
             }
-            let target = anchored_grab_target(state, target);
+            let target = anchored_grab_target(state, dispatcher, target);
             start_window_grab(state, dispatcher, &target, intent)
         }
         InteractionIntent::DismissPopupGrab | InteractionIntent::None => false,
@@ -414,7 +414,11 @@ pub(crate) fn resize_cursor_icon_names(edges: u32) -> &'static [&'static str] {
 }
 
 /// Place the logical window so the point under the cursor stays put, then snap the animation.
-fn anchored_grab_target(state: &mut State, mut target: WindowTarget) -> WindowTarget {
+fn anchored_grab_target(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    mut target: WindowTarget,
+) -> WindowTarget {
     if state.is_tiled_root_surface(target.root_surface) {
         return target;
     }
@@ -448,6 +452,7 @@ fn anchored_grab_target(state: &mut State, mut target: WindowTarget) -> WindowTa
         let position = surface.root_position();
         surface.set_root_position(position.0 + dx, position.1 + dy);
         drop(surface);
+        note_root_position(state, dispatcher, target.root_surface);
         state.mark_root_geometry_dirty(target.root_surface);
         target.geometry.root_pos.0 += dx;
         target.geometry.root_pos.1 += dy;
@@ -651,6 +656,7 @@ fn pickup_tiled_drag(
     };
     surface.set_root_position(root_pos.0, root_pos.1);
     drop(surface);
+    note_root_position(state, dispatcher, root_surface);
     state.mark_root_geometry_dirty(root_surface);
     // Tile to preview uses the windows animation. Hyprland does the same by assigning
     // m_realPosition and m_realSize when the tiled window becomes floating.
@@ -750,6 +756,7 @@ fn place_grabbed_root(
     };
     surface.set_root_position(root_pos.0, root_pos.1);
     drop(surface);
+    note_root_position(state, dispatcher, root_surface);
     state.mark_root_geometry_dirty(root_surface);
     if let Some(window) = state.window_for_root(root_surface) {
         state
@@ -766,6 +773,15 @@ fn place_grabbed_root(
         request_outputs_for_rects(state, rects, dispatcher);
     } else {
         request_active_output(state, dispatcher);
+    }
+}
+
+fn note_root_position(state: &State, dispatcher: &mut Dispatcher, root: Resolved<WlSurfaceId>) {
+    if let Some(toplevel) = state
+        .window_for_root(root)
+        .and_then(|window| state.toplevel(window))
+    {
+        toplevel.position_changed(dispatcher);
     }
 }
 

@@ -114,6 +114,7 @@ fn collect_unmanaged_scene_entries(
     entries: &mut Vec<SceneEntry>,
     next_id: &mut SceneEntryId,
 ) {
+    let mut x_roots = Vec::new();
     for root_surface in state.root_surfaces() {
         if managed_roots.contains(&root_surface) || state.is_popup_root_surface(root_surface) {
             continue;
@@ -125,20 +126,35 @@ fn collect_unmanaged_scene_entries(
             || surface.has_dnd_icon_role()
             || surface.has_lock_surface_role()
             || surface.is_hidden_xwayland_surface()
+            || surface.layer_surface().is_some()
         {
             continue;
         }
-        if surface.layer_surface().is_some() {
+        if surface.has_xwayland_role() {
+            x_roots.push((surface.xwayland_shown_order(), root_surface));
             continue;
         }
-        entries.push(SceneEntry {
-            id: *next_id,
-            root_surface,
-            role: SceneRole::UnmanagedRoot,
-            workspace_id: state.root_surface_workspace(root_surface),
-        });
-        *next_id += 1;
+        push_unmanaged_entry(state, entries, next_id, root_surface);
     }
+    x_roots.sort_by_key(|(order, _)| *order);
+    for (_, root_surface) in x_roots {
+        push_unmanaged_entry(state, entries, next_id, root_surface);
+    }
+}
+
+fn push_unmanaged_entry(
+    state: &State,
+    entries: &mut Vec<SceneEntry>,
+    next_id: &mut SceneEntryId,
+    root_surface: Resolved<WlSurfaceId>,
+) {
+    entries.push(SceneEntry {
+        id: *next_id,
+        root_surface,
+        role: SceneRole::UnmanagedRoot,
+        workspace_id: state.root_surface_workspace(root_surface),
+    });
+    *next_id += 1;
 }
 
 #[cfg(test)]

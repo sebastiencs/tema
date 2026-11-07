@@ -2281,6 +2281,7 @@ impl Client {
                 crate::capture::note_window_state(state, dispatcher, window, maximized, fullscreen);
             }
         }
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::Reconfigure);
     }
 
     #[cfg(test)]

@@ -328,6 +328,7 @@ fn map_request_places_a_sized_window_and_ignores_an_unknown_one() {
                 0,
             ),
             testing::encode(&net_wm_state.request(), 0),
+            testing::encode(&client_list(&atoms, &[window]).request(), 0),
             testing::encode(&MapWindow { window }, 0),
         ],
     );
@@ -350,9 +351,19 @@ fn map_request_skips_configure_when_the_pending_size_is_empty() {
         vec![
             testing::encode(&state_property.request(), 0),
             testing::encode(&net_wm_state.request(), 0),
+            testing::encode(&client_list(&atoms, &[window]).request(), 0),
             testing::encode(&MapWindow { window }, 0),
         ],
     );
+}
+
+fn client_list(atoms: &crate::x11::Atoms, windows: &[Window]) -> crate::x11::PropertyChange {
+    change_property_u32s(
+        Window(0x100),
+        atoms._NET_CLIENT_LIST,
+        atoms.WINDOW,
+        &windows.iter().map(|window| window.0).collect::<Vec<_>>(),
+    )
 }
 
 #[test]
@@ -875,7 +886,8 @@ fn map_request_writes_net_wm_state_from_the_flags() {
 #[test]
 fn a_paired_mapped_window_is_shown_at_its_x_geometry() {
     let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
-    let surface = show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x50), 80, 1);
+    let surface =
+        show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x50), 80, 1, 1);
     assert!(wm.windows.get(&Window(0x50)).unwrap().shown);
     assert!(!hidden(&state, surface));
     assert_eq!(root_position(&state, surface), (30, 40));
@@ -897,7 +909,7 @@ fn unmap_destroy_and_unpair_each_hide() {
     let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
 
     let unmapped =
-        show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x50), 80, 1);
+        show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x50), 80, 1, 0);
     deliver(
         &mut wm,
         &mut state,
@@ -916,7 +928,7 @@ fn unmap_destroy_and_unpair_each_hide() {
     assert!(!scene_has(&state, unmapped));
 
     let destroyed =
-        show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x51), 81, 2);
+        show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x51), 81, 2, 0);
     deliver(
         &mut wm,
         &mut state,
@@ -934,7 +946,7 @@ fn unmap_destroy_and_unpair_each_hide() {
     assert!(!scene_has(&state, destroyed));
 
     let unpaired =
-        show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x52), 82, 3);
+        show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, Window(0x52), 82, 3, 0);
     let event = SurfaceEvent::Destroyed { serial: 3, surface: unpaired };
     surfaces.apply(event);
     note_surface(&mut wm, &mut state, &mut dispatcher, &surfaces, &event);
@@ -947,7 +959,7 @@ fn unmap_destroy_and_unpair_each_hide() {
 fn configure_notify_while_shown_moves_the_root() {
     let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
     let window = Window(0x50);
-    let surface = show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, window, 80, 1);
+    let surface = show_at(&mut wm, &mut state, &mut dispatcher, &mut surfaces, window, 80, 1, 1);
     deliver(
         &mut wm,
         &mut state,
@@ -964,7 +976,7 @@ fn configure_notify_while_shown_moves_the_root() {
             width: 10,
             height: 12,
             border_width: 0,
-            override_redirect: 0,
+            override_redirect: 1,
         }),
     );
     let tracked = wm.windows.get(&window).unwrap();
@@ -975,7 +987,7 @@ fn configure_notify_while_shown_moves_the_root() {
     assert!(picked(&state, (30.5, 40.5)).is_none());
 }
 
-fn open_wm() -> (Wm, crate::State, Dispatcher, SurfaceSerials) {
+pub(super) fn open_wm() -> (Wm, crate::State, Dispatcher, SurfaceSerials) {
     let (mut wm, mut state, mut dispatcher, surfaces) = drive_to_ready(None);
     let io = drain_io(&mut dispatcher);
     let (_, dispatch_to) = io.writes.into_iter().next().expect("claim write");
@@ -983,7 +995,7 @@ fn open_wm() -> (Wm, crate::State, Dispatcher, SurfaceSerials) {
     (wm, state, dispatcher, surfaces)
 }
 
-fn deliver(
+pub(super) fn deliver(
     wm: &mut Wm,
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,
@@ -1007,13 +1019,55 @@ fn deliver(
     sent
 }
 
-fn expect_requests(sent: Vec<Vec<u8>>, expected: Vec<Vec<u8>>) {
+pub(super) fn reconfigure(
+    wm: &mut Wm,
+    state: &mut crate::State,
+    dispatcher: &mut Dispatcher,
+    surfaces: &SurfaceSerials,
+) -> Vec<Vec<u8>> {
+    handle_event(wm, state, dispatcher, surfaces, WmEvent::Reconfigure)
+}
+
+pub(super) fn handle_event(
+    wm: &mut Wm,
+    state: &mut crate::State,
+    dispatcher: &mut Dispatcher,
+    surfaces: &SurfaceSerials,
+    event: WmEvent,
+) -> Vec<Vec<u8>> {
+    {
+        let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+        wm.handle(event, &mut ctx).unwrap();
+    }
+    take_writes(wm, state, dispatcher, surfaces)
+}
+
+pub(super) fn take_writes(
+    wm: &mut Wm,
+    state: &mut crate::State,
+    dispatcher: &mut Dispatcher,
+    surfaces: &SurfaceSerials,
+) -> Vec<Vec<u8>> {
+    wm.flush_outgoing(dispatcher);
+    let io = drain_io(dispatcher);
+    let sent = io
+        .writes
+        .iter()
+        .flat_map(|(buffer, _)| testing::split_requests(buffer))
+        .collect();
+    for (_, dispatch_to) in io.writes {
+        ack_write(wm, state, dispatcher, surfaces, dispatch_to);
+    }
+    sent
+}
+
+pub(super) fn expect_requests(sent: Vec<Vec<u8>>, expected: Vec<Vec<u8>>) {
     assert_eq!(&sent[..expected.len()], expected.as_slice());
     assert_eq!(sent.len(), expected.len() + 1);
     assert_eq!(sent.last().unwrap()[0], 43);
 }
 
-fn created(
+pub(super) fn created(
     window: Window,
     x: i16,
     y: i16,
@@ -1035,7 +1089,7 @@ fn created(
     })
 }
 
-fn map_request(window: Window) -> Event {
+pub(super) fn map_request(window: Window) -> Event {
     Event::MapRequest(MapRequest {
         send_event: false,
         sequence: 0,
@@ -1049,7 +1103,7 @@ fn serial_atom(wm: &Wm) -> Atom {
     ready.atoms.WL_SURFACE_SERIAL
 }
 
-fn serial_message(window: Window, atom: Atom, serial: u64) -> Event {
+pub(super) fn serial_message(window: Window, atom: Atom, serial: u64) -> Event {
     let mut data = ClientMessageData::default();
     data.set_data32([serial as u32, (serial >> 32) as u32, 0, 0, 0]);
     Event::ClientMessage(ClientMessage {
@@ -1070,6 +1124,7 @@ fn show_at(
     window: Window,
     raw: u32,
     serial: u64,
+    override_redirect: u8,
 ) -> Resolved<WlSurfaceId> {
     deliver(wm, state, dispatcher, surfaces, created(window, 30, 40, 10, 12, 0));
     deliver(
@@ -1082,7 +1137,7 @@ fn show_at(
             sequence: 0,
             event: Window(0x100),
             window,
-            override_redirect: 0,
+            override_redirect,
         }),
     );
     let surface = buffered_x_root(state, raw, serial, 10, 12);
@@ -1090,10 +1145,54 @@ fn show_at(
     surfaces.apply(assigned);
     let atom = serial_atom(wm);
     deliver(wm, state, dispatcher, surfaces, serial_message(window, atom, serial));
+    finish_properties(wm, state, dispatcher, surfaces, window);
     surface
 }
 
-fn buffered_x_root(
+pub(super) fn deliver_property(
+    wm: &mut Wm,
+    state: &mut crate::State,
+    dispatcher: &mut Dispatcher,
+    surfaces: &SurfaceSerials,
+    window: Window,
+    atom: Atom,
+    result: Result<crate::x11::Property, crate::x11::PropertyError>,
+) {
+    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+    wm.handle(WmEvent::Property { window, atom, result }, &mut ctx)
+        .unwrap();
+}
+
+fn finish_properties(
+    wm: &mut Wm,
+    state: &mut crate::State,
+    dispatcher: &mut Dispatcher,
+    surfaces: &SurfaceSerials,
+    window: Window,
+) {
+    let atoms = {
+        let WmPhase::Ready(ready) = &wm.phase else { panic!("ready") };
+        ready.atoms
+    };
+    for (property, _) in super::props::loads(&atoms) {
+        deliver_property(
+            wm,
+            state,
+            dispatcher,
+            surfaces,
+            window,
+            property,
+            Ok(crate::x11::Property {
+                r#type: Atom(0),
+                format: 0,
+                data: Vec::new(),
+                truncated: false,
+            }),
+        );
+    }
+}
+
+pub(super) fn buffered_x_root(
     state: &mut crate::State,
     raw: u32,
     serial: u64,
@@ -1111,21 +1210,21 @@ fn buffered_x_root(
     surface
 }
 
-fn hidden(state: &crate::State, surface: Resolved<WlSurfaceId>) -> bool {
+pub(super) fn hidden(state: &crate::State, surface: Resolved<WlSurfaceId>) -> bool {
     surface.try_ref(state).unwrap().is_hidden_xwayland_surface()
 }
 
-fn root_position(state: &crate::State, surface: Resolved<WlSurfaceId>) -> (i32, i32) {
+pub(super) fn root_position(state: &crate::State, surface: Resolved<WlSurfaceId>) -> (i32, i32) {
     surface.try_ref(state).unwrap().root_position()
 }
 
-fn scene_has(state: &crate::State, surface: Resolved<WlSurfaceId>) -> bool {
+pub(super) fn scene_has(state: &crate::State, surface: Resolved<WlSurfaceId>) -> bool {
     state.build_scene_model().entries.iter().any(|entry| {
         entry.root_surface == surface && entry.role == crate::scene::SceneRole::UnmanagedRoot
     })
 }
 
-fn picked(state: &crate::State, at: (f64, f64)) -> Option<Resolved<WlSurfaceId>> {
+pub(super) fn picked(state: &crate::State, at: (f64, f64)) -> Option<Resolved<WlSurfaceId>> {
     crate::input::pick::scene_pick_at(state, at)
         .surface_focus
         .map(|focus| focus.target.surface)
@@ -1156,7 +1255,7 @@ fn open_with_read(
     (wm, state, dispatcher, surfaces, read)
 }
 
-fn x_surface(state: &mut crate::State, raw: u32, serial: u64) -> Resolved<WlSurfaceId> {
+pub(super) fn x_surface(state: &mut crate::State, raw: u32, serial: u64) -> Resolved<WlSurfaceId> {
     let mut surface = WlSurface::new(WlSurfaceId::from(raw), ClientId::from_raw(1), 1);
     assert!(surface.assign_xwayland_role());
     surface.test_set_xwayland_serial(serial);
@@ -1164,7 +1263,7 @@ fn x_surface(state: &mut crate::State, raw: u32, serial: u64) -> Resolved<WlSurf
     Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(wayland_id), object_id)
 }
 
-fn note_surface(
+pub(super) fn note_surface(
     wm: &mut Wm,
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,
@@ -1175,7 +1274,7 @@ fn note_surface(
     wm.on_surface_event(event, &mut ctx).unwrap();
 }
 
-fn configure_request(
+pub(super) fn configure_request(
     window: Window,
     mask: ConfigWindow,
     x: i16,

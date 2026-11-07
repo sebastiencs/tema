@@ -82,6 +82,48 @@ pub(super) fn loads(atoms: &Atoms) -> [(Atom, Atom); 12] {
     ]
 }
 
+/// Whether this window floats. Decided once, when it becomes managed.
+///
+/// A window floats when it is modal, has type dialog, utility, toolbar or
+/// splash, has a fixed size, or names `WM_TRANSIENT_FOR`.
+pub(super) fn wants_floating(props: &WindowProps, atoms: &Atoms) -> bool {
+    props.modal
+        || props.window_types.iter().any(|ty| {
+            *ty == atoms._NET_WM_WINDOW_TYPE_DIALOG
+                || *ty == atoms._NET_WM_WINDOW_TYPE_UTILITY
+                || *ty == atoms._NET_WM_WINDOW_TYPE_TOOLBAR
+                || *ty == atoms._NET_WM_WINDOW_TYPE_SPLASH
+        })
+        || fixed_size(&props.normal_hints)
+        || props.transient_for.is_some()
+}
+
+/// Min and max are hint indexes 5 to 8. Both axes count only when their flag is
+/// set, both values are positive, and max equals min.
+fn fixed_size(hints: &[u32]) -> bool {
+    const FLAGS: usize = 0;
+    const MIN_WIDTH: usize = 5;
+    const MIN_HEIGHT: usize = 6;
+    const MAX_WIDTH: usize = 7;
+    const MAX_HEIGHT: usize = 8;
+    const P_MIN_SIZE: u32 = 1 << 4;
+    const P_MAX_SIZE: u32 = 1 << 5;
+    let flags = hints.get(FLAGS).copied().unwrap_or(0);
+    if flags & P_MIN_SIZE == 0 || flags & P_MAX_SIZE == 0 {
+        return false;
+    }
+    let Some(min_width) = positive_hint(hints.get(MIN_WIDTH).copied()) else { return false };
+    let Some(min_height) = positive_hint(hints.get(MIN_HEIGHT).copied()) else { return false };
+    let Some(max_width) = positive_hint(hints.get(MAX_WIDTH).copied()) else { return false };
+    let Some(max_height) = positive_hint(hints.get(MAX_HEIGHT).copied()) else { return false };
+    min_width == max_width && min_height == max_height
+}
+
+fn positive_hint(value: Option<u32>) -> Option<i32> {
+    let value = i32::try_from(value?).ok()?;
+    (value > 0).then_some(value)
+}
+
 /// `_NET_WM_STATE` atoms for the flags that are set, in write order.
 pub(super) fn net_wm_state(props: &WindowProps, atoms: &Atoms) -> Vec<Atom> {
     let mut state = Vec::new();
@@ -175,6 +217,7 @@ impl Wm {
         window: Window,
         atom: crate::x11::Atom,
         result: Result<Property, PropertyError>,
+        ctx: &mut WmCtx<'_>,
     ) -> Result<(), WmFailure> {
         let WmPhase::Ready(ready) = &self.phase else { return Ok(()) };
         let atoms = ready.atoms;
@@ -185,6 +228,14 @@ impl Wm {
             }
         }
         apply(&mut tracked.props, atom, &atoms, result);
+        let finished = if tracked.props_outstanding == 0 {
+            false
+        } else {
+            tracked.props_outstanding -= 1;
+            tracked.props_outstanding == 0
+        };
+        drop(tracked);
+        self.note_property_batch(window, finished, ctx);
         Ok(())
     }
 
@@ -201,7 +252,12 @@ impl Wm {
             event: WmEvent::Property { window, atom: property, result },
         });
         match get_property(&mut self.conn, window, property, ty, MAX_BYTES, redispatch) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(tracked) = self.windows.get_mut(&window) {
+                    tracked.props_outstanding = tracked.props_outstanding.saturating_add(1);
+                }
+                Ok(())
+            }
             Err(error) => {
                 self.phase = WmPhase::Failed;
                 Err(WmFailure { reason: error.to_string() })

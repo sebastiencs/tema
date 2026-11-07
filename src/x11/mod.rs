@@ -28,11 +28,12 @@ pub(crate) use generated::{
     Colormap, CompositeRedirectSubwindows, ConfigWindow, ConfigureNotify, ConfigureRequest,
     ConfigureWindow, ConfigureWindowAux, CreateGc, CreateGcAux, CreateNotify, CreatePixmap,
     CreateWindow, CreateWindowAux, Cursor, DestroyNotify, Directformat, Drawable, Event, EventMask,
-    FreeGc, FreePixmap, Gcontext, GetProperty, ImageFormat, MapNotify, MapRequest, MapWindow,
-    NoReply, PictType, Pictformat, Pictforminfo, Picture, Pixmap, Property as PropertyState,
-    PropertyNotify, PutImage, Redirect, RenderCreateCursor, RenderCreatePicture,
-    RenderCreatePictureAux, RenderFreePicture, RenderQueryPictFormats, RenderQueryPictFormatsReply,
-    Request, SetSelectionOwner, StackMode, UnmapNotify, Window, WindowClass,
+    FreeGc, FreePixmap, Gcontext, GetProperty, ImageFormat, KillClient, MapNotify, MapRequest,
+    MapWindow, NoReply, PictType, Pictformat, Pictforminfo, Picture, Pixmap,
+    Property as PropertyState, PropertyNotify, PutImage, Redirect, RenderCreateCursor,
+    RenderCreatePicture, RenderCreatePictureAux, RenderFreePicture, RenderQueryPictFormats,
+    RenderQueryPictFormatsReply, Request, SendEvent, SetSelectionOwner, StackMode, UnmapNotify,
+    Window, WindowClass,
 };
 #[allow(unused_imports)]
 pub(crate) use io::XIo;
@@ -46,4 +47,4 @@ pub(crate) use startup::{
     Bringup, ExtensionInfo, Extensions, Startup, StartupError, StartupEvent, Status,
 };
 #[allow(unused_imports)]
-pub(crate) use wire::{Reader, WireError, Writer};
+pub(crate) use wire::{event_bytes, Reader, WireError, Writer};

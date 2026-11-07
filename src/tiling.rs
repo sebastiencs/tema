@@ -2269,7 +2269,7 @@ fn is_managed_root_surface_candidate_common(
     surface: &WlSurface,
 ) -> bool {
     surface.is_root()
-        && surface.role() == Role::XdgSurface
+        && matches!(surface.role(), Role::XdgSurface | Role::XwaylandSurface)
         && !surface.has_cursor_role()
         && !surface.has_dnd_icon_role()
         && state

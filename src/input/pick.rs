@@ -160,6 +160,7 @@ pub(crate) fn build_window_target(
                 resolve_xdg_window_role_snapshot(state, root_surface, xdg_surface_id.wayland_id())
             })
             .unwrap_or(WindowRoleSnapshot::Unsupported),
+        Role::XwaylandSurface => resolve_toplevel_snapshot(state, root_surface),
         _ => WindowRoleSnapshot::Unsupported,
     };
 
@@ -192,6 +193,13 @@ pub(crate) fn resolve_xdg_window_role_snapshot(
     else {
         return WindowRoleSnapshot::Unsupported;
     };
+    resolve_toplevel_snapshot(state, root_surface)
+}
+
+fn resolve_toplevel_snapshot(
+    state: &State,
+    root_surface: Resolved<WlSurfaceId>,
+) -> WindowRoleSnapshot {
     let Some(window) = state.window_for_root(root_surface) else {
         return WindowRoleSnapshot::Unsupported;
     };

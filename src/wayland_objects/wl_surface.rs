@@ -218,6 +218,8 @@ pub struct WlSurface {
     xwayland_serial: Option<u64>,
     /// Set once the X window manager has placed this surface.
     xwayland_shown: bool,
+    /// Map-time order of an override-redirect window. Later is higher.
+    xwayland_shown_order: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -462,6 +464,7 @@ impl WlSurface {
             xwayland_surface_object: None,
             xwayland_serial: None,
             xwayland_shown: false,
+            xwayland_shown_order: 0,
         }
     }
 
@@ -600,6 +603,14 @@ impl WlSurface {
 
     pub(crate) fn set_xwayland_shown(&mut self, shown: bool) {
         self.xwayland_shown = shown;
+    }
+
+    pub(crate) fn set_xwayland_shown_order(&mut self, order: u64) {
+        self.xwayland_shown_order = order;
+    }
+
+    pub(crate) fn xwayland_shown_order(&self) -> u64 {
+        self.xwayland_shown_order
     }
 
     pub fn lock_surface(&self) -> Option<Resolved<ExtSessionLockSurfaceV1Id>> {
@@ -2309,6 +2320,21 @@ impl WlSurface {
                     }
                     dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
                 }
+            } else if this.has_xwayland_role() && state.window_for_root(resolved_surface).is_some()
+            {
+                if is_mapped {
+                    state.confirm_root_surface_mapped(resolved_surface);
+                    let (regrabbed, opened) = client
+                        .with_ungrabbed(this, state, |state| state.relayout_dirty_workspaces());
+                    this = regrabbed;
+                    if !opened.is_empty() {
+                        kick_visual_animation_pump(dispatcher);
+                    }
+                }
+                if let Some(workspace_id) = state.root_surface_workspace(resolved_surface) {
+                    crate::tiling::mark_workspace_dirty(state, workspace_id);
+                }
+                dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
             }
             if !is_mapped {
                 if let Some(close) =

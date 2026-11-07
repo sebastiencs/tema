@@ -44,6 +44,15 @@ pub(crate) struct Writer<'a> {
     request: Option<usize>,
 }
 
+/// Serializes one 32-byte X event.
+pub(crate) fn event_bytes(
+    serialize: impl FnOnce(&mut Writer<'_>) -> Result<(), WireError>,
+) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    serialize(&mut Writer::new(&mut bytes)).expect("event encodes");
+    bytes.as_slice().try_into().expect("event is 32 bytes")
+}
+
 impl<'a> Writer<'a> {
     pub(crate) fn new(buf: &'a mut Vec<u8>) -> Self {
         let origin = buf.len();
