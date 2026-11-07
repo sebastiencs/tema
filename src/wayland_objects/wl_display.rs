@@ -50,7 +50,7 @@ impl Object for WlDisplay {
             }
             GetRegistry { registry } => {
                 let (resolved, _) = client.insert_object(state, WlRegistry::new(registry));
-                WlRegistry::announce(resolved, state, dispatcher);
+                WlRegistry::announce(resolved, state, dispatcher, client.is_xwayland());
             }
         }
         Ok(())

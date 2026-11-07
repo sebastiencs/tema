@@ -1,5 +1,6 @@
 use crate::{
     clients::{Client, ClientDispatcher, EventWriter, RawRequest, Resolved},
+    globals::Global,
     object::{Object, Parser, RequestResult},
     protocol_generated::{wl_display, wl_registry, WaylandId, WlRegistryId},
     state::{GrabbedObject, State},
@@ -33,10 +34,11 @@ impl WlRegistry {
         registry: crate::clients::Resolved<WlRegistryId>,
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
+        xwayland: bool,
     ) {
         let advertised = state
             .globals
-            .iter()
+            .iter_for(xwayland)
             .map(|(name, global)| {
                 let (interface_name, interface_version) = global.interface();
                 (name, interface_name.to_string(), interface_version)
@@ -77,6 +79,16 @@ impl Object for WlRegistry {
                     );
                     return Ok(());
                 };
+                if global.xwayland_only() && !client.is_xwayland() {
+                    drop(global);
+                    client.protocol_violation_disconnect(
+                        dispatcher,
+                        self.id.into(),
+                        wl_display::Error::InvalidObject as u32,
+                        "invalid global name",
+                    );
+                    return Ok(());
+                }
 
                 let (_, max_version) = global.interface();
                 let version = requested_version.min(max_version);
@@ -95,5 +107,192 @@ impl Object for WlRegistry {
         if let Some(registry) = client.resolve(self.id, state) {
             state.globals.release_registry(registry);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            clients::{Client, ClientAction, ClientId, ClientManagerAction, RawEvent},
+            globals::{Global, GlobalName},
+            io_uring::model::IoUringAction,
+            protocol_generated::{NewId, WaylandId, WlDisplayId, WlRegistryId},
+            runner::{Dispatcher, Model},
+            state::State,
+            test_support::state_for_tests,
+            wayland_objects::wl_display::WlDisplay,
+        },
+    };
+
+    struct XwaylandOnlyGlobal;
+
+    impl Global for XwaylandOnlyGlobal {
+        fn interface(&self) -> (&'static str, u32) {
+            ("xwayland-only", 1)
+        }
+
+        fn xwayland_only(&self) -> bool {
+            true
+        }
+
+        fn bind(
+            &mut self,
+            _client: &mut Client,
+            _state: &mut State,
+            _id: NewId,
+            _version: u32,
+            _dispatcher: &mut ClientDispatcher,
+        ) {
+        }
+    }
+
+    fn request(object: u32, opcode: u16) -> RawEvent {
+        RawEvent::new(WaylandId::from(object), opcode, 8)
+    }
+
+    fn dispatch_request<K>(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        object: K,
+        event: RawEvent,
+    ) where
+        K: crate::object::IdToObject + Into<WaylandId> + Copy,
+    {
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        client_dispatcher.set_requester_object_id_for_tests(object.into());
+        client.grab_object(object, state).on(
+            client,
+            state,
+            (&*event.into_bytes()).try_into().unwrap(),
+            &mut client_dispatcher,
+        );
+    }
+
+    fn registry(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+    ) -> WlRegistryId {
+        client.insert_object(state, WlDisplay::default());
+        let mut event = request(1, 1);
+        event.id(WlRegistryId::from(2));
+        dispatch_request(client, state, dispatcher, WlDisplayId::from(1u32), event);
+        WlRegistryId::from(2)
+    }
+
+    fn sent(dispatcher: &Dispatcher, text: &str) -> bool {
+        let mut found = false;
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            if let IoUringAction::Sendmsg { buffer, .. } = action {
+                if buffer
+                    .windows(text.len())
+                    .any(|window| window == text.as_bytes())
+                {
+                    found = true;
+                }
+            }
+        });
+        found
+    }
+
+    fn offered(client: &Client, state: &State, name: GlobalName) -> bool {
+        let registry = client.resolve(WlRegistryId::from(2u32), state).unwrap();
+        state.globals.was_offered(name, registry)
+    }
+
+    #[test]
+    fn a_normal_registry_hides_an_xwayland_global_and_the_xwayland_registry_lists_it() {
+        let mut state = state_for_tests();
+        let name = state.insert_global(Box::new(XwaylandOnlyGlobal));
+        let mut normal = Client::new_for_tests(ClientId::from_raw(1));
+        let mut xwayland = Client::new_xwayland_for_tests(ClientId::from_raw(2));
+        let mut normal_dispatcher = Dispatcher::default();
+        let mut xwayland_dispatcher = Dispatcher::default();
+
+        registry(&mut normal, &mut state, &mut normal_dispatcher);
+        registry(&mut xwayland, &mut state, &mut xwayland_dispatcher);
+
+        assert!(!offered(&normal, &state, name));
+        assert!(!sent(&normal_dispatcher, "xwayland-only"));
+        assert!(offered(&xwayland, &state, name));
+        assert!(sent(&xwayland_dispatcher, "xwayland-only"));
+    }
+
+    #[test]
+    fn binding_an_xwayland_global_disconnects_a_normal_client() {
+        let mut state = state_for_tests();
+        let name = state.insert_global(Box::new(XwaylandOnlyGlobal));
+        let mut normal = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let registry_id = registry(&mut normal, &mut state, &mut dispatcher);
+
+        let mut bind = request(u32::from(registry_id), 0);
+        bind.uint(name.as_u32());
+        bind.string("xwayland-only");
+        bind.uint(1);
+        bind.id(9u32);
+        dispatch_request(&mut normal, &mut state, &mut dispatcher, registry_id, bind);
+
+        assert!(dispatcher.test_has_queued_action(|action: &ClientManagerAction| {
+            matches!(action, ClientManagerAction::Close { id } if *id == normal.client_id())
+        }));
+        assert!(state.globals.try_grab_global(name.as_u32()).is_some());
+
+        let mut xwayland = Client::new_xwayland_for_tests(ClientId::from_raw(2));
+        let mut xwayland_dispatcher = Dispatcher::default();
+        let xwayland_registry = registry(&mut xwayland, &mut state, &mut xwayland_dispatcher);
+        let mut bind = request(u32::from(xwayland_registry), 0);
+        bind.uint(name.as_u32());
+        bind.string("xwayland-only");
+        bind.uint(1);
+        bind.id(9u32);
+        dispatch_request(
+            &mut xwayland,
+            &mut state,
+            &mut xwayland_dispatcher,
+            xwayland_registry,
+            bind,
+        );
+        assert!(!xwayland_dispatcher.test_has_queued_action(|action: &ClientManagerAction| {
+            matches!(action, ClientManagerAction::Close { .. })
+        }));
+    }
+
+    #[test]
+    fn a_global_added_later_is_sent_only_to_the_xwayland_client() {
+        let mut state = state_for_tests();
+        let mut normal = Client::new_for_tests(ClientId::from_raw(1));
+        let mut xwayland = Client::new_xwayland_for_tests(ClientId::from_raw(2));
+        let mut normal_dispatcher = Dispatcher::default();
+        let mut xwayland_dispatcher = Dispatcher::default();
+        registry(&mut normal, &mut state, &mut normal_dispatcher);
+        registry(&mut xwayland, &mut state, &mut xwayland_dispatcher);
+        let name = state.insert_global(Box::new(XwaylandOnlyGlobal));
+
+        let action = ClientAction::RegistryGlobalAdded {
+            name: name.as_u32(),
+            interface: "xwayland-only".to_string(),
+            version: 1,
+        };
+        normal
+            .process(&mut state, action, &mut normal_dispatcher)
+            .unwrap();
+        xwayland
+            .process(
+                &mut state,
+                ClientAction::RegistryGlobalAdded {
+                    name: name.as_u32(),
+                    interface: "xwayland-only".to_string(),
+                    version: 1,
+                },
+                &mut xwayland_dispatcher,
+            )
+            .unwrap();
+
+        assert!(!offered(&normal, &state, name));
+        assert!(offered(&xwayland, &state, name));
     }
 }

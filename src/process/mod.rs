@@ -12,6 +12,8 @@ mod sys;
 
 #[allow(unused_imports)]
 pub(crate) use fd_map::{apply, plan, FdOp};
+#[cfg(test)]
+pub(crate) use forker::lock_forks;
 #[allow(unused_imports)]
 pub(crate) use forker::{spawn_forker, ForkerHandle};
 #[allow(unused_imports)]
@@ -22,10 +24,10 @@ pub(crate) use protocol::{decode, encode, FromForker, ToForker, MAX_MESSAGE};
 pub(crate) use reaper::become_reaped;
 #[allow(unused_imports)]
 pub(crate) use sys::{
-    close_range_from, count_threads, dup_above, dup_to, pidfd_open, pipe_cloexec, recv_with_fds,
-    reset_signals, send_with_fds, set_child_subreaper, set_cloexec, set_pdeathsig,
-    set_process_name, socketpair_dgram, socketpair_seqpacket, waitid_pidfd, ChildExit,
-    MAX_ATTACHED_FDS,
+    close_range_from, count_threads, dup_above, dup_to, pidfd_open, pidfd_send_signal,
+    pipe_cloexec, recv_with_fds, reset_signals, send_with_fds, set_child_subreaper, set_cloexec,
+    set_pdeathsig, set_process_name, socketpair_dgram, socketpair_seqpacket, socketpair_stream,
+    waitid_pidfd, ChildExit, MAX_ATTACHED_FDS,
 };
 
 /// Environment every spawn inherits. `DISPLAY` is absent on purpose: the

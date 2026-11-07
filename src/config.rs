@@ -49,6 +49,7 @@ pub enum OutputScaleSetting {
 pub struct RuntimeConfig {
     path: PathBuf,
     pub general: GeneralConfig,
+    pub xwayland: XwaylandConfig,
     pub tiling: TilingConfig,
     pub decorations: DecorationsConfig,
     pub effects: EffectsConfig,
@@ -79,6 +80,11 @@ impl Default for RendererSelection {
     fn default() -> Self {
         Self::OpenGl
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XwaylandConfig {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,6 +397,7 @@ pub enum ConfigWatcherAction {
 #[serde(default, deny_unknown_fields)]
 struct ConfigFile {
     general: GeneralConfigFile,
+    xwayland: XwaylandConfigFile,
     tiling: TilingConfigFile,
     decorations: DecorationsConfigFile,
     effects: EffectsConfigFile,
@@ -504,6 +511,12 @@ fn output_scale_setting_from_f64(scale: f64) -> anyhow::Result<OutputScaleSettin
         bail!("output scale must be finite and positive");
     };
     Ok(OutputScaleSetting::Fixed(scale))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct XwaylandConfigFile {
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -624,6 +637,7 @@ impl RuntimeConfig {
                 inner_gap: sanitize_non_negative_i32(parsed.general.inner_gap),
                 renderer: parse_renderer(&parsed.general.renderer)?,
             },
+            xwayland: XwaylandConfig { enabled: parsed.xwayland.enabled },
             tiling: TilingConfig {
                 drag: TilingDragConfig {
                     threshold: sanitize_non_negative_i32(parsed.tiling.drag.threshold),
@@ -655,6 +669,7 @@ impl RuntimeConfig {
                 inner_gap: 0,
                 renderer: RendererSelection::OpenGl,
             },
+            xwayland: XwaylandConfig::default(),
             tiling: TilingConfig::default(),
             decorations: DecorationsConfig::default(),
             effects: EffectsConfig::default(),
@@ -821,6 +836,18 @@ impl KeyBinding {
 impl MouseBindingTrigger {
     fn matches(&self, button: u32, modifiers: u32) -> bool {
         self.button == button && self.modifiers == modifiers
+    }
+}
+
+impl Default for XwaylandConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Default for XwaylandConfigFile {
+    fn default() -> Self {
+        Self { enabled: XwaylandConfig::default().enabled }
     }
 }
 
@@ -1152,6 +1179,15 @@ pub fn reload_from_disk(
             running = state.config.general.renderer,
         );
         next.general.renderer = state.config.general.renderer;
+    }
+    if next.xwayland.enabled != state.config.xwayland.enabled {
+        log::warn!(
+            "xwayland.enabled is {requested} in {path} and the running value is {running}; restart the compositor to change it",
+            requested = next.xwayland.enabled,
+            path = path.display(),
+            running = state.config.xwayland.enabled,
+        );
+        next.xwayland.enabled = state.config.xwayland.enabled;
     }
     let changed = state.config != next;
     state.config = next;
@@ -2236,6 +2272,99 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(state.config.general.renderer, RendererSelection::Auto);
+    }
+
+    #[test]
+    fn xwayland_is_enabled_by_default_and_can_be_turned_off() {
+        let xkb = Xkb::new();
+        assert!(RuntimeConfig::default().xwayland.enabled);
+        assert!(
+            RuntimeConfig::parse_for_test("", &xkb)
+                .unwrap()
+                .xwayland
+                .enabled
+        );
+        assert!(
+            RuntimeConfig::parse_for_test("[xwayland]\nenabled = true\n", &xkb)
+                .unwrap()
+                .xwayland
+                .enabled
+        );
+
+        let disabled =
+            RuntimeConfig::parse_for_test("[xwayland]\nenabled = false\n", &xkb).unwrap();
+        assert!(!disabled.xwayland.enabled);
+    }
+
+    #[test]
+    fn rejects_unknown_xwayland_keys() {
+        let error =
+            RuntimeConfig::parse_for_test("[xwayland]\nscaling_mode = \"default\"\n", &Xkb::new())
+                .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error:#}");
+    }
+
+    #[test]
+    fn reload_keeps_running_xwayland_enabled_and_applies_other_settings() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            [general]
+            outer_gap = 4
+
+            [xwayland]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(
+            &path,
+            r#"
+            [general]
+            outer_gap = 16
+
+            [xwayland]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        assert!(state.config.xwayland.enabled);
+        assert_eq!(state.config.general.outer_gap, 16);
+    }
+
+    #[test]
+    fn reload_ignores_an_xwayland_only_change() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[xwayland]\nenabled = false\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[xwayland]\nenabled = true\n").unwrap();
+
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(!changed);
+        assert!(!state.config.xwayland.enabled);
     }
 
     #[test]

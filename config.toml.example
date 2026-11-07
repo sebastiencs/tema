@@ -17,6 +17,10 @@ renderer = "opengl"
 outer_gap = 10
 inner_gap = 10
 
+# Xwayland starts lazily on the first X connection. Changing this requires a restart.
+[xwayland]
+enabled = true
+
 # Mouse move of a tiled window.
 # threshold is logical pixels before the window is picked up; 0 picks it up immediately.
 # precise_mouse_move false splits a wide tile left/right and a tall tile top/bottom.

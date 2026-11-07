@@ -4,8 +4,8 @@
 //! a custom handler survive `exec`, so a child must call [`reset_signals`]
 //! before it execs.
 //!
-//! `nix` 0.31 has no wrapper for `pidfd_open` or `close_range`. Those two
-//! stay on `libc`.
+//! `nix` 0.31 has no wrapper for `pidfd_open`, `pidfd_send_signal`, or
+//! `close_range`. Those stay on `libc`.
 
 use std::{
     ffi::CStr,
@@ -53,6 +53,10 @@ pub(crate) fn socketpair_dgram() -> std::io::Result<(OwnedFd, OwnedFd)> {
     socketpair(SockType::Datagram)
 }
 
+pub(crate) fn socketpair_stream() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    socketpair(SockType::Stream)
+}
+
 pub(crate) fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok(pipe2(OFlag::O_CLOEXEC)?)
 }
@@ -64,6 +68,24 @@ pub(crate) fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
         return Err(Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// Signal the process `pidfd` refers to. `info` is NULL, so no `siginfo` is sent.
+pub(crate) fn pidfd_send_signal(pidfd: &impl AsRawFd, signal: i32) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Collect the exit of the process `pidfd` refers to, without blocking.
@@ -425,6 +447,28 @@ mod tests {
             unistd::pause();
         });
         kill(pid, Signal::SIGKILL).unwrap();
+        assert_eq!(wait_ready(&pidfd), ChildExit::Signal(libc::SIGKILL));
+    }
+
+    #[test]
+    fn stream_socketpair_is_connected_and_cloexec() {
+        let (left, right) = socketpair_stream().unwrap();
+        assert!(is_cloexec(&left));
+        assert!(is_cloexec(&right));
+        assert_eq!(unistd::write(&left, b"hi").unwrap(), 2);
+        let mut buffer = [0u8; 2];
+        assert_eq!(unistd::read(&right, &mut buffer).unwrap(), 2);
+        assert_eq!(&buffer, b"hi");
+    }
+
+    #[test]
+    fn pidfd_send_signal_kills_a_sleeping_child() {
+        let _lock = crate::process::forker::lock_forks();
+        let (_pid, pidfd, _reap) = fork_child(|| {
+            unistd::sleep(30);
+            unsafe { libc::_exit(0) }
+        });
+        pidfd_send_signal(&pidfd, libc::SIGKILL).unwrap();
         assert_eq!(wait_ready(&pidfd), ChildExit::Signal(libc::SIGKILL));
     }
 

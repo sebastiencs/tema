@@ -73,6 +73,10 @@ pub enum GlobalRemoveAckError {
 pub trait Global {
     /// Returns `(interface_name, interface_version)`
     fn interface(&self) -> (&'static str, u32);
+    /// Only the Xwayland client may see or bind this global.
+    fn xwayland_only(&self) -> bool {
+        false
+    }
     fn bind(
         &mut self,
         client: &mut Client,
@@ -141,6 +145,21 @@ impl Globals {
                 .expect("missing global wire name");
             (!self.removed.contains(&name)).then_some((name, global))
         })
+    }
+
+    /// Globals this client may hear about. `xwayland` is the Xwayland client.
+    pub fn iter_for(&self, xwayland: bool) -> impl Iterator<Item = (GlobalName, &Box<dyn Global>)> {
+        self.iter()
+            .filter(move |(_, global)| xwayland || !global.xwayland_only())
+    }
+
+    pub fn is_xwayland_only(&self, name: GlobalName) -> bool {
+        let Some(&slot_id) = self.slots_by_name.get(&name) else {
+            return false;
+        };
+        self.map
+            .try_get(slot_id)
+            .is_some_and(|global| global.xwayland_only())
     }
 
     pub fn insert(&mut self, global: Box<dyn Global>) -> GlobalName {

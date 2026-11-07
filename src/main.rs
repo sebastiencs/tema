@@ -204,6 +204,7 @@ mod utils;
 mod visual_animation;
 mod wayland_objects;
 mod xkb;
+mod xwayland;
 
 /// Master switch for incremental damage (surface commits, output damage, partial GL redraw,
 /// `FB_DAMAGE_CLIPS`, buffer age, occlusion, etc.). When `false`, code paths should fall back
@@ -385,6 +386,7 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     let signals = Box::new(signals::SignalHandler::install().map_err(StartupError::Signals)?);
     runner.add_model(signals);
     runner.add_model(Box::new(process::ProcessManager::new(forker)));
+    runner.add_model(Box::new(xwayland::Xwayland::new()));
 
     let mut dispatcher = Dispatcher::default();
     dispatcher.start::<ClientManager>();
@@ -392,6 +394,9 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     for (key, value) in process::default_environment() {
         dispatcher.dispatch(process::ProcessManagerAction::SetEnv { key, value: Some(value) });
     }
+    // After the forker has the default environment, so DISPLAY is queued
+    // before any later spawn. The compositor's own environment is unchanged.
+    dispatcher.start::<xwayland::Xwayland>();
     dispatcher.start::<libinput::Libinput>();
     dispatcher.start::<scheduler::IdleScheduler>();
     dispatcher.start::<config::ConfigWatcher>();

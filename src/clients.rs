@@ -146,9 +146,19 @@ pub struct ClientManager {
     fd: UnixListener,
     path: PathBuf,
     set: BTreeSet<ClientId>,
+    /// Notified once, when an adopted client is closed.
+    closed: BTreeMap<ClientId, Redispatcher<ClientId>>,
     accept_op_id: Option<RingId>,
     accepting: bool,
     unlinked: bool,
+}
+
+/// How an adopted client differs from one accepted on the Wayland socket.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClientOrigin {
+    pub(crate) xwayland: bool,
+    /// Replaces the pid from `SO_PEERCRED`. Uid and gid still come from there.
+    pub(crate) pid: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -173,19 +183,46 @@ impl std::error::Error for SocketBindError {
 pub enum ClientManagerAction {
     Start,
     RearmAccept,
-    NewClient { new_client: RawFd },
+    NewClient {
+        new_client: RawFd,
+    },
+    /// Take ownership of an already-connected socket and run it as a client.
+    AdoptClient {
+        fd: OwnedFd,
+        origin: ClientOrigin,
+        adopted: Redispatcher<ClientId>,
+        closed: Redispatcher<ClientId>,
+    },
     LibinputEvent,
     UdevEvent,
-    RegistryGlobalAdded { name: u32, interface: String, version: u32 },
-    RegistryGlobalRemoved { name: u32 },
-    OutputStateChanged { output_id: OutputId },
-    OutputRemoved { output_id: OutputId },
-    GammaControlFailed { output_id: OutputId },
-    DiscardSurfacePresentationFeedbacksForBackend { drm_id: DrmId },
-    PublishWorkspaceStateChanged { affected_outputs: Vec<OutputId> },
+    RegistryGlobalAdded {
+        name: u32,
+        interface: String,
+        version: u32,
+    },
+    RegistryGlobalRemoved {
+        name: u32,
+    },
+    OutputStateChanged {
+        output_id: OutputId,
+    },
+    OutputRemoved {
+        output_id: OutputId,
+    },
+    GammaControlFailed {
+        output_id: OutputId,
+    },
+    DiscardSurfacePresentationFeedbacksForBackend {
+        drm_id: DrmId,
+    },
+    PublishWorkspaceStateChanged {
+        affected_outputs: Vec<OutputId>,
+    },
     WorkspaceStateChanged,
     LayerShellLayoutChanged,
-    Close { id: ClientId },
+    Close {
+        id: ClientId,
+    },
     Stop,
 }
 
@@ -211,6 +248,7 @@ impl ClientManager {
             fd,
             path,
             set: BTreeSet::default(),
+            closed: BTreeMap::new(),
             accept_op_id: None,
             accepting: true,
             unlinked: false,
@@ -248,6 +286,9 @@ impl ClientManager {
         log::trace!("client {:?} closed", id);
         if self.set.remove(&id) {
             dispatcher.stop_model(id);
+        }
+        if let Some(closed) = self.closed.remove(&id) {
+            dispatcher.redispatch_to(closed, id);
         }
     }
 
@@ -315,9 +356,25 @@ impl Model for ClientManager {
 
                 let client_id = self.next_id();
                 self.set.insert(client_id);
-                dispatcher.start_model(client_id, Client::new(client_id, new_client));
+                let fd = unsafe { OwnedFd::from_raw_fd(new_client) };
+                dispatcher.start_model(
+                    client_id,
+                    Client::new(client_id, fd, ClientOrigin { xwayland: false, pid: None }),
+                );
 
                 log::trace!("new_client id={:?} fd={:?}", client_id, new_client);
+            }
+            AdoptClient { fd, origin, adopted, closed } => {
+                if !self.accepting {
+                    drop(fd);
+                    return Ok(());
+                }
+                let client_id = self.next_id();
+                self.set.insert(client_id);
+                self.closed.insert(client_id, closed);
+                dispatcher.start_model(client_id, Client::new(client_id, fd, origin));
+                dispatcher.redispatch_to(adopted, client_id);
+                log::trace!("adopted client id={:?} xwayland={}", client_id, origin.xwayland);
             }
             LibinputEvent => {
                 // self.libinput.dispatch();
@@ -431,6 +488,9 @@ struct ClientObjectEntry {
 pub struct Client {
     id: ClientId,
     fd: OwnedFd,
+    xwayland: bool,
+    /// Pid to use instead of `SO_PEERCRED`, for a client we spawned ourselves.
+    pid_override: Option<i32>,
     reader_id: Option<ClientReaderId>,
     /// the key `WaylandId` is the id we share with the client
     /// the value `ObjectId` is an index in our `State::objects`
@@ -602,10 +662,12 @@ pub enum DataSourceClientEvent {
 }
 
 impl Client {
-    fn new(client_id: ClientId, fd: RawFd) -> Self {
+    fn new(client_id: ClientId, fd: OwnedFd, origin: ClientOrigin) -> Self {
         Self {
             id: client_id,
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            fd,
+            xwayland: origin.xwayland,
+            pid_override: origin.pid,
             reader_id: None,
             objects: BTreeMap::default(),
             info: None,
@@ -616,9 +678,18 @@ impl Client {
 
     #[cfg(test)]
     pub(crate) fn new_for_tests(client_id: ClientId) -> Self {
-        use std::os::fd::IntoRawFd as _;
-        let fd: RawFd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
-        Self::new(client_id, fd)
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        Self::new(client_id, fd, ClientOrigin { xwayland: false, pid: None })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_xwayland_for_tests(client_id: ClientId) -> Self {
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        Self::new(client_id, fd, ClientOrigin { xwayland: true, pid: None })
+    }
+
+    pub fn is_xwayland(&self) -> bool {
+        self.xwayland
     }
 
     pub fn client_id(&self) -> ClientId {
@@ -664,6 +735,9 @@ impl Client {
             let e = std::io::Error::last_os_error();
             log::error!("Unable to `getsockopt` of new client: {:?}", e);
             return;
+        }
+        if let Some(pid) = self.pid_override {
+            cred.pid = pid;
         }
         let command = match std::fs::read(format!("/proc/{}/cmdline", cred.pid)) {
             Ok(cmdline) if !cmdline.is_empty() => {
@@ -1889,6 +1963,10 @@ impl Client {
         interface: String,
         version: u32,
     ) {
+        let global_name = crate::globals::GlobalName::from_raw(name);
+        if state.globals.is_xwayland_only(global_name) && !self.is_xwayland() {
+            return;
+        }
         let registries = self
             .iter_resolved_of::<WlRegistryId>(state)
             .collect::<Vec<_>>();
@@ -1909,6 +1987,9 @@ impl Client {
         name: u32,
     ) {
         let global_name = crate::globals::GlobalName::from_raw(name);
+        if state.globals.is_xwayland_only(global_name) && !self.is_xwayland() {
+            return;
+        }
         for registry in self.iter_resolved_of::<WlRegistryId>(state) {
             if !state.globals.was_offered(global_name, registry) {
                 continue;
@@ -2596,9 +2677,10 @@ impl Model for Client {
                 self.read_process_info();
                 state.set_client_process_info(self.id, self.info.clone());
                 log::info!(
-                    "new client_id={:?} command={:?}",
+                    "new client_id={:?} command={:?} xwayland={}",
                     self.id,
-                    self.info.as_ref().map(|p| &p.command)
+                    self.info.as_ref().map(|p| &p.command),
+                    self.xwayland
                 );
 
                 let display: WlDisplay = WlDisplay::default();
@@ -3638,7 +3720,7 @@ mod surface_output_refresh_tests {
 
 #[cfg(test)]
 mod socket_shutdown_tests {
-    use std::{io::Read, os::unix::net::UnixStream};
+    use std::{cell::RefCell, io::Read, os::unix::net::UnixStream, rc::Rc};
 
     use {
         super::*,
@@ -3878,6 +3960,152 @@ mod socket_shutdown_tests {
             Err(error) => assert!(error.to_string().contains("bind Wayland socket")),
             Ok(_manager) => panic!("bind succeeded"),
         }
+    }
+
+    fn record_ids() -> (Rc<RefCell<Vec<ClientId>>>, Redispatcher<ClientId>) {
+        let ids = Rc::new(RefCell::new(Vec::new()));
+        let recorded = ids.clone();
+        let notify = Redispatcher::to_any(move |id| {
+            recorded.borrow_mut().push(id);
+            crate::runner::AnyAction::empty()
+        });
+        (ids, notify)
+    }
+
+    #[test]
+    fn adopting_a_socket_starts_a_client_and_returns_its_id() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (adopted, adopted_notify) = record_ids();
+        let (_closed, closed_notify) = record_ids();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AdoptClient {
+                    fd: socket.into(),
+                    origin: ClientOrigin { xwayland: true, pid: None },
+                    adopted: adopted_notify,
+                    closed: closed_notify,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        let id = adopted.borrow()[0];
+        assert_eq!(id, ClientId(0));
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            id,
+            |action| matches!(action, ClientAction::Start)
+        ));
+    }
+
+    #[test]
+    fn closing_an_adopted_client_fires_once() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_adopted, adopted_notify) = record_ids();
+        let (closed, closed_notify) = record_ids();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AdoptClient {
+                    fd: socket.into(),
+                    origin: ClientOrigin { xwayland: true, pid: None },
+                    adopted: adopted_notify,
+                    closed: closed_notify,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let id = ClientId(0);
+
+        manager
+            .process(&mut state, ClientManagerAction::Close { id }, &mut dispatcher)
+            .unwrap();
+        manager
+            .process(&mut state, ClientManagerAction::Close { id }, &mut dispatcher)
+            .unwrap();
+
+        assert_eq!(closed.borrow().as_slice(), &[id]);
+        assert!(dispatcher.test_stop_queued(id));
+    }
+
+    #[test]
+    fn adopt_after_stop_drops_the_socket() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        manager
+            .process(&mut state, ClientManagerAction::Stop, &mut dispatcher)
+            .unwrap();
+        let (adopted, adopted_notify) = record_ids();
+        let (closed, closed_notify) = record_ids();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AdoptClient {
+                    fd: socket.into(),
+                    origin: ClientOrigin { xwayland: false, pid: None },
+                    adopted: adopted_notify,
+                    closed: closed_notify,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        let mut buffer = [0u8; 1];
+        assert_eq!(peer.read(&mut buffer).unwrap(), 0);
+        assert!(adopted.borrow().is_empty());
+        assert!(closed.borrow().is_empty());
+        assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId(0),
+            |action| matches!(action, ClientAction::Start)
+        ));
+    }
+
+    #[test]
+    fn a_pid_override_reads_that_process_command_line() {
+        let pid = std::process::id() as i32;
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(
+            ClientId::from_raw(3),
+            socket.into(),
+            ClientOrigin { xwayland: true, pid: Some(pid) },
+        );
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        client
+            .process(&mut state, ClientAction::Start, &mut dispatcher)
+            .unwrap();
+
+        let info = client.info.as_ref().expect("process info");
+        assert!(client.is_xwayland());
+        assert_eq!(info.cred.pid, pid);
+        assert_eq!(info.cred.uid, unsafe { libc::getuid() });
+        assert_eq!(info.cred.gid, unsafe { libc::getgid() });
+        assert_eq!(info.command(), cmdline_of(pid));
+        assert!(!Client::new_for_tests(ClientId::from_raw(1)).is_xwayland());
+    }
+
+    fn cmdline_of(pid: i32) -> String {
+        let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 

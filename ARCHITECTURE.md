@@ -622,7 +622,7 @@ That is the whole system.
 
 ## 16. Processes
 
-The compositor does not fork. The process that was started from the terminal becomes a reaper, and a helper process, the forker, creates every child. Keybinding commands use this path now. Xwayland will use it later.
+The compositor does not fork. The process that was started from the terminal becomes a reaper, and a helper process, the forker, creates every child. Keybinding commands and Xwayland use this path.
 
 ```text
 tema reaper          original pid, child subreaper, terminal process group
@@ -646,7 +646,7 @@ The reaper and the compositor keep the terminal's standard streams. The forker p
 
 The reaper exits when the compositor exits, with the same code, or `128 + signal`. A status that does not fit in a byte becomes 1. It does not wait for other children. Programs that are still running are reparented and keep running. The forker dies with the reaper because of its death signal. While the reaper is alive it reaps every child, including a daemon whose parent already exited.
 
-On shutdown the runner stops `ProcessManager` immediately after `ClientManager`. That drops the socket. The forker sees the close and exits 0.
+On shutdown the runner stops Xwayland, then `ClientManager`, then `ProcessManager`. Stopping the process manager drops the socket. The forker sees the close and exits 0.
 
 ### File descriptors
 
@@ -705,3 +705,92 @@ Run a normal session from a terminal, with the example bindings (`Super+Return` 
 4. Start again and `kill -9` the compositor pid. The reaper exits 137 and the forker dies.
 5. Start again and `kill -9` the forker pid. The compositor logs `forker died` and stays up. Another `Super+Return` warns `forker is unavailable`.
 6. Spawn `sleep 300 &` from a keybinding (`sh -lc` is added by the compositor, so the command itself is `sleep 300 &`). `ps -o pid,ppid,comm` shows that `sleep` is a child of `tema reaper`.
+
+## 17. Xwayland
+
+Xwayland is enabled by default. At startup the compositor claims one X display and publishes it to the forker as `DISPLAY=:N`. No Xwayland process exists yet. The first connection to the listening socket is what spawns it. The compositor's own environment stays as it was, including when tema is nested under an outer X server. Only programs the forker starts receive `:N`.
+
+```toml
+[xwayland]
+enabled = true
+```
+
+`enabled = false` logs `Xwayland disabled` and skips the display. A reload that flips `enabled` logs the requested value and the running value, then keeps the running one. Changing it takes a restart.
+
+```text
+Start
+  disabled, or no display available → stay down, no DISPLAY
+  otherwise                         → Waiting
+                                      /tmp/.X11-unix/XN and /tmp/.XN-lock
+                                      forker DISPLAY=:N
+                                      poll the socket, no Xwayland process
+
+connection
+  → Launching
+      Spawned → Running
+                read displayfd and stderr
+                adopt the Wayland socket as the Xwayland client
+      Failed  → count an early failure
+  displayfd text → ready, log "Xwayland ready on :N"
+  Wayland client drops → SIGKILL that run; the exit follows
+
+exit of a good run → Waiting again, same :N, same files
+early failure      → Waiting again, until the third in a row
+third early failure, a listen error, or a lost forker
+                   → GivenUp
+                     unlink both files, clear forker DISPLAY
+
+Stop → unlink both files, SIGKILL a running server, leave DISPLAY set
+```
+
+A completion tagged with an older launch is ignored. A pid that arrives after `Stop` is killed and not adopted.
+
+### File descriptors
+
+Xwayland is started as `Xwayland -terminate -rootless -verbose 10 -displayfd 3 -listenfd 4 -wm 5`. Descriptors 0 and 1 stay `/dev/null`. The spawn also sets `WAYLAND_SOCKET=6` and removes `LIBEI_SOCKET`.
+
+| Slot | In Xwayland | Kept by the compositor |
+| --- | --- | --- |
+| 2 | stderr, write end | read end. Whole lines are logged as `Xwayland: …` |
+| 3 | `-displayfd`, write end | read end. The first bytes mark the server ready |
+| 4 | `-listenfd` | the same listening socket, duplicated |
+| 5 | `-wm` | the other end of the socketpair, held open |
+| 6 | `WAYLAND_SOCKET` | the other end, adopted as a Wayland client |
+
+The adopted client is logged as `new client_id=… command=… xwayland=true`. Its pid is Xwayland's. A socketpair's peer credentials would otherwise name the compositor.
+
+### Lock file and socket
+
+Displays `500` through `1499` are tried in order. Display `N` is the filesystem socket `/tmp/.X11-unix/XN` plus the lock `/tmp/.XN-lock`. There is no abstract-namespace socket. `/tmp/.X11-unix` has to already exist, be a directory, and be writable.
+
+The lock is created exclusively, mode `0444`. Its text is the compositor pid in ten columns and a newline, because the compositor owns the display across Xwayland restarts. A lock whose pid is dead is removed and the number is tried again. A live pid, or a file that is not a pid, is left in place and the search moves on. A number whose socket cannot be bound is skipped the same way. The listen backlog is 4096.
+
+Dropping the display unlinks both files. Restart keeps them. Give-up and `Stop` drop them.
+
+### Restart
+
+A run fails early when it never becomes ready, or when it became ready and then exits with a non-zero code or a signal in under ten seconds. A ready exit with code 0 is a clean run at any age. So is a ready run that lasted at least ten seconds, whatever the status. Three early failures in a row give up. Any other run clears the count.
+
+A failed `exec` counts, because the server never became ready. The listening socket still has the unaccepted connection, so the new poll wakes at once and the next attempt follows immediately. A listen error, and a lost forker, give up on the spot. The lost-forker path kills the running server first.
+
+Give-up logs `Xwayland gave up: …`, unlinks both files, and removes `DISPLAY` from the forker. `Stop` leaves `DISPLAY` set, because the forker is stopping too.
+
+### `WM_S0`
+
+`-wm 5` is always passed, and our end of that socket stays open. Xwayland accepts clients on the listen socket only once a window manager owns the `WM_S0` selection. Nothing here claims it yet. That arrives in M5. Until then `xterm` starts Xwayland, the server becomes ready, and the X client waits.
+
+### Xwayland-only globals
+
+A global may answer `xwayland_only`. The default is no, so every current global stays visible to every client. An Xwayland-only global is offered only to the Xwayland client, both in the first registry dump and when the global appears later. A normal client that binds the name is disconnected with `invalid global name`, the same response as an unknown name. Removal is sent only to registries that were offered the name. No such global is registered yet. M4 adds `xwayland_shell_v1`.
+
+### Manual check
+
+Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
+
+1. `ls /tmp/.X11-unix/XN /tmp/.XN-lock` shows both files. `pgrep -x Xwayland` prints nothing.
+2. Spawn a terminal with the usual keybinding. `echo $DISPLAY` prints `:N`.
+3. Run `xterm`. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, and `Xwayland ready on :N`. `xterm` waits. That lasts until M5.
+4. `kill -9 $(pgrep -x Xwayland)`. The log shows `Xwayland exited with signal 9`. A new `xterm` starts Xwayland again on the same `:N`, and both files are still there. A signal within ten seconds of becoming ready counts as an early failure, so one kill relaunches, and a third early failure gives up.
+5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
+6. `[xwayland] enabled = false`, then start tema. The log says `Xwayland disabled`. Neither file exists, and a spawned terminal has an empty `DISPLAY`.
+7. Quit tema during a normal session. No `Xwayland` process remains, and both files are gone.
