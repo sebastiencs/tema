@@ -12,6 +12,7 @@ use crate::{
     region::RectI,
     render::{BlurVisualStyle, RoundedRing, Texture},
     state::{DrmId, WorkspaceId},
+    window::WindowId,
 };
 
 use super::track::{Easing, RetargetableTrack, TrackStatus, UnitValue};
@@ -29,6 +30,7 @@ pub struct FrozenClosingBlur {
 struct ClosingSnapshotAnimation {
     id: u64,
     source: Resolved<WlSurfaceId>,
+    window: WindowId,
     workspace_id: Option<WorkspaceId>,
     bounds: RectI,
     pose: Option<RectI>,
@@ -47,6 +49,7 @@ impl ClosingSnapshotAnimation {
     fn start(
         id: u64,
         source: Resolved<WlSurfaceId>,
+        window: WindowId,
         workspace_id: Option<WorkspaceId>,
         bounds: RectI,
         blur: Option<FrozenClosingBlur>,
@@ -54,6 +57,7 @@ impl ClosingSnapshotAnimation {
         Self {
             id,
             source,
+            window,
             workspace_id,
             bounds,
             pose: None,
@@ -193,6 +197,7 @@ impl RetainedClosingSnapshot {
     pub(crate) fn new(
         id: u64,
         source: Resolved<WlSurfaceId>,
+        window: WindowId,
         workspace_id: Option<WorkspaceId>,
         bounds: RectI,
         blur: Option<FrozenClosingBlur>,
@@ -200,7 +205,14 @@ impl RetainedClosingSnapshot {
         texture: Rc<dyn Texture>,
     ) -> Self {
         Self {
-            animation: ClosingSnapshotAnimation::start(id, source, workspace_id, bounds, blur),
+            animation: ClosingSnapshotAnimation::start(
+                id,
+                source,
+                window,
+                workspace_id,
+                bounds,
+                blur,
+            ),
             drm_id,
             texture,
             #[cfg(test)]
@@ -214,6 +226,11 @@ impl RetainedClosingSnapshot {
 
     pub(crate) fn source(&self) -> Resolved<WlSurfaceId> {
         self.animation.source
+    }
+
+    /// Window this image was captured from. The snapshot keeps the id after that window is gone.
+    pub(crate) fn window(&self) -> WindowId {
+        self.animation.window
     }
 
     pub(crate) fn workspace_id(&self) -> Option<WorkspaceId> {
@@ -350,7 +367,14 @@ impl RetainedClosingSnapshot {
     ) -> (Self, Rc<Cell<u32>>) {
         let probe = Rc::new(Cell::new(0));
         let snapshot = Self {
-            animation: ClosingSnapshotAnimation::start(id, source, None, bounds, None),
+            animation: ClosingSnapshotAnimation::start(
+                id,
+                source,
+                WindowId::for_tests(id),
+                None,
+                bounds,
+                None,
+            ),
             drm_id,
             texture: crate::render::inert_texture(),
             release_probe: Some(Rc::clone(&probe)),

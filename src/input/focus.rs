@@ -238,7 +238,7 @@ pub(crate) fn focused_window_close(
     if state.session_lock.input_gated() {
         return None;
     }
-    if !state.managed_root_surfaces.contains_key(&surface) {
+    if !state.is_managed_window(surface) {
         return None;
     }
     let focus = state.seat.keyboard_focus()?;
@@ -841,6 +841,7 @@ mod tests {
         let surface =
             crate::clients::Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(raw), oid);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface);
         surface
     }
 
@@ -854,15 +855,17 @@ mod tests {
         let upper = insert_root(&mut state, 82);
         let _ = state.assign_root_surface_to_workspace(lower, workspace_id);
         let _ = state.assign_root_surface_to_workspace(upper, workspace_id);
+        let lower_window = state.window_for_root(lower).unwrap();
+        let upper_window = state.window_for_root(upper).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![lower, upper];
-        state.managed_root_surfaces.get_mut(&lower).unwrap().mapped = true;
-        state.managed_root_surfaces.get_mut(&upper).unwrap().mapped = true;
+            .stack = vec![lower_window, upper_window];
+        state.managed_window_mut(lower).unwrap().mapped = true;
+        state.managed_window_mut(upper).unwrap().mapped = true;
 
         let candidate = topmost_focus_candidate_for_workspace(&state, workspace_id, None)
             .expect("focus candidate");
@@ -884,11 +887,7 @@ mod tests {
             .unwrap()
             .test_map(crate::state::ObjectId::from(raw as usize), x, y, 30, 30);
         let _ = state.assign_root_surface_to_workspace(surface, workspace_id);
-        state
-            .managed_root_surfaces
-            .get_mut(&surface)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(surface).unwrap().mapped = true;
         surface
     }
 
@@ -906,13 +905,16 @@ mod tests {
         let older = place_window(state, 81, workspace_id, 0, 0);
         let under_pointer = place_window(state, 82, workspace_id, 40, 0);
         let closing = place_window(state, 83, workspace_id, 0, 50);
+        let older_window = state.window_for_root(older).unwrap();
+        let under_pointer_window = state.window_for_root(under_pointer).unwrap();
+        let closing_window = state.window_for_root(closing).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![older, under_pointer, closing];
+            .stack = vec![older_window, under_pointer_window, closing_window];
         ThreeWindows { workspace_id, older, under_pointer, closing }
     }
 

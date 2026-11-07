@@ -106,15 +106,19 @@ mod tests {
 
         let first = insert_root(&mut state, 31);
         let second = insert_root(&mut state, 32);
+        crate::test_support::insert_window(&mut state, first);
+        crate::test_support::insert_window(&mut state, second);
         let _ = state.assign_root_surface_to_workspace(first, workspace_id);
         let _ = state.assign_root_surface_to_workspace(second, workspace_id);
+        let first_window = state.window_for_root(first).unwrap();
+        let second_window = state.window_for_root(second).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![first, second];
+            .stack = vec![first_window, second_window];
 
         let scene = crate::scene::build_scene_model(&state);
         let order = build_workspace_focus_order(&state, &scene, workspace_id, None);

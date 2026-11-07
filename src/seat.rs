@@ -1324,10 +1324,12 @@ impl SeatState {
     pub(crate) fn start_toplevel_move(
         &mut self,
         _client_id: ClientId,
+        window: crate::window::WindowId,
         root_surface: Resolved<WlSurfaceId>,
         initial_geometry: WindowTargetGeometry,
     ) {
         self.pointer_interactive_grab = Some(PointerInteractiveGrab::Move {
+            window,
             root_surface,
             initial_pointer_pos: self.pointer_pos,
             initial_geometry,
@@ -1337,15 +1339,15 @@ impl SeatState {
     pub(crate) fn start_toplevel_resize(
         &mut self,
         _client_id: ClientId,
+        window: crate::window::WindowId,
         root_surface: Resolved<WlSurfaceId>,
-        xdg_toplevel: Resolved<XdgToplevelId>,
         size_constraints: InteractiveSizeConstraints,
         edges: u32,
         initial_geometry: WindowTargetGeometry,
     ) {
         self.pointer_interactive_grab = Some(PointerInteractiveGrab::Resize {
+            window,
             root_surface,
-            xdg_toplevel,
             size_constraints,
             edges,
             initial_pointer_pos: self.pointer_pos,
@@ -1357,11 +1359,13 @@ impl SeatState {
     pub(crate) fn start_toplevel_tiled_resize(
         &mut self,
         _client_id: ClientId,
+        window: crate::window::WindowId,
         root_surface: Resolved<WlSurfaceId>,
         edges: u32,
         resize_state: TiledResizeState,
     ) {
         self.pointer_interactive_grab = Some(PointerInteractiveGrab::ResizeTiled {
+            window,
             root_surface,
             edges,
             initial_pointer_pos: self.pointer_pos,
@@ -2414,21 +2418,25 @@ mod surface_tree_hit_test_tests {
 
         let _ = state.assign_root_surface_to_workspace(root(&state, lower), workspace_id);
         let _ = state.assign_root_surface_to_workspace(root(&state, upper), workspace_id);
+        let managed_lower = root(&state, lower);
+        crate::test_support::insert_window(&mut state, managed_lower);
+        let managed_upper = root(&state, upper);
+        crate::test_support::insert_window(&mut state, managed_upper);
+        let lower_window = state.window_for_root(managed_lower).unwrap();
+        let upper_window = state.window_for_root(managed_upper).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![root(&state, lower), root(&state, upper)];
+            .stack = vec![lower_window, upper_window];
         state
-            .managed_root_surfaces
-            .get_mut(&root(&state, lower))
+            .managed_window_mut(root(&state, lower))
             .unwrap()
             .mapped = true;
         state
-            .managed_root_surfaces
-            .get_mut(&root(&state, upper))
+            .managed_window_mut(root(&state, upper))
             .unwrap()
             .mapped = true;
 
@@ -3405,7 +3413,7 @@ mod xdg_seat_tests {
             WlSurfaceId::from(171),
             XdgSurfaceId::from(181),
         );
-        let _toplevel_object_id = assign_toplevel_role(
+        let toplevel_object_id = assign_toplevel_role(
             &mut state,
             &mut client,
             &mut client_dispatcher,
@@ -3416,15 +3424,7 @@ mod xdg_seat_tests {
         {
             let toplevel = state
                 .objects
-                .get_mut(
-                    state
-                        .xdg_toplevel_object_id(Resolved::new(
-                            client.client_id(),
-                            XdgSurfaceId::from(181),
-                            xdg_surface_object_id,
-                        ))
-                        .unwrap(),
-                )
+                .get_mut(toplevel_object_id)
                 .downcast_mut::<XdgToplevel>()
                 .unwrap();
             toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
@@ -3521,7 +3521,7 @@ mod xdg_seat_tests {
             WlSurfaceId::from(201),
             XdgSurfaceId::from(211),
         );
-        let _toplevel_object_id = assign_toplevel_role(
+        let toplevel_object_id = assign_toplevel_role(
             &mut state,
             &mut client,
             &mut client_dispatcher,
@@ -3532,15 +3532,7 @@ mod xdg_seat_tests {
         {
             let toplevel = state
                 .objects
-                .get_mut(
-                    state
-                        .xdg_toplevel_object_id(Resolved::new(
-                            client.client_id(),
-                            XdgSurfaceId::from(211),
-                            xdg_surface_object_id,
-                        ))
-                        .unwrap(),
-                )
+                .get_mut(toplevel_object_id)
                 .downcast_mut::<XdgToplevel>()
                 .unwrap();
             toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
@@ -3916,7 +3908,7 @@ mod xdg_seat_tests {
             WlSurfaceId::from(266),
             XdgSurfaceId::from(276),
         );
-        let _toplevel_object_id = assign_toplevel_role(
+        let toplevel_object_id = assign_toplevel_role(
             &mut state,
             &mut client,
             &mut client_dispatcher,
@@ -3927,15 +3919,7 @@ mod xdg_seat_tests {
         {
             let toplevel = state
                 .objects
-                .get_mut(
-                    state
-                        .xdg_toplevel_object_id(Resolved::new(
-                            client.client_id(),
-                            XdgSurfaceId::from(276),
-                            xdg_surface_object_id,
-                        ))
-                        .unwrap(),
-                )
+                .get_mut(toplevel_object_id)
                 .downcast_mut::<XdgToplevel>()
                 .unwrap();
             toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
@@ -4030,7 +4014,7 @@ mod xdg_seat_tests {
             WlSurfaceId::from(267),
             XdgSurfaceId::from(277),
         );
-        let _toplevel_object_id = assign_toplevel_role(
+        let toplevel_object_id = assign_toplevel_role(
             &mut state,
             &mut client,
             &mut client_dispatcher,
@@ -4041,15 +4025,7 @@ mod xdg_seat_tests {
         {
             let toplevel = state
                 .objects
-                .get_mut(
-                    state
-                        .xdg_toplevel_object_id(Resolved::new(
-                            client.client_id(),
-                            XdgSurfaceId::from(277),
-                            xdg_surface_object_id,
-                        ))
-                        .unwrap(),
-                )
+                .get_mut(toplevel_object_id)
                 .downcast_mut::<XdgToplevel>()
                 .unwrap();
             toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
@@ -4082,7 +4058,7 @@ mod xdg_seat_tests {
             WlSurfaceId::from(260),
             XdgSurfaceId::from(270),
         );
-        let _toplevel_object_id = assign_toplevel_role(
+        let toplevel_object_id = assign_toplevel_role(
             &mut state,
             &mut client,
             &mut client_dispatcher,
@@ -4093,15 +4069,7 @@ mod xdg_seat_tests {
         {
             let toplevel = state
                 .objects
-                .get_mut(
-                    state
-                        .xdg_toplevel_object_id(Resolved::new(
-                            client.client_id(),
-                            XdgSurfaceId::from(270),
-                            xdg_surface_object_id,
-                        ))
-                        .unwrap(),
-                )
+                .get_mut(toplevel_object_id)
                 .downcast_mut::<XdgToplevel>()
                 .unwrap();
             toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
@@ -4517,9 +4485,10 @@ mod xdg_seat_tests {
         state: &State,
         surface: Resolved<WlSurfaceId>,
     ) -> (crate::tiling::SplitAxis, Vec<(Resolved<WlSurfaceId>, f64)>) {
+        let window = state.window_for_root(surface).unwrap();
         let workspace_id = state.root_surface_workspace(surface).unwrap();
         let layout = &state.workspaces.try_get(workspace_id).unwrap().layout;
-        let leaf_id = layout.surface_leaves[&surface];
+        let leaf_id = layout.window_leaves[&window];
         let crate::tiling::LayoutNode::Leaf(leaf) = &layout.nodes[&leaf_id] else {
             panic!("tiled drag surface is not a leaf");
         };
@@ -4534,7 +4503,7 @@ mod xdg_seat_tests {
                 let crate::tiling::LayoutNode::Leaf(leaf) = &layout.nodes[&child.node_id] else {
                     panic!("drag split child is a leaf");
                 };
-                (leaf.surface_object_id, child.weight)
+                (state.window_root_surface(leaf.window).unwrap(), child.weight)
             })
             .collect();
         (container.axis, children)
@@ -4576,13 +4545,9 @@ mod xdg_seat_tests {
 
     fn set_server_side_decoration(state: &mut State, object_id: ObjectId) {
         let toplevel_object_id = state
-            .objects
-            .try_ref_object::<WlSurface>(object_id)
-            .unwrap()
-            .xdg_surface()
-            .and_then(|xdg_surface| state.xdg_toplevel(xdg_surface))
-            .unwrap()
-            .object_id();
+            .window_for_root(root(state, object_id))
+            .and_then(|window| state.window_role_object(window))
+            .unwrap();
         let mut toplevel = state.objects.grab_object::<XdgToplevel>(toplevel_object_id);
         toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
     }
@@ -4919,8 +4884,7 @@ mod xdg_seat_tests {
 
     fn window_visual(state: &State, object_id: ObjectId) -> RectI {
         state
-            .managed_root_surfaces
-            .get(&root(state, object_id))
+            .managed_window(root(state, object_id))
             .unwrap()
             .geometry_animation
             .visual_rect()
@@ -5369,13 +5333,9 @@ mod xdg_seat_tests {
         let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
         let (_stayed, dragged) = map_drag_pair(&mut state, &mut client, &mut client_dispatcher);
         let dragged_toplevel = state
-            .objects
-            .try_ref_object::<WlSurface>(dragged)
-            .unwrap()
-            .xdg_surface()
-            .and_then(|xdg_surface| state.xdg_toplevel(xdg_surface))
-            .unwrap()
-            .object_id();
+            .window_for_root(root(&state, dragged))
+            .and_then(|window| state.window_role_object(window))
+            .unwrap();
         {
             let mut toplevel = state.objects.grab_object::<XdgToplevel>(dragged_toplevel);
             toplevel.test_set_interactive_size_constraints(None, Some((80, 60)));
@@ -5428,13 +5388,9 @@ mod xdg_seat_tests {
             80,
         );
         let dragged_toplevel = state
-            .objects
-            .try_ref_object::<WlSurface>(dragged)
-            .unwrap()
-            .xdg_surface()
-            .and_then(|xdg_surface| state.xdg_toplevel(xdg_surface))
-            .unwrap()
-            .object_id();
+            .window_for_root(root(&state, dragged))
+            .and_then(|window| state.window_role_object(window))
+            .unwrap();
         {
             let mut toplevel = state.objects.grab_object::<XdgToplevel>(dragged_toplevel);
             toplevel.test_set_interactive_size_constraints(Some((900, 1)), None);
@@ -5855,6 +5811,7 @@ mod xdg_seat_tests {
         let (client, _dispatcher) = test_client_and_dispatcher(7);
 
         state.seat.pointer_interactive_grab = Some(super::PointerInteractiveGrab::ResizeTiled {
+            window: crate::window::WindowId::for_tests(1),
             root_surface: crate::clients::Resolved::new(
                 client.client_id(),
                 WlSurfaceId::from(999u32),

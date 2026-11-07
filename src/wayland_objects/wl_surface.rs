@@ -34,6 +34,7 @@ use crate::{
         zwp_idle_inhibitor_v1::detach_destroyed_surface,
         zwp_pointer_constraints_v1::{apply_pointer_constraint_commit, defunct_pointer_constraint},
     },
+    window::Toplevel,
     ENABLE_DAMAGE,
 };
 
@@ -1733,7 +1734,11 @@ impl WlSurface {
                 let warp = self.pointer_lock_warp_geometry();
                 let resolved = client.resolve(self.id, state);
                 if let Some(resolved) = resolved {
-                    begin_managed_toplevel_close_surface(state, resolved, self, dispatcher);
+                    if let Some(window) = state.window_for_root(resolved) {
+                        begin_managed_toplevel_close_surface(
+                            state, window, resolved, self, dispatcher,
+                        );
+                    }
                 }
                 self.cancel_blocked(client, state, dispatcher);
                 self.retire_current();
@@ -1985,7 +1990,9 @@ impl WlSurface {
             && self.role == Role::XdgSurface
             && !self.has_cursor_role()
             && !self.has_dnd_icon_role())
-        .then(|| crate::root_geometry::effective_decoration_insets_for_surface(state, &*self));
+        .then(|| {
+            crate::root_geometry::effective_decoration_insets_for_surface(state, resolved_surface)
+        });
         let mut this = if let Some(shell_surface) = self.shell_surface {
             let (mut this, preferred_output_id) = client.with_ungrabbed(self, state, |state| {
                 let this = resolved_surface.rref(state);
@@ -2147,7 +2154,10 @@ impl WlSurface {
         }
         if let Some(old_effective_insets) = old_effective_insets {
             let new_effective_insets =
-                crate::root_geometry::effective_decoration_insets_for_surface(state, &this);
+                crate::root_geometry::effective_decoration_insets_for_surface(
+                    state,
+                    resolved_surface,
+                );
             if old_effective_insets != new_effective_insets
                 && (state.is_tiled_root_surface(resolved_surface)
                     || state.root_surface_is_fullscreen(resolved_surface))
@@ -2209,22 +2219,11 @@ impl WlSurface {
                             root_surface: resolved_surface,
                         });
                     }
-                    if let Some(toplevel) = xdg_surface_id
-                        .try_ref(state)
-                        .and_then(XdgSurface::toplevel_role)
-                    {
+                    if let Some(window) = state.window_for_root(resolved_surface) {
                         if is_mapped {
-                            let (title, app_id) = toplevel
-                                .try_ref(state)
-                                .map(|toplevel| {
-                                    (toplevel.title().to_string(), toplevel.app_id().to_string())
-                                })
-                                .unwrap_or_default();
-                            crate::capture::map_xdg_toplevel(
-                                state, dispatcher, toplevel, title, app_id,
-                            );
+                            crate::capture::map_window(state, dispatcher, window);
                         } else {
-                            crate::capture::unmap_xdg_toplevel(state, dispatcher, toplevel);
+                            crate::capture::unmap_window(state, dispatcher, window);
                         }
                     }
                     dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
@@ -2919,7 +2918,9 @@ impl WlSurface {
     ) {
         self.complete_release_callbacks_now(client, state, dispatcher);
         let object = client.resolve(self.id, state).unwrap();
-        begin_managed_toplevel_close_surface(state, object, self, dispatcher);
+        if let Some(window) = state.window_for_root(object) {
+            begin_managed_toplevel_close_surface(state, window, object, self, dispatcher);
+        }
         let scene_bounds = state.surface_scene_bounds_with_ref(object, self);
         state.seat.clear_cursor_surface(object);
         let geometry = self.pointer_lock_warp_geometry();
@@ -3101,7 +3102,9 @@ impl Object for WlSurface {
         dispatcher: &mut ClientDispatcher,
     ) {
         if let Some(resolved) = client.resolve(self.id, state) {
-            begin_managed_toplevel_close_surface(state, resolved, self, dispatcher);
+            if let Some(window) = state.window_for_root(resolved) {
+                begin_managed_toplevel_close_surface(state, window, resolved, self, dispatcher);
+            }
         }
         let constraint = self.pointer_constraint.take();
         defunct_pointer_constraint(constraint, state, dispatcher, false, None);
@@ -4084,9 +4087,53 @@ mod tests {
         }
         assert_eq!(state.closing_snapshots.len(), 1);
         assert!(state
-            .managed_root_surfaces
-            .get(&state.closing_snapshots[0].source())
+            .managed_window(state.closing_snapshots[0].source())
             .is_none());
+    }
+
+    #[test]
+    fn closing_animation_plays_after_the_toplevel_is_destroyed() {
+        let mut state = state_for_tests();
+        state.config.animations.set_close_duration_msec(100);
+        let backend = BackendOutputRef::new(DrmId::from(5usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id =
+            map_closing_candidate(&mut state, &mut client, &mut dispatcher, 240);
+        let window = state
+            .window_for_root(root(&state, surface_object_id))
+            .unwrap();
+        {
+            let surface = state
+                .objects
+                .get_mut(surface_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            surface.pending.buffer = Some(None);
+        }
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.on_commit(&mut client, &mut state, &mut client_dispatcher);
+        }
+        assert_eq!(state.closing_snapshots.len(), 1);
+        assert_eq!(state.closing_snapshots[0].window(), window);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.delete_self(&mut client, &mut state, &mut client_dispatcher);
+        }
+        assert_eq!(state.closing_snapshots.len(), 1);
+        assert!(state.managed_window_state(window).is_none());
+
+        let now = std::time::Instant::now();
+        state.advance_visual_animations(now);
+        assert_eq!(state.closing_snapshots[0].alpha(), 255);
+        state.advance_visual_animations(now + std::time::Duration::from_millis(50));
+        let alpha = state.closing_snapshots[0].alpha();
+        assert!(alpha > 0 && alpha < 255);
+        assert_eq!(state.closing_snapshots[0].window(), window);
     }
 
     #[test]
@@ -4356,8 +4403,7 @@ mod tests {
             XdgSurfaceId::from(131),
         );
         state
-            .managed_root_surfaces
-            .get_mut(&root(&state, surface_object_id))
+            .managed_window_mut(root(&state, surface_object_id))
             .unwrap()
             .mode = crate::state::ManagedWindowMode::Floating;
 
@@ -5737,21 +5783,19 @@ mod tests {
             WlSurface::new(WlSurfaceId::from(44u32), ClientId::from_raw(4), 6),
         );
         state.register_root_surface(surface_resolved);
+        crate::test_support::insert_window(&mut state, surface_resolved);
         let _ = state.assign_root_surface_to_workspace(surface_resolved, workspace_id);
+        let window = state.window_for_root(surface_resolved).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![surface_resolved];
+            .stack = vec![window];
 
         assert!(!super::should_focus_new_toplevel_on_map(&state, surface_resolved));
-        state
-            .managed_root_surfaces
-            .get_mut(&surface_resolved)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(surface_resolved).unwrap().mapped = true;
         assert!(super::should_focus_new_toplevel_on_map(&state, surface_resolved));
     }
 }

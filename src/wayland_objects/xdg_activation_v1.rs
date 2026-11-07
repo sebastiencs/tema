@@ -85,7 +85,10 @@ impl Object for XdgActivationV1 {
                     );
                     return Ok(());
                 };
-                if !state.raise_root_surface(focus.surface) {
+                let raised = state
+                    .window_for_root(focus.surface)
+                    .is_some_and(|window| state.raise_window(window));
+                if !raised && !state.raise_root_surface(focus.surface) {
                     return Ok(());
                 }
                 set_keyboard_focus_from_surface(state, dispatcher, Some(focus));

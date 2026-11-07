@@ -4378,13 +4378,19 @@ fn remember_animation_outputs(state: &State, rect: RectI, output_ids: &mut BTree
 
 fn active_animation_output_ids(state: &State) -> BTreeSet<OutputId> {
     let mut output_ids = BTreeSet::new();
-    for (&surface, managed) in &state.managed_root_surfaces {
-        if !managed.focus_animation.is_active()
-            && !managed.lifecycle_animation.is_active()
-            && !managed.geometry_animation.is_active()
-        {
+    let animating = state
+        .managed_window_states()
+        .filter_map(|(window, managed)| {
+            (managed.focus_animation.is_active()
+                || managed.lifecycle_animation.is_active()
+                || managed.geometry_animation.is_active())
+            .then_some(window)
+        })
+        .collect::<Vec<_>>();
+    for window in animating {
+        let Some(surface) = state.window_root_surface(window) else {
             continue;
-        }
+        };
         let Some(rect) = state.root_surface_motion_bounds(surface) else {
             continue;
         };
@@ -6635,6 +6641,7 @@ pub(crate) struct ClosingCapturePlan {
 
 pub(crate) fn begin_managed_toplevel_close_surface(
     state: &mut State,
+    window: crate::window::WindowId,
     surface_id: Resolved<WlSurfaceId>,
     surface: &WlSurface,
     dispatcher: &mut Dispatcher,
@@ -6642,18 +6649,19 @@ pub(crate) fn begin_managed_toplevel_close_surface(
     let Some(peek) = ClosingRootPeek::from_surface(surface) else {
         return;
     };
-    if !closing_snapshot_eligible(state, surface_id, &peek) {
+    if !closing_snapshot_eligible(state, window, surface_id, &peek) {
         return;
     }
     state.refresh_root_geometry_for_closing(surface_id, surface, None);
     let Some(peek) = ClosingRootPeek::from_surface(surface) else {
         return;
     };
-    begin_closing_from_peek(state, surface_id, peek, dispatcher);
+    begin_closing_from_peek(state, window, surface_id, peek, dispatcher);
 }
 
 pub(crate) fn begin_managed_toplevel_close_id(
     state: &mut State,
+    window: crate::window::WindowId,
     surface_id: Resolved<WlSurfaceId>,
     decoration_mode: Option<
         crate::wayland_objects::xdg_surface::xdg_toplevel::ToplevelDecorationMode,
@@ -6669,7 +6677,7 @@ pub(crate) fn begin_managed_toplevel_close_id(
     let Some(peek) = ClosingRootPeek::from_surface(&surface) else {
         return;
     };
-    if !closing_snapshot_eligible(state, surface_id, &peek) {
+    if !closing_snapshot_eligible(state, window, surface_id, &peek) {
         return;
     }
     state.refresh_root_geometry_for_closing(surface_id, &surface, decoration_mode);
@@ -6678,11 +6686,12 @@ pub(crate) fn begin_managed_toplevel_close_id(
     let Some(peek) = peek else {
         return;
     };
-    begin_closing_from_peek(state, surface_id, peek, dispatcher);
+    begin_closing_from_peek(state, window, surface_id, peek, dispatcher);
 }
 
 fn closing_snapshot_eligible(
     state: &State,
+    window: crate::window::WindowId,
     surface_id: Resolved<WlSurfaceId>,
     peek: &ClosingRootPeek,
 ) -> bool {
@@ -6699,31 +6708,32 @@ fn closing_snapshot_eligible(
     {
         return false;
     }
-    let Some(managed) = state.managed_root_surface_state(surface_id) else {
+    if state.window_root_surface(window) != Some(surface_id) {
+        return false;
+    }
+    let Some(managed) = state.managed_window_state(window) else {
         return false;
     };
     if !managed.mapped || !peek.has_buffer || peek.role != Role::XdgSurface {
         return false;
     }
-    let Some(xdg_surface) = peek.xdg_surface else {
-        return false;
-    };
-    state.xdg_toplevel(xdg_surface).is_some()
+    peek.xdg_surface.is_some()
 }
 
 fn begin_closing_from_peek(
     state: &mut State,
+    window: crate::window::WindowId,
     surface_id: Resolved<WlSurfaceId>,
     peek: ClosingRootPeek,
     dispatcher: &mut Dispatcher,
 ) {
-    if !closing_snapshot_eligible(state, surface_id, &peek) {
+    if !closing_snapshot_eligible(state, window, surface_id, &peek) {
         return;
     }
     let Some(plan) = plan_closing_from_peek(state, surface_id, &peek) else {
         return;
     };
-    let Some(snapshot) = realize_closing_capture(state, plan) else {
+    let Some(snapshot) = realize_closing_capture(state, window, plan) else {
         return;
     };
     state.closing_snapshots.push(snapshot);
@@ -6997,6 +7007,7 @@ fn union_rects(rects: Vec<RectI>) -> Option<RectI> {
 
 fn realize_closing_capture(
     state: &mut State,
+    window: crate::window::WindowId,
     plan: ClosingCapturePlan,
 ) -> Option<RetainedClosingSnapshot> {
     let texture = realize_closing_texture(state, &plan).or_else(|| {
@@ -7014,11 +7025,12 @@ fn realize_closing_capture(
     let id = state.next_closing_snapshot_id;
     state.next_closing_snapshot_id = state.next_closing_snapshot_id.saturating_add(1);
     let workspace_id = state
-        .managed_root_surface_state(plan.source)
+        .managed_window_state(window)
         .map(|managed| managed.workspace_id);
     Some(RetainedClosingSnapshot::new(
         id,
         plan.source,
+        window,
         workspace_id,
         plan.bounds,
         plan.blur,
@@ -7660,10 +7672,11 @@ fn render_composed_entry(
     let logical_layout = state
         .committed_root_geometry(root_surface)
         .map(|geometry| geometry.layout_rect_global);
-    let visual_layout = state
-        .managed_root_surfaces
-        .get(&root_surface)
-        .and_then(|managed| managed.geometry_animation.visual_rect());
+    let visual_layout = state.window_for_root(root_surface).and_then(|window| {
+        state
+            .managed_window_state(window)
+            .and_then(|managed| managed.geometry_animation.visual_rect())
+    });
     let geometry_scale = match (logical_layout, visual_layout) {
         (Some(logical), Some(visual))
             if logical != visual && logical.width > 0 && logical.height > 0 =>
@@ -7909,6 +7922,7 @@ mod window_animation_tests {
         state.config.animations.set_focus_duration_msec(120);
         let surface = root(state, object_id);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface);
         state.assign_root_surface_to_workspace(surface, workspace_id);
         (output_id, surface)
     }
@@ -7939,8 +7953,7 @@ mod window_animation_tests {
         surface: crate::clients::Resolved<WlSurfaceId>,
     ) -> u8 {
         state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .focus_animation
             .current()
@@ -8075,8 +8088,7 @@ mod window_animation_tests {
         let (output_id, surface) = mapped_focus_target(&mut state);
         state.config.animations.set_open_duration_msec(100);
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .lifecycle_animation
             .start_opening();
@@ -8101,8 +8113,7 @@ mod window_animation_tests {
         assert!(queues_animation_frame(&dispatcher, output_id));
         assert_eq!(visual_opacity(&state, surface), 120);
         assert!(!state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .lifecycle_animation
             .is_active());
@@ -8119,8 +8130,7 @@ mod window_animation_tests {
         let (output_id, surface) = mapped_focus_target(&mut state);
         state.config.animations.set_open_duration_msec(0);
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .lifecycle_animation
             .start_opening();
@@ -8131,8 +8141,7 @@ mod window_animation_tests {
         assert!(queues_animation_frame(&dispatcher, output_id));
         assert_eq!(visual_opacity(&state, surface), 120);
         assert!(!state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .lifecycle_animation
             .is_active());
@@ -8831,19 +8840,16 @@ mod closing_capture_tests {
             .downcast_mut::<WlSurface>()
             .unwrap()
             .set_xdg_surface_impl(xdg_resolved);
+        let window = state.allocate_window_id();
         let (_, toplevel_object) = state.insert_object(
             crate::wayland_objects::xdg_surface::xdg_toplevel::XdgToplevel::new(
                 crate::protocol_generated::XdgToplevelId::from(51),
                 xdg_resolved,
                 7,
+                window,
             ),
         );
-        let toplevel = crate::clients::Resolved::new(
-            ClientId::from_raw(1),
-            crate::protocol_generated::XdgToplevelId::from(51),
-            toplevel_object,
-        );
-        state.register_xdg_toplevel_role(xdg_resolved, toplevel);
+        state.insert_window(window, parent, toplevel_object);
         state
             .objects
             .get_mut(toplevel_object)
@@ -8852,7 +8858,7 @@ mod closing_capture_tests {
             .set_decoration_mode(ToplevelDecorationMode::ServerSide);
         let workspace = state.active_workspace_for_output(output_id).unwrap();
         state.assign_root_surface_to_workspace(parent, workspace);
-        state.managed_root_surfaces.get_mut(&parent).unwrap().mapped = true;
+        state.managed_window_mut(parent).unwrap().mapped = true;
         state.mark_root_geometry_dirty(parent);
 
         let (_, child_object) =
@@ -9037,6 +9043,7 @@ mod closing_capture_tests {
         let snapshot = crate::visual_animation::RetainedClosingSnapshot::new(
             11,
             test_resolved_wl_surface_client1(3),
+            crate::window::WindowId::for_tests(11),
             None,
             RectI::new(5, 6, 40, 20).unwrap(),
             Some(crate::visual_animation::FrozenClosingBlur {
@@ -9094,6 +9101,7 @@ mod closing_capture_tests {
                 .push(crate::visual_animation::RetainedClosingSnapshot::new(
                     id,
                     test_resolved_wl_surface_client1(id as usize),
+                    crate::window::WindowId::for_tests(id),
                     workspace_id,
                     RectI::new(200, 8, 400, 16).unwrap(),
                     None,
@@ -9163,6 +9171,7 @@ mod closing_capture_tests {
             .push(crate::visual_animation::RetainedClosingSnapshot::new(
                 31,
                 test_resolved_wl_surface_client1(31),
+                crate::window::WindowId::for_tests(31),
                 Some(outgoing),
                 captured,
                 None,
@@ -9211,17 +9220,14 @@ mod closing_capture_tests {
             .active_workspace_for_output(state.outputs.iter().next().unwrap().0)
             .unwrap();
         state.assign_root_surface_to_workspace(surface, workspace);
-        state
-            .managed_root_surfaces
-            .get_mut(&surface)
-            .unwrap()
-            .mapped = true;
+        let window = crate::test_support::insert_window(&mut state, surface);
+        state.managed_window_mut(surface).unwrap().mapped = true;
         let mut dispatcher = crate::runner::Dispatcher::default();
-        super::begin_managed_toplevel_close_id(&mut state, surface, None, &mut dispatcher);
+        super::begin_managed_toplevel_close_id(&mut state, window, surface, None, &mut dispatcher);
         assert!(state.closing_snapshots.is_empty());
 
         state.session_active = false;
-        super::begin_managed_toplevel_close_id(&mut state, surface, None, &mut dispatcher);
+        super::begin_managed_toplevel_close_id(&mut state, window, surface, None, &mut dispatcher);
         assert!(state.closing_snapshots.is_empty());
     }
 }

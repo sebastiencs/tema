@@ -251,6 +251,7 @@ mod tests {
         let surface =
             crate::clients::Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(raw), oid);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface);
         surface
     }
 
@@ -265,13 +266,15 @@ mod tests {
         let unmanaged = insert_root(&mut state, 43);
         let _ = state.assign_root_surface_to_workspace(first, workspace_id);
         let _ = state.assign_root_surface_to_workspace(second, workspace_id);
+        let first_window = state.window_for_root(first).unwrap();
+        let second_window = state.window_for_root(second).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![first, second];
+            .stack = vec![first_window, second_window];
 
         let scene = crate::scene::build_scene_model(&state);
         let ordered = compose_global_root_order(&state, &scene, None);
@@ -345,25 +348,23 @@ mod tests {
         let other = insert_root(&mut state, 62);
         let _ = state.assign_root_surface_to_workspace(fullscreen, workspace_id);
         let _ = state.assign_root_surface_to_workspace(other, workspace_id);
+        let fullscreen_window = state.window_for_root(fullscreen).unwrap();
+        let other_window = state.window_for_root(other).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![fullscreen, other];
+            .stack = vec![fullscreen_window, other_window];
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
-            .fullscreen = Some(crate::tiling::FullscreenState { surface_object_id: fullscreen });
-        state
-            .managed_root_surfaces
-            .get_mut(&fullscreen)
-            .unwrap()
-            .mapped = true;
-        state.managed_root_surfaces.get_mut(&other).unwrap().mapped = true;
+            .fullscreen = Some(crate::tiling::FullscreenState { window: fullscreen_window });
+        state.managed_window_mut(fullscreen).unwrap().mapped = true;
+        state.managed_window_mut(other).unwrap().mapped = true;
         state
             .objects
             .get_mut(fullscreen.object_id())
@@ -407,29 +408,32 @@ mod tests {
         let _ = state.assign_root_surface_to_workspace(incoming_root, incoming);
         let _ = state.assign_root_surface_to_workspace(other_root, other_workspace);
         for root in [outgoing_root, incoming_root, other_root] {
-            state.managed_root_surfaces.get_mut(&root).unwrap().mapped = true;
+            state.managed_window_mut(root).unwrap().mapped = true;
         }
+        let outgoing_window = state.window_for_root(outgoing_root).unwrap();
+        let incoming_window = state.window_for_root(incoming_root).unwrap();
+        let other_window = state.window_for_root(other_root).unwrap();
         state
             .workspaces
             .try_get_mut(outgoing)
             .unwrap()
             .layout
             .floating
-            .stack = vec![outgoing_root];
+            .stack = vec![outgoing_window];
         state
             .workspaces
             .try_get_mut(incoming)
             .unwrap()
             .layout
             .floating
-            .stack = vec![incoming_root];
+            .stack = vec![incoming_window];
         state
             .workspaces
             .try_get_mut(other_workspace)
             .unwrap()
             .layout
             .floating
-            .stack = vec![other_root];
+            .stack = vec![other_window];
         let policy =
             crate::scene::WorkspaceParticipationPolicy::Transition { group_id, outgoing, incoming };
 

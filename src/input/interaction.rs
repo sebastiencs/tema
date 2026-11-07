@@ -20,9 +20,8 @@ pub(crate) fn window_allows_compositor_interaction(target: &WindowTarget) -> boo
     !matches!(
         target.role,
         // Comment so we can move gtk windows
-        // WindowRoleSnapshot::XdgToplevel { is_maximized: true, .. }
-        WindowRoleSnapshot::XdgToplevel { is_fullscreen: true, .. }
-            | WindowRoleSnapshot::Unsupported
+        // WindowRoleSnapshot::Toplevel { is_maximized: true, .. }
+        WindowRoleSnapshot::Toplevel { is_fullscreen: true, .. } | WindowRoleSnapshot::Unsupported
     )
 }
 
@@ -92,11 +91,17 @@ pub(crate) fn request_toplevel_move(
     {
         return false;
     }
+    let Some(window) = state.window_for_root(root_surface) else {
+        return false;
+    };
+    if state.window_role_object(window) != Some(xdg_toplevel.object_id()) {
+        return false;
+    }
     let Some(target) = build_protocol_move_target(
         state,
         root_surface,
-        WindowRoleSnapshot::XdgToplevel {
-            xdg_toplevel,
+        WindowRoleSnapshot::Toplevel {
+            window,
             size_constraints: InteractiveSizeConstraints::default(),
             is_maximized,
             is_fullscreen,
@@ -139,11 +144,17 @@ pub(crate) fn request_toplevel_resize(
     {
         return false;
     }
+    let Some(window) = state.window_for_root(root_surface) else {
+        return false;
+    };
+    if state.window_role_object(window) != Some(xdg_toplevel.object_id()) {
+        return false;
+    }
     let Some(target) = build_protocol_resize_target(
         state,
         root_surface,
-        WindowRoleSnapshot::XdgToplevel {
-            xdg_toplevel,
+        WindowRoleSnapshot::Toplevel {
+            window,
             size_constraints,
             is_maximized,
             is_fullscreen,

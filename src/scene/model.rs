@@ -73,19 +73,18 @@ fn append_workspace_scene_entries(
     let Some(workspace) = state.workspaces.try_get(workspace_id) else {
         return;
     };
-    if let Some(fullscreen) = workspace
-        .layout
-        .fullscreen
-        .as_ref()
-        .filter(|fullscreen| state.root_surface_is_mapped(fullscreen.surface_object_id))
-    {
-        push_workspace_root(entries, next_id, seen, fullscreen.surface_object_id, workspace_id);
-        return;
+    if let Some(fullscreen) = workspace.layout.fullscreen.as_ref() {
+        if let Some(root_surface) = state.window_root_surface(fullscreen.window) {
+            if state.root_surface_is_mapped(root_surface) {
+                push_workspace_root(entries, next_id, seen, root_surface, workspace_id);
+                return;
+            }
+        }
     }
-    for root_surface in workspace.layout.tiled_scene_order() {
+    for root_surface in crate::tiling::tiled_scene_order(state, &workspace.layout) {
         push_workspace_root(entries, next_id, seen, root_surface, workspace_id);
     }
-    for root_surface in workspace.layout.floating_scene_order() {
+    for root_surface in crate::tiling::floating_scene_order(state, &workspace.layout) {
         push_workspace_root(entries, next_id, seen, root_surface, workspace_id);
     }
 }
@@ -250,7 +249,9 @@ mod tests {
             .remove(&right);
 
         let root_surface = insert_root(&mut state, 10);
+        crate::test_support::insert_window(&mut state, root_surface);
         let _ = state.assign_root_surface_to_workspace(root_surface, workspace_id);
+        let window = state.window_for_root(root_surface).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
@@ -258,7 +259,7 @@ mod tests {
             .layout
             .floating
             .stack
-            .push(root_surface);
+            .push(window);
 
         let scene = build_scene_model(&state);
         let managed = scene
@@ -278,7 +279,9 @@ mod tests {
         let workspace_id = state.active_workspace_for_output(output_id).unwrap();
         let managed = insert_root(&mut state, 11);
         let unmanaged = insert_root(&mut state, 12);
+        crate::test_support::insert_window(&mut state, managed);
         let _ = state.assign_root_surface_to_workspace(managed, workspace_id);
+        let window = state.window_for_root(managed).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
@@ -286,7 +289,7 @@ mod tests {
             .layout
             .floating
             .stack
-            .push(managed);
+            .push(window);
 
         let scene = build_scene_model(&state);
         assert_eq!(
@@ -387,30 +390,36 @@ mod tests {
         let outgoing_root = insert_root(&mut state, 90);
         let incoming_root = insert_root(&mut state, 91);
         let other_root = insert_root(&mut state, 92);
+        crate::test_support::insert_window(&mut state, outgoing_root);
+        crate::test_support::insert_window(&mut state, incoming_root);
+        crate::test_support::insert_window(&mut state, other_root);
         let _ = state.assign_root_surface_to_workspace(outgoing_root, outgoing);
         let _ = state.assign_root_surface_to_workspace(incoming_root, incoming);
         let _ = state.assign_root_surface_to_workspace(other_root, other_workspace);
+        let outgoing_window = state.window_for_root(outgoing_root).unwrap();
+        let incoming_window = state.window_for_root(incoming_root).unwrap();
+        let other_window = state.window_for_root(other_root).unwrap();
         state
             .workspaces
             .try_get_mut(outgoing)
             .unwrap()
             .layout
             .floating
-            .stack = vec![outgoing_root];
+            .stack = vec![outgoing_window];
         state
             .workspaces
             .try_get_mut(incoming)
             .unwrap()
             .layout
             .floating
-            .stack = vec![incoming_root];
+            .stack = vec![incoming_window];
         state
             .workspaces
             .try_get_mut(other_workspace)
             .unwrap()
             .layout
             .floating
-            .stack = vec![other_root];
+            .stack = vec![other_window];
 
         let policy = crate::scene::visibility::WorkspaceParticipationPolicy::Transition {
             group_id,

@@ -23,6 +23,7 @@ use crate::{
         ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
         zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
     },
+    window::WindowId,
 };
 
 /// Stable mapped-toplevel identity. Values are never reused after [`close_toplevel`].
@@ -255,8 +256,8 @@ enum Pending {
 pub struct CaptureRegistry {
     next_toplevel: u64,
     toplevels: BTreeMap<ToplevelKey, ToplevelRecord>,
-    /// Mapped XDG toplevels. A new map after unmap gets a new [`ToplevelKey`].
-    by_xdg: BTreeMap<Resolved<XdgToplevelId>, ToplevelKey>,
+    /// Mapped windows. A new map after unmap gets a new [`ToplevelKey`].
+    by_window: BTreeMap<WindowId, ToplevelKey>,
     /// Lists that already received a handle for a key. Destroying that handle does not create
     /// another one until the toplevel is unmapped and mapped again.
     announced: BTreeSet<(Resolved<ExtForeignToplevelListV1Id>, ToplevelKey)>,
@@ -638,21 +639,20 @@ fn schedule_capture(
     }
 }
 
-fn outputs_for_toplevel(state: &State, key: ToplevelKey) -> Vec<OutputId> {
-    let Some(toplevel) = state
+fn window_for_toplevel_key(state: &State, key: ToplevelKey) -> Option<WindowId> {
+    state
         .capture
-        .by_xdg
+        .by_window
         .iter()
         .find(|(_, candidate)| **candidate == key)
-        .map(|(toplevel, _)| *toplevel)
-    else {
+        .map(|(window, _)| *window)
+}
+
+fn outputs_for_toplevel(state: &State, key: ToplevelKey) -> Vec<OutputId> {
+    let Some(window) = window_for_toplevel_key(state, key) else {
         return Vec::new();
     };
-    let Some(surface) = toplevel
-        .try_ref(state)
-        .and_then(|toplevel| toplevel.xdg_surface().try_ref(state))
-        .map(|xdg_surface| xdg_surface.wl_surface())
-    else {
+    let Some(surface) = state.window_root_surface(window) else {
         return Vec::new();
     };
     let Some(bounds) = surface
@@ -1646,14 +1646,7 @@ pub(crate) fn toplevel_root_surface(
     state: &State,
     key: ToplevelKey,
 ) -> Option<Resolved<crate::protocol_generated::WlSurfaceId>> {
-    let toplevel = state
-        .capture
-        .by_xdg
-        .iter()
-        .find(|(_, candidate)| **candidate == key)
-        .map(|(toplevel, _)| *toplevel)?;
-    let xdg_surface = toplevel.try_ref(state)?.xdg_surface();
-    Some(xdg_surface.try_ref(state)?.wl_surface())
+    state.window_root_surface(window_for_toplevel_key(state, key)?)
 }
 
 /// Bounds of the window as this compositor draws it: the surface tree, popups, and decoration box.
@@ -2036,7 +2029,7 @@ pub(crate) fn close_toplevel(state: &mut State, dispatcher: &mut Dispatcher, key
         .retain(|(_, announced)| *announced != key);
     state
         .capture
-        .by_xdg
+        .by_window
         .retain(|_, announced| *announced != key);
     fail_queued_jobs(state, CaptureTarget::Toplevel(key));
     state
@@ -2226,50 +2219,50 @@ fn clear_parent_references(
 
 /// `xdg_toplevel.configure` sent `maximized` and `fullscreen`. Stored even while the window is
 /// still unmapped, then copied onto the record at map.
-pub(crate) fn note_xdg_shell_state(
+pub(crate) fn note_window_state(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    toplevel: Resolved<XdgToplevelId>,
+    window: WindowId,
     maximized: bool,
     fullscreen: bool,
 ) {
-    let Some(key) = state.capture.by_xdg.get(&toplevel).copied() else {
+    let Some(key) = state.capture.by_window.get(&window).copied() else {
         return;
     };
     note_shell_state(state, dispatcher, key, maximized, fullscreen);
 }
 
-pub(crate) fn note_xdg_parent(
+pub(crate) fn note_window_parent(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    toplevel: Resolved<XdgToplevelId>,
-    parent: Option<Resolved<XdgToplevelId>>,
+    window: WindowId,
+    parent: Option<WindowId>,
 ) {
-    let Some(key) = state.capture.by_xdg.get(&toplevel).copied() else {
+    let Some(key) = state.capture.by_window.get(&window).copied() else {
         return;
     };
-    let parent_key = parent.and_then(|parent| state.capture.by_xdg.get(&parent).copied());
+    let parent_key = parent.and_then(|parent| state.capture.by_window.get(&parent).copied());
     note_parent(state, dispatcher, key, parent_key);
 }
 
 fn adopt_children_of(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    parent: Resolved<XdgToplevelId>,
+    parent: WindowId,
     parent_key: ToplevelKey,
 ) {
-    let mapped: Vec<Resolved<XdgToplevelId>> = state.capture.by_xdg.keys().copied().collect();
-    let children: Vec<Resolved<XdgToplevelId>> = mapped
+    let mapped: Vec<WindowId> = state.capture.by_window.keys().copied().collect();
+    let children: Vec<WindowId> = mapped
         .into_iter()
-        .filter(|toplevel| {
-            toplevel
-                .try_ref(state)
-                .and_then(|toplevel| toplevel.parent_toplevel())
+        .filter(|window| {
+            state
+                .toplevel(*window)
+                .and_then(|toplevel| toplevel.parent_window())
                 == Some(parent)
         })
         .collect();
     for child in children {
-        if let Some(child_key) = state.capture.by_xdg.get(&child).copied() {
+        if let Some(child_key) = state.capture.by_window.get(&child).copied() {
             note_parent(state, dispatcher, child_key, Some(parent_key));
         }
     }
@@ -2312,35 +2305,20 @@ fn keyboard_activated_toplevel(state: &State) -> Option<ToplevelKey> {
     let root = state
         .root_surface_for_surface(focus.surface)
         .unwrap_or(focus.surface);
-    let xdg_surface = root.try_ref(state)?.xdg_surface()?;
-    let toplevel = state.xdg_toplevel(xdg_surface).or_else(|| {
-        xdg_surface
-            .try_ref(state)
-            .and_then(crate::wayland_objects::xdg_surface::XdgSurface::toplevel_role)
-    })?;
-    state.capture.by_xdg.get(&toplevel).copied()
+    let window = state.window_for_root(root)?;
+    state.capture.by_window.get(&window).copied()
 }
 
-/// Copy the toplevel root's `wl_surface` output membership. Subsurfaces and popups are ignored.
+/// Copy the window root's `wl_surface` output membership.
 pub(crate) fn sync_toplevel_outputs(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    surface: Resolved<WlSurfaceId>,
+    window: WindowId,
 ) {
-    let Some(xdg_surface) = surface
-        .try_ref(state)
-        .and_then(|surface| surface.xdg_surface())
-    else {
+    let Some(surface) = state.window_root_surface(window) else {
         return;
     };
-    let Some(toplevel) = state.xdg_toplevel(xdg_surface).or_else(|| {
-        xdg_surface
-            .try_ref(state)
-            .and_then(crate::wayland_objects::xdg_surface::XdgSurface::toplevel_role)
-    }) else {
-        return;
-    };
-    let Some(key) = state.capture.by_xdg.get(&toplevel).copied() else {
+    let Some(key) = state.capture.by_window.get(&window).copied() else {
         return;
     };
     let next = surface
@@ -2800,68 +2778,70 @@ fn send_wlr_parent(
     }
 }
 
-/// Publish one mapped XDG toplevel. A later map of the same toplevel gets a new identifier.
-pub(crate) fn map_xdg_toplevel(
-    state: &mut State,
-    dispatcher: &mut Dispatcher,
-    toplevel: Resolved<XdgToplevelId>,
-    title: impl Into<String>,
-    app_id: impl Into<String>,
-) {
-    if state.capture.by_xdg.contains_key(&toplevel) {
+/// Publish one mapped window. A later map gets a new identifier.
+///
+/// Title and app id come from the toplevel trait. Shell bits are the last configure the
+/// xdg role published; another shell leaves them unset.
+pub(crate) fn map_window(state: &mut State, dispatcher: &mut Dispatcher, window: WindowId) {
+    if state.capture.by_window.contains_key(&window) {
         return;
     }
+    let Some((title, app_id, parent)) = state.toplevel(window).map(|toplevel| {
+        (toplevel.title().to_string(), toplevel.app_id().to_string(), toplevel.parent_window())
+    }) else {
+        return;
+    };
+    let shell = state.window_role_object(window).and_then(|role| {
+        state
+            .objects
+            .try_get(role)?
+            .downcast_ref::<crate::wayland_objects::xdg_surface::xdg_toplevel::XdgToplevel>()
+            .map(|toplevel| toplevel.published_shell_state())
+    });
     let key = announce_toplevel(state, dispatcher, title, app_id);
-    state.capture.by_xdg.insert(toplevel, key);
-    let published = toplevel
-        .try_ref(state)
-        .map(|toplevel_ref| (toplevel_ref.published_shell_state(), toplevel_ref.parent_toplevel()));
-    if let Some(((maximized, fullscreen), parent)) = published {
+    state.capture.by_window.insert(window, key);
+    if let Some((maximized, fullscreen)) = shell {
         note_shell_state(state, dispatcher, key, maximized, fullscreen);
-        let parent_key = parent.and_then(|parent| state.capture.by_xdg.get(&parent).copied());
-        note_parent(state, dispatcher, key, parent_key);
     }
-    adopt_children_of(state, dispatcher, toplevel, key);
+    let parent_key = parent.and_then(|parent| state.capture.by_window.get(&parent).copied());
+    note_parent(state, dispatcher, key, parent_key);
+    adopt_children_of(state, dispatcher, window, key);
 }
 
-/// Stop listing and capturing an XDG toplevel that unmapped or was destroyed.
-pub(crate) fn unmap_xdg_toplevel(
-    state: &mut State,
-    dispatcher: &mut Dispatcher,
-    toplevel: Resolved<XdgToplevelId>,
-) {
-    let Some(key) = state.capture.by_xdg.remove(&toplevel) else {
+/// Stop listing and capturing a window that unmapped or was destroyed.
+pub(crate) fn unmap_window(state: &mut State, dispatcher: &mut Dispatcher, window: WindowId) {
+    let Some(key) = state.capture.by_window.remove(&window) else {
         return;
     };
     close_toplevel(state, dispatcher, key);
 }
 
-pub(crate) fn retitle_xdg_toplevel(
+pub(crate) fn retitle_window(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    toplevel: Resolved<XdgToplevelId>,
+    window: WindowId,
     title: String,
 ) {
-    update_xdg_detail(state, dispatcher, toplevel, true, title);
+    update_window_detail(state, dispatcher, window, true, title);
 }
 
-pub(crate) fn reapp_xdg_toplevel(
+pub(crate) fn reapp_window(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    toplevel: Resolved<XdgToplevelId>,
+    window: WindowId,
     app_id: String,
 ) {
-    update_xdg_detail(state, dispatcher, toplevel, false, app_id);
+    update_window_detail(state, dispatcher, window, false, app_id);
 }
 
-fn update_xdg_detail(
+fn update_window_detail(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    toplevel: Resolved<XdgToplevelId>,
+    window: WindowId,
     title: bool,
     value: String,
 ) {
-    let Some(key) = state.capture.by_xdg.get(&toplevel).copied() else {
+    let Some(key) = state.capture.by_window.get(&window).copied() else {
         return;
     };
     let Some(record) = state.capture.toplevels.get_mut(&key) else {
@@ -2935,20 +2915,12 @@ pub(crate) fn sync_mapped_toplevels(
 }
 
 /// Send every currently mapped toplevel to a wlr manager that just bound.
-/// The root `wl_surface` for a mapped toplevel, when this key still has an XDG toplevel.
+/// The root `wl_surface` for a mapped window, when this key still has one.
 pub(crate) fn root_surface_for_toplevel_key(
     state: &State,
     key: ToplevelKey,
 ) -> Option<Resolved<WlSurfaceId>> {
-    let toplevel = state
-        .capture
-        .by_xdg
-        .iter()
-        .find(|(_, candidate)| **candidate == key)
-        .map(|(toplevel, _)| *toplevel)?;
-    let xdg_surface = toplevel.try_ref(state)?.xdg_surface();
-    let surface = xdg_surface.try_ref(state)?.wl_surface();
-    Some(state.root_surface_for_surface(surface).unwrap_or(surface))
+    state.window_root_surface(window_for_toplevel_key(state, key)?)
 }
 
 pub(crate) fn sync_wlr_manager(
@@ -4385,8 +4357,9 @@ mod tests {
     fn insert_toplevel(
         client: &mut crate::clients::Client,
         state: &mut State,
-    ) -> Resolved<crate::protocol_generated::XdgToplevelId> {
-        client
+    ) -> (WindowId, Resolved<crate::protocol_generated::XdgToplevelId>) {
+        let window = state.allocate_window_id();
+        let toplevel = client
             .insert_object(
                 state,
                 crate::wayland_objects::xdg_toplevel::XdgToplevel::new(
@@ -4397,24 +4370,33 @@ mod tests {
                         crate::state::ObjectId::from(1usize),
                     ),
                     7,
+                    window,
                 ),
             )
-            .0
+            .0;
+        let root = Resolved::new(
+            client.client_id(),
+            WlSurfaceId::from(60),
+            crate::state::ObjectId::from(60usize),
+        );
+        state.insert_window(window, root, toplevel.object_id());
+        toplevel.ref_mut(state).test_set_identity("Terminal", "app");
+        (window, toplevel)
     }
 
     #[test]
     fn mapping_a_toplevel_publishes_its_identity_and_unmap_stops_capture() {
         let (mut client, mut dispatcher, mut state) = client_state();
-        let toplevel = insert_toplevel(&mut client, &mut state);
+        let (window, toplevel) = insert_toplevel(&mut client, &mut state);
         ExtForeignToplevelListV1::attach(
             &mut client,
             &mut state,
             &mut dispatcher,
             ExtForeignToplevelListV1Id::from(50),
         );
-        map_xdg_toplevel(&mut state, &mut dispatcher, toplevel, "Terminal", "app");
+        map_window(&mut state, &mut dispatcher, window);
         test_deliver(&mut client, &mut state, &mut dispatcher);
-        let key = state.capture.by_xdg[&toplevel];
+        let key = state.capture.by_window[&window];
         let handle = state.capture.handles_for(key)[0];
         let handle_id: u32 = handle.wayland_id().into();
         assert_eq!(handle.rref(&state).title(), "Terminal");
@@ -4427,7 +4409,7 @@ mod tests {
         test_dispatch(&mut client, &mut state, &mut dispatcher, toplevel.wayland_id(), event);
         test_deliver(&mut client, &mut state, &mut dispatcher);
         assert_eq!(handle.rref(&state).title(), "Next");
-        retitle_xdg_toplevel(&mut state, &mut dispatcher, toplevel, "Next".to_string());
+        retitle_window(&mut state, &mut dispatcher, window, "Next".to_string());
         assert!(state.capture.pending.get(&client.client_id()).is_none());
 
         client.insert_object(
@@ -4472,14 +4454,14 @@ mod tests {
             event,
         );
         let first_identifier = handle.rref(&state).identifier().to_string();
-        unmap_xdg_toplevel(&mut state, &mut dispatcher, toplevel);
+        unmap_window(&mut state, &mut dispatcher, window);
         test_deliver(&mut client, &mut state, &mut dispatcher);
         assert!(handle.rref(&state).is_closed());
         assert!(test_sent(&dispatcher, 54, 5));
 
-        map_xdg_toplevel(&mut state, &mut dispatcher, toplevel, "Next", "app");
+        map_window(&mut state, &mut dispatcher, window);
         test_deliver(&mut client, &mut state, &mut dispatcher);
-        let remapped = state.capture.by_xdg[&toplevel];
+        let remapped = state.capture.by_window[&window];
         let again = state.capture.handles_for(remapped)[0];
         assert_ne!(again.rref(&state).identifier(), first_identifier);
         assert_ne!(remapped, key);
@@ -4488,8 +4470,8 @@ mod tests {
     #[test]
     fn a_later_list_receives_mapped_toplevels_without_replacing_old_handles() {
         let (mut client, mut dispatcher, mut state) = client_state();
-        let toplevel = insert_toplevel(&mut client, &mut state);
-        map_xdg_toplevel(&mut state, &mut dispatcher, toplevel, "Terminal", "app");
+        let (window, _toplevel) = insert_toplevel(&mut client, &mut state);
+        map_window(&mut state, &mut dispatcher, window);
         let first = ExtForeignToplevelListV1::attach(
             &mut client,
             &mut state,
@@ -4497,7 +4479,7 @@ mod tests {
             ExtForeignToplevelListV1Id::from(50),
         );
         test_deliver(&mut client, &mut state, &mut dispatcher);
-        let key = state.capture.by_xdg[&toplevel];
+        let key = state.capture.by_window[&window];
         assert_eq!(state.capture.handles_for(key).len(), 1);
         let original = state.capture.handles_for(key)[0];
         ExtForeignToplevelListV1::attach(
@@ -5021,6 +5003,7 @@ mod tests {
             )
             .0;
         surface.ref_mut(state).set_xdg_surface_impl(xdg_surface);
+        let window = state.allocate_window_id();
         let toplevel = client
             .insert_object(
                 state,
@@ -5028,18 +5011,86 @@ mod tests {
                     crate::protocol_generated::XdgToplevelId::from(82),
                     xdg_surface,
                     7,
+                    window,
                 ),
             )
             .0;
+        state.insert_window(window, surface, toplevel.object_id());
+        toplevel.ref_mut(state).bind_object_id(toplevel.object_id());
+        toplevel.ref_mut(state).test_set_identity("Terminal", "app");
         ExtForeignToplevelListV1::attach(
             client,
             state,
             dispatcher,
             ExtForeignToplevelListV1Id::from(84),
         );
-        map_xdg_toplevel(state, dispatcher, toplevel, "Terminal", "app");
-        let key = state.capture.by_xdg[&toplevel];
+        map_window(state, dispatcher, window);
+        let key = state.capture.by_window[&window];
         (surface, key)
+    }
+
+    #[test]
+    fn a_recreated_toplevel_gets_a_new_handle() {
+        let (mut client, mut dispatcher, mut state) = client_state();
+        let (surface, key) = mapped_window(&mut client, &mut state, &mut dispatcher);
+        test_deliver(&mut client, &mut state, &mut dispatcher);
+        let handle = state.capture.handles_for(key)[0];
+        let first = handle.rref(&state).identifier().to_string();
+        let window = window_for_key(&state, key);
+        unmap_window(&mut state, &mut dispatcher, window);
+        state.destroy_window(window);
+        test_deliver(&mut client, &mut state, &mut dispatcher);
+        assert!(handle.rref(&state).is_closed());
+
+        let xdg_surface = surface
+            .ref_mut(&mut state)
+            .xdg_surface()
+            .expect("xdg surface");
+        let replacement = state.allocate_window_id();
+        let toplevel = client
+            .insert_object(
+                &mut state,
+                crate::wayland_objects::xdg_toplevel::XdgToplevel::new(
+                    crate::protocol_generated::XdgToplevelId::from(90),
+                    xdg_surface,
+                    7,
+                    replacement,
+                ),
+            )
+            .0;
+        state.insert_window(replacement, surface, toplevel.object_id());
+        toplevel
+            .ref_mut(&mut state)
+            .test_set_identity("Again", "app");
+        map_window(&mut state, &mut dispatcher, replacement);
+        test_deliver(&mut client, &mut state, &mut dispatcher);
+        let again = state.capture.by_window[&replacement];
+        assert_ne!(again, key);
+        assert_eq!(state.capture.handles_for(again)[0].rref(&state).title(), "Again");
+        assert_ne!(
+            state.capture.handles_for(again)[0]
+                .rref(&state)
+                .identifier(),
+            first
+        );
+    }
+
+    fn window_for_key(state: &State, key: ToplevelKey) -> WindowId {
+        super::window_for_toplevel_key(state, key).expect("mapped window")
+    }
+
+    fn resolved_toplevel(
+        state: &State,
+        window: WindowId,
+    ) -> Resolved<crate::protocol_generated::XdgToplevelId> {
+        let role = state.window_role_object(window).expect("role");
+        let wayland_id = state.objects.try_get(role).expect("role object").id();
+        let client_id = state.window_root_surface(window).expect("root").client_id();
+        Resolved::new(
+            client_id,
+            crate::protocol_generated::XdgToplevelId::from(u32::from(wayland_id)),
+            role,
+        )
     }
 
     #[test]
@@ -5278,20 +5329,14 @@ mod tests {
     fn shell_output_and_parent_updates_stay_on_the_record() {
         let (mut client, mut dispatcher, mut state) = client_state();
         let (surface, key) = mapped_window(&mut client, &mut state, &mut dispatcher);
-        let toplevel = state
-            .capture
-            .by_xdg
-            .iter()
-            .find(|(_, mapped)| **mapped == key)
-            .map(|(toplevel, _)| *toplevel)
-            .expect("mapped toplevel");
-        note_xdg_shell_state(&mut state, &mut dispatcher, toplevel, true, false);
+        let window = window_for_key(&state, key);
+        note_window_state(&mut state, &mut dispatcher, window, true, false);
         test_deliver(&mut client, &mut state, &mut dispatcher);
         assert!(state.capture.toplevels[&key].maximized);
         assert!(!state.capture.toplevels[&key].fullscreen);
         assert!(!state.capture.toplevels[&key].closed);
         assert_eq!(state.capture.toplevels[&key].title, "Terminal");
-        note_xdg_shell_state(&mut state, &mut dispatcher, toplevel, false, true);
+        note_window_state(&mut state, &mut dispatcher, window, false, true);
         assert!(!state.capture.toplevels[&key].maximized);
         assert!(state.capture.toplevels[&key].fullscreen);
 
@@ -5309,15 +5354,10 @@ mod tests {
         assert!(!state.capture.toplevels[&child].closed);
 
         let output = insert_output(&mut client, &mut state);
-        let xdg_surface = surface
-            .ref_mut(&mut state)
-            .xdg_surface()
-            .expect("toplevel surface");
-        state.register_xdg_toplevel_role(xdg_surface, toplevel);
         surface
             .ref_mut(&mut state)
             .update_output_membership(vec![output]);
-        sync_toplevel_outputs(&mut state, &mut dispatcher, surface);
+        sync_toplevel_outputs(&mut state, &mut dispatcher, window);
         assert_eq!(
             state.capture.toplevels[&key].outputs,
             std::collections::BTreeSet::from([output])
@@ -5325,7 +5365,7 @@ mod tests {
         surface
             .ref_mut(&mut state)
             .update_output_membership(Vec::new());
-        sync_toplevel_outputs(&mut state, &mut dispatcher, surface);
+        sync_toplevel_outputs(&mut state, &mut dispatcher, window);
         assert!(state.capture.toplevels[&key].outputs.is_empty());
         assert!(!state.capture.handles_for(key).is_empty());
     }
@@ -5339,26 +5379,15 @@ mod tests {
 
         let (mut client, mut dispatcher, mut state) = client_state();
         let (surface, key) = mapped_window(&mut client, &mut state, &mut dispatcher);
-        let toplevel = state
-            .capture
-            .by_xdg
-            .iter()
-            .find(|(_, mapped)| **mapped == key)
-            .map(|(toplevel, _)| *toplevel)
-            .expect("mapped toplevel");
-        note_xdg_shell_state(&mut state, &mut dispatcher, toplevel, true, false);
+        let window = window_for_key(&state, key);
+        note_window_state(&mut state, &mut dispatcher, window, true, false);
         let parent = announce_toplevel(&mut state, &mut dispatcher, "Parent", "parent");
         note_parent(&mut state, &mut dispatcher, key, Some(parent));
         let output = insert_output(&mut client, &mut state);
-        let xdg_surface = surface
-            .ref_mut(&mut state)
-            .xdg_surface()
-            .expect("toplevel surface");
-        state.register_xdg_toplevel_role(xdg_surface, toplevel);
         surface
             .ref_mut(&mut state)
             .update_output_membership(vec![output]);
-        sync_toplevel_outputs(&mut state, &mut dispatcher, surface);
+        sync_toplevel_outputs(&mut state, &mut dispatcher, window);
         ZwlrForeignToplevelManagerV1::attach(
             &mut client,
             &mut state,
@@ -5478,23 +5507,12 @@ mod tests {
 
         let (mut client, mut dispatcher, mut state) = client_state();
         let (surface, key) = mapped_window(&mut client, &mut state, &mut dispatcher);
-        let toplevel = state
-            .capture
-            .by_xdg
-            .iter()
-            .find(|(_, mapped)| **mapped == key)
-            .map(|(toplevel, _)| *toplevel)
-            .expect("mapped toplevel");
+        let window = window_for_key(&state, key);
         let output = state.insert_output(test_output_drm1(0, 0, 640, 480));
-        let xdg_surface = surface
-            .ref_mut(&mut state)
-            .xdg_surface()
-            .expect("toplevel surface");
-        state.register_xdg_toplevel_role(xdg_surface, toplevel);
         surface
             .ref_mut(&mut state)
             .update_output_membership(vec![output]);
-        sync_toplevel_outputs(&mut state, &mut dispatcher, surface);
+        sync_toplevel_outputs(&mut state, &mut dispatcher, window);
         ZwlrForeignToplevelManagerV1::attach(
             &mut client,
             &mut state,
@@ -5535,16 +5553,10 @@ mod tests {
             let _ = handle;
             (key, handle_id)
         };
-        let toplevel = state
-            .capture
-            .by_xdg
-            .iter()
-            .find(|(_, mapped)| **mapped == key)
-            .map(|(toplevel, _)| *toplevel)
-            .expect("toplevel");
+        let window = window_for_key(&state, key);
         let before = test_sent_opcodes(&dispatcher, handle_id);
-        retitle_xdg_toplevel(&mut state, &mut dispatcher, toplevel, "Renamed".to_string());
-        note_xdg_shell_state(&mut state, &mut dispatcher, toplevel, true, false);
+        retitle_window(&mut state, &mut dispatcher, window, "Renamed".to_string());
+        note_window_state(&mut state, &mut dispatcher, window, true, false);
         test_deliver(&mut client, &mut state, &mut dispatcher);
         let after = test_sent_opcodes(&dispatcher, handle_id);
         assert_eq!(&after[before.len()..], &[0, 4, 5]);
@@ -5585,15 +5597,7 @@ mod tests {
         let (mut client, mut dispatcher, mut state) = client_state();
         let (key, handle, handle_id) =
             attached_wlr_handle(&mut client, &mut state, &mut dispatcher);
-        let toplevel = state
-            .capture
-            .by_xdg
-            .iter()
-            .find(|(_, mapped)| **mapped == key)
-            .map(|(toplevel, _)| *toplevel)
-            .expect("toplevel");
-        let xdg_surface = toplevel.rref(&state).xdg_surface();
-        state.register_xdg_toplevel_role(xdg_surface, toplevel);
+        let toplevel = resolved_toplevel(&state, window_for_key(&state, key));
         client.insert_object(&mut state, WlSeat::new(WlSeatId::from(91)));
 
         let mut activate = test_request(handle_id, 4, 1);

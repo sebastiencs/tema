@@ -67,7 +67,10 @@ pub(crate) fn inhibitor_is_honored(state: &State, surface: Resolved<WlSurfaceId>
     {
         return false;
     }
-    state.root_surface_is_mapped(root)
+    let Some(window) = state.window_for_root(root) else {
+        return false;
+    };
+    state.window_is_mapped(window)
         && root_has_protocol_visibility(state, root)
         && workspace_output_enabled(state, root)
 }
@@ -188,15 +191,12 @@ mod tests {
             state.insert_object(WlSurface::new(WlSurfaceId::from(raw), ClientId::from_raw(1), 6));
         let surface = Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(raw), object_id);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface);
         surface
     }
 
     fn map_root(state: &mut State, surface: Resolved<WlSurfaceId>) {
-        state
-            .managed_root_surfaces
-            .get_mut(&surface)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(surface).unwrap().mapped = true;
     }
 
     fn track_inhibitor(
@@ -247,12 +247,13 @@ mod tests {
         map_root(&mut state, covered);
         map_root(&mut state, fullscreen);
         let workspace_id = state.root_surface_workspace(covered).unwrap();
+        let fullscreen_window = state.window_for_root(fullscreen).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
-            .set_fullscreen(Some(fullscreen));
+            .set_fullscreen(Some(fullscreen_window));
 
         assert!(!inhibitor_is_honored(&state, covered));
         assert!(inhibitor_is_honored(&state, fullscreen));
@@ -284,12 +285,13 @@ mod tests {
         map_root(&mut state, window);
         let output_id = state.outputs.iter().next().unwrap().0;
         let workspace_id = state.root_surface_workspace(window).unwrap();
+        let layout_window = state.window_for_root(window).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
-            .set_fullscreen(Some(window));
+            .set_fullscreen(Some(layout_window));
 
         let (_, layer_root_id) =
             state.insert_object(WlSurface::new(WlSurfaceId::from(15), ClientId::from_raw(1), 6));
@@ -426,12 +428,7 @@ mod tests {
         assert!(input_idle.deadline().is_none());
 
         map_root(&mut fixture.state, root);
-        fixture
-            .state
-            .managed_root_surfaces
-            .get_mut(&root)
-            .unwrap()
-            .mapped = false;
+        fixture.state.managed_window_mut(root).unwrap().mapped = false;
         let released_at = resumed_at + Duration::from_secs(9);
         refresh(&mut fixture.state, &mut fixture.dispatcher, released_at);
         let aware = fixture
@@ -471,12 +468,7 @@ mod tests {
             .rref(&fixture.state);
         assert!(aware.deadline().is_none());
 
-        fixture
-            .state
-            .managed_root_surfaces
-            .get_mut(&root)
-            .unwrap()
-            .mapped = false;
+        fixture.state.managed_window_mut(root).unwrap().mapped = false;
         let released_at = during + Duration::from_secs(2);
         refresh(&mut fixture.state, &mut fixture.dispatcher, released_at);
         assert_eq!(notices(&clock(&fixture)), vec![IdleNotice::Idled]);
@@ -536,12 +528,13 @@ mod tests {
         map_root(&mut state, covered);
         map_root(&mut state, fullscreen);
         let workspace_id = state.root_surface_workspace(covered).unwrap();
+        let fullscreen_window = state.window_for_root(fullscreen).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
-            .set_fullscreen(Some(fullscreen));
+            .set_fullscreen(Some(fullscreen_window));
 
         let covered_popup = attach_popup(&mut state, covered, 17);
         let fullscreen_popup = attach_popup(&mut state, fullscreen, 21);
@@ -618,12 +611,7 @@ mod tests {
 
         let first_resume = idle_at + Duration::from_secs(1);
         refresh(&mut fixture.state, &mut fixture.dispatcher, first_resume);
-        fixture
-            .state
-            .managed_root_surfaces
-            .get_mut(&root)
-            .unwrap()
-            .mapped = false;
+        fixture.state.managed_window_mut(root).unwrap().mapped = false;
         let released = first_resume + Duration::from_secs(2);
         refresh(&mut fixture.state, &mut fixture.dispatcher, released);
         let second_idle = released + Duration::from_millis(1_000);

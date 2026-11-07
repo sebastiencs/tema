@@ -332,7 +332,7 @@ mod tests {
         runner::Dispatcher,
         seat::{handle_pointer_motion, quiesce_for_session_pause, SeatClientEvent},
         state::{ObjectId, State},
-        test_support::{state_for_tests, test_client_and_dispatcher},
+        test_support::{insert_window, state_for_tests, test_client_and_dispatcher},
         wayland_objects::{
             pointer_constraint::{ConstraintLifetime, ConstraintStatus, SurfacePointerConstraint},
             wl_pointer::WlPointer,
@@ -674,6 +674,7 @@ mod tests {
             (100, 80),
         );
         focus_keyboard(&mut setup);
+        insert_window(&mut setup.state, setup.surface);
         assert!(crate::input::apply_interaction_intent(
             &mut setup.state,
             &mut setup.dispatcher,

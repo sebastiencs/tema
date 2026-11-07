@@ -4,6 +4,7 @@ use crate::{
     clients::{Client, ClientDispatcher, RawRequest},
     protocol_generated::{Constants, WaylandId},
     state::{Grab, GrabbedObject, ObjectId, State},
+    window::Toplevel,
 };
 
 /// Internal object-safe extension methods for `dyn Object`.
@@ -47,6 +48,16 @@ pub trait Object: ObjectDynExt {
         _state: &mut State,
         _dispatcher: &mut ClientDispatcher,
     ) {
+    }
+
+    /// This object as a managed toplevel. Surfaces and other roles return `None`.
+    fn as_toplevel(&self) -> Option<&dyn Toplevel> {
+        None
+    }
+
+    /// Mutable form of [`as_toplevel`](Object::as_toplevel).
+    fn as_toplevel_mut(&mut self) -> Option<&mut dyn Toplevel> {
+        None
     }
 }
 

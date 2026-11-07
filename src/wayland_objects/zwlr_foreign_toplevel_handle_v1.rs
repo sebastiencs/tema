@@ -18,6 +18,7 @@ use crate::{
     seat::{resolve_activation_target, set_keyboard_focus_from_surface},
     state::{GrabbedObject, State},
     wayland_objects::wl_display::WlDisplay,
+    window::Toplevel,
 };
 
 /// `fullscreen` was added to the state enum in version 2, with `set_fullscreen`.
@@ -156,7 +157,10 @@ impl ZwlrForeignToplevelHandleV1 {
         let Some(focus) = resolve_activation_target(state, root) else {
             return;
         };
-        if !state.raise_root_surface(focus.surface) {
+        let raised = state
+            .window_for_root(focus.surface)
+            .is_some_and(|window| state.raise_window(window));
+        if !raised && !state.raise_root_surface(focus.surface) {
             return;
         }
         set_keyboard_focus_from_surface(state, dispatcher, Some(focus));
@@ -174,29 +178,26 @@ impl ZwlrForeignToplevelHandleV1 {
         let Some(root) = crate::capture::root_surface_for_toplevel_key(state, self.key) else {
             return;
         };
-        let _ =
-            crate::wayland_objects::xdg_surface::request_toplevel_close(state, dispatcher, root);
+        if let Some(window) = state.window_for_root(root) {
+            let _ = state.request_window_close(window, dispatcher);
+        }
     }
 
     fn fullscreen(&self, state: &mut State, dispatcher: &mut ClientDispatcher, fullscreen: bool) {
         let Some(root) = crate::capture::root_surface_for_toplevel_key(state, self.key) else {
             return;
         };
-        if let Some(xdg_surface) = root
-            .try_ref(state)
-            .and_then(|surface| surface.xdg_surface())
-        {
-            if let Some(toplevel) = state.xdg_toplevel(xdg_surface) {
-                if let Some(toplevel) = toplevel.try_ref_mut(state) {
-                    toplevel.set_requested_fullscreen(fullscreen);
-                }
-            }
+        let Some(window) = state.window_for_root(root) else {
+            return;
+        };
+        if let Some(toplevel) = state.toplevel_mut(window) {
+            toplevel.set_requested_fullscreen(fullscreen);
         }
         let affected_outputs = state
-            .root_surface_workspace(root)
-            .map(|workspace_id| state.workspace_output_ids(workspace_id))
+            .managed_window_state(window)
+            .map(|managed| state.workspace_output_ids(managed.workspace_id))
             .unwrap_or_default();
-        if state.set_root_surface_fullscreen(root, fullscreen) {
+        if state.set_window_fullscreen(window, fullscreen) {
             if !affected_outputs.is_empty() {
                 request_outputs(state, affected_outputs.into_iter(), dispatcher);
             }

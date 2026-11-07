@@ -368,8 +368,8 @@ mod tests {
             handle_pointer_scroll, quiesce_for_session_pause, PointerAxisChange,
             PointerScrollFrame, PointerScrollSource, SeatClientEvent,
         },
-        state::{ManagedRootSurfaceState, ManagedWindowMode, ObjectId, State, WorkspaceId},
-        test_support::{state_for_tests, test_client_and_dispatcher},
+        state::{ManagedWindowMode, ManagedWindowState, ObjectId, State, WorkspaceId},
+        test_support::{insert_window, state_for_tests, test_client_and_dispatcher},
         visual_animation::{
             FocusVisualAnimation, WindowGeometryAnimation, WindowLifecycleAnimation,
             WindowVisualBase,
@@ -498,9 +498,9 @@ mod tests {
         assert!(setup.state.seat.active_pointer_lock.is_none());
         assert_eq!(setup.state.seat.pointer_pos, (1.0, 1.0));
 
-        setup.state.managed_root_surfaces.insert(
+        setup.state.insert_managed_window(
             setup.surface,
-            ManagedRootSurfaceState {
+            ManagedWindowState {
                 workspace_id: WorkspaceId::from_parts(1, 1),
                 mode: ManagedWindowMode::Floating,
                 fullscreen: true,
@@ -923,6 +923,7 @@ mod tests {
     fn a_move_grab_unlocks_before_it_takes_the_pointer() {
         let mut setup = prepare(ConstraintLifetime::Oneshot, None, (10.0, 10.0));
         focus_keyboard(&mut setup);
+        insert_window(&mut setup.state, setup.surface);
         assert!(crate::input::apply_interaction_intent(
             &mut setup.state,
             &mut setup.dispatcher,

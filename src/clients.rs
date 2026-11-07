@@ -2207,12 +2207,13 @@ impl Client {
             if !root_has_protocol_visibility(state, root_surface) {
                 continue;
             }
-            let tiled_geometry = state.tiled_root_surface_geometry(root_surface);
+            let window = toplevel_ref.window();
+            let tiled_geometry = state.tiled_window_geometry(window);
             let resizing = tiled_resize_surfaces.contains(&root_surface);
             let surface_configure_bounds = state.configure_bounds_for_surface(wl_surface, None);
             let scheduled_floating_restore =
-                if tiled_geometry.is_none() && !state.root_surface_is_fullscreen(root_surface) {
-                    state.take_scheduled_floating_restore_state(root_surface)
+                if tiled_geometry.is_none() && !state.window_is_fullscreen(window) {
+                    state.take_window_floating_restore(window)
                 } else {
                     None
                 };
@@ -2263,13 +2264,10 @@ impl Client {
                     );
                 }
             }
-            if let Some((maximized, fullscreen)) = toplevel
-                .try_ref(state)
-                .map(|toplevel| toplevel.published_shell_state())
-            {
-                crate::capture::note_xdg_shell_state(
-                    state, dispatcher, toplevel, maximized, fullscreen,
-                );
+            if let Some(toplevel) = toplevel.try_ref(state) {
+                let window = toplevel.window();
+                let (maximized, fullscreen) = toplevel.published_shell_state();
+                crate::capture::note_window_state(state, dispatcher, window, maximized, fullscreen);
             }
         }
     }
@@ -2438,7 +2436,9 @@ fn refresh_surface_tree_outputs(
         );
         (surface_obj.current_stack().to_vec(), child_base, delta)
     };
-    crate::capture::sync_toplevel_outputs(state, dispatcher, surface);
+    if let Some(window) = state.window_for_root(surface) {
+        crate::capture::sync_toplevel_outputs(state, dispatcher, window);
+    }
 
     for output_id in delta.left {
         for output in client.output_object_ids_for_output(state, output_id) {
@@ -2501,7 +2501,9 @@ fn clear_surface_tree_outputs(
         let delta = surface_obj.update_output_membership(Vec::new());
         (surface_obj.current_stack().to_vec(), delta)
     };
-    crate::capture::sync_toplevel_outputs(state, dispatcher, surface);
+    if let Some(window) = state.window_for_root(surface) {
+        crate::capture::sync_toplevel_outputs(state, dispatcher, window);
+    }
 
     for output_id in delta.left {
         for output in client.output_object_ids_for_output(state, output_id) {
@@ -2916,14 +2918,13 @@ impl Model for Client {
                         &mut dispatcher,
                     );
                 }
-                if let Some((maximized, fullscreen)) = xdg_toplevel
-                    .try_ref(state)
-                    .map(|toplevel| toplevel.published_shell_state())
-                {
-                    crate::capture::note_xdg_shell_state(
+                if let Some(toplevel) = xdg_toplevel.try_ref(state) {
+                    let window = toplevel.window();
+                    let (maximized, fullscreen) = toplevel.published_shell_state();
+                    crate::capture::note_window_state(
                         state,
                         &mut dispatcher,
-                        xdg_toplevel,
+                        window,
                         maximized,
                         fullscreen,
                     );

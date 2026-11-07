@@ -355,16 +355,18 @@ mod tests {
                 .unwrap();
             xdg_surface.test_set_initial_commit_complete(true);
         }
+        let window = state.allocate_window_id();
         let (toplevel_resolved, _) = client.insert_object(
             &mut state,
             XdgToplevel::new(
                 toplevel_id,
                 Resolved::new(client.client_id(), xdg_surface_id, xdg_surface_object_id),
                 7,
+                window,
             ),
         );
         let toplevel_object_id = toplevel_resolved.object_id();
-        state.register_xdg_toplevel_role(xdg_surface_resolved, toplevel_resolved);
+        state.insert_window(window, surface_resolved, toplevel_resolved.object_id());
         let (decoration_resolved, _) = client.insert_object(
             &mut state,
             ZxdgToplevelDecorationV1::new(decoration_id, toplevel_resolved, 1),
@@ -476,16 +478,18 @@ mod tests {
                 .unwrap();
             xdg_surface.test_set_initial_commit_complete(true);
         }
+        let window = state.allocate_window_id();
         let (toplevel_resolved, _) = client.insert_object(
             &mut state,
             XdgToplevel::new(
                 toplevel_id,
                 Resolved::new(client.client_id(), xdg_surface_id, xdg_surface_object_id),
                 7,
+                window,
             ),
         );
         let toplevel_object_id = toplevel_resolved.object_id();
-        state.register_xdg_toplevel_role(xdg_surface_resolved, toplevel_resolved);
+        state.insert_window(window, surface_resolved, toplevel_resolved.object_id());
         let (decoration_resolved, _) = client.insert_object(
             &mut state,
             ZxdgToplevelDecorationV1::new(decoration_id, toplevel_resolved, 1),

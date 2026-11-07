@@ -7,8 +7,8 @@ use crate::{
     object::Object,
     protocol_generated::{
         ExtIdleNotificationV1Id, HyprlandCtmControlManagerV1Id, WaylandId, WlDataOfferId,
-        WlDataSourceId, WlSeatId, WlSurfaceId, XdgSurfaceId, XdgToplevelId, ZwlrGammaControlV1Id,
-        ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
+        WlDataSourceId, WlSeatId, WlSurfaceId, ZwlrGammaControlV1Id, ZwlrLayerSurfaceV1Id,
+        ZwpIdleInhibitorV1Id,
     },
     region::RectI,
     render::{
@@ -32,12 +32,10 @@ use crate::{
     },
     wayland_objects::{
         wl_surface::WlSurface,
-        xdg_surface::{
-            xdg_toplevel::{ToplevelDecorationMode, XdgToplevel},
-            XdgSurface,
-        },
+        xdg_surface::{xdg_toplevel::ToplevelDecorationMode, XdgSurface},
         zwlr_layer_surface_v1::{output_usable_bounds_with_snapshot, LayerLayoutObjectSnapshot},
     },
+    window::{Toplevel, WindowEntry, WindowId},
     xkb::{KeyboardState, Xkb},
 };
 
@@ -434,7 +432,7 @@ pub enum ManagedWindowMode {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ManagedRootSurfaceState {
+pub struct ManagedWindowState {
     pub workspace_id: WorkspaceId,
     pub mode: ManagedWindowMode,
     pub fullscreen: bool,
@@ -905,12 +903,17 @@ pub struct State {
     pub workspaces: IndexMap<WorkspaceId, Workspace>,
     pub output_workspace_groups: BTreeMap<OutputId, WorkspaceGroupId>,
     pub root_surface_workspaces: BTreeMap<Resolved<WlSurfaceId>, WorkspaceId>,
-    pub managed_root_surfaces: BTreeMap<Resolved<WlSurfaceId>, ManagedRootSurfaceState>,
+    /// Per-window layout state. Only a root that hosts a window has an entry.
+    managed_windows: BTreeMap<WindowId, ManagedWindowState>,
     pub(crate) closing_snapshots: Vec<RetainedClosingSnapshot>,
     pub(crate) next_closing_snapshot_id: u64,
     pub root_geometry_cache: BTreeMap<Resolved<WlSurfaceId>, Cell<RootGeometryCacheEntry>>,
     pub(crate) client_process_info: BTreeMap<ClientId, Option<Rc<ProcessInfo>>>,
-    pub xdg_toplevel_roles: BTreeMap<Resolved<XdgSurfaceId>, Resolved<XdgToplevelId>>,
+    /// Live toplevels, allocated in `xdg_surface.get_toplevel` and released with that role.
+    pub(crate) windows: BTreeMap<WindowId, WindowEntry>,
+    pub(crate) window_by_root: BTreeMap<Resolved<WlSurfaceId>, WindowId>,
+    /// Next [`WindowId`] value. The first allocated id is 1.
+    pub(crate) next_window_id: u64,
     /// Unblocked `hyprland_ctm_control_manager_v1` singleton; new binds are blocked while set.
     pub ctm_control_owner: Option<Resolved<HyprlandCtmControlManagerV1Id>>,
     /// `wl_data_offer`s keyed by the source object, so source teardown can drop them
@@ -965,6 +968,72 @@ fn workspace_transition_direction(
 }
 
 impl State {
+    // Root wrappers that still have callers. Each one resolves `window_for_root` and calls
+    // the window function.
+    //
+    // - `managed_window`, `managed_window_mut`, `is_managed_window`, `managed_root_surface_state`,
+    //   `managed_windows`, `insert_managed_window`, `remove_managed_window`
+    // - `root_surface_is_mapped`, `prepare_root_surface_initial_layout`, `confirm_root_surface_mapped`
+    // - `root_surface_is_fullscreen`, `is_tiled_root_surface`, `is_floating_root_surface`
+    // - `set_root_surface_floating`, `set_root_surface_fullscreen`
+    // - `retile_root_surface_after_drag`, `take_scheduled_floating_restore_state`
+    //
+    // `focused_root_surface` stays: keyboard focus is a surface. `focused_window` reads it.
+    // `raise_root_surface` stays for roots that are not in the layout; the layout raise is
+    // `raise_window`. `assign_root_surface_to_workspace` stays for every root.
+    // `assign_window_to_workspace` looks the root up. Geometry, outputs, popups, and process
+    // info stay on the root.
+
+    pub(crate) fn new(
+        globals: Globals,
+        config: RuntimeConfig,
+        keyboard: KeyboardState,
+        xkb: Xkb,
+    ) -> Self {
+        Self {
+            objects: Default::default(),
+            root_surfaces: Default::default(),
+            root_surface_process_info: Default::default(),
+            layer_surface_objects: Default::default(),
+            inputs: Default::default(),
+            drm: Default::default(),
+            outputs: Default::default(),
+            active_output: None,
+            workspace_groups: Default::default(),
+            workspaces: Default::default(),
+            output_workspace_groups: Default::default(),
+            root_surface_workspaces: Default::default(),
+            managed_windows: Default::default(),
+            closing_snapshots: Vec::new(),
+            next_closing_snapshot_id: 1,
+            root_geometry_cache: Default::default(),
+            client_process_info: Default::default(),
+            windows: Default::default(),
+            window_by_root: Default::default(),
+            next_window_id: 1,
+            ctm_control_owner: None,
+            data_offers_by_source: Default::default(),
+            next_workspace_serial: 1,
+            backend_syncobj_globals: Default::default(),
+            session_active: true,
+            idle_notifications: Vec::new(),
+            idle_inhibitors: Vec::new(),
+            idle_inhibitors_honored: false,
+            session_lock: Default::default(),
+            capture: Default::default(),
+            #[cfg(test)]
+            realize_closing_snapshots_in_tests: false,
+            frame_scheduler: Default::default(),
+            presentation: Default::default(),
+            globals,
+            activation_tokens: Default::default(),
+            config,
+            seat: SeatState::default(),
+            keyboard,
+            xkb,
+        }
+    }
+
     fn next_workspace_stable_id(&mut self) -> String {
         let serial = self.next_workspace_serial;
         self.next_workspace_serial = self.next_workspace_serial.saturating_add(1);
@@ -1034,39 +1103,198 @@ impl State {
             })
     }
 
+    pub fn managed_window_state(&self, window: WindowId) -> Option<&ManagedWindowState> {
+        self.managed_windows.get(&window)
+    }
+
+    pub fn managed_window_state_mut(
+        &mut self,
+        window: WindowId,
+    ) -> Option<&mut ManagedWindowState> {
+        self.managed_windows.get_mut(&window)
+    }
+
+    pub fn managed_window_states(&self) -> impl Iterator<Item = (WindowId, &ManagedWindowState)> {
+        self.managed_windows
+            .iter()
+            .map(|(window, managed)| (*window, managed))
+    }
+
+    pub fn managed_window(&self, root: Resolved<WlSurfaceId>) -> Option<&ManagedWindowState> {
+        self.managed_window_state(self.window_for_root(root)?)
+    }
+
+    pub fn managed_window_mut(
+        &mut self,
+        root: Resolved<WlSurfaceId>,
+    ) -> Option<&mut ManagedWindowState> {
+        self.managed_window_state_mut(self.window_for_root(root)?)
+    }
+
+    pub fn managed_windows(
+        &self,
+    ) -> impl Iterator<Item = (Resolved<WlSurfaceId>, &ManagedWindowState)> {
+        let states = &self.managed_windows;
+        self.window_by_root
+            .iter()
+            .filter_map(move |(root, window)| states.get(window).map(|managed| (*root, managed)))
+    }
+
+    pub fn is_managed_window(&self, root: Resolved<WlSurfaceId>) -> bool {
+        self.window_for_root(root)
+            .is_some_and(|window| self.managed_window_state(window).is_some())
+    }
+
+    pub(crate) fn replace_managed_window_state(
+        &mut self,
+        window: WindowId,
+        managed: ManagedWindowState,
+    ) -> Option<ManagedWindowState> {
+        self.managed_windows.insert(window, managed)
+    }
+
+    pub(crate) fn take_managed_window(&mut self, window: WindowId) -> Option<ManagedWindowState> {
+        let managed = self.managed_windows.remove(&window);
+        self.destroy_window(window);
+        managed
+    }
+
+    pub(crate) fn insert_managed_window(
+        &mut self,
+        root: Resolved<WlSurfaceId>,
+        managed: ManagedWindowState,
+    ) -> Option<ManagedWindowState> {
+        let window = if let Some(window) = self.window_for_root(root) {
+            window
+        } else {
+            let window = self.allocate_window_id();
+            self.insert_window(window, root, ObjectId::from(1_000_000usize));
+            window
+        };
+        self.replace_managed_window_state(window, managed)
+    }
+
+    pub(crate) fn remove_managed_window(
+        &mut self,
+        root: Resolved<WlSurfaceId>,
+    ) -> Option<ManagedWindowState> {
+        self.take_managed_window(self.window_for_root(root)?)
+    }
+
     pub fn managed_root_surface_state(
         &self,
         surface: Resolved<WlSurfaceId>,
-    ) -> Option<&ManagedRootSurfaceState> {
-        self.managed_root_surfaces.get(&surface)
+    ) -> Option<&ManagedWindowState> {
+        self.managed_window(surface)
+    }
+
+    fn fresh_managed_window(
+        &self,
+        root: Resolved<WlSurfaceId>,
+        workspace_id: WorkspaceId,
+    ) -> ManagedWindowState {
+        ManagedWindowState {
+            workspace_id,
+            mode: ManagedWindowMode::Tiled,
+            fullscreen: false,
+            mapped: false,
+            awaiting_initial_layout: true,
+            remembered_floating_state: None,
+            restore_floating_state_on_next_configure: false,
+            hold_floating_layout: false,
+            focus_animation: FocusVisualAnimation::settled(self.focus_visual_base(root)),
+            lifecycle_animation: WindowLifecycleAnimation::idle(),
+            geometry_animation: WindowGeometryAnimation::unarmed(),
+        }
+    }
+
+    /// Creates tiled state for a window that was just registered.
+    ///
+    /// The workspace is the one the root already belongs to. When the root has none yet,
+    /// this assigns the active workspace. Without a workspace the window has no state.
+    pub(crate) fn attach_fresh_managed_window(
+        &mut self,
+        id: WindowId,
+        root: Resolved<WlSurfaceId>,
+    ) {
+        // Read the workspace map directly. `root_surface_workspace` also resolves popup
+        // parents through `try_ref`, and this runs from `xdg_surface.get_toplevel` while
+        // that `xdg_surface` is grabbed.
+        let workspace_id =
+            if let Some(workspace_id) = self.root_surface_workspaces.get(&root).copied() {
+                workspace_id
+            } else {
+                let Some(workspace_id) = self
+                    .active_output_id()
+                    .and_then(|output_id| self.active_workspace_for_output(output_id))
+                    .or_else(|| {
+                        self.workspace_groups
+                            .iter()
+                            .find_map(|(_, group)| group.active_workspace)
+                    })
+                else {
+                    return;
+                };
+                if !self.assign_root_surface_to_workspace(root, workspace_id) {
+                    return;
+                }
+                workspace_id
+            };
+        let managed = self.fresh_managed_window(root, workspace_id);
+        self.managed_windows.insert(id, managed);
+    }
+
+    /// Drops layout state and takes the root out of its workspace layout.
+    pub(crate) fn drop_managed_window(&mut self, id: WindowId, root: Resolved<WlSurfaceId>) {
+        self.managed_windows.remove(&id);
+        let Some(workspace_id) = self.root_surface_workspaces.get(&root).copied() else {
+            return;
+        };
+        let Some(workspace) = self.workspaces.try_get_mut(workspace_id) else {
+            return;
+        };
+        workspace.layout.remove_window(id);
+    }
+
+    pub fn take_window_floating_restore(
+        &mut self,
+        window: WindowId,
+    ) -> Option<RememberedFloatingState> {
+        let managed = self.managed_window_state_mut(window)?;
+        std::mem::take(&mut managed.restore_floating_state_on_next_configure)
+            .then_some(managed.remembered_floating_state)
+            .flatten()
     }
 
     pub fn take_scheduled_floating_restore_state(
         &mut self,
         surface: Resolved<WlSurfaceId>,
     ) -> Option<RememberedFloatingState> {
-        let managed = self.managed_root_surfaces.get_mut(&surface)?;
-        std::mem::take(&mut managed.restore_floating_state_on_next_configure)
-            .then_some(managed.remembered_floating_state)
-            .flatten()
+        self.take_window_floating_restore(self.window_for_root(surface)?)
     }
 
-    pub fn root_surface_is_mapped(&self, surface: Resolved<WlSurfaceId>) -> bool {
-        self.managed_root_surfaces
-            .get(&surface)
+    pub fn window_is_mapped(&self, window: WindowId) -> bool {
+        self.managed_window_state(window)
             .is_some_and(|managed| managed.mapped)
     }
 
-    pub fn prepare_root_surface_initial_layout(&mut self, surface: Resolved<WlSurfaceId>) -> bool {
+    pub fn root_surface_is_mapped(&self, surface: Resolved<WlSurfaceId>) -> bool {
+        self.window_for_root(surface)
+            .is_some_and(|window| self.window_is_mapped(window))
+    }
+
+    pub fn prepare_window_initial_layout(&mut self, window: WindowId) -> bool {
+        let Some(root) = self.window_root_surface(window) else {
+            return false;
+        };
         let Some(workspace_id) = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window_state(window)
             .map(|managed| managed.workspace_id)
-            .or_else(|| self.ensure_root_surface_workspace(surface))
+            .or_else(|| self.ensure_root_surface_workspace(root))
         else {
             return false;
         };
-        let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+        let Some(managed) = self.managed_window_state_mut(window) else {
             return false;
         };
         if managed.mode != ManagedWindowMode::Tiled || managed.mapped {
@@ -1080,15 +1308,19 @@ impl State {
         true
     }
 
-    pub fn confirm_root_surface_mapped(&mut self, surface: Resolved<WlSurfaceId>) {
+    pub fn prepare_root_surface_initial_layout(&mut self, surface: Resolved<WlSurfaceId>) -> bool {
+        self.window_for_root(surface)
+            .is_some_and(|window| self.prepare_window_initial_layout(window))
+    }
+
+    pub fn confirm_window_mapped(&mut self, window: WindowId) {
         let Some(workspace_id) = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window_state(window)
             .map(|managed| managed.workspace_id)
         else {
             return;
         };
-        let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+        let Some(managed) = self.managed_window_state_mut(window) else {
             return;
         };
         if !managed.awaiting_initial_layout {
@@ -1098,38 +1330,10 @@ impl State {
         tiling::mark_workspace_dirty(self, workspace_id);
     }
 
-    pub fn register_xdg_toplevel_role(
-        &mut self,
-        xdg_surface: Resolved<XdgSurfaceId>,
-        toplevel: Resolved<XdgToplevelId>,
-    ) {
-        self.xdg_toplevel_roles.insert(xdg_surface, toplevel);
-    }
-
-    pub fn unregister_xdg_toplevel_role(
-        &mut self,
-        xdg_surface: Resolved<XdgSurfaceId>,
-        toplevel: Resolved<XdgToplevelId>,
-    ) {
-        if self.xdg_toplevel_roles.get(&xdg_surface) == Some(&toplevel) {
-            self.xdg_toplevel_roles.remove(&xdg_surface);
+    pub fn confirm_root_surface_mapped(&mut self, surface: Resolved<WlSurfaceId>) {
+        if let Some(window) = self.window_for_root(surface) {
+            self.confirm_window_mapped(window);
         }
-    }
-
-    pub fn xdg_toplevel(
-        &self,
-        xdg_surface: Resolved<XdgSurfaceId>,
-    ) -> Option<Resolved<XdgToplevelId>> {
-        self.xdg_toplevel_roles
-            .get(&xdg_surface)
-            .copied()
-            .filter(|toplevel| toplevel.exists(self))
-    }
-
-    #[cfg(test)]
-    pub fn xdg_toplevel_object_id(&self, xdg_surface: Resolved<XdgSurfaceId>) -> Option<ObjectId> {
-        self.xdg_toplevel(xdg_surface)
-            .map(|toplevel| toplevel.object_id())
     }
 
     pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
@@ -1504,15 +1708,18 @@ impl State {
         if let Some(previous_workspace_id) =
             self.root_surface_workspaces.insert(surface, workspace_id)
         {
+            let window = self.window_for_root(surface);
             if let Some(previous_workspace) = self.workspaces.try_get_mut(previous_workspace_id) {
                 previous_workspace.root_surfaces.remove(&surface);
-                if previous_workspace
-                    .layout
-                    .fullscreen
-                    .as_ref()
-                    .is_some_and(|fullscreen| fullscreen.surface_object_id == surface)
-                {
-                    previous_workspace.layout.set_fullscreen(None);
+                if let Some(window) = window {
+                    if previous_workspace
+                        .layout
+                        .fullscreen
+                        .as_ref()
+                        .is_some_and(|fullscreen| fullscreen.window == window)
+                    {
+                        previous_workspace.layout.set_fullscreen(None);
+                    }
                 }
             }
             tiling::mark_workspace_dirty(self, previous_workspace_id);
@@ -1523,48 +1730,43 @@ impl State {
         };
         workspace.root_surfaces.insert(surface);
         workspace.layout.mark_dirty();
-        let initial_animation = FocusVisualAnimation::settled(self.focus_visual_base(surface));
-        self.managed_root_surfaces
-            .entry(surface)
-            .and_modify(|managed| {
+        if let Some(window) = self.window_for_root(surface) {
+            if self.managed_windows.contains_key(&window) {
+                let managed = self.managed_windows.get_mut(&window).unwrap();
                 managed.workspace_id = workspace_id;
                 managed.geometry_animation.prefer_relocation();
-            })
-            .or_insert(ManagedRootSurfaceState {
-                workspace_id,
-                mode: ManagedWindowMode::Tiled,
-                fullscreen: false,
-                mapped: false,
-                awaiting_initial_layout: true,
-                remembered_floating_state: None,
-                restore_floating_state_on_next_configure: false,
-                hold_floating_layout: false,
-                focus_animation: initial_animation,
-                lifecycle_animation: WindowLifecycleAnimation::idle(),
-                geometry_animation: WindowGeometryAnimation::unarmed(),
-            });
+            } else {
+                let managed = self.fresh_managed_window(surface, workspace_id);
+                self.managed_windows.insert(window, managed);
+            }
+        }
         self.mark_root_geometry_dirty(surface);
         true
+    }
+
+    pub fn assign_window_to_workspace(
+        &mut self,
+        window: WindowId,
+        workspace_id: WorkspaceId,
+    ) -> bool {
+        let Some(root) = self.window_root_surface(window) else {
+            return false;
+        };
+        self.assign_root_surface_to_workspace(root, workspace_id)
     }
 
     pub fn detach_root_surface_from_workspace(
         &mut self,
         surface: Resolved<WlSurfaceId>,
     ) -> Option<WorkspaceId> {
+        let window = self.window_for_root(surface);
         let workspace_id = self.root_surface_workspaces.remove(&surface)?;
         if let Some(workspace) = self.workspaces.try_get_mut(workspace_id) {
             workspace.root_surfaces.remove(&surface);
-            workspace.layout.remove_surface(surface);
-            if workspace
-                .layout
-                .fullscreen
-                .as_ref()
-                .is_some_and(|fullscreen| fullscreen.surface_object_id == surface)
-            {
-                workspace.layout.set_fullscreen(None);
+            if let Some(window) = window {
+                workspace.layout.remove_window(window);
             }
         }
-        self.managed_root_surfaces.remove(&surface);
         self.root_geometry_cache.remove(&surface);
         Some(workspace_id)
     }
@@ -1573,20 +1775,14 @@ impl State {
         &mut self,
         surface: Resolved<WlSurfaceId>,
     ) -> Option<WorkspaceId> {
+        let window = self.window_for_root(surface);
         let workspace_id = self.root_surface_workspaces.remove(&surface)?;
         if let Some(workspace) = self.workspaces.try_get_mut(workspace_id) {
             workspace.root_surfaces.remove(&surface);
-            workspace.layout.remove_surface(surface);
-            if workspace
-                .layout
-                .fullscreen
-                .as_ref()
-                .is_some_and(|fullscreen| fullscreen.surface_object_id == surface)
-            {
-                workspace.layout.set_fullscreen(None);
+            if let Some(window) = window {
+                workspace.layout.remove_window(window);
             }
         }
-        self.managed_root_surfaces.remove(&surface);
         Some(workspace_id)
     }
 
@@ -1788,18 +1984,21 @@ impl State {
 
     pub(crate) fn sync_window_geometry_goal(
         &mut self,
-        surface: Resolved<WlSurfaceId>,
+        window: WindowId,
         motion: WindowGeometryMotion,
     ) {
-        if !self.managed_root_surfaces.contains_key(&surface) {
+        let Some(surface) = self.window_root_surface(window) else {
+            return;
+        };
+        if self.managed_window_state(window).is_none() {
             return;
         }
         if motion == WindowGeometryMotion::Warp {
-            if let Some(managed) = self.managed_root_surfaces.get_mut(&surface) {
+            if let Some(managed) = self.managed_window_state_mut(window) {
                 managed.hold_floating_layout = false;
             }
-        } else if let Some(held) = self.held_floating_layout(surface) {
-            let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+        } else if let Some(held) = self.held_floating_layout(window) {
+            let Some(managed) = self.managed_window_state_mut(window) else {
                 return;
             };
             managed
@@ -1810,7 +2009,7 @@ impl State {
         let Some(geometry) = self.ensure_root_geometry_fresh(surface) else {
             return;
         };
-        let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+        let Some(managed) = self.managed_window_state_mut(window) else {
             return;
         };
         managed
@@ -1819,8 +2018,9 @@ impl State {
     }
 
     /// Saved floating frame while the attached buffer is still a different size.
-    fn held_floating_layout(&mut self, surface: Resolved<WlSurfaceId>) -> Option<RectI> {
-        let managed = self.managed_root_surfaces.get(&surface)?;
+    fn held_floating_layout(&mut self, window: WindowId) -> Option<RectI> {
+        let surface = self.window_root_surface(window)?;
+        let managed = self.managed_window_state(window)?;
         if !managed.hold_floating_layout
             || managed.fullscreen
             || managed.mode != ManagedWindowMode::Floating
@@ -1832,7 +2032,7 @@ impl State {
         let caught_up = geometry.layout_rect_global.width == remembered.layout_rect.width
             && geometry.layout_rect_global.height == remembered.layout_rect.height;
         if caught_up {
-            if let Some(managed) = self.managed_root_surfaces.get_mut(&surface) {
+            if let Some(managed) = self.managed_window_state_mut(window) {
                 managed.hold_floating_layout = false;
             }
             return None;
@@ -1919,25 +2119,17 @@ impl State {
         let layout_allocation = tiling::layout_allocation_for_surface(self, surface);
         root_geometry::build_committed_root_geometry(
             self,
+            surface,
             surface_ref,
             layout_allocation,
             overrides,
         )
     }
 
-    pub fn tiled_root_surface_geometry(
-        &self,
-        surface: Resolved<WlSurfaceId>,
-    ) -> Option<CommittedRootGeometry> {
-        self.committed_root_geometry(surface)
+    pub fn tiled_window_geometry(&self, window: WindowId) -> Option<CommittedRootGeometry> {
+        let root = self.window_root_surface(window)?;
+        self.committed_root_geometry(root)
             .filter(|geometry| geometry.tiled_edges != 0 || geometry.fullscreen)
-    }
-
-    fn root_surface_xdg_toplevel(&self, object_id: ObjectId) -> Option<&XdgToplevel> {
-        let surface = self.objects.try_ref_object::<WlSurface>(object_id)?;
-        let xdg_surface = surface.xdg_surface()?;
-        self.xdg_toplevel(xdg_surface)
-            .map(|toplevel| toplevel.rref(self))
     }
 
     /// Decoration mode sent to a toplevel.
@@ -2087,8 +2279,7 @@ impl State {
     ) -> Option<RectI> {
         let logical = self.root_surface_visual_damage_rect(surface);
         let animated = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .and_then(|managed| managed.geometry_animation.visual_rect())
             .and_then(|rect| self.geometry_sample_influence(surface, rect));
         match (logical, animated) {
@@ -2135,8 +2326,7 @@ impl State {
         let root = self.root_surface_for_surface(surface).unwrap_or(surface);
         let logical = self.committed_root_geometry(root)?.layout_rect_global;
         let visual = self
-            .managed_root_surfaces
-            .get(&root)
+            .managed_window(root)
             .and_then(|managed| managed.geometry_animation.visual_rect())?;
         (logical != visual && logical.width > 0 && logical.height > 0).then_some((logical, visual))
     }
@@ -2161,9 +2351,8 @@ impl State {
             return VisualAnimationAdvance::default();
         };
         let included_surfaces = self
-            .managed_root_surfaces
-            .keys()
-            .copied()
+            .managed_windows()
+            .map(|(surface, _)| surface)
             .filter(|surface| {
                 self.root_surface_motion_bounds(*surface)
                     .is_some_and(|rect| rect.intersects(output_bounds))
@@ -2212,29 +2401,30 @@ impl State {
             GeometryTiming { duration: windows.duration(), easing: windows.easing() };
         let moving = self.config.animations.moving();
         let moving_motion = GeometryTiming { duration: moving.duration(), easing: moving.easing() };
-        let surfaces = self
-            .managed_root_surfaces
-            .keys()
-            .copied()
+        let windows = self
+            .managed_window_states()
+            .map(|(window, _)| window)
             .collect::<Vec<_>>();
         let mut damaged_rects = Vec::new();
         let mut has_active_animations = false;
-        for surface in surfaces {
+        for window in windows {
+            let Some(surface) = self.window_root_surface(window) else {
+                continue;
+            };
             if !include_surface(surface) {
                 continue;
             }
             let goal = self.focus_visual_base(surface);
             let damage_rect = self.root_surface_visual_damage_rect(surface);
             let before_visual = self
-                .managed_root_surfaces
-                .get(&surface)
+                .managed_window_state(window)
                 .and_then(|managed| managed.geometry_animation.visual_rect());
             let output = self
                 .root_surface_workspace(surface)
                 .and_then(|workspace_id| self.workspace_output_id(workspace_id))
                 .and_then(|output_id| self.output_bounds(output_id));
             let after_visual = {
-                let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+                let Some(managed) = self.managed_window_state_mut(window) else {
                     continue;
                 };
                 let previous = composed_window_style(
@@ -2534,13 +2724,11 @@ impl State {
         let border_config = self.config.decorations.border;
         let shadow_config = self.config.decorations.shadow;
         let animated_values = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .map(|managed| managed.focus_animation.current())
             .unwrap_or_else(|| self.focus_visual_base(surface));
         let lifecycle = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .map(|managed| managed.lifecycle_animation.sample())
             .unwrap_or(WindowLifecycleAnim::Idle);
         let resolved = resolve_window_visual(
@@ -2612,7 +2800,7 @@ impl State {
         loop {
             // A managed toplevel is its own root. Close snapshots run while that
             // surface is grabbed, and popup_parent_surface would try_ref it.
-            if self.managed_root_surfaces.contains_key(&surface) {
+            if self.is_managed_window(surface) {
                 return Some(surface);
             }
             if let Some(parent_surface) = self.popup_parent_surface(surface) {
@@ -2736,8 +2924,15 @@ impl State {
         self.root_surface_for_surface(focus.surface)
     }
 
-    pub fn root_surface_is_fullscreen(&self, surface: Resolved<WlSurfaceId>) -> bool {
-        let Some(workspace_id) = self.root_surface_workspace(surface) else {
+    pub fn focused_window(&self) -> Option<WindowId> {
+        self.window_for_root(self.focused_root_surface()?)
+    }
+
+    pub fn window_is_fullscreen(&self, window: WindowId) -> bool {
+        let Some(workspace_id) = self
+            .managed_window_state(window)
+            .map(|managed| managed.workspace_id)
+        else {
             return false;
         };
         let Some(workspace) = self.workspaces.try_get(workspace_id) else {
@@ -2747,15 +2942,30 @@ impl State {
             .layout
             .fullscreen
             .as_ref()
-            .is_some_and(|fullscreen| fullscreen.surface_object_id == surface)
+            .is_some_and(|fullscreen| fullscreen.window == window)
+    }
+
+    pub fn root_surface_is_fullscreen(&self, surface: Resolved<WlSurfaceId>) -> bool {
+        self.window_for_root(surface)
+            .is_some_and(|window| self.window_is_fullscreen(window))
+    }
+
+    pub fn window_is_tiled(&self, window: WindowId) -> bool {
+        tiling::window_is_tiled(self, window)
+    }
+
+    pub fn window_is_floating(&self, window: WindowId) -> bool {
+        tiling::window_is_floating(self, window)
     }
 
     pub fn is_tiled_root_surface(&self, surface: Resolved<WlSurfaceId>) -> bool {
-        tiling::is_tiled_surface(self, surface)
+        self.window_for_root(surface)
+            .is_some_and(|window| self.window_is_tiled(window))
     }
 
     pub fn is_floating_root_surface(&self, surface: Resolved<WlSurfaceId>) -> bool {
-        tiling::is_floating_surface(self, surface)
+        self.window_for_root(surface)
+            .is_some_and(|window| self.window_is_floating(window))
     }
 
     fn current_root_surface_remembered_floating_state(
@@ -2770,21 +2980,19 @@ impl State {
         })
     }
 
-    pub fn set_root_surface_floating(
-        &mut self,
-        surface: Resolved<WlSurfaceId>,
-        floating: bool,
-    ) -> bool {
+    pub fn set_window_floating(&mut self, window: WindowId, floating: bool) -> bool {
+        let Some(root) = self.window_root_surface(window) else {
+            return false;
+        };
         let Some(workspace_id) = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window_state(window)
             .map(|managed| managed.workspace_id)
-            .or_else(|| self.root_surface_workspace(surface))
+            .or_else(|| self.root_surface_workspace(root))
         else {
             return false;
         };
-        let current_state = self.current_root_surface_remembered_floating_state(surface);
-        let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+        let current_state = self.current_root_surface_remembered_floating_state(root);
+        let Some(managed) = self.managed_window_state_mut(window) else {
             return false;
         };
         let was_floating = managed.mode == ManagedWindowMode::Floating;
@@ -2811,7 +3019,7 @@ impl State {
                     .layout
                     .fullscreen
                     .as_ref()
-                    .is_some_and(|fullscreen| fullscreen.surface_object_id == surface)
+                    .is_some_and(|fullscreen| fullscreen.window == window)
                 {
                     changed = true;
                     workspace.layout.set_fullscreen(None);
@@ -2824,27 +3032,38 @@ impl State {
         }
         if floating {
             if let Some(remembered_state) = restore_state {
-                self.restore_root_surface_floating_state(surface, remembered_state);
+                self.restore_root_surface_floating_state(root, remembered_state);
             }
         }
         changed
     }
 
+    pub fn set_root_surface_floating(
+        &mut self,
+        surface: Resolved<WlSurfaceId>,
+        floating: bool,
+    ) -> bool {
+        self.window_for_root(surface)
+            .is_some_and(|window| self.set_window_floating(window, floating))
+    }
+
     /// Removes a tiled window from the split tree without applying its remembered
     /// floating geometry. The drag preview supplies the temporary size and position.
-    pub fn float_tiled_root_surface_for_drag(&mut self, surface: Resolved<WlSurfaceId>) -> bool {
-        if !self.is_tiled_root_surface(surface) {
+    pub fn float_window_for_drag(&mut self, window: WindowId) -> bool {
+        if !self.window_is_tiled(window) {
             return false;
         }
+        let Some(root) = self.window_root_surface(window) else {
+            return false;
+        };
         let Some(workspace_id) = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window_state(window)
             .map(|managed| managed.workspace_id)
-            .or_else(|| self.root_surface_workspace(surface))
+            .or_else(|| self.root_surface_workspace(root))
         else {
             return false;
         };
-        let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+        let Some(managed) = self.managed_window_state_mut(window) else {
             return false;
         };
         managed.mode = ManagedWindowMode::Floating;
@@ -2856,7 +3075,7 @@ impl State {
                 .layout
                 .fullscreen
                 .as_ref()
-                .is_some_and(|fullscreen| fullscreen.surface_object_id == surface)
+                .is_some_and(|fullscreen| fullscreen.window == window)
             {
                 workspace.layout.set_fullscreen(None);
             }
@@ -2867,8 +3086,8 @@ impl State {
     }
 
     /// Returns a drag preview to tiled mode without storing the preview geometry.
-    pub fn retile_root_surface_after_drag(&mut self, surface: Resolved<WlSurfaceId>) -> bool {
-        let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+    pub fn retile_window_after_drag(&mut self, window: WindowId) -> bool {
+        let Some(managed) = self.managed_window_state_mut(window) else {
             return false;
         };
         let workspace_id = managed.workspace_id;
@@ -2880,74 +3099,61 @@ impl State {
         true
     }
 
-    pub fn set_root_surface_fullscreen(
-        &mut self,
-        surface: Resolved<WlSurfaceId>,
-        fullscreen: bool,
-    ) -> bool {
+    pub fn retile_root_surface_after_drag(&mut self, surface: Resolved<WlSurfaceId>) -> bool {
+        self.window_for_root(surface)
+            .is_some_and(|window| self.retile_window_after_drag(window))
+    }
+
+    pub fn set_window_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> bool {
+        let Some(root) = self.window_root_surface(window) else {
+            return false;
+        };
         let Some(workspace_id) = self
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window_state(window)
             .map(|managed| managed.workspace_id)
-            .or_else(|| self.root_surface_workspace(surface))
+            .or_else(|| self.root_surface_workspace(root))
         else {
             return false;
         };
-        let object_id = surface.object_id();
-        let current_state = self.current_root_surface_remembered_floating_state(surface);
+        let current_state = self.current_root_surface_remembered_floating_state(root);
         let mut restore_state = None;
         if fullscreen {
             let managed_ids = self
-                .managed_root_surfaces
-                .iter()
-                .filter_map(|(candidate_surface, managed)| {
+                .managed_window_states()
+                .filter_map(|(candidate, managed)| {
                     (managed.workspace_id == workspace_id && managed.fullscreen)
-                        .then_some(*candidate_surface)
+                        .then_some(candidate)
                 })
                 .collect::<Vec<_>>();
-            for candidate_surface in managed_ids {
-                if let Some(managed) = self.managed_root_surfaces.get_mut(&candidate_surface) {
-                    if candidate_surface.object_id() != object_id {
-                        if managed.mode == ManagedWindowMode::Floating {
-                            managed.restore_floating_state_on_next_configure =
-                                managed.remembered_floating_state.is_some();
-                        }
-                        managed.fullscreen = false;
-                    }
+            for candidate in managed_ids {
+                if candidate == window {
+                    continue;
                 }
-                if candidate_surface.object_id() != object_id {
-                    self.sync_root_surface_requested_fullscreen(candidate_surface, false);
+                if let Some(managed) = self.managed_window_state_mut(candidate) {
+                    if managed.mode == ManagedWindowMode::Floating {
+                        managed.restore_floating_state_on_next_configure =
+                            managed.remembered_floating_state.is_some();
+                    }
+                    managed.fullscreen = false;
+                }
+                if let Some(candidate_root) = self.window_root_surface(candidate) {
+                    self.sync_root_surface_requested_fullscreen(candidate_root, false);
                 }
             }
-            let initial_animation = FocusVisualAnimation::settled(self.focus_visual_base(surface));
-            self.managed_root_surfaces
-                .entry(surface)
-                .and_modify(|managed| {
-                    if !managed.fullscreen && managed.mode == ManagedWindowMode::Floating {
-                        if let Some(remembered_state) = current_state {
-                            managed.remembered_floating_state = Some(remembered_state);
-                        }
-                    }
-                    managed.restore_floating_state_on_next_configure = false;
-                    managed.hold_floating_layout = false;
-                    managed.fullscreen = true;
-                })
-                .or_insert(ManagedRootSurfaceState {
-                    workspace_id,
-                    mode: ManagedWindowMode::Tiled,
-                    fullscreen: true,
-                    mapped: false,
-                    awaiting_initial_layout: true,
-                    remembered_floating_state: None,
-                    restore_floating_state_on_next_configure: false,
-                    hold_floating_layout: false,
-                    focus_animation: initial_animation,
-                    lifecycle_animation: WindowLifecycleAnimation::idle(),
-                    geometry_animation: WindowGeometryAnimation::unarmed(),
-                });
+            let Some(managed) = self.managed_window_state_mut(window) else {
+                return false;
+            };
+            if !managed.fullscreen && managed.mode == ManagedWindowMode::Floating {
+                if let Some(remembered_state) = current_state {
+                    managed.remembered_floating_state = Some(remembered_state);
+                }
+            }
+            managed.restore_floating_state_on_next_configure = false;
+            managed.hold_floating_layout = false;
+            managed.fullscreen = true;
         } else {
             {
-                let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+                let Some(managed) = self.managed_window_state_mut(window) else {
                     return false;
                 };
                 if !managed.fullscreen {
@@ -2964,58 +3170,64 @@ impl State {
                     managed.hold_floating_layout = false;
                 }
             }
-            self.sync_root_surface_requested_fullscreen(surface, false);
+            self.sync_root_surface_requested_fullscreen(root, false);
         }
         tiling::mark_workspace_dirty(self, workspace_id);
         self.relayout_dirty_workspaces();
         if let Some(remembered_state) = restore_state {
-            self.restore_root_surface_floating_state(surface, remembered_state);
+            self.restore_root_surface_floating_state(root, remembered_state);
         }
         true
     }
 
-    pub fn resize_tiled_root_surface(
+    pub fn set_root_surface_fullscreen(
         &mut self,
         surface: Resolved<WlSurfaceId>,
-        edges: u32,
-        dx: i32,
-        dy: i32,
+        fullscreen: bool,
     ) -> bool {
-        let changed = tiling::resize_tiled_surface(self, surface, edges, dx, dy);
+        self.window_for_root(surface)
+            .is_some_and(|window| self.set_window_fullscreen(window, fullscreen))
+    }
+
+    pub fn resize_tiled_window(&mut self, window: WindowId, edges: u32, dx: i32, dy: i32) -> bool {
+        let changed = tiling::resize_tiled_window(self, window, edges, dx, dy);
         if changed {
             self.relayout_dirty_workspaces();
         }
         changed
     }
 
-    pub fn begin_tiled_root_surface_resize(
+    pub fn begin_tiled_window_resize(
         &mut self,
-        surface: Resolved<WlSurfaceId>,
+        window: WindowId,
         edges: u32,
     ) -> Option<TiledResizeState> {
         self.relayout_dirty_workspaces();
-        let workspace_id = self.root_surface_workspace(surface)?;
+        let root = self.window_root_surface(window)?;
+        let workspace_id = self.root_surface_workspace(root)?;
         let workspace = self.workspaces.try_get(workspace_id)?;
-        workspace.layout.begin_tiled_resize(surface, edges)
+        workspace.layout.begin_tiled_resize(window, edges)
     }
 
-    pub fn resize_tiled_root_surface_from_state(
+    pub fn resize_tiled_window_from_state(
         &mut self,
-        surface: Resolved<WlSurfaceId>,
+        window: WindowId,
         resize_state: TiledResizeState,
         dx: i32,
         dy: i32,
     ) -> bool {
-        let Some(workspace_id) = self.root_surface_workspace(surface) else {
+        let Some(root) = self.window_root_surface(window) else {
+            return false;
+        };
+        let Some(workspace_id) = self.root_surface_workspace(root) else {
             return false;
         };
         let Some(workspace) = self.workspaces.try_get_mut(workspace_id) else {
             return false;
         };
-        let changed =
-            workspace
-                .layout
-                .resize_tiled_surface_from_state(surface, resize_state, dx, dy);
+        let changed = workspace
+            .layout
+            .resize_tiled_window_from_state(window, resize_state, dx, dy);
         if changed {
             self.relayout_dirty_workspaces();
         }
@@ -3051,7 +3263,7 @@ impl State {
         if dx == 0 && dy == 0 {
             return;
         }
-        for managed in self.managed_root_surfaces.values_mut() {
+        for managed in self.managed_windows.values_mut() {
             if managed.workspace_id != workspace_id {
                 continue;
             }
@@ -3117,7 +3329,10 @@ impl State {
         self.mark_root_geometry_dirty(surface);
         // The attached buffer is still the fullscreen frame. Sampling it would aim the
         // animation at that size, parked on the restored floating origin.
-        let Some(managed) = self.managed_root_surfaces.get_mut(&surface) else {
+        let Some(window) = self.window_for_root(surface) else {
+            return false;
+        };
+        let Some(managed) = self.managed_window_state_mut(window) else {
             return false;
         };
         managed
@@ -3131,17 +3346,12 @@ impl State {
         surface: Resolved<WlSurfaceId>,
         fullscreen: bool,
     ) {
-        let Some(xdg_surface) = self
-            .objects
-            .try_ref_object::<WlSurface>(surface.object_id())
-            .and_then(|surface| surface.xdg_surface())
-        else {
+        let Some(window) = self.window_for_root(surface) else {
             return;
         };
-        let Some(toplevel) = self.xdg_toplevel(xdg_surface) else {
+        let Some(toplevel) = self.toplevel_mut(window) else {
             return;
         };
-        let mut toplevel = toplevel.grab(self);
         toplevel.set_requested_fullscreen(fullscreen);
     }
 
@@ -3214,7 +3424,7 @@ impl State {
         {
             return;
         }
-        self.unregister_root_surface(surface);
+        self.forget_registered_root(surface);
         self.root_surfaces.push(surface);
         self.root_surface_process_info.insert(
             surface,
@@ -3313,6 +3523,25 @@ impl State {
         else {
             return;
         };
+        if let Some(window) = self.window_for_root(found) {
+            self.destroy_window(window);
+        }
+        self.forget_registered_root(found);
+    }
+
+    /// Drop a root from the root list without releasing its window.
+    ///
+    /// `register_root_surface` refreshes an existing root this way. Raising a window does that,
+    /// and the window has to stay.
+    fn forget_registered_root(&mut self, surface: Resolved<WlSurfaceId>) {
+        let Some(found) = self
+            .root_surfaces
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == surface)
+        else {
+            return;
+        };
         self.root_surfaces.retain(|candidate| *candidate != found);
         self.root_surface_process_info.remove(&found);
         if let Some(workspace_id) = self.detach_root_surface_from_workspace(found) {
@@ -3356,12 +3585,24 @@ impl State {
             .map(|info| info.command())
     }
 
+    pub fn raise_window(&mut self, window: WindowId) -> bool {
+        let Some(root) = self.window_root_surface(window) else {
+            return false;
+        };
+        if !root.exists(self) {
+            return false;
+        }
+        tiling::raise_window(self, window)
+    }
+
     pub fn raise_root_surface(&mut self, surface: Resolved<WlSurfaceId>) -> bool {
         if !surface.exists(self) {
             return false;
         }
-        if tiling::raise_surface(self, surface) {
-            return true;
+        if let Some(window) = self.window_for_root(surface) {
+            if self.raise_window(window) {
+                return true;
+            }
         }
         self.register_root_surface(surface);
         true
@@ -3834,6 +4075,8 @@ mod tests {
         state.config.effects.opacity.inactive_dim = 44;
         state.config.animations.set_focus_duration_msec(120);
         state.register_root_surface(root(&state, object_id));
+        let managed_object_id = root(&state, object_id);
+        crate::test_support::insert_window(&mut state, managed_object_id);
         state.assign_root_surface_to_workspace(root(&state, object_id), workspace_id);
         let surface = root(&state, object_id);
         state.seat.keyboard_focus = Some(crate::input::SurfaceFocus::new(surface));
@@ -3844,8 +4087,7 @@ mod tests {
         assert!(advance.has_active_animations);
 
         let current = state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .focus_animation
             .current();
@@ -3864,8 +4106,7 @@ mod tests {
         assert_eq!(first.shadow_alpha, second.shadow_alpha);
         assert_eq!(
             state
-                .managed_root_surfaces
-                .get(&surface)
+                .managed_window(surface)
                 .unwrap()
                 .focus_animation
                 .current(),
@@ -3897,6 +4138,7 @@ mod tests {
         state.config.animations.set_focus_duration_msec(100);
         let surface = root(&state, object_id);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(&mut state, surface);
         state.assign_root_surface_to_workspace(surface, workspace_id);
         state.root_geometry_cache.insert(
             surface,
@@ -3970,13 +4212,13 @@ mod tests {
         let inactive = state.root_surface_visual_state(surface).unwrap();
         assert_eq!(inactive.effects.opacity_alpha, 90);
         assert_eq!(inactive.effects.dim_alpha, 30);
-        assert!(!state.managed_root_surfaces.contains_key(&surface));
+        assert!(!state.is_managed_window(surface));
 
         state.seat.keyboard_focus = Some(crate::input::SurfaceFocus::new(surface));
         let focused = state.root_surface_visual_state(surface).unwrap();
         assert_eq!(focused.effects.opacity_alpha, 255);
         assert_eq!(focused.effects.dim_alpha, 0);
-        assert!(!state.managed_root_surfaces.contains_key(&surface));
+        assert!(!state.is_managed_window(surface));
     }
 
     #[test]
@@ -4006,11 +4248,11 @@ mod tests {
             .set_linear(crate::animation_config::AnimationNode::FadeIn);
         let surface = root(&state, object_id);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(&mut state, surface);
         state.assign_root_surface_to_workspace(surface, workspace_id);
         state.seat.keyboard_focus = Some(crate::input::SurfaceFocus::new(surface));
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .lifecycle_animation
             .start_opening();
@@ -4023,8 +4265,7 @@ mod tests {
         assert_eq!(hidden.shadow_alpha, 0);
         assert_eq!(hidden_again.effects.opacity_alpha, 0);
         assert!(state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .lifecycle_animation
             .is_active());
@@ -4056,8 +4297,7 @@ mod tests {
         let restored = state.root_surface_visual_state(surface).unwrap();
         assert_eq!(restored.effects.opacity_alpha, 200);
         assert!(!state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .lifecycle_animation
             .is_active());
@@ -4796,7 +5036,7 @@ mod tests {
     }
 
     #[test]
-    fn assigning_root_surface_creates_persistent_managed_state() {
+    fn a_registered_root_gains_managed_state_when_it_becomes_a_window() {
         let mut state = state_for_tests();
         let backend = BackendOutputRef::new(DrmId::from(0usize));
         let output_id =
@@ -4807,6 +5047,11 @@ mod tests {
             state.insert_object(WlSurface::new(WlSurfaceId::from(12u32), ClientId::from_raw(3), 6));
         state.register_root_surface(root(&state, object_id));
         assert_eq!(state.root_surface_workspace(root(&state, object_id)), Some(workspace_id));
+        assert!(state
+            .managed_root_surface_state(root(&state, object_id))
+            .is_none());
+        let managed_object_id = root(&state, object_id);
+        crate::test_support::insert_window(&mut state, managed_object_id);
 
         let managed = state
             .managed_root_surface_state(root(&state, object_id))
@@ -4852,6 +5097,8 @@ mod tests {
             surface.test_map(ObjectId::from(0usize), 20, 30, 120, 90);
         }
         state.register_root_surface(root(&state, object_id));
+        let managed_object_id = root(&state, object_id);
+        crate::test_support::insert_window(&mut state, managed_object_id);
 
         assert!(state.set_root_surface_floating(root(&state, object_id), true));
         {
@@ -4903,6 +5150,10 @@ mod tests {
             state.insert_object(WlSurface::new(WlSurfaceId::from(14u32), ClientId::from_raw(5), 6));
         state.register_root_surface(root(&state, first_object_id));
         state.register_root_surface(root(&state, second_object_id));
+        let managed_first_object_id = root(&state, first_object_id);
+        crate::test_support::insert_window(&mut state, managed_first_object_id);
+        let managed_second_object_id = root(&state, second_object_id);
+        crate::test_support::insert_window(&mut state, managed_second_object_id);
         assert_eq!(state.root_surface_workspace(root(&state, first_object_id)), Some(workspace_id));
         assert_eq!(
             state.root_surface_workspace(root(&state, second_object_id)),
@@ -4953,6 +5204,8 @@ mod tests {
             surface.test_map(ObjectId::from(0usize), 30, 40, 160, 120);
         }
         state.register_root_surface(root(&state, object_id));
+        let managed_object_id = root(&state, object_id);
+        crate::test_support::insert_window(&mut state, managed_object_id);
         assert!(state.set_root_surface_floating(root(&state, object_id), true));
         {
             let mut surface = state.objects.grab_object::<WlSurface>(object_id);
@@ -5023,6 +5276,7 @@ mod tests {
         }
         state.register_root_surface(root(&state, object_id));
         let root_surface = root(&state, object_id);
+        crate::test_support::insert_window(&mut state, root_surface);
         state.root_geometry_cache.insert(
             root_surface,
             Cell::new(RootGeometryCacheEntry {
@@ -5041,11 +5295,7 @@ mod tests {
                 built_from_revision: 0,
             }),
         );
-        state
-            .managed_root_surfaces
-            .get_mut(&root_surface)
-            .unwrap()
-            .mode = ManagedWindowMode::Floating;
+        state.managed_window_mut(root_surface).unwrap().mode = ManagedWindowMode::Floating;
 
         assert!(state.set_root_surface_floating(root_surface, false));
         assert_eq!(
@@ -5105,11 +5355,12 @@ mod tests {
         let (_, object_id) =
             state.insert_object(WlSurface::new(WlSurfaceId::from(16u32), ClientId::from_raw(7), 6));
         state.register_root_surface(root(&state, object_id));
+        let managed_object_id = root(&state, object_id);
+        crate::test_support::insert_window(&mut state, managed_object_id);
         state.assign_root_surface_to_workspace(root(&state, object_id), left_workspace);
         let surface = root(&state, object_id);
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .remembered_floating_state = Some(RememberedFloatingState {
             root_pos: (10, 20),
@@ -5146,11 +5397,12 @@ mod tests {
         let (_, object_id) =
             state.insert_object(WlSurface::new(WlSurfaceId::from(17u32), ClientId::from_raw(8), 6));
         state.register_root_surface(root(&state, object_id));
+        let managed_object_id = root(&state, object_id);
+        crate::test_support::insert_window(&mut state, managed_object_id);
         state.assign_root_surface_to_workspace(root(&state, object_id), left_workspace);
         let surface = root(&state, object_id);
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .remembered_floating_state = Some(RememberedFloatingState {
             root_pos: (10, 20),
@@ -5158,8 +5410,7 @@ mod tests {
             layout_rect: RectI { x: 10, y: 20, width: 50, height: 50 },
         });
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .restore_floating_state_on_next_configure = true;
 

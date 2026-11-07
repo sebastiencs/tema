@@ -39,7 +39,7 @@ Wayland protocol
   wl_display, wl_registry, wl_surface, xdg_surface, wl_shm, etc.
 
 This compositor
-  Clients, Wayland objects, surface state, roles, buffer handling
+  Clients, Wayland objects, windows, surface state, roles, buffer handling
 
 Rendering layer
   OpenGL ES or Vulkan
@@ -154,6 +154,8 @@ The Wayland layer does not directly put pixels on the monitor. It defines:
 - which buffer is attached
 - which role a surface has
 - when a state change becomes visible
+
+A managed toplevel is also a window. Layout, workspaces, grabs, snapshots, keybindings, and capture use that `WindowId`. Section 18 describes the split between windows and surfaces.
 
 The lower graphics layers take over after that.
 
@@ -532,7 +534,7 @@ If coming back after a long time, this order should restore the mental model qui
 2. `src/runner.rs`
    Understand the action-driven runtime.
 3. `src/state.rs`
-   See what global state the compositor owns.
+   See what global state the compositor owns. Windows, the layout, and the `Toplevel` trait are section 18 and `src/window.rs`.
 4. `src/clients.rs`
    Rebuild the Wayland server/client mental model.
 5. `src/wayland_objects/wl_display.rs`
@@ -560,6 +562,7 @@ If coming back after a long time, this order should restore the mental model qui
 - client: an application using the Wayland protocol
 - global: an advertised protocol capability such as `wl_compositor` or `wl_shm`
 - surface: a client-visible drawable object
+- window: one managed toplevel, identified by a `WindowId` for as long as its role object lives
 - role: the semantic meaning of a surface, such as xdg toplevel
 - buffer: image data attached to a surface
 - attach/commit: Wayland's "pending state then apply atomically" model
@@ -794,3 +797,39 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
 6. `[xwayland] enabled = false`, then start tema. The log says `Xwayland disabled`. Neither file exists, and a spawned terminal has an empty `DISPLAY`.
 7. Quit tema during a normal session. No `Xwayland` process remains, and both files are gone.
+
+## 18. Windows
+
+A managed toplevel is a window. The layout, workspaces, grabs, closing snapshots, keybindings, and capture talk about a `WindowId` and reach shell behavior through the `Toplevel` trait. `XdgToplevel` is the only implementor. The types live in `src/window.rs`. The layout tree lives in `src/tiling.rs`.
+
+### Lifetime
+
+`xdg_surface.get_toplevel` allocates the `WindowId` and calls `insert_window`. The first id is 1. Each value is used once.
+
+`WindowEntry` stores the root `wl_surface` and the `ObjectId` of the role object. `windows` is keyed by `WindowId`. `window_by_root` finds the window that currently owns a root. A root hosts at most one window.
+
+`insert_window` also creates the `ManagedWindowState`: tiled, waiting for its first layout, on the workspace the root already belongs to. `destroy_window` drops that state and takes the window out of the workspace layout.
+
+The id is released when that `xdg_toplevel` is destroyed, when its client disconnects, or when the root is unregistered. Unregistering a root is what a deleted `wl_surface` does.
+
+### A new toplevel on the same surface
+
+Destroying the `xdg_toplevel` drops the window and frees the root. The next `get_toplevel` on that same `wl_surface` receives a new `WindowId` and a fresh `ManagedWindowState`. It is tiled and placed like a window that just appeared. Capture does the same for foreign-toplevel handles: `by_window` maps the `WindowId` to a `ToplevelKey`, and a later map receives a new key.
+
+### The trait and the grab rule
+
+`State::toplevel` and `toplevel_mut` read `window_role_object`, then downcast through `Object::as_toplevel`. They panic when that role object is already grabbed. A request handler that holds the role uses `self`. `window_role_object` only reads the map, so it stays safe during the grab. Capture updates that only touch the capture registry are safe from inside the handler. `map_window` calls `state.toplevel`, so it runs from the `wl_surface` commit, where the toplevel is free.
+
+The trait covers the title, the app id, the parent window, size limits, the maximize and fullscreen requests, the decoration mode, close, interactive resize, and a fullscreen request made by the compositor. The xdg protocol actions that still name an `xdg_toplevel` are close, interactive resize configure, and the move and resize requests.
+
+### What stays on the surface
+
+Keyboard focus is a `SurfaceFocus` holding the root surface. `focused_window` reads that surface and looks up the window.
+
+These maps stay keyed by the root surface: the geometry cache, output membership, presentation, process info, `Workspace.root_surfaces`, and `root_surface_workspaces`. Popups, layer surfaces, cursors, and role-less roots stay surfaces. They have no `WindowId`.
+
+`WorkspaceLayout` is keyed by `WindowId`: tiled leaves, the floating stack, and fullscreen. The scene still lists root surfaces. It calls `window_for_root` when it needs the window's layout or animation state.
+
+### X windows
+
+M6 adds X windows on this same path. The X role object stays in `state.objects` and implements `Toplevel`. Creating the window calls `insert_window`. Destroying it calls `destroy_window`. Layout, grabs, snapshots, keybindings, and capture then see it as a window.

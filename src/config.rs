@@ -27,6 +27,7 @@ use crate::{
     protocol_generated::WlSurfaceId,
     runner::{Dispatcher, Model, Redispatcher, ShutdownReason},
     state::{FractionalScale, ManagedWindowMode, State, WorkspaceGroupId, WorkspaceId},
+    window::WindowId,
     xkb::{KeyboardState, Xkb},
 };
 
@@ -1278,11 +1279,10 @@ pub fn execute_action(state: &mut State, dispatcher: &mut Dispatcher, action: Co
             );
         }
         CompositorAction::Close => {
-            let Some(root) = require_focused_window(state, "close") else {
+            let Some(window) = require_focused_window(state, "close") else {
                 return;
             };
-            if !crate::wayland_objects::xdg_surface::request_toplevel_close(state, dispatcher, root)
-            {
+            if !state.request_window_close(window, dispatcher) {
                 log::info!("close ignored; focused window has no toplevel");
             }
         }
@@ -1293,25 +1293,29 @@ pub fn execute_action(state: &mut State, dispatcher: &mut Dispatcher, action: Co
             cycle_focused_workspace(state, dispatcher, FocusCycle::Previous);
         }
         CompositorAction::ToggleFloating => {
-            let Some(root) = require_focused_window(state, "toggle-floating") else {
+            let Some(window) = require_focused_window(state, "toggle-floating") else {
                 return;
             };
             let floating = state
-                .managed_root_surface_state(root)
+                .managed_window_state(window)
                 .is_some_and(|managed| managed.mode == ManagedWindowMode::Floating);
-            if state.set_root_surface_floating(root, !floating) {
-                finish_root_mode_change(state, dispatcher, root);
+            if state.set_window_floating(window, !floating) {
+                if let Some(root) = state.window_root_surface(window) {
+                    finish_root_mode_change(state, dispatcher, root);
+                }
             }
         }
         CompositorAction::ToggleFullscreen => {
-            let Some(root) = require_focused_window(state, "toggle-fullscreen") else {
+            let Some(window) = require_focused_window(state, "toggle-fullscreen") else {
                 return;
             };
             let fullscreen = state
-                .managed_root_surface_state(root)
+                .managed_window_state(window)
                 .is_some_and(|managed| managed.fullscreen);
-            if state.set_root_surface_fullscreen(root, !fullscreen) {
-                finish_root_mode_change(state, dispatcher, root);
+            if state.set_window_fullscreen(window, !fullscreen) {
+                if let Some(root) = state.window_root_surface(window) {
+                    finish_root_mode_change(state, dispatcher, root);
+                }
             }
         }
         CompositorAction::WorkspaceIndex { index } => {
@@ -1426,17 +1430,18 @@ pub(crate) fn active_workspace_group(state: &State) -> Option<ActiveWorkspaceGro
     Some(ActiveWorkspaceGroup { group_id, workspace_id })
 }
 
-/// Keyboard focus walked up to a workspace-managed root.
+/// Window for the keyboard focus, walked up to a workspace-managed root.
 ///
 /// Sway commands use the seat's focused container. A popup or subsurface here resolves to
-/// its managed toplevel. Layer-shell focus and a missing focus have no workspace root.
-pub(crate) fn focused_managed_root(state: &State) -> Option<Resolved<WlSurfaceId>> {
+/// its managed toplevel. Layer-shell focus and a missing focus have no window.
+pub(crate) fn focused_managed_root(state: &State) -> Option<WindowId> {
     let focus = state.seat.keyboard_focus()?;
     let root = state.root_surface_for_surface(focus.surface)?;
+    let window = state.window_for_root(root)?;
     state
-        .managed_root_surface_state(root)
+        .managed_window_state(window)
         .is_some()
-        .then_some(root)
+        .then_some(window)
 }
 
 /// One-based index into the active output's workspace list.
@@ -1454,12 +1459,12 @@ pub(crate) fn workspace_at_index(state: &State, index: u32) -> Option<WorkspaceI
         .copied()
 }
 
-pub(crate) fn require_focused_window(state: &State, action: &str) -> Option<Resolved<WlSurfaceId>> {
-    let root = focused_managed_root(state);
-    if root.is_none() {
+pub(crate) fn require_focused_window(state: &State, action: &str) -> Option<WindowId> {
+    let window = focused_managed_root(state);
+    if window.is_none() {
         log::info!("{action} ignored; no focused window");
     }
-    root
+    window
 }
 
 pub(crate) fn require_workspace_index(
@@ -1492,10 +1497,13 @@ fn cycle_focused_workspace(state: &mut State, dispatcher: &mut Dispatcher, cycle
         FocusCycle::Next => "focus-next",
         FocusCycle::Previous => "focus-previous",
     };
-    let Some(root) = require_focused_window(state, action) else {
+    let Some(focused) = require_focused_window(state, action) else {
         return;
     };
-    let Some(workspace_id) = state.root_surface_workspace(root) else {
+    let Some(workspace_id) = state
+        .managed_window_state(focused)
+        .map(|managed| managed.workspace_id)
+    else {
         log::info!("{action} ignored; focused window has no workspace");
         return;
     };
@@ -1505,8 +1513,8 @@ fn cycle_focused_workspace(state: &mut State, dispatcher: &mut Dispatcher, cycle
     if workspace.layout.fullscreen.is_some() {
         return;
     }
-    let mut tiled = workspace.layout.tiled_scene_order();
-    let mut floating = workspace.layout.floating_scene_order();
+    let mut tiled = workspace.layout.tiled_windows();
+    let mut floating = workspace.layout.floating_windows();
     if tiled.is_empty() && floating.is_empty() {
         log::info!("{action} ignored; no workspace window");
         return;
@@ -1537,14 +1545,17 @@ fn cycle_focused_workspace(state: &mut State, dispatcher: &mut Dispatcher, cycle
         let Some(workspace) = state.workspaces.try_get_mut(workspace_id) else {
             return;
         };
-        if !workspace.layout.reorder_tiled_scene_order(&tiled)
-            || !workspace.layout.set_floating_scene_order(floating)
+        if !workspace.layout.reorder_tiled_windows(&tiled)
+            || !workspace.layout.set_floating_windows(floating)
         {
             return;
         }
-        workspace.layout.focus_surface(target);
+        workspace.layout.focus_window(target);
     }
-    if state.seat.keyboard_focus().map(|focus| focus.surface) != Some(target) {
+    let Some(target_root) = state.window_root_surface(target) else {
+        return;
+    };
+    if state.seat.keyboard_focus().map(|focus| focus.surface) != Some(target_root) {
         crate::input::pointer_lock::release_pointer_capture(state, dispatcher);
     }
     let outputs = state.workspace_output_ids(workspace_id);
@@ -1555,11 +1566,11 @@ fn cycle_focused_workspace(state: &mut State, dispatcher: &mut Dispatcher, cycle
     crate::input::set_keyboard_focus(
         state,
         dispatcher,
-        Some(crate::input::SurfaceFocus::new(target)),
+        Some(crate::input::SurfaceFocus::new(target_root)),
     );
 }
 
-fn rotate_back_to_front(order: &mut Vec<Resolved<WlSurfaceId>>) {
+fn rotate_back_to_front<T>(order: &mut Vec<T>) {
     if order.len() < 2 {
         return;
     }
@@ -1567,7 +1578,7 @@ fn rotate_back_to_front(order: &mut Vec<Resolved<WlSurfaceId>>) {
     order.push(backmost);
 }
 
-fn rotate_front_to_back(order: &mut Vec<Resolved<WlSurfaceId>>) {
+fn rotate_front_to_back<T>(order: &mut Vec<T>) {
     if order.len() < 2 {
         return;
     }
@@ -1637,15 +1648,17 @@ fn select_workspace_index(state: &mut State, dispatcher: &mut Dispatcher, index:
 }
 
 fn move_focused_window_to_workspace(state: &mut State, dispatcher: &mut Dispatcher, index: u32) {
-    let Some(root) = require_focused_window(state, "move-to-workspace") else {
+    let Some(window) = require_focused_window(state, "move-to-workspace") else {
         return;
     };
     let Some(workspace_id) = require_workspace_index(state, "move-to-workspace", index) else {
         return;
     };
-    let source_workspace = state.root_surface_workspace(root);
+    let source_workspace = state
+        .managed_window_state(window)
+        .map(|managed| managed.workspace_id);
     let already_there = source_workspace == Some(workspace_id);
-    if !already_there && !state.assign_root_surface_to_workspace(root, workspace_id) {
+    if !already_there && !state.assign_window_to_workspace(window, workspace_id) {
         log::info!("move-to-workspace ignored; could not move the focused window");
         return;
     }
@@ -1664,6 +1677,9 @@ fn move_focused_window_to_workspace(state: &mut State, dispatcher: &mut Dispatch
     }
     outputs.extend(state.workspace_output_ids(workspace_id));
     publish_workspace_outputs(state, dispatcher, outputs);
+    let Some(root) = state.window_root_surface(window) else {
+        return;
+    };
     crate::input::set_keyboard_focus(
         state,
         dispatcher,
@@ -1922,7 +1938,8 @@ mod tests {
             runner::Dispatcher,
             state::{BackendOutputRef, DrmId, OutputId},
             test_support::{
-                state_for_tests, state_for_tests_with_config, test_output_with_crtc_name,
+                insert_window, state_for_tests, state_for_tests_with_config,
+                test_output_with_crtc_name,
             },
             wayland_objects::wl_surface::WlSurface,
         },
@@ -2811,6 +2828,7 @@ mod tests {
             state.insert_object(WlSurface::new(WlSurfaceId::from(41u32), ClientId::from_raw(1), 6));
         let surface = Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(41u32), object_id);
         state.register_root_surface(surface);
+        insert_window(state, surface);
         assert!(state.managed_root_surface_state(surface).is_some());
         (output, surface)
     }
@@ -2824,9 +2842,9 @@ mod tests {
         assert!(focused_managed_root(&state).is_none());
 
         state.seat.keyboard_focus = Some(SurfaceFocus::new(surface));
-        assert_eq!(focused_managed_root(&state), Some(surface));
+        assert_eq!(focused_managed_root(&state), state.window_for_root(surface));
 
-        state.managed_root_surfaces.remove(&surface);
+        state.remove_managed_window(surface);
         assert!(focused_managed_root(&state).is_none());
     }
 
@@ -2938,6 +2956,7 @@ mod tests {
             state.insert_object(WlSurface::new(WlSurfaceId::from(raw), ClientId::from_raw(1), 6));
         let surface = Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(raw), object_id);
         state.register_root_surface(surface);
+        insert_window(state, surface);
         surface
     }
 
@@ -2950,24 +2969,25 @@ mod tests {
     }
 
     fn place_tiled(state: &mut State, surface: Resolved<WlSurfaceId>) {
+        let window = state.window_for_root(surface).unwrap();
         let layout = layout_mut(state, surface);
-        if !layout.is_tiled_surface(surface) {
-            assert!(layout.insert_tiled(surface));
+        if !layout.is_tiled_window(window) {
+            assert!(layout.insert_tiled(window));
         }
     }
 
     fn place_floating(state: &mut State, surface: Resolved<WlSurfaceId>) {
+        let window = state.window_for_root(surface).unwrap();
         {
             let layout = layout_mut(state, surface);
-            if !layout.contains_surface(surface) {
-                assert!(layout.insert_tiled(surface));
+            if !layout.contains_window(window) {
+                assert!(layout.insert_tiled(window));
             }
-            if !layout.is_floating_surface(surface) {
-                assert!(layout.set_floating(surface, true));
+            if !layout.is_floating_window(window) {
+                assert!(layout.set_floating(window, true));
             }
         }
-        state.managed_root_surfaces.get_mut(&surface).unwrap().mode =
-            crate::state::ManagedWindowMode::Floating;
+        state.managed_window_mut(surface).unwrap().mode = crate::state::ManagedWindowMode::Floating;
     }
 
     fn scene_orders(
@@ -2976,7 +2996,10 @@ mod tests {
     ) -> (Vec<Resolved<WlSurfaceId>>, Vec<Resolved<WlSurfaceId>>) {
         let workspace_id = state.root_surface_workspace(surface).unwrap();
         let layout = &state.workspaces.try_get(workspace_id).unwrap().layout;
-        (layout.tiled_scene_order(), layout.floating_scene_order())
+        (
+            crate::tiling::tiled_scene_order(state, layout),
+            crate::tiling::floating_scene_order(state, layout),
+        )
     }
 
     fn keyboard_surface(state: &State) -> Option<Resolved<WlSurfaceId>> {
@@ -3192,12 +3215,13 @@ mod tests {
         assert!(state.set_root_surface_floating(surface, true));
         assert!(state.set_root_surface_fullscreen(surface, true));
         let source = state.root_surface_workspace(surface).unwrap();
+        let window = state.window_for_root(surface).unwrap();
         state
             .workspaces
             .try_get_mut(source)
             .unwrap()
             .layout
-            .set_fullscreen(Some(surface));
+            .set_fullscreen(Some(window));
         let output = state.workspace_output_id(source).unwrap();
         let workspaces = group_workspaces(&state, output);
         let mut dispatcher = Dispatcher::default();
@@ -3243,6 +3267,7 @@ mod tests {
             state.insert_object(WlSurface::new(WlSurfaceId::from(51u32), ClientId::from_raw(1), 6));
         let surface = Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(51u32), object_id);
         state.register_root_surface(surface);
+        insert_window(&mut state, surface);
         state.seat.keyboard_focus = Some(SurfaceFocus::new(surface));
         let source = state.root_surface_workspace(surface).unwrap();
         state.seat.pointer_pos = (150.0, 10.0);

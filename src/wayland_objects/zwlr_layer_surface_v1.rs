@@ -1347,8 +1347,8 @@ mod tests {
             runner::Dispatcher,
             state::{GrabbedObject, State},
             test_support::{
-                insert_root_surface, resolved_wl_surface, state_for_tests, test_output_drm1_crtc,
-                test_resolved_wl_surface_client1,
+                insert_root_surface, insert_window, resolved_wl_surface, state_for_tests,
+                test_output_drm1_crtc, test_resolved_wl_surface_client1,
             },
             wayland_objects::wl_display::WlDisplay,
         },
@@ -1501,11 +1501,8 @@ mod tests {
         let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
         let root_object_id = insert_root_surface(&mut state, 40);
         let root_surface = resolved_wl_surface(&state, root_object_id);
-        state
-            .managed_root_surfaces
-            .get_mut(&root_surface)
-            .unwrap()
-            .fullscreen = true;
+        insert_window(&mut state, root_surface);
+        state.managed_window_mut(root_surface).unwrap().fullscreen = true;
 
         let mut layer_surface = ZwlrLayerSurfaceV1::new(
             ZwlrLayerSurfaceV1Id::from(41u32),

@@ -203,6 +203,7 @@ mod udev;
 mod utils;
 mod visual_animation;
 mod wayland_objects;
+mod window;
 mod xkb;
 mod xwayland;
 
@@ -318,46 +319,7 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     let mut globals = Globals::new();
     globals.initialize();
 
-    let mut state = State {
-        objects: Default::default(),
-        root_surfaces: Default::default(),
-        root_surface_process_info: Default::default(),
-        layer_surface_objects: Default::default(),
-        inputs: Default::default(),
-        drm: Default::default(),
-        outputs: Default::default(),
-        active_output: None,
-        workspace_groups: Default::default(),
-        workspaces: Default::default(),
-        output_workspace_groups: Default::default(),
-        root_surface_workspaces: Default::default(),
-        managed_root_surfaces: Default::default(),
-        closing_snapshots: Vec::new(),
-        next_closing_snapshot_id: 1,
-        root_geometry_cache: Default::default(),
-        client_process_info: Default::default(),
-        xdg_toplevel_roles: Default::default(),
-        ctm_control_owner: None,
-        data_offers_by_source: Default::default(),
-        next_workspace_serial: 1,
-        backend_syncobj_globals: Default::default(),
-        session_active: true,
-        idle_notifications: Vec::new(),
-        idle_inhibitors: Vec::new(),
-        idle_inhibitors_honored: false,
-        session_lock: Default::default(),
-        capture: Default::default(),
-        #[cfg(test)]
-        realize_closing_snapshots_in_tests: false,
-        frame_scheduler: Default::default(),
-        presentation: Default::default(),
-        globals,
-        activation_tokens: Default::default(),
-        config,
-        seat: Default::default(),
-        keyboard,
-        xkb,
-    };
+    let mut state = State::new(globals, config, keyboard, xkb);
     let mut startup_dispatcher = Dispatcher::default();
     config::apply_general_settings(&mut state, &mut startup_dispatcher);
 

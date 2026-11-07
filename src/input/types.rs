@@ -1,11 +1,12 @@
 use crate::{
     clients::{ClientId, Resolved},
-    protocol_generated::{WlSurfaceId, XdgToplevelId},
+    protocol_generated::WlSurfaceId,
     root_geometry::WindowTargetGeometry,
     tiling::TiledResizeState,
     wayland_objects::xdg_surface::xdg_toplevel::{
         InteractiveSizeConstraints, ToplevelDecorationMode,
     },
+    window::WindowId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, derive_more::Deref)]
@@ -45,8 +46,8 @@ pub(crate) struct ScenePick {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowRoleSnapshot {
-    XdgToplevel {
-        xdg_toplevel: Resolved<XdgToplevelId>,
+    Toplevel {
+        window: WindowId,
         size_constraints: InteractiveSizeConstraints,
         is_maximized: bool,
         is_fullscreen: bool,
@@ -114,13 +115,14 @@ pub(crate) const PROTOCOL_INTERACTION_START_OPTIONS: InteractionStartOptions =
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ActiveGrab {
     Move {
+        window: WindowId,
         root_surface: Resolved<WlSurfaceId>,
         initial_pointer_pos: (f64, f64),
         initial_geometry: WindowTargetGeometry,
     },
     Resize {
+        window: WindowId,
         root_surface: Resolved<WlSurfaceId>,
-        xdg_toplevel: Resolved<XdgToplevelId>,
         size_constraints: InteractiveSizeConstraints,
         edges: u32,
         initial_pointer_pos: (f64, f64),
@@ -128,6 +130,7 @@ pub(crate) enum ActiveGrab {
         last_size: (i32, i32),
     },
     ResizeTiled {
+        window: WindowId,
         root_surface: Resolved<WlSurfaceId>,
         edges: u32,
         initial_pointer_pos: (f64, f64),
@@ -137,8 +140,8 @@ pub(crate) enum ActiveGrab {
     /// travels past `threshold`, then it becomes a temporary floating preview.
     /// The preview follows the pointer and may extend past the source output.
     MoveTiled {
+        window: WindowId,
         root_surface: Resolved<WlSurfaceId>,
-        xdg_toplevel: Resolved<XdgToplevelId>,
         size_constraints: InteractiveSizeConstraints,
         decoration_mode: ToplevelDecorationMode,
         origin_pointer: (f64, f64),

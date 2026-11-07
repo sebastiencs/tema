@@ -195,16 +195,18 @@ mod tests {
                 insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(40), 2, 2);
             surface.test_map(buffer_object_id, 0, 0, 2, 2);
         }
+        let window = state.allocate_window_id();
         let (toplevel_resolved, _) = client.insert_object(
             &mut state,
             XdgToplevel::new(
                 toplevel_id,
                 Resolved::new(client.client_id(), xdg_surface_id, xdg_surface_object_id),
                 7,
+                window,
             ),
         );
         let toplevel_object_id = toplevel_resolved.object_id();
-        state.register_xdg_toplevel_role(xdg_surface_resolved, toplevel_resolved);
+        state.insert_window(window, surface_resolved, toplevel_resolved.object_id());
 
         {
             let mut manager = client.grab_object(manager_id, &mut state);
@@ -268,15 +270,17 @@ mod tests {
                 insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(40), 2, 2);
             surface.test_map(buffer_object_id, 0, 0, 2, 2);
         }
+        let window = state.allocate_window_id();
         let (toplevel_resolved, _) = client.insert_object(
             &mut state,
             XdgToplevel::new(
                 toplevel_id,
                 Resolved::new(client.client_id(), xdg_surface_id, xdg_surface_object_id),
                 7,
+                window,
             ),
         );
-        state.register_xdg_toplevel_role(xdg_surface_resolved, toplevel_resolved);
+        state.insert_window(window, surface_resolved, toplevel_resolved.object_id());
 
         {
             let mut manager = client.grab_object(manager_id, &mut state);

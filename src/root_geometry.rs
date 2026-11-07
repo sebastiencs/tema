@@ -11,6 +11,7 @@ use {
             wl_surface::WlSurface,
             xdg_surface::{xdg_toplevel::ToplevelDecorationMode, XdgSurface},
         },
+        window::Toplevel,
     },
     std::cell::Cell,
 };
@@ -187,6 +188,7 @@ pub fn resolve_committed_root_geometry_with_overrides(
     cached_geometry_reusable_for_overrides(state, surface_object_id, overrides).or_else(|| {
         build_committed_root_geometry(
             state,
+            surface_object_id,
             surface,
             crate::tiling::layout_allocation_for_surface(state, surface_object_id),
             overrides,
@@ -281,29 +283,27 @@ pub fn effective_decoration_insets(
     state: &State,
     surface_object_id: Resolved<WlSurfaceId>,
 ) -> DecorationInsets {
-    let Some(surface) = state
+    if state
         .objects
         .try_ref_object::<WlSurface>(surface_object_id.object_id())
-    else {
+        .is_none()
+    {
         return state.frame_insets();
-    };
-    effective_decoration_insets_for_surface(state, surface)
+    }
+    effective_decoration_insets_for_surface(state, surface_object_id)
 }
 
-/// Compute effective decoration insets for a surface using the current
-/// decoration ownership policy and the surface's effective logical geometry.
+/// Frame reserved for a root that has a toplevel. Both decoration modes use it.
 pub fn effective_decoration_insets_for_surface(
     state: &State,
-    surface: &WlSurface,
+    surface: Resolved<WlSurfaceId>,
 ) -> DecorationInsets {
-    let has_toplevel = surface
-        .xdg_surface()
-        .and_then(|xdg_surface| state.xdg_toplevel(xdg_surface))
-        .is_some_and(|toplevel| toplevel.exists(state));
-    if has_toplevel {
-        state.frame_insets()
-    } else {
-        DecorationInsets::default()
+    match state
+        .toplevel_for_root(surface)
+        .map(|toplevel| toplevel.decoration_mode())
+    {
+        Some(_) => state.frame_insets(),
+        None => DecorationInsets::default(),
     }
 }
 
@@ -373,6 +373,7 @@ pub fn effective_window_geometry_for_surface(
 /// from the returned snapshot instead of storing duplicate rectangles.
 pub fn build_committed_root_geometry(
     state: &State,
+    surface_id: Resolved<WlSurfaceId>,
     surface: &WlSurface,
     layout_allocation: Option<LayoutAllocation>,
     overrides: GeometryBuildOverrides,
@@ -380,15 +381,10 @@ pub fn build_committed_root_geometry(
     let xdg_surface = surface
         .xdg_surface()
         .and_then(|xdg_surface| xdg_surface.try_ref(state));
-    let toplevel = surface
-        .xdg_surface()
-        .and_then(|xdg_surface| state.xdg_toplevel(xdg_surface));
     let decoration_mode = overrides.decoration_mode.or_else(|| {
-        toplevel.and_then(|toplevel| {
-            toplevel
-                .try_ref(state)
-                .map(|toplevel| toplevel.decoration_mode())
-        })
+        state
+            .toplevel_for_root(surface_id)
+            .map(|toplevel| toplevel.decoration_mode())
     });
     let explicit_window_geometry = overrides
         .explicit_window_geometry

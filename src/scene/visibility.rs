@@ -340,13 +340,16 @@ fn fullscreen_allows_root(
     let Some(workspace) = state.workspaces.try_get(workspace_id) else {
         return false;
     };
-    workspace
-        .layout
-        .fullscreen
-        .as_ref()
-        .filter(|fullscreen| state.root_surface_is_mapped(fullscreen.surface_object_id))
-        .map(|fullscreen| fullscreen.surface_object_id == root_surface)
-        .unwrap_or(true)
+    let Some(fullscreen) = workspace.layout.fullscreen.as_ref() else {
+        return true;
+    };
+    let Some(fullscreen_root) = state.window_root_surface(fullscreen.window) else {
+        return true;
+    };
+    if !state.root_surface_is_mapped(fullscreen_root) {
+        return true;
+    }
+    fullscreen_root == root_surface
 }
 
 fn normalize_participation_policy(
@@ -401,6 +404,7 @@ mod tests {
         let surface =
             crate::clients::Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(raw), oid);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface);
         surface
     }
 
@@ -483,16 +487,8 @@ mod tests {
         let incoming_root = insert_root(&mut state, 82);
         assert!(state.assign_root_surface_to_workspace(outgoing_root, outgoing));
         let _ = state.assign_root_surface_to_workspace(incoming_root, incoming);
-        state
-            .managed_root_surfaces
-            .get_mut(&outgoing_root)
-            .unwrap()
-            .mapped = true;
-        state
-            .managed_root_surfaces
-            .get_mut(&incoming_root)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(outgoing_root).unwrap().mapped = true;
+        state.managed_window_mut(incoming_root).unwrap().mapped = true;
         let policy = WorkspaceParticipationPolicy::Transition { group_id, outgoing, incoming };
         let ctx = CompositionEvalContext { state: &state, output_id, snapshot: None, policy };
         let outgoing_entry = workspace_entry(outgoing_root, outgoing);
@@ -516,17 +512,18 @@ mod tests {
         let workspace_id = state.active_workspace_for_output(output_id).unwrap();
         let root = insert_root(&mut state, 83);
         let _ = state.assign_root_surface_to_workspace(root, workspace_id);
+        let window = state.window_for_root(root).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![root];
+            .stack = vec![window];
 
         assert!(root_has_protocol_visibility(&state, root));
         assert!(!root_participates_in_input(&state, root));
-        state.managed_root_surfaces.get_mut(&root).unwrap().mapped = true;
+        state.managed_window_mut(root).unwrap().mapped = true;
         assert!(root_participates_in_input(&state, root));
     }
 
@@ -542,22 +539,15 @@ mod tests {
         let covered = insert_root(&mut state, 85);
         assert!(state.assign_root_surface_to_workspace(fullscreen, outgoing));
         assert!(state.assign_root_surface_to_workspace(covered, outgoing));
-        state
-            .managed_root_surfaces
-            .get_mut(&fullscreen)
-            .unwrap()
-            .mapped = true;
-        state
-            .managed_root_surfaces
-            .get_mut(&covered)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(fullscreen).unwrap().mapped = true;
+        state.managed_window_mut(covered).unwrap().mapped = true;
+        let fullscreen_window = state.window_for_root(fullscreen).unwrap();
         state
             .workspaces
             .try_get_mut(outgoing)
             .unwrap()
             .layout
-            .fullscreen = Some(crate::tiling::FullscreenState { surface_object_id: fullscreen });
+            .fullscreen = Some(crate::tiling::FullscreenState { window: fullscreen_window });
         let policy = WorkspaceParticipationPolicy::Transition { group_id, outgoing, incoming };
         let ctx = CompositionEvalContext { state: &state, output_id, snapshot: None, policy };
         let fullscreen_entry = workspace_entry(fullscreen, outgoing);
@@ -583,11 +573,7 @@ mod tests {
         let other_workspace = state.active_workspace_for_output(other).unwrap();
         let unrelated = insert_root(&mut state, 86);
         assert!(state.assign_root_surface_to_workspace(unrelated, other_workspace));
-        state
-            .managed_root_surfaces
-            .get_mut(&unrelated)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(unrelated).unwrap().mapped = true;
         let policy = WorkspaceParticipationPolicy::Transition { group_id, outgoing, incoming };
         let ctx =
             CompositionEvalContext { state: &state, output_id: other, snapshot: None, policy };
@@ -621,16 +607,8 @@ mod tests {
         let incoming_root = insert_root(&mut state, 92);
         assert!(state.assign_root_surface_to_workspace(outgoing_root, outgoing));
         assert_eq!(state.root_surface_workspace(incoming_root), Some(incoming));
-        state
-            .managed_root_surfaces
-            .get_mut(&outgoing_root)
-            .unwrap()
-            .mapped = true;
-        state
-            .managed_root_surfaces
-            .get_mut(&incoming_root)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(outgoing_root).unwrap().mapped = true;
+        state.managed_window_mut(incoming_root).unwrap().mapped = true;
         let ctx = CompositionEvalContext {
             state: &state,
             output_id,
@@ -662,17 +640,14 @@ mod tests {
         assert!(state.assign_root_surface_to_workspace(fullscreen, outgoing));
         assert!(state.assign_root_surface_to_workspace(covered, outgoing));
         assert_eq!(state.root_surface_workspace(incoming_root), Some(incoming));
-        state
-            .managed_root_surfaces
-            .get_mut(&fullscreen)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(fullscreen).unwrap().mapped = true;
+        let fullscreen_window = state.window_for_root(fullscreen).unwrap();
         state
             .workspaces
             .try_get_mut(outgoing)
             .unwrap()
             .layout
-            .fullscreen = Some(crate::tiling::FullscreenState { surface_object_id: fullscreen });
+            .fullscreen = Some(crate::tiling::FullscreenState { window: fullscreen_window });
         let ctx = CompositionEvalContext {
             state: &state,
             output_id,
@@ -696,11 +671,7 @@ mod tests {
             &ctx,
             CompositionSource::SceneEntry(&workspace_entry(incoming_root, incoming))
         ));
-        state
-            .managed_root_surfaces
-            .get_mut(&incoming_root)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(incoming_root).unwrap().mapped = true;
         let ctx = CompositionEvalContext {
             state: &state,
             output_id,

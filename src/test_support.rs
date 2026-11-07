@@ -8,7 +8,6 @@ use crate::{
     input::SurfaceFocus,
     protocol_generated::{WlBufferId, WlSubsurfaceId, WlSurfaceId, XdgSurfaceId, XdgToplevelId},
     runner::Dispatcher,
-    seat::SeatState,
     state::{BackendOutputRef, DrmId, FractionalScale, ObjectId, Output, OutputMode, State},
     wayland_objects::{
         wl_buffer::{NewWlBufferParams, WlBuffer},
@@ -41,45 +40,7 @@ pub fn state_for_tests_with_config(config: RuntimeConfig) -> State {
     let keyboard = xkb.create_keyboard_state();
     let mut globals = Globals::new();
     globals.initialize();
-    State {
-        objects: Default::default(),
-        root_surfaces: Default::default(),
-        root_surface_process_info: Default::default(),
-        layer_surface_objects: Default::default(),
-        inputs: Default::default(),
-        drm: Default::default(),
-        outputs: Default::default(),
-        active_output: None,
-        workspace_groups: Default::default(),
-        workspaces: Default::default(),
-        output_workspace_groups: Default::default(),
-        root_surface_workspaces: Default::default(),
-        managed_root_surfaces: Default::default(),
-        closing_snapshots: Vec::new(),
-        next_closing_snapshot_id: 1,
-        realize_closing_snapshots_in_tests: false,
-        root_geometry_cache: Default::default(),
-        client_process_info: Default::default(),
-        xdg_toplevel_roles: Default::default(),
-        ctm_control_owner: None,
-        data_offers_by_source: Default::default(),
-        next_workspace_serial: 1,
-        backend_syncobj_globals: Default::default(),
-        session_active: true,
-        idle_notifications: Vec::new(),
-        idle_inhibitors: Vec::new(),
-        idle_inhibitors_honored: false,
-        session_lock: Default::default(),
-        capture: Default::default(),
-        frame_scheduler: Default::default(),
-        presentation: Default::default(),
-        globals,
-        activation_tokens: Default::default(),
-        config,
-        seat: SeatState::default(),
-        keyboard,
-        xkb,
-    }
+    State::new(globals, config, keyboard, xkb)
 }
 
 pub fn resolved_wl_surface(state: &State, object_id: ObjectId) -> Resolved<WlSurfaceId> {
@@ -98,6 +59,16 @@ pub fn insert_root_surface(state: &mut State, wl_surface_id: u32) -> ObjectId {
         .1;
     state.register_root_surface(Resolved::new(ClientId::from_raw(1), wl_id, object_id));
     object_id
+}
+
+/// Registers a window for `root` when tests need managed state without an `xdg_toplevel`.
+pub fn insert_window(state: &mut State, root: Resolved<WlSurfaceId>) -> crate::window::WindowId {
+    if let Some(window) = state.window_for_root(root) {
+        return window;
+    }
+    let window = state.allocate_window_id();
+    state.insert_window(window, root, ObjectId::from(1_000_000usize));
+    window
 }
 
 pub fn insert_wl_subsurface(

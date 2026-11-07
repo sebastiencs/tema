@@ -4,7 +4,7 @@ use crate::{
     clients::{ClientAction, ClientId, ClientManagerAction, Resolved},
     cursor::CursorSourceRef,
     drm::{request_active_output, request_outputs_for_points, request_outputs_for_rects},
-    protocol_generated::{xdg_toplevel::ResizeEdge, WlSurfaceId, XdgToplevelId},
+    protocol_generated::{xdg_toplevel::ResizeEdge, WlSurfaceId},
     region::RectI,
     root_geometry::{CommittedRootGeometry, WindowTargetGeometry},
     runner::Dispatcher,
@@ -12,6 +12,7 @@ use crate::{
     state::State,
     tiling::ExtractedTiledLeaf,
     wayland_objects::xdg_surface::xdg_toplevel::InteractiveSizeConstraints,
+    window::{Toplevel, WindowId},
 };
 
 use super::{
@@ -50,8 +51,8 @@ pub(crate) fn apply_interaction_intent(
                 && matches!(intent, InteractionIntent::StartMove(_))
                 && state.is_tiled_root_surface(target.root_surface)
             {
-                if let WindowRoleSnapshot::XdgToplevel {
-                    xdg_toplevel,
+                if let WindowRoleSnapshot::Toplevel {
+                    window,
                     size_constraints,
                     decoration_mode,
                     ..
@@ -60,8 +61,8 @@ pub(crate) fn apply_interaction_intent(
                     return start_tiled_drag(
                         state,
                         dispatcher,
+                        window,
                         target.root_surface,
-                        xdg_toplevel,
                         size_constraints,
                         decoration_mode,
                         target.geometry,
@@ -82,6 +83,16 @@ pub(crate) fn apply_pointer_interactive_grab(
     let Some(grab) = state.seat.pointer_interactive_grab else {
         return false;
     };
+    let window = match grab {
+        ActiveGrabState::Move { window, .. }
+        | ActiveGrabState::Resize { window, .. }
+        | ActiveGrabState::ResizeTiled { window, .. }
+        | ActiveGrabState::MoveTiled { window, .. } => window,
+    };
+    if state.window_root_surface(window).is_none() {
+        abort_pointer_interactive_grab(state, dispatcher, 0);
+        return true;
+    }
     match grab {
         ActiveGrabState::Move { root_surface, initial_pointer_pos, initial_geometry, .. } => {
             move_grabbed_root(
@@ -93,8 +104,8 @@ pub(crate) fn apply_pointer_interactive_grab(
             );
         }
         ActiveGrabState::MoveTiled {
+            window,
             root_surface,
-            xdg_toplevel,
             size_constraints,
             decoration_mode,
             origin_pointer,
@@ -108,8 +119,8 @@ pub(crate) fn apply_pointer_interactive_grab(
             pickup_tiled_drag(
                 state,
                 dispatcher,
+                window,
                 root_surface,
-                xdg_toplevel,
                 size_constraints,
                 decoration_mode,
             );
@@ -128,8 +139,8 @@ pub(crate) fn apply_pointer_interactive_grab(
             place_grabbed_root(state, dispatcher, root_surface, root_pos);
         }
         ActiveGrabState::Resize {
+            window,
             root_surface,
-            xdg_toplevel,
             size_constraints,
             edges,
             initial_pointer_pos,
@@ -170,7 +181,7 @@ pub(crate) fn apply_pointer_interactive_grab(
             drop(surface);
             state.mark_root_geometry_dirty(root_surface);
             state.sync_window_geometry_goal(
-                root_surface,
+                window,
                 crate::visual_animation::WindowGeometryMotion::Warp,
             );
             let new_bounds = interactive_damage_rect(state, root_surface);
@@ -187,22 +198,15 @@ pub(crate) fn apply_pointer_interactive_grab(
             }
 
             if last_size != (width, height) {
-                dispatch_client_action(
-                    dispatcher,
-                    root_surface.client_id(),
-                    ClientAction::InteractiveResizeConfigure {
-                        xdg_toplevel,
-                        width,
-                        height,
-                        resizing: true,
-                    },
-                );
+                if let Some(toplevel) = state.toplevel(window) {
+                    toplevel.interactive_resize(dispatcher, (width, height), true);
+                }
                 last_size = (width, height);
             }
 
             state.seat.pointer_interactive_grab = Some(ActiveGrabState::Resize {
+                window,
                 root_surface,
-                xdg_toplevel,
                 size_constraints,
                 edges,
                 initial_pointer_pos,
@@ -210,14 +214,21 @@ pub(crate) fn apply_pointer_interactive_grab(
                 last_size,
             });
         }
-        ActiveGrabState::ResizeTiled { root_surface, edges, initial_pointer_pos, resize_state } => {
+        ActiveGrabState::ResizeTiled {
+            window,
+            root_surface,
+            edges,
+            initial_pointer_pos,
+            resize_state,
+        } => {
             let dx = (state.seat.pointer_pos.0 - initial_pointer_pos.0).round() as i32;
             let dy = (state.seat.pointer_pos.1 - initial_pointer_pos.1).round() as i32;
-            if state.resize_tiled_root_surface_from_state(root_surface, resize_state, dx, dy) {
+            if state.resize_tiled_window_from_state(window, resize_state, dx, dy) {
                 dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
                 request_active_output(state, dispatcher);
             }
             state.seat.pointer_interactive_grab = Some(ActiveGrabState::ResizeTiled {
+                window,
                 root_surface,
                 edges,
                 initial_pointer_pos,
@@ -254,17 +265,10 @@ fn settle_pointer_interactive_grab(
         return false;
     };
     if !cancel {
-        if let ActiveGrabState::Resize { root_surface, xdg_toplevel, last_size, .. } = grab {
-            dispatch_client_action(
-                dispatcher,
-                root_surface.client_id(),
-                ClientAction::InteractiveResizeConfigure {
-                    xdg_toplevel,
-                    width: last_size.0,
-                    height: last_size.1,
-                    resizing: false,
-                },
-            );
+        if let ActiveGrabState::Resize { window, last_size, .. } = grab {
+            if let Some(toplevel) = state.toplevel(window) {
+                toplevel.interactive_resize(dispatcher, last_size, false);
+            }
         }
     }
     let origin = state.seat.tiled_drag_origin.take();
@@ -309,10 +313,12 @@ fn settle_tiled_drag(
     if cancel && mapped && retiled {
         // Cancel, session lock, and session pause put the window back on its tile immediately.
         // A normal drop leaves the windows animation that retile just recorded.
-        state.sync_window_geometry_goal(
-            root_surface,
-            crate::visual_animation::WindowGeometryMotion::Warp,
-        );
+        if let Some(window) = state.window_for_root(root_surface) {
+            state.sync_window_geometry_goal(
+                window,
+                crate::visual_animation::WindowGeometryMotion::Warp,
+            );
+        }
     }
 }
 
@@ -320,6 +326,9 @@ fn place_dragged_window(state: &mut State, surface: Resolved<WlSurfaceId>) -> bo
     let (pointer_x, pointer_y) = state.seat.pointer_pos;
     let precise_mouse_move = state.config.tiling.drag.precise_mouse_move;
     let split_ratio = state.config.tiling.drag.split_ratio.get();
+    let Some(window) = state.window_for_root(surface) else {
+        return false;
+    };
     let Some(workspace_id) = state.root_surface_workspace(surface) else {
         return false;
     };
@@ -327,7 +336,7 @@ fn place_dragged_window(state: &mut State, surface: Resolved<WlSurfaceId>) -> bo
         return false;
     };
     workspace.layout.place_dragged_tiled_leaf(
-        surface,
+        window,
         pointer_x,
         pointer_y,
         precise_mouse_move,
@@ -364,6 +373,9 @@ pub(crate) fn tiled_resize_active_root_surfaces(state: &State) -> BTreeSet<Resol
     else {
         return BTreeSet::new();
     };
+    let Some(window) = state.window_for_root(root_surface) else {
+        return BTreeSet::new();
+    };
     let Some(workspace_id) = state.root_surface_workspace(root_surface) else {
         return BTreeSet::new();
     };
@@ -372,8 +384,11 @@ pub(crate) fn tiled_resize_active_root_surfaces(state: &State) -> BTreeSet<Resol
     };
     workspace
         .layout
-        .resize_affected_surfaces(root_surface, resize_state)
+        .resize_affected_windows(window, resize_state)
         .unwrap_or_default()
+        .into_iter()
+        .filter_map(|window| state.window_root_surface(window))
+        .collect()
 }
 
 pub(crate) fn recover_pointer_after_interactive_grab_loss(
@@ -411,9 +426,12 @@ fn anchored_grab_target(state: &mut State, mut target: WindowTarget) -> WindowTa
         .map(|geometry| geometry.layout_rect_global)
         .unwrap_or(target.geometry.target_rect);
     let Some(visual) = state
-        .managed_root_surfaces
-        .get(&target.root_surface)
-        .and_then(|managed| managed.geometry_animation.visual_rect())
+        .window_for_root(target.root_surface)
+        .and_then(|window| {
+            state
+                .managed_window_state(window)
+                .and_then(|managed| managed.geometry_animation.visual_rect())
+        })
     else {
         return target;
     };
@@ -442,7 +460,7 @@ fn anchored_grab_target(state: &mut State, mut target: WindowTarget) -> WindowTa
     else {
         return target;
     };
-    if let Some(managed) = state.managed_root_surfaces.get_mut(&target.root_surface) {
+    if let Some(managed) = state.managed_window_mut(target.root_surface) {
         managed
             .geometry_animation
             .set_goal(goal, crate::visual_animation::WindowGeometryMotion::Warp);
@@ -483,13 +501,14 @@ fn start_window_grab(
         ),
         (
             InteractionIntent::StartResize(_, edges),
-            WindowRoleSnapshot::XdgToplevel { xdg_toplevel, size_constraints, .. },
+            WindowRoleSnapshot::Toplevel { window, size_constraints, .. },
         ) => {
-            if state.is_tiled_root_surface(target.root_surface) {
+            if state.window_is_tiled(window) {
                 start_interactive_tiled_resize(
                     state,
                     dispatcher,
                     target.client_id(),
+                    window,
                     target.root_surface,
                     edges,
                 )
@@ -498,8 +517,8 @@ fn start_window_grab(
                     state,
                     dispatcher,
                     target.client_id(),
+                    window,
                     target.root_surface,
-                    xdg_toplevel,
                     size_constraints,
                     edges,
                     target.geometry,
@@ -515,8 +534,8 @@ const TILED_DRAG_PREVIEW_SCALE: f64 = 0.8489;
 fn start_tiled_drag(
     state: &mut State,
     dispatcher: &mut Dispatcher,
+    window: WindowId,
     root_surface: Resolved<WlSurfaceId>,
-    xdg_toplevel: Resolved<XdgToplevelId>,
     size_constraints: InteractiveSizeConstraints,
     decoration_mode: crate::wayland_objects::xdg_surface::xdg_toplevel::ToplevelDecorationMode,
     initial_geometry: WindowTargetGeometry,
@@ -525,8 +544,8 @@ fn start_tiled_drag(
     let pointer = state.seat.pointer_pos;
     let threshold = state.config.tiling.drag.threshold;
     state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled {
+        window,
         root_surface,
-        xdg_toplevel,
         size_constraints,
         decoration_mode,
         origin_pointer: pointer,
@@ -541,8 +560,8 @@ fn start_tiled_drag(
         pickup_tiled_drag(
             state,
             dispatcher,
+            window,
             root_surface,
-            xdg_toplevel,
             size_constraints,
             decoration_mode,
         );
@@ -560,8 +579,8 @@ fn tiled_drag_threshold_reached(origin: (f64, f64), pointer: (f64, f64), thresho
 fn pickup_tiled_drag(
     state: &mut State,
     dispatcher: &mut Dispatcher,
+    window: WindowId,
     root_surface: Resolved<WlSurfaceId>,
-    xdg_toplevel: Resolved<XdgToplevelId>,
     size_constraints: InteractiveSizeConstraints,
     decoration_mode: crate::wayland_objects::xdg_surface::xdg_toplevel::ToplevelDecorationMode,
 ) {
@@ -578,7 +597,7 @@ fn pickup_tiled_drag(
     let mut frame = scaled_tiled_preview_frame(geometry.layout_rect_global, pointer);
     let Some(mut built) = root_surface
         .try_ref(state)
-        .and_then(|surface| preview_geometry(state, &surface, frame))
+        .and_then(|surface| preview_geometry(state, root_surface, &surface, frame))
     else {
         abort_pointer_interactive_grab(state, dispatcher, 0);
         return;
@@ -592,7 +611,7 @@ fn pickup_tiled_drag(
         frame.y = (pointer.1 - frame.height as f64 / 2.0).round() as i32;
         let Some(rebuilt) = root_surface
             .try_ref(state)
-            .and_then(|surface| preview_geometry(state, &surface, frame))
+            .and_then(|surface| preview_geometry(state, root_surface, &surface, frame))
         else {
             abort_pointer_interactive_grab(state, dispatcher, 0);
             return;
@@ -605,16 +624,16 @@ fn pickup_tiled_drag(
     state.seat.tiled_drag_origin = state
         .root_surface_workspace(root_surface)
         .and_then(|workspace_id| state.workspaces.try_get(workspace_id))
-        .and_then(|workspace| workspace.layout.capture_tiled_drag_origin(root_surface));
-    if !state.float_tiled_root_surface_for_drag(root_surface) {
+        .and_then(|workspace| workspace.layout.capture_tiled_drag_origin(window));
+    if !state.float_window_for_drag(window) {
         abort_pointer_interactive_grab(state, dispatcher, 0);
         return;
     }
     let mut grab_geometry = grab_geometry;
     grab_geometry.root_pos = root_pos;
     state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled {
+        window,
         root_surface,
-        xdg_toplevel,
         size_constraints,
         decoration_mode,
         origin_pointer: pointer,
@@ -635,20 +654,10 @@ fn pickup_tiled_drag(
     state.mark_root_geometry_dirty(root_surface);
     // Tile to preview uses the windows animation. Hyprland does the same by assigning
     // m_realPosition and m_realSize when the tiled window becomes floating.
-    state.sync_window_geometry_goal(
-        root_surface,
-        crate::visual_animation::WindowGeometryMotion::Layout,
-    );
-    dispatch_client_action(
-        dispatcher,
-        root_surface.client_id(),
-        ClientAction::InteractiveResizeConfigure {
-            xdg_toplevel,
-            width: clamped.0,
-            height: clamped.1,
-            resizing: false,
-        },
-    );
+    state.sync_window_geometry_goal(window, crate::visual_animation::WindowGeometryMotion::Layout);
+    if let Some(toplevel) = state.toplevel(window) {
+        toplevel.interactive_resize(dispatcher, clamped, false);
+    }
     dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
     let new_bounds = interactive_damage_rect(state, root_surface);
     if let Some(new_bounds) = new_bounds {
@@ -694,11 +703,13 @@ fn scaled_tiled_preview_frame(
 
 fn preview_geometry(
     state: &State,
+    root_surface: Resolved<WlSurfaceId>,
     surface: &crate::wayland_objects::wl_surface::WlSurface,
     frame: crate::region::RectI,
 ) -> Option<CommittedRootGeometry> {
     crate::root_geometry::build_committed_root_geometry(
         state,
+        root_surface,
         surface,
         Some(crate::tiling::LayoutAllocation {
             frame_rect: frame,
@@ -740,10 +751,10 @@ fn place_grabbed_root(
     surface.set_root_position(root_pos.0, root_pos.1);
     drop(surface);
     state.mark_root_geometry_dirty(root_surface);
-    state.sync_window_geometry_goal(
-        root_surface,
-        crate::visual_animation::WindowGeometryMotion::Warp,
-    );
+    if let Some(window) = state.window_for_root(root_surface) {
+        state
+            .sync_window_geometry_goal(window, crate::visual_animation::WindowGeometryMotion::Warp);
+    }
     let new_bounds = interactive_damage_rect(state, root_surface);
     dispatch_client_action(
         dispatcher,
@@ -765,10 +776,13 @@ fn start_interactive_move(
     root_surface: Resolved<WlSurfaceId>,
     initial_geometry: WindowTargetGeometry,
 ) -> bool {
+    let Some(window) = state.window_for_root(root_surface) else {
+        return false;
+    };
     begin_compositor_pointer_grab(state, dispatcher, POINTER_MOVE_CURSOR_ICON_NAMES);
     state
         .seat
-        .start_toplevel_move(client_id, root_surface, initial_geometry);
+        .start_toplevel_move(client_id, window, root_surface, initial_geometry);
     true
 }
 
@@ -776,8 +790,8 @@ fn start_interactive_resize(
     state: &mut State,
     dispatcher: &mut Dispatcher,
     client_id: ClientId,
+    window: WindowId,
     root_surface: Resolved<WlSurfaceId>,
-    xdg_toplevel: Resolved<XdgToplevelId>,
     size_constraints: InteractiveSizeConstraints,
     edges: u32,
     initial_geometry: WindowTargetGeometry,
@@ -785,8 +799,8 @@ fn start_interactive_resize(
     begin_compositor_pointer_grab(state, dispatcher, resize_cursor_icon_names(edges));
     state.seat.start_toplevel_resize(
         client_id,
+        window,
         root_surface,
-        xdg_toplevel,
         size_constraints,
         edges,
         initial_geometry,
@@ -798,16 +812,17 @@ fn start_interactive_tiled_resize(
     state: &mut State,
     dispatcher: &mut Dispatcher,
     client_id: ClientId,
+    window: WindowId,
     root_surface: Resolved<WlSurfaceId>,
     edges: u32,
 ) -> bool {
-    let Some(resize_state) = state.begin_tiled_root_surface_resize(root_surface, edges) else {
+    let Some(resize_state) = state.begin_tiled_window_resize(window, edges) else {
         return false;
     };
     begin_compositor_pointer_grab(state, dispatcher, resize_cursor_icon_names(edges));
     state
         .seat
-        .start_toplevel_tiled_resize(client_id, root_surface, edges, resize_state);
+        .start_toplevel_tiled_resize(client_id, window, root_surface, edges, resize_state);
     true
 }
 
@@ -955,6 +970,31 @@ mod tests {
         assert!(!super::tiled_drag_threshold_reached((0.0, 0.0), (3.0, 4.0), 5));
         assert!(super::tiled_drag_threshold_reached((0.0, 0.0), (3.0, 4.0), 4));
         assert!(super::tiled_drag_threshold_reached((10.0, 10.0), (10.0, 21.0), 10));
+    }
+
+    #[test]
+    fn interactive_grab_ends_when_its_window_is_destroyed() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = crate::test_support::test_client_and_dispatcher(1);
+        let root_object = crate::test_support::insert_root_surface(&mut state, 71);
+        let root = crate::test_support::resolved_wl_surface(&state, root_object);
+        let window = crate::test_support::insert_window(&mut state, root);
+        let geometry = crate::root_geometry::WindowTargetGeometry {
+            root_pos: (0, 0),
+            resize_size: (10, 10),
+            target_rect: RectI { x: 0, y: 0, width: 10, height: 10 },
+            binding_rect: RectI { x: 0, y: 0, width: 10, height: 10 },
+        };
+        state.seat.pointer_interactive_grab = Some(super::ActiveGrabState::Move {
+            window,
+            root_surface: root,
+            initial_pointer_pos: (0.0, 0.0),
+            initial_geometry: geometry,
+        });
+        state.destroy_window(window);
+
+        assert!(super::apply_pointer_interactive_grab(&mut state, &mut dispatcher));
+        assert!(state.seat.pointer_interactive_grab.is_none());
     }
 
     #[test]

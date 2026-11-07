@@ -8,6 +8,7 @@ use crate::{
         wl_surface::{Role, StackEntry, WlSurface},
         xdg_surface::xdg_toplevel::ToplevelDecorationMode,
     },
+    window::Toplevel,
 };
 
 use super::{
@@ -173,7 +174,7 @@ pub(crate) fn build_window_target(
 
 fn protocol_decoration_mode(role: WindowRoleSnapshot) -> Option<ToplevelDecorationMode> {
     match role {
-        WindowRoleSnapshot::XdgToplevel { decoration_mode, .. } => Some(decoration_mode),
+        WindowRoleSnapshot::Toplevel { decoration_mode, .. } => Some(decoration_mode),
         WindowRoleSnapshot::Unsupported => None,
     }
 }
@@ -183,26 +184,26 @@ pub(crate) fn resolve_xdg_window_role_snapshot(
     root_surface: Resolved<WlSurfaceId>,
     xdg_surface_id: XdgSurfaceId,
 ) -> WindowRoleSnapshot {
-    let Some(xdg_surface) = root_surface
+    let Some(_xdg_surface) = root_surface
         .try_ref(state)
         .and_then(|s| s.xdg_surface())
         .filter(|xs| xs.wayland_id() == xdg_surface_id)
     else {
         return WindowRoleSnapshot::Unsupported;
     };
-    state
-        .xdg_toplevel(xdg_surface)
-        .map(|xdg_toplevel| {
-            let toplevel = xdg_toplevel.rref(state);
-            WindowRoleSnapshot::XdgToplevel {
-                xdg_toplevel,
-                size_constraints: toplevel.interactive_size_constraints(),
-                is_maximized: toplevel.is_maximized(),
-                is_fullscreen: state.root_surface_is_fullscreen(root_surface),
-                decoration_mode: toplevel.decoration_mode(),
-            }
-        })
-        .unwrap_or(WindowRoleSnapshot::Unsupported)
+    let Some(window) = state.window_for_root(root_surface) else {
+        return WindowRoleSnapshot::Unsupported;
+    };
+    let Some(toplevel) = state.toplevel(window) else {
+        return WindowRoleSnapshot::Unsupported;
+    };
+    WindowRoleSnapshot::Toplevel {
+        window,
+        size_constraints: toplevel.size_constraints(),
+        is_maximized: toplevel.is_maximized(),
+        is_fullscreen: state.window_is_fullscreen(window),
+        decoration_mode: toplevel.decoration_mode(),
+    }
 }
 
 pub(crate) fn rect_contains_point(bounds: RectI, pointer_pos: (f64, f64)) -> bool {
@@ -402,7 +403,7 @@ mod tests {
         config::DecorationInsets,
         protocol_generated::{
             xdg_toplevel::ResizeEdge, WlSubsurfaceId, WlSurfaceId, XdgPopupId, XdgSurfaceId,
-            XdgToplevelId, XdgWmBaseId,
+            XdgWmBaseId,
         },
         region::RectI,
         root_geometry::CommittedRootGeometry,
@@ -429,6 +430,7 @@ mod tests {
             state.insert_object(WlSurface::new(WlSurfaceId::from(raw), ClientId::from_raw(1), 6));
         let surface = Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(raw), object_id);
         state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface);
         surface
     }
 
@@ -497,12 +499,8 @@ mod tests {
         let target = build_protocol_move_target(
             &state,
             root_surface,
-            WindowRoleSnapshot::XdgToplevel {
-                xdg_toplevel: Resolved::new(
-                    ClientId::from_raw(7),
-                    XdgToplevelId::from(42u32),
-                    ObjectId::from(42usize),
-                ),
+            WindowRoleSnapshot::Toplevel {
+                window: crate::window::WindowId::for_tests(42),
                 size_constraints: InteractiveSizeConstraints::default(),
                 is_maximized: false,
                 is_fullscreen: false,
@@ -554,12 +552,8 @@ mod tests {
         let target = build_protocol_resize_target(
             &state,
             root_surface,
-            WindowRoleSnapshot::XdgToplevel {
-                xdg_toplevel: Resolved::new(
-                    ClientId::from_raw(8),
-                    XdgToplevelId::from(52u32),
-                    ObjectId::from(52usize),
-                ),
+            WindowRoleSnapshot::Toplevel {
+                window: crate::window::WindowId::for_tests(52),
                 size_constraints: InteractiveSizeConstraints::default(),
                 is_maximized: false,
                 is_fullscreen: false,
@@ -683,15 +677,19 @@ mod tests {
         let upper = Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(72), upper_object_id);
         state.register_root_surface(lower);
         state.register_root_surface(upper);
+        crate::test_support::insert_window(&mut state, lower);
+        crate::test_support::insert_window(&mut state, upper);
         let _ = state.assign_root_surface_to_workspace(lower, workspace_id);
         let _ = state.assign_root_surface_to_workspace(upper, workspace_id);
+        let lower_window = state.window_for_root(lower).unwrap();
+        let upper_window = state.window_for_root(upper).unwrap();
         state
             .workspaces
             .try_get_mut(workspace_id)
             .unwrap()
             .layout
             .floating
-            .stack = vec![lower, upper];
+            .stack = vec![lower_window, upper_window];
         state
             .objects
             .get_mut(lower.object_id())
@@ -705,8 +703,8 @@ mod tests {
             .unwrap()
             .test_map(ObjectId::from(502usize), 0, 0, 100, 100);
 
-        state.managed_root_surfaces.get_mut(&lower).unwrap().mapped = true;
-        state.managed_root_surfaces.get_mut(&upper).unwrap().mapped = true;
+        state.managed_window_mut(lower).unwrap().mapped = true;
+        state.managed_window_mut(upper).unwrap().mapped = true;
 
         let pick = scene_pick_at(&state, (10.0, 10.0));
         assert_eq!(pick.surface_focus.map(|focus| focus.target.surface), Some(upper));
@@ -728,25 +726,23 @@ mod tests {
         let other_output = insert_pick_root(&mut state, 82);
         let _ = state.assign_root_surface_to_workspace(unmapped, left_workspace);
         let _ = state.assign_root_surface_to_workspace(other_output, right_workspace);
-        state
-            .managed_root_surfaces
-            .get_mut(&other_output)
-            .unwrap()
-            .mapped = true;
+        state.managed_window_mut(other_output).unwrap().mapped = true;
+        let unmapped_window = state.window_for_root(unmapped).unwrap();
+        let other_output_window = state.window_for_root(other_output).unwrap();
         state
             .workspaces
             .try_get_mut(left_workspace)
             .unwrap()
             .layout
             .floating
-            .stack = vec![unmapped];
+            .stack = vec![unmapped_window];
         state
             .workspaces
             .try_get_mut(right_workspace)
             .unwrap()
             .layout
             .floating
-            .stack = vec![other_output];
+            .stack = vec![other_output_window];
         state
             .objects
             .get_mut(unmapped.object_id())
@@ -845,18 +841,15 @@ mod tests {
         let workspace = state.active_workspace_for_output(output).unwrap();
         let surface = insert_pick_root(state, 91);
         state.assign_root_surface_to_workspace(surface, workspace);
+        let window = state.window_for_root(surface).unwrap();
         state
             .workspaces
             .try_get_mut(workspace)
             .unwrap()
             .layout
             .floating
-            .stack = vec![surface];
-        state
-            .managed_root_surfaces
-            .get_mut(&surface)
-            .unwrap()
-            .mapped = true;
+            .stack = vec![window];
+        state.managed_window_mut(surface).unwrap().mapped = true;
         state
             .objects
             .get_mut(surface.object_id())
@@ -871,8 +864,7 @@ mod tests {
             .set_root_position(logical.x, logical.y);
         state.mark_root_geometry_dirty(surface);
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .geometry_animation
             .set_goal(visual, crate::visual_animation::WindowGeometryMotion::Layout);
@@ -960,8 +952,7 @@ mod tests {
         assert_eq!(position, (100, 0));
         state.advance_visual_animations(std::time::Instant::now());
         let visual_now = state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .geometry_animation
             .visual_rect()
@@ -996,8 +987,7 @@ mod tests {
             .set_linear(crate::animation_config::AnimationNode::WindowsMove);
         let goal = RectI::new(200, 0, 100, 100).unwrap();
         state
-            .managed_root_surfaces
-            .get_mut(&surface)
+            .managed_window_mut(surface)
             .unwrap()
             .geometry_animation
             .set_goal(goal, crate::visual_animation::WindowGeometryMotion::Layout);
@@ -1005,8 +995,7 @@ mod tests {
         state.advance_visual_animations(now);
         state.advance_visual_animations(now + Duration::from_millis(100));
         let midway = state
-            .managed_root_surfaces
-            .get(&surface)
+            .managed_window(surface)
             .unwrap()
             .geometry_animation
             .visual_rect()
@@ -1023,8 +1012,7 @@ mod tests {
         state.advance_visual_animations(now + Duration::from_millis(200));
         assert_eq!(
             state
-                .managed_root_surfaces
-                .get(&surface)
+                .managed_window(surface)
                 .unwrap()
                 .geometry_animation
                 .visual_rect(),
@@ -1118,18 +1106,16 @@ mod tests {
         ));
         let workspace = state.active_workspace_for_output(output).unwrap();
         state.assign_root_surface_to_workspace(parent_wl, workspace);
+        crate::test_support::insert_window(&mut state, parent_wl);
+        let parent_window = state.window_for_root(parent_wl).unwrap();
         state
             .workspaces
             .try_get_mut(workspace)
             .unwrap()
             .layout
             .floating
-            .stack = vec![parent_wl];
-        state
-            .managed_root_surfaces
-            .get_mut(&parent_wl)
-            .unwrap()
-            .mapped = true;
+            .stack = vec![parent_window];
+        state.managed_window_mut(parent_wl).unwrap().mapped = true;
 
         let layout = state
             .committed_root_geometry(parent_wl)
@@ -1137,8 +1123,7 @@ mod tests {
             .layout_rect_global;
         let shifted = RectI { x: layout.x + 80, ..layout };
         state
-            .managed_root_surfaces
-            .get_mut(&parent_wl)
+            .managed_window_mut(parent_wl)
             .unwrap()
             .geometry_animation
             .set_goal(shifted, crate::visual_animation::WindowGeometryMotion::Layout);
