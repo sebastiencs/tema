@@ -8,6 +8,7 @@ mod lines;
 mod restart;
 mod socket;
 mod surfaces;
+mod xwm;
 
 pub(crate) use surfaces::SurfaceEvent;
 
@@ -71,7 +72,8 @@ struct Run {
     started: Instant,
     ready: bool,
     client: Option<ClientId>,
-    wm: OwnedFd,
+    wm_fd: OwnedFd,
+    wm: Option<xwm::Wm>,
     stderr: Option<OwnedFd>,
     displayfd: Option<OwnedFd>,
     lines: LineSplitter,
@@ -95,6 +97,7 @@ pub(crate) enum XwaylandAction {
     DisplayReady { run: u64, read: RingId, result: std::io::Result<ReadWriteCompleted> },
     Stderr { run: u64, read: RingId, result: std::io::Result<ReadWriteCompleted> },
     Surface { client: ClientId, event: SurfaceEvent },
+    Wm { run: u64, event: xwm::WmEvent },
 }
 
 impl Xwayland {
@@ -217,7 +220,8 @@ impl Xwayland {
             started,
             ready: false,
             client: None,
-            wm,
+            wm_fd: wm,
+            wm: None,
             stderr: Some(stderr),
             displayfd: Some(displayfd),
             lines: LineSplitter::default(),
@@ -248,7 +252,7 @@ impl Xwayland {
     }
 
     fn on_exited(&mut self, exit: ChildExit, dispatcher: &mut Dispatcher) {
-        let Some(finished) = self.take_child() else { return };
+        let Some(finished) = self.take_child(dispatcher) else { return };
         cancel_reads(&finished.reads, dispatcher);
         let ran_for = finished.started.elapsed();
         match exit {
@@ -263,8 +267,11 @@ impl Xwayland {
     }
 
     fn on_lost(&mut self, dispatcher: &mut Dispatcher) {
-        match &self.phase {
+        match &mut self.phase {
             Phase::Running(run) => {
+                if let Some(wm) = run.wm.as_mut() {
+                    wm.stop(dispatcher);
+                }
                 let reads = run.reads.clone();
                 let pidfd = Rc::clone(&run.pidfd);
                 cancel_reads(&reads, dispatcher);
@@ -289,7 +296,14 @@ impl Xwayland {
         self.kill(&pidfd);
     }
 
-    fn on_surface(&mut self, client: ClientId, event: SurfaceEvent) {
+    fn on_surface(
+        &mut self,
+        client: ClientId,
+        event: SurfaceEvent,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+    ) {
+        let run = self.run;
         let Phase::Running(running) = &mut self.phase else {
             log::debug!("dropping Xwayland surface event for client {client:?}: not running");
             return;
@@ -299,20 +313,38 @@ impl Xwayland {
             return;
         }
         running.surfaces.apply(event);
+        let result = {
+            let Run { wm, surfaces, .. } = running;
+            let Some(wm) = wm.as_mut() else { return };
+            let mut ctx = xwm::WmCtx { run, state, dispatcher, surfaces };
+            wm.on_surface_event(&event, &mut ctx)
+        };
+        if let Err(failure) = result {
+            log::error!("XWM failed: {failure}");
+            if let Phase::Running(running) = &mut self.phase {
+                if let Some(mut wm) = running.wm.take() {
+                    wm.stop(dispatcher);
+                }
+                let pidfd = Rc::clone(&running.pidfd);
+                self.kill(&pidfd);
+            }
+        }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn surface_for_serial(&self, serial: u64) -> Option<Resolved<WlSurfaceId>> {
         let Phase::Running(running) = &self.phase else { return None };
         running.surfaces.get(serial)
     }
 
-    fn take_child(&mut self) -> Option<Finished> {
+    fn take_child(&mut self, dispatcher: &mut Dispatcher) -> Option<Finished> {
         if !matches!(self.phase, Phase::Running(_) | Phase::Launching { .. }) {
             return None;
         }
         match std::mem::replace(&mut self.phase, Phase::Disabled) {
-            Phase::Running(run) => {
+            Phase::Running(mut run) => {
+                if let Some(wm) = run.wm.as_mut() {
+                    wm.stop(dispatcher);
+                }
                 Some(Finished { ready: run.ready, started: run.started, reads: run.reads })
             }
             Phase::Launching { started, .. } => {
@@ -331,7 +363,10 @@ impl Xwayland {
             Phase::Waiting { poll } => {
                 dispatcher.dispatch(IoUringAction::PollRemove { target: poll });
             }
-            Phase::Running(run) => {
+            Phase::Running(mut run) => {
+                if let Some(wm) = run.wm.as_mut() {
+                    wm.stop(dispatcher);
+                }
                 cancel_reads(&run.reads, dispatcher);
                 self.kill(&run.pidfd);
             }
@@ -360,6 +395,7 @@ impl Xwayland {
         run: u64,
         read: RingId,
         result: std::io::Result<ReadWriteCompleted>,
+        dispatcher: &mut Dispatcher,
     ) {
         if self.run != run {
             return;
@@ -374,6 +410,8 @@ impl Xwayland {
                 running.ready = true;
                 running.displayfd = None;
                 log::info!("Xwayland ready on :{number}: {text}");
+                let fd = running.wm_fd.as_raw_fd();
+                running.wm = Some(xwm::Wm::start(fd, run, number, dispatcher));
             }
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => running.displayfd = None,
             Err(error) => {
@@ -440,6 +478,35 @@ impl Xwayland {
         }
     }
 
+    fn on_wm(
+        &mut self,
+        run: u64,
+        event: xwm::WmEvent,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+    ) {
+        if self.run != run {
+            return;
+        }
+        let Phase::Running(running) = &mut self.phase else { return };
+        let result = {
+            let Run { wm, surfaces, .. } = running;
+            let Some(wm) = wm.as_mut() else { return };
+            let mut ctx = xwm::WmCtx { run, state, dispatcher, surfaces };
+            wm.handle(event, &mut ctx)
+        };
+        if let Err(failure) = result {
+            log::error!("XWM failed: {failure}");
+            if let Phase::Running(running) = &mut self.phase {
+                if let Some(mut wm) = running.wm.take() {
+                    wm.stop(dispatcher);
+                }
+                let pidfd = Rc::clone(&running.pidfd);
+                self.kill(&pidfd);
+            }
+        }
+    }
+
     fn give_up(&mut self, dispatcher: &mut Dispatcher, reason: &str) {
         if matches!(self.phase, Phase::GivenUp) {
             return;
@@ -498,13 +565,16 @@ impl Model for Xwayland {
             XwaylandAction::ClientAdopted { run, id } => self.on_adopted(run, id),
             XwaylandAction::ClientClosed { run, id } => self.on_client_closed(run, id),
             XwaylandAction::DisplayReady { run, read, result } => {
-                self.on_display_ready(run, read, result)
+                self.on_display_ready(run, read, result, dispatcher)
             }
             XwaylandAction::Stderr { run, read, result } => {
                 self.on_stderr(dispatcher, run, read, result)
             }
             XwaylandAction::Stop => self.stop(dispatcher),
-            XwaylandAction::Surface { client, event } => self.on_surface(client, event),
+            XwaylandAction::Surface { client, event } => {
+                self.on_surface(client, event, state, dispatcher)
+            }
+            XwaylandAction::Wm { run, event } => self.on_wm(run, event, state, dispatcher),
         }
         Ok(())
     }
@@ -757,7 +827,7 @@ mod tests {
                 &mut dispatcher,
             )
             .unwrap();
-        assert_eq!(read_lengths(&dispatcher), vec![DISPLAYFD_BYTES, STDERR_BYTES]);
+        assert_eq!(read_lengths(&dispatcher), vec![DISPLAYFD_BYTES, STDERR_BYTES, 64 * 1024]);
         xwayland
             .process(
                 &mut state,
@@ -773,7 +843,10 @@ mod tests {
                 &mut dispatcher,
             )
             .unwrap();
-        assert_eq!(read_lengths(&dispatcher), vec![DISPLAYFD_BYTES, STDERR_BYTES, STDERR_BYTES]);
+        assert_eq!(
+            read_lengths(&dispatcher),
+            vec![DISPLAYFD_BYTES, STDERR_BYTES, STDERR_BYTES, 64 * 1024]
+        );
         xwayland
             .process(
                 &mut state,
@@ -789,7 +862,10 @@ mod tests {
                 &mut dispatcher,
             )
             .unwrap();
-        assert_eq!(read_lengths(&dispatcher), vec![DISPLAYFD_BYTES, STDERR_BYTES, STDERR_BYTES]);
+        assert_eq!(
+            read_lengths(&dispatcher),
+            vec![DISPLAYFD_BYTES, STDERR_BYTES, STDERR_BYTES, 64 * 1024]
+        );
     }
 
     #[test]
@@ -833,7 +909,7 @@ mod tests {
             count_kind::<IoUringAction>(&dispatcher, |action| {
                 matches!(action, IoUringAction::Cancel { .. })
             }),
-            1
+            2
         );
         assert_eq!(count_unset_display(&dispatcher), 0);
         assert!(Path::new(&socket).exists());

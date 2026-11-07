@@ -613,12 +613,12 @@ mod tests {
             runner::{AnyAction, Dispatcher, Redispatcher},
             x11::{
                 generated::{
-                    Atom, BackingStore, Colormap, DestroyWindow, Event, EventMask, ImageOrder,
-                    QueryExtensionReply, Screen, SelectionEvent, Setup, Window, XError,
-                    XFixesSelectionNotify,
+                    Atom, DestroyWindow, Event, QueryExtensionReply, SelectionEvent, Window,
+                    XError, XFixesSelectionNotify,
                 },
+                testing::{ready_connection, split_requests},
                 wire::Writer,
-                ConnectionError, State, XConnection, XReplyError,
+                ConnectionError, XConnection, XReplyError,
             },
         },
     };
@@ -667,66 +667,6 @@ mod tests {
                 minor: 2,
             },
         ]
-    }
-
-    fn screen() -> Screen {
-        Screen {
-            root: Window(0x100),
-            default_colormap: Colormap(0),
-            white_pixel: 0,
-            black_pixel: 0,
-            current_input_masks: EventMask::empty(),
-            width_in_pixels: 1,
-            height_in_pixels: 1,
-            width_in_millimeters: 1,
-            height_in_millimeters: 1,
-            min_installed_maps: 1,
-            max_installed_maps: 1,
-            root_visual: 0x21,
-            backing_stores: BackingStore::NotUseful,
-            save_unders: 0,
-            root_depth: 24,
-            allowed_depths_len: 0,
-            allowed_depths: Vec::new(),
-        }
-    }
-
-    fn ready_connection() -> (XConnection, Dispatcher) {
-        let mut setup = Setup {
-            status: 1,
-            protocol_major_version: 11,
-            protocol_minor_version: 0,
-            length: 0,
-            release_number: 1,
-            resource_id_base: 0x20,
-            resource_id_mask: 0b1100,
-            motion_buffer_size: 0,
-            vendor_len: 0,
-            maximum_request_length: 256,
-            roots_len: 1,
-            pixmap_formats_len: 0,
-            image_byte_order: ImageOrder::LSBFirst,
-            bitmap_format_bit_order: ImageOrder::LSBFirst,
-            bitmap_format_scanline_unit: 32,
-            bitmap_format_scanline_pad: 32,
-            min_keycode: 8,
-            max_keycode: 255,
-            vendor: Vec::new(),
-            pixmap_formats: Vec::new(),
-            roots: vec![screen()],
-        };
-        let mut bytes = Vec::new();
-        setup.serialize(&mut Writer::new(&mut bytes));
-        let extra = bytes.len() - 8;
-        setup.length = u16::try_from(extra / 4).unwrap();
-        bytes.clear();
-        setup.serialize(&mut Writer::new(&mut bytes));
-        let (mut connection, _) = XConnection::new();
-        let mut dispatcher = Dispatcher::default();
-        let read = connection.on_read(&bytes, &mut dispatcher);
-        assert!(read.dead.is_none());
-        assert_eq!(connection.state(), State::Ready);
-        (connection, dispatcher)
     }
 
     fn started() -> (XConnection, Dispatcher, Startup, Vec<u8>) {
@@ -796,17 +736,8 @@ mod tests {
         bytes
     }
 
-    fn requests(bytes: &[u8]) -> Vec<&[u8]> {
-        let mut found = Vec::new();
-        let mut offset = 0;
-        while offset + 4 <= bytes.len() {
-            let units = u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
-            let len = usize::from(units) * 4;
-            found.push(&bytes[offset..offset + len]);
-            offset += len;
-        }
-        assert_eq!(offset, bytes.len());
-        found
+    fn requests(bytes: &[u8]) -> Vec<Vec<u8>> {
+        split_requests(bytes)
     }
 
     fn query_name(request: &[u8]) -> &[u8] {
@@ -868,10 +799,8 @@ mod tests {
     #[test]
     fn queries_use_the_wire_names_and_a_second_start_is_idle() {
         let (mut connection, _, mut startup, queries) = started();
-        let names: Vec<&[u8]> = requests(&queries)
-            .iter()
-            .map(|request| query_name(request))
-            .collect();
+        let found = requests(&queries);
+        let names: Vec<&[u8]> = found.iter().map(|request| query_name(request)).collect();
         assert_eq!(names, [b"Composite".as_slice(), b"XFIXES", b"RENDER", b"X-Resource"]);
         startup.start(&mut connection, Redispatcher::to_any(AnyAction::from));
         assert!(connection.take_outgoing().is_empty());
@@ -894,14 +823,14 @@ mod tests {
         let version_requests = requests(&version_bytes);
         assert_eq!(version_requests.len(), 4);
         assert_eq!(version_requests[0][0], 142);
-        assert_eq!(u32_at(version_requests[0], 4), 0);
-        assert_eq!(u32_at(version_requests[0], 8), 4);
+        assert_eq!(u32_at(&version_requests[0], 4), 0);
+        assert_eq!(u32_at(&version_requests[0], 8), 4);
         assert_eq!(version_requests[1][0], 143);
-        assert_eq!(u32_at(version_requests[1], 4), 6);
-        assert_eq!(u32_at(version_requests[1], 8), 0);
+        assert_eq!(u32_at(&version_requests[1], 4), 6);
+        assert_eq!(u32_at(&version_requests[1], 8), 0);
         assert_eq!(version_requests[2][0], 144);
-        assert_eq!(u32_at(version_requests[2], 4), 0);
-        assert_eq!(u32_at(version_requests[2], 8), 11);
+        assert_eq!(u32_at(&version_requests[2], 4), 0);
+        assert_eq!(u32_at(&version_requests[2], 8), 11);
         assert_eq!(version_requests[3][0], 145);
         assert_eq!(version_requests[3][4], 1);
         assert_eq!(version_requests[3][5], 2);
@@ -921,7 +850,7 @@ mod tests {
         let atom_requests = requests(&atom_bytes);
         assert_eq!(atom_requests.len(), crate::x11::atoms::NAMES.len());
         assert_eq!(atom_requests[0][1], 0);
-        assert_eq!(query_name(atom_requests[0]), b"CLIPBOARD");
+        assert_eq!(query_name(&atom_requests[0]), b"CLIPBOARD");
 
         let mut event = Vec::new();
         XFixesSelectionNotify {

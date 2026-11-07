@@ -153,6 +153,14 @@ impl CursorState {
         self.set_named_cursor_internal(CursorOwner::Compositor, DEFAULT_ICON_NAMES)
     }
 
+    /// The first frame of `default`, or of `left_ptr` when `default` is absent.
+    pub(crate) fn default_image(&mut self) -> Option<CursorImage> {
+        DEFAULT_ICON_NAMES.iter().find_map(|name| {
+            self.load_icon(name)
+                .and_then(|animation| animation.frames.into_iter().next())
+        })
+    }
+
     pub fn ensure_default_named_cursor(&mut self) -> bool {
         if matches!(
             self.source.as_ref(),
@@ -338,6 +346,22 @@ impl CursorState {
             CursorSource::Named(cursor) => cursor.owner.client_id(),
             CursorSource::Surface { cursor } => Some(cursor.surface.client_id()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_block_icons(&mut self, names: &[&str]) {
+        for name in names {
+            self.cache.insert((*name).to_string(), None);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_cache_frames(&mut self, name: &str, frames: Vec<CursorImage>) {
+        let total_duration_msec = frames
+            .iter()
+            .fold(0u32, |total, frame| total.saturating_add(frame.delay_msec.max(1)));
+        self.cache
+            .insert(name.to_string(), Some(NamedCursorAnimation { frames, total_duration_msec }));
     }
 
     #[cfg(test)]
@@ -686,5 +710,22 @@ mod tests {
             cursor.source().unwrap(),
             CursorSourceRef::Named { owner_client_id: None, .. }
         ));
+    }
+
+    #[test]
+    fn default_image_is_the_first_cached_frame() {
+        let mut cursor = CursorState::new("tema-missing-cursor-theme".to_string(), 24);
+        cursor.test_block_icons(DEFAULT_ICON_NAMES);
+        assert!(cursor.default_image().is_none());
+        let first = CursorImage::new("default".to_string(), 1, 1, 2, 3, 1, vec![1, 2, 3, 4]);
+        let second = CursorImage::new("default".to_string(), 1, 1, 0, 0, 1, vec![5, 6, 7, 8]);
+        cursor.test_cache_frames("default", vec![first.clone(), second]);
+        assert_eq!(
+            cursor
+                .default_image()
+                .as_ref()
+                .map(|image| &image.pixels_rgba),
+            Some(&first.pixels_rgba)
+        );
     }
 }

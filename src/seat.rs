@@ -1195,6 +1195,20 @@ impl SeatState {
         self.cursor.set_theme(theme_name, theme_size)
     }
 
+    pub(crate) fn default_cursor_image(&mut self) -> Option<crate::cursor::CursorImage> {
+        self.cursor.default_image()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_block_cursor_icons(&mut self, names: &[&str]) {
+        self.cursor.test_block_icons(names);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_cache_cursor_icon(&mut self, name: &str, image: crate::cursor::CursorImage) {
+        self.cursor.test_cache_frames(name, vec![image]);
+    }
+
     pub fn pointer_position(&self) -> (f64, f64) {
         self.pointer_pos
     }

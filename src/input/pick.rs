@@ -60,7 +60,7 @@ fn pick_roots(
             || surface.has_cursor_role()
             || surface.has_dnd_icon_role()
             || surface.has_lock_surface_role()
-            || surface.has_xwayland_role()
+            || surface.is_hidden_xwayland_surface()
         {
             continue;
         }
@@ -1142,5 +1142,41 @@ mod tests {
                 .map(|focus| focus.target.surface),
             Some(popup_wl)
         );
+    }
+
+    #[test]
+    fn pick_finds_a_shown_x_root_with_a_buffer_at_its_x_position() {
+        let mut state = state_for_tests();
+        let (_, object_id) =
+            state.insert_object(WlSurface::new(WlSurfaceId::from(40), ClientId::from_raw(1), 6));
+        let surface = Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(40), object_id);
+        state.register_root_surface(surface);
+        {
+            let wl_surface = state
+                .objects
+                .get_mut(surface.object_id())
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            assert!(wl_surface.assign_xwayland_role());
+            wl_surface.test_map(ObjectId::from(900usize), 0, 0, 10, 12);
+            wl_surface.set_root_position(30, 40);
+            wl_surface.set_xwayland_shown(true);
+        }
+
+        assert_eq!(
+            scene_pick_at(&state, (30.5, 40.5))
+                .surface_focus
+                .map(|focus| focus.target.surface),
+            Some(surface)
+        );
+        assert!(scene_pick_at(&state, (0.5, 0.5)).surface_focus.is_none());
+
+        state
+            .objects
+            .get_mut(surface.object_id())
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .test_clear_committed_buffer();
+        assert!(scene_pick_at(&state, (30.5, 40.5)).surface_focus.is_none());
     }
 }

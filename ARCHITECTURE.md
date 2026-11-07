@@ -553,8 +553,8 @@ If coming back after a long time, this order should restore the mental model qui
    Understand output buffer allocation.
 12. `src/input.rs`, `src/udev.rs`, `src/dbus.rs`
    Rebuild device discovery and session/device access.
-13. `src/x11/` and section 19
-   The X11 codec, the sans-IO connection, startup, and the io_uring driver. M5's XWM model is the owner.
+13. `src/x11/` and sections 19 and 20
+   The X11 codec, the sans-IO connection, startup, and the io_uring driver. Section 20 is the XWM that owns them.
 
 ## 14. Vocabulary
 
@@ -619,7 +619,9 @@ If coming back after a long time, this order should restore the mental model qui
 - pending queue: sent requests, in order, waiting for a later sequence to retire them
 - sync point: the GetInputFocus that `take_outgoing` appends after void requests, so those voids can retire
 - atom: a numeric id for a string. `NAMES` are interned at startup. `PREDEFINED` are fixed values from the generated constants
-- XWM: the model M5 adds. It owns the X connection and claims `WM_S0`
+- XWM: the window manager in section 20. It owns the X connection for one Xwayland run and claims `WM_S0`
+- check window: the 10×10 window created when the XWM claims its role. It owns `WM_S0` and `_NET_WM_CM_S0`. Its id is `_NET_SUPPORTING_WM_CHECK` on the root and on itself, and its `_NET_WM_NAME` is `tema`
+- `WM_STATE`: the ICCCM property, type `WM_STATE`, format 32, two CARD32s `[state, icon_window]`. Normal is `[1, 0]`. Withdrawn is `[0, 0]`
 - `xwayland_surface_v1`: the role object that links one `wl_surface` to an X window. The X role remains after the object is destroyed
 - serial: the non-zero `u64` from `set_serial`, low half in `serial_lo` and high half in `serial_hi`. It is pending until `wl_surface.commit`, then stored on the current Xwayland run
 
@@ -793,7 +795,7 @@ Give-up logs `Xwayland gave up: …`, unlinks both files, and removes `DISPLAY` 
 
 ### `WM_S0`
 
-`-wm 5` is always passed, and our end of that socket stays open. Xwayland accepts clients on the listen socket only once a window manager owns the `WM_S0` selection. Nothing here claims it yet. That arrives in M5, on the connection in section 19. Until then `xterm` starts Xwayland, the server becomes ready, and the X client waits.
+`-wm 5` is always passed, and our end of that socket stays open. Displayfd readiness starts the window manager in section 20 on that socket. Xwayland accepts clients on the listen socket once that window manager owns the `WM_S0` selection.
 
 ### Xwayland-only globals
 
@@ -815,13 +817,13 @@ The role is `Role::XwaylandSurface`. `get_xwayland_surface` assigns it, and it s
 
 `wl_surface.destroy` while the `xwayland_surface_v1` still exists is `wl_surface.defunct_role_object`. The client is disconnected, and both objects stay. After the role object is gone, destroying the surface succeeds. A committed serial queues `Destroyed` with that serial and the surface. With no committed serial, that destroy queues nothing.
 
-An X-role root is left out of the scene, pointer picking, rendering, and keyboard focus restore. `register_root_surface` still records it. Drawing waits until M5 and M6 pair the window and map it.
+A hidden X-role root stays out of the scene, pointer picking, and rendering. `register_root_surface` still records it. Section 20 shows it, as an unmanaged root at its X position, once the window is paired and mapped. Keyboard focus restore still skips every X-role surface.
 
 ### Surface events
 
 `XwaylandAction::Surface` carries `SerialAssigned` or `Destroyed`, and the client id. The types live in `src/xwayland/surfaces.rs`. The current run applies the event when that client is the adopted Xwayland client. Another client, or an event while Xwayland is not running, is logged at debug and dropped. `Destroyed` removes the serial when the stored surface is the one in the event. `ClientClosed` clears the map. `surface_for_serial` reads it. A successful assign is stored there and is not logged on its own.
 
-M5's XWM pairs the X client message `WL_SURFACE_SERIAL` with that map. The message serial is `data[0] | (data[1] << 32)`, the same packing as `set_serial`. The lookup is `surface_for_serial`.
+The window manager in section 20 pairs the X client message `WL_SURFACE_SERIAL` with that map. The message serial is `data[0] | (data[1] << 32)`, the same packing as `set_serial`. The lookup is `surface_for_serial`.
 
 ### Manual check
 
@@ -829,7 +831,7 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 
 1. `ls /tmp/.X11-unix/XN /tmp/.XN-lock` shows both files. `pgrep -x Xwayland` prints nothing.
 2. Spawn a terminal with the usual keybinding. `echo $DISPLAY` prints `:N`.
-3. `Xwayland -version` reports 24.1 or newer. Run `xterm` with `RUST_LOG=debug` on the compositor. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, `Xwayland ready on :N`, and `bound xwayland_shell_v1`. `xterm` still waits, because `WM_S0` is M5, so no window surface is associated and no serial is committed. Nothing is drawn.
+3. `Xwayland -version` reports 24.1 or newer. Run `xterm` with `RUST_LOG=debug` on the compositor. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, `Xwayland ready on :N`, `bound xwayland_shell_v1`, and `XWM ready on :N`. The window checks are in section 20.
 4. `kill -9 $(pgrep -x Xwayland)`. The log shows `Xwayland exited with signal 9`. A new `xterm` starts Xwayland again on the same `:N`, and both files are still there. A signal within ten seconds of becoming ready counts as an early failure, so one kill relaunches, and a third early failure gives up.
 5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
 6. `[xwayland] enabled = false`, then start tema. The log says `Xwayland disabled`. Neither file exists, and a spawned terminal has an empty `DISPLAY`.
@@ -874,7 +876,7 @@ M6 adds X windows on this same path. The X role object stays in `state.objects` 
 
 ## 19. The X11 connection
 
-`src/x11/` is the library M5's window-manager model will own. The running compositor still only launches Xwayland, as section 17 describes, and the `-wm` socket stays open. This library is what will speak on it.
+`src/x11/` is the library the window manager in section 20 owns. Section 17 launches Xwayland and holds the `-wm` socket open. This library is what speaks on it.
 
 The owner keeps an `XConnection` and an `XIo` beside the model that drives them. `send` takes a `Redispatcher`, and the reply comes back as an action.
 
@@ -934,9 +936,9 @@ The intern batch follows the version replies. Each name in `NAMES` goes out as a
 
 `get_property` sends one `GetProperty`. `long_offset` is 0, `delete` is 0, and `long_length` is `max_bytes / 4`. The reply becomes a `Property` with its type, format, bytes, and `truncated` set when `bytes_after` is non-zero. `Atom::Any` keeps the type the server returns. A requested type that differs, on a property that exists, is a type error. Format 0 is an absent property. `as_u32s`, `as_atoms`, and `as_windows` read native-endian format 32 words. `as_utf8` replaces invalid sequences. `as_latin1` maps each byte to a character. The change helpers build a `Replace` `ChangeProperty`. `delete_property` builds `DeleteProperty`.
 
-### Who owns it in M5
+### Who owns it
 
-M5's XWM model owns the `XConnection` and the `XIo`. It writes the setup, runs `Startup`, and passes a `Redispatcher` that turns each reply into an action of that model. The `WM_S0` claim from section 17 happens on this connection once startup is ready.
+The XWM in section 20 owns the `XConnection` and the `XIo` for the current run. Displayfd readiness starts it. It writes the setup, runs `Startup`, and passes a `Redispatcher` that turns each reply into `XwaylandAction::Wm`. The `WM_S0` claim runs on this connection once startup is ready.
 
 ### Trying it against Xwayland
 
@@ -947,3 +949,83 @@ WAYLAND_DISPLAY=<socket> cargo test --offline --bin tema x11::live:: -- --ignore
 ```
 
 It spawns `/usr/bin/Xwayland :N -rootless -wm <fd> -displayfd <fd>`, drives the connection with `poll`, `read`, and `write`, runs startup, and reads `WM_NAME` on the root. The spawn runs when `WAYLAND_DISPLAY` is set.
+
+## 20. The X window manager
+
+`src/xwayland/xwm/` is the window manager for one Xwayland run. The current `Run` holds it as `wm`. Displayfd readiness, the same moment section 17 logs `Xwayland ready on :N`, calls `Wm::start` with the `-wm` descriptor, the run counter, and the display number. `XwaylandAction::Wm` carries the run. An action from an older run is dropped. The code lives next to the connection in section 19 and uses it. It does not speak Wayland itself. Surface pairing arrives as `XwaylandAction::Surface`.
+
+### Startup
+
+`Wm::start` queues the setup bytes from `XConnection::new` and arms one 64 KiB read. The handshake reaching Ready starts `Startup`. Ready claims the role, logs `XWM ready on :N`, and then uploads the root cursor. A failed handshake, a failed startup, or a send error during the claim logs `XWM failed: …`, cancels the X read, drops `Run.wm`, and SIGKILLs that Xwayland. Section 17's restart policy then applies. A protocol error on one of the claim's void requests is logged with the request name and the connection stays up.
+
+`take_child`, `Stop`, and a lost forker stop the WM before they cancel reads or kill the process. The Wayland client closing does the same through the process exit.
+
+### The role claim
+
+The claim is ten void requests, in this order:
+
+1. `ChangeWindowAttributes` on the root. The event mask is `SubstructureNotify`, `SubstructureRedirect`, and `PropertyChange`.
+2. `CompositeRedirectSubwindows` with `Redirect::Manual`.
+3. `CreateWindow` for the check window: 10×10, `InputOutput`, depth 0, visual 0, parent the root, placed at (0, 0). The id is the first one `generate_id` returns.
+4. `_NET_WM_NAME` `tema`, type `UTF8_STRING`, on the check window.
+5. `_NET_SUPPORTING_WM_CHECK`, type `WINDOW`, on the root. The value is the check window id.
+6. `_NET_SUPPORTING_WM_CHECK`, type `WINDOW`, on the check window. The value is the check window id.
+7. `SetSelectionOwner` of `WM_S0`, owner the check window, time 0.
+8. `SetSelectionOwner` of `_NET_WM_CM_S0`, the same owner and time.
+9. `_NET_SUPPORTED`, type `ATOM`, on the root. The atoms are `_NET_WM_STATE`, `_NET_ACTIVE_WINDOW`, `_NET_WM_MOVERESIZE`, `_NET_WM_STATE_FOCUSED`, `_NET_WM_STATE_MODAL`, `_NET_WM_STATE_FULLSCREEN`, `_NET_WM_STATE_MAXIMIZED_VERT`, `_NET_WM_STATE_MAXIMIZED_HORZ`, `_NET_WM_STATE_HIDDEN`, `_NET_CLIENT_LIST`, and `_NET_CLIENT_LIST_STACKING`.
+10. `_NET_ACTIVE_WINDOW`, type `WINDOW`, value `[0]`, on the root.
+
+### The root cursor
+
+After the claim, the seat's default cursor image is the first frame of `default`, or of `left_ptr` when `default` has none. With an image, the WM sends `RenderQueryPictFormats` and keeps the image until the reply. The format is the direct pictformat of depth 32 whose channels are alpha at 24, red at 16, green at 8, and blue at 0, each with mask `0xff`. The upload is `CreatePixmap`, `CreateGc`, `PutImage` of the premultiplied pixels as native-endian ARGB, `RenderCreatePicture`, `RenderCreateCursor` at the image hotspot, and `ChangeWindowAttributes` of the root cursor. The picture, gc, and pixmap are then freed.
+
+A missing image, an image with no pixels, a missing format, a request that does not fit, or a reply error is logged at debug and skipped. The WM stays up.
+
+### Window lifetime
+
+`CreateNotify` records a window other than the check window and other than an id already recorded. A duplicate does not reset the record. The event rectangle is both `geometry` and `pending`. The window then gets `PropertyChange` and `FocusChange`. `override_redirect` is stored from the event.
+
+`MapRequest` on a known window writes `WM_STATE` Normal, which is `[1, 0]`. When `pending` has a positive width and height, it configures the window to 1×1 at (0, 0) and then to `pending`. It then writes `_NET_WM_STATE` from the stored flags and sends `MapWindow`. An unknown window sends nothing.
+
+`MapNotify` sets `mapped` and refreshes `override_redirect`. `UnmapNotify` clears `mapped` and writes `WM_STATE` Withdrawn, which is `[0, 0]`.
+
+`ConfigureRequest` on a window that is not shown merges the `X`, `Y`, `Width`, and `Height` bits into `pending`. A shown window, and an unknown window, leave `pending` as it was. `ConfigureNotify` updates `override_redirect` and `geometry`. While the window is not shown, `pending` becomes that geometry. While it is shown, the root moves.
+
+`DestroyNotify` drops the window. When `by_serial` points at it, that entry goes too. A shown surface is hidden.
+
+### Serial pairing
+
+`WL_SURFACE_SERIAL` is a `ClientMessage` of format 32 whose type is that atom, on a window already tracked. The serial is `data32[0] | (data32[1] << 32)`. `last_serial` starts at 0, so serial 0 is ignored. A serial at or below `last_serial` is logged at debug and ignored. A higher serial becomes `last_serial`, the previous `by_serial` entry is removed, the old surface is unpaired, and the new serial is stored. When the run's surface map already holds that serial, the window is paired. `SerialAssigned` pairs in the other order. Pairing requires the X role and a committed serial equal to the message. The log is `X window … paired with …`.
+
+`Destroyed` clears the surface when it is the one stored on that serial's window. The `by_serial` entry stays until `DestroyNotify`.
+
+### Showing
+
+A window is shown when it has a paired surface and `mapped` is set. Showing places the root at `geometry.x`, `geometry.y`, sets `xwayland_shown`, marks the root geometry dirty, and damages the old rectangle and the new one. Hiding clears the flag, with `try_grab` because the surface may already be gone, and damages the old rectangle. The scene, pointer picking, and output assignment use `is_hidden_xwayland_surface`, so a shown X root is an unmanaged root and a hidden one is skipped. The committed buffer supplies the surface size. The X position is the compositor's global logical position. Keyboard focus still skips every X-role surface.
+
+`ConfigureNotify` on a shown window updates that position. `ConfigureRequest` on a shown window is ignored, so a client cannot drag a window that is already on screen. M6 is what moves a managed window into the layout. Until then every shown window, including an override-redirect menu, stays an unmanaged root at its X geometry.
+
+### Properties
+
+Pairing sends `GetProperty` for `WM_CLASS`, `WM_NAME`, `_NET_WM_NAME`, `WM_TRANSIENT_FOR` (`WINDOW`), `WM_PROTOCOLS` (`ATOM`), `WM_HINTS`, `WM_NORMAL_HINTS` (`WM_SIZE_HINTS`), `_MOTIF_WM_HINTS`, `_NET_STARTUP_ID`, `_NET_WM_STATE`, `_NET_WM_WINDOW_TYPE` (`ATOM`), and `WM_WINDOW_ROLE`. The type is `Atom::Any` unless a type is named above. `max_bytes` is 4096. The reply is `WmEvent::Property`. A window that is already gone drops it. `truncated` keeps the bytes that arrived and logs them at debug.
+
+`PropertyNotify` on a tracked window reloads that one atom. An atom outside the list, or a window that is not tracked, sends nothing.
+
+A UTF-8 title, from `WM_NAME` or `_NET_WM_NAME`, replaces `title` and sets `utf8_title`. A later `STRING` `WM_NAME` leaves that title in place. `STRING` before any UTF-8 title is Latin-1. `COMPOUND_TEXT` leaves the title unchanged. A missing `WM_CLASS` clears instance and class. A present value splits on NUL into instance and class. A missing `WM_WINDOW_ROLE` clears the role. `WM_TRANSIENT_FOR` keeps the first window, and a missing or failed read clears it. `WM_PROTOCOLS` and `_NET_WM_WINDOW_TYPE` replace their atom lists when the read succeeds. A missing `WM_HINTS`, a failed read, or a value whose flags omit `InputHint`, sets `input_hint`. `WM_NORMAL_HINTS` keeps at most 18 words. `_MOTIF_WM_HINTS` stores the decorations word, index 2, as 0 when the value is shorter. `_NET_WM_STATE` clears `fullscreen` and then sets each of modal, fullscreen, maximized vertically, maximized horizontally, and hidden whose atom is present. Flags absent from the new value stay as they were, other than fullscreen.
+
+`MapRequest` writes those five flags back as `_NET_WM_STATE`, type `ATOM`, in that order, immediately before `MapWindow`.
+
+### `WM_STATE`
+
+`WM_STATE` is type `WM_STATE`, format 32, and two CARD32s, `[state, icon_window]`. `MapRequest` writes Normal, `[1, 0]`. `UnmapNotify` writes Withdrawn, `[0, 0]`. The icon window is 0.
+
+### Manual check
+
+Run a normal session from a terminal, with `RUST_LOG=debug`. Note `:N` in `Allocated display :N`.
+
+1. Run `xterm`. The log shows `Xwayland ready on :N` and `XWM ready on :N`. The window appears at the position X gave it.
+2. Run `xterm -geometry 80x24+200+100`. That window appears at X position (200, 100).
+3. Ctrl+click in an xterm. The override-redirect menu appears at the pointer.
+4. `xprop -root _NET_SUPPORTING_WM_CHECK` prints a window id. `xprop -id <that id> _NET_WM_NAME` prints `tema`. `xprop -root _NET_SUPPORTED` lists the eleven atoms from the claim, in that order. `xprop WM_STATE` on the xterm prints `window state: Normal` and icon window `0x0`.
+5. Close the xterm. The window leaves the screen.
+6. `kill -9 $(pgrep -x Xwayland)`. A new `xterm` starts Xwayland again on the same `:N`, logs `XWM ready on :N`, and shows a window. A signal within ten seconds of becoming ready still counts as an early failure, as section 17 describes.

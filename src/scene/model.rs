@@ -124,7 +124,7 @@ fn collect_unmanaged_scene_entries(
         if surface.has_cursor_role()
             || surface.has_dnd_icon_role()
             || surface.has_lock_surface_role()
-            || surface.has_xwayland_role()
+            || surface.is_hidden_xwayland_surface()
         {
             continue;
         }
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn excludes_xwayland_roots_from_scene_model() {
+    fn scene_includes_an_x_root_only_while_it_is_shown() {
         let mut state = state_for_tests();
         let surface = insert_root(&mut state, 30);
         assert!(state
@@ -236,12 +236,27 @@ mod tests {
             .unwrap()
             .assign_xwayland_role());
 
-        let scene = build_scene_model(&state);
-        assert!(scene.entries.is_empty());
-        assert!(!scene
-            .entries
-            .iter()
-            .any(|entry| entry.root_surface == surface || entry.role == SceneRole::UnmanagedRoot));
+        let hidden = build_scene_model(&state);
+        assert!(hidden.entries.is_empty());
+
+        state
+            .objects
+            .get_mut(surface.object_id())
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .set_xwayland_shown(true);
+        let shown = build_scene_model(&state);
+        assert!(shown.entries.iter().any(|entry| {
+            entry.root_surface == surface && entry.role == SceneRole::UnmanagedRoot
+        }));
+
+        state
+            .objects
+            .get_mut(surface.object_id())
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .set_xwayland_shown(false);
+        assert!(build_scene_model(&state).entries.is_empty());
     }
 
     #[test]

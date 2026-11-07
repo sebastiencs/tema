@@ -216,6 +216,8 @@ pub struct WlSurface {
     xwayland_surface_object: Option<Resolved<XwaylandSurfaceV1Id>>,
     /// Serial applied by a successful commit. `None` until then.
     xwayland_serial: Option<u64>,
+    /// Set once the X window manager has placed this surface.
+    xwayland_shown: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -459,6 +461,7 @@ impl WlSurface {
             lock_surface: None,
             xwayland_surface_object: None,
             xwayland_serial: None,
+            xwayland_shown: false,
         }
     }
 
@@ -591,6 +594,14 @@ impl WlSurface {
         self.role == Role::XwaylandSurface
     }
 
+    pub fn is_hidden_xwayland_surface(&self) -> bool {
+        self.has_xwayland_role() && !self.xwayland_shown
+    }
+
+    pub(crate) fn set_xwayland_shown(&mut self, shown: bool) {
+        self.xwayland_shown = shown;
+    }
+
     pub fn lock_surface(&self) -> Option<Resolved<ExtSessionLockSurfaceV1Id>> {
         self.lock_surface
     }
@@ -643,6 +654,11 @@ impl WlSurface {
 
     pub fn xwayland_serial(&self) -> Option<u64> {
         self.xwayland_serial
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_xwayland_serial(&mut self, serial: u64) {
+        self.xwayland_serial = Some(serial);
     }
 
     pub(crate) fn set_pending_xwayland_serial(&mut self, serial: u64) {

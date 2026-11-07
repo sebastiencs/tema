@@ -288,6 +288,12 @@ impl XConnection {
         self.write_request(request, true, PendingKind::Void)
     }
 
+    /// The sequence the next request will use.
+    #[cfg(test)]
+    pub(crate) fn test_next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     /// Bytes waiting to be written. Appends GetInputFocus when void requests trail.
     pub(crate) fn take_outgoing(&mut self) -> Vec<u8> {
         if self.state == State::Ready && self.needs_sync {

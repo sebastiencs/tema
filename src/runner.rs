@@ -376,6 +376,22 @@ impl Dispatcher {
             .filter(|action| predicate(action))
             .count()
     }
+
+    /// Removes every queued `T` and returns those values. Other actions stay queued.
+    pub(crate) fn test_take_queued_actions<T: 'static>(&mut self) -> Vec<T> {
+        let mut kept = VecDeque::new();
+        let mut taken = Vec::new();
+        for action in self.queue.drain(..) {
+            match action.ptr.downcast::<T>() {
+                Ok(value) => taken.push(*value),
+                Err(ptr) => {
+                    kept.push_back(AnyAction { id: action.id, ptr, type_name: action.type_name })
+                }
+            }
+        }
+        self.queue = kept;
+        taken
+    }
 }
 
 pub enum Redispatcher<R> {
@@ -1097,5 +1113,16 @@ mod shutdown_tests {
             session_shutdown(SessionFault::BusClosed, "system bus closed").to_string(),
             "dbus: system bus closed"
         );
+    }
+
+    #[test]
+    fn test_take_queued_actions_leaves_the_other_actions_queued() {
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.dispatch(1u32);
+        dispatcher.dispatch("kept".to_string());
+        dispatcher.dispatch(2u32);
+        assert_eq!(dispatcher.test_take_queued_actions::<u32>(), vec![1, 2]);
+        assert_eq!(dispatcher.test_take_queued_actions::<String>(), vec!["kept".to_string()]);
+        assert!(dispatcher.test_take_queued_actions::<u32>().is_empty());
     }
 }
