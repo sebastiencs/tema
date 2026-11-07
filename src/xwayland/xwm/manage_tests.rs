@@ -24,7 +24,7 @@ use super::{
     Wm, WmEvent, WmPhase,
 };
 
-fn atoms(wm: &Wm) -> Atoms {
+pub(super) fn atoms(wm: &Wm) -> Atoms {
     let WmPhase::Ready(ready) = &wm.phase else { panic!("ready") };
     ready.atoms
 }
@@ -100,13 +100,13 @@ fn reply(
     deliver_property(wm, state, dispatcher, surfaces, window, property, result);
 }
 
-struct ManagedWindow {
-    surface: Resolved<WlSurfaceId>,
-    window: crate::window::WindowId,
-    object: crate::state::ObjectId,
+pub(super) struct ManagedWindow {
+    pub(super) surface: Resolved<WlSurfaceId>,
+    pub(super) window: crate::window::WindowId,
+    pub(super) object: crate::state::ObjectId,
 }
 
-fn manage(
+pub(super) fn manage(
     wm: &mut Wm,
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,
@@ -133,7 +133,7 @@ fn manage(
     )
 }
 
-fn manage_with(
+pub(super) fn manage_with(
     wm: &mut Wm,
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,
@@ -200,7 +200,7 @@ fn pair_box(
     surface
 }
 
-fn cardinals(words: &[u32]) -> crate::x11::Property {
+pub(super) fn cardinals(words: &[u32]) -> crate::x11::Property {
     let mut data = Vec::with_capacity(words.len() * 4);
     for word in words {
         data.extend(word.to_ne_bytes());
@@ -1091,7 +1091,7 @@ fn close_on_a_focused_x_window_queues_the_wm_close() {
     }));
 }
 
-fn delete_window_request(window: Window, protocols: Atom, delete: Atom) -> Vec<u8> {
+pub(super) fn delete_window_request(window: Window, protocols: Atom, delete: Atom) -> Vec<u8> {
     let mut data = ClientMessageData::default();
     data.set_data32([delete.0, 0, 0, 0, 0]);
     let message = ClientMessage {
@@ -1237,6 +1237,7 @@ fn iconic_while_unfocused_writes_iconic_and_hidden() {
     let window = Window(0x50);
     let managed =
         manage(&mut wm, &mut state, &mut dispatcher, &mut surfaces, window, 80, 1, "Term", "XTerm");
+    state.seat.keyboard_focus = None;
     let ready = atoms(&wm);
     let sent = deliver(
         &mut wm,
@@ -1286,7 +1287,7 @@ fn change_state_normal_clears_hidden() {
     );
 }
 
-fn state_message(window: Window, kind: Atom, words: [u32; 5]) -> Event {
+pub(super) fn state_message(window: Window, kind: Atom, words: [u32; 5]) -> Event {
     let mut data = ClientMessageData::default();
     data.set_data32(words);
     Event::ClientMessage(ClientMessage {
@@ -1299,14 +1300,14 @@ fn state_message(window: Window, kind: Atom, words: [u32; 5]) -> Event {
     })
 }
 
-fn net_state_request(window: Window, atoms: &Atoms, state: &[Atom]) -> Vec<u8> {
+pub(super) fn net_state_request(window: Window, atoms: &Atoms, state: &[Atom]) -> Vec<u8> {
     testing::encode(
         &change_property_atoms(window, atoms._NET_WM_STATE, atoms.ATOM, state).request(),
         0,
     )
 }
 
-fn wm_state_request(window: Window, wm_state: Atom, state: u32) -> Vec<u8> {
+pub(super) fn wm_state_request(window: Window, wm_state: Atom, state: u32) -> Vec<u8> {
     testing::encode(&change_property_u32s(window, wm_state, wm_state, &[state, 0]).request(), 0)
 }
 
@@ -1462,7 +1463,7 @@ fn destroyed(window: Window) -> Event {
     })
 }
 
-fn window_list(atoms: &Atoms, property: Atom, windows: &[Window]) -> Vec<u8> {
+pub(super) fn window_list(atoms: &Atoms, property: Atom, windows: &[Window]) -> Vec<u8> {
     let ids: Vec<u32> = windows.iter().map(|window| window.0).collect();
     testing::encode(&change_property_u32s(Window(0x100), property, atoms.WINDOW, &ids).request(), 0)
 }
@@ -1509,7 +1510,7 @@ fn clamp_placed(origin: i32, size: i32, bounds_origin: i32, bounds_size: i32) ->
     origin.clamp(bounds_origin, bounds_origin + bounds_size - size)
 }
 
-fn hidden_workspace(
+pub(super) fn hidden_workspace(
     state: &crate::State,
     output: crate::state::OutputId,
 ) -> crate::state::WorkspaceId {
@@ -1526,7 +1527,7 @@ fn hidden_workspace(
         .expect("hidden workspace")
 }
 
-fn add_output(state: &mut crate::State) -> crate::state::OutputId {
+pub(super) fn add_output(state: &mut crate::State) -> crate::state::OutputId {
     state.insert_output(crate::test_support::test_output_drm0_wh(800, 600))
 }
 
@@ -1678,7 +1679,11 @@ fn a_resize_grab_on_a_floating_x_window_configures_the_new_size() {
     );
     state.seat.pointer_pos = (140.0, 100.0);
     assert!(crate::input::apply_pointer_interactive_grab(&mut state, &mut dispatcher));
-    let queued = dispatcher.test_take_queued_actions::<crate::xwayland::XwaylandAction>();
+    let queued = dispatcher
+        .test_take_queued_actions::<crate::xwayland::XwaylandAction>()
+        .into_iter()
+        .filter(|action| !matches!(action, crate::xwayland::XwaylandAction::KeyboardFocus))
+        .collect::<Vec<_>>();
     assert!(matches!(
         queued.as_slice(),
         [crate::xwayland::XwaylandAction::Wm {
@@ -1717,7 +1722,11 @@ fn a_floating_move_sends_the_new_position() {
     );
     state.seat.pointer_pos = (25.0, -10.0);
     assert!(crate::input::apply_pointer_interactive_grab(&mut state, &mut dispatcher));
-    let queued = dispatcher.test_take_queued_actions::<crate::xwayland::XwaylandAction>();
+    let queued = dispatcher
+        .test_take_queued_actions::<crate::xwayland::XwaylandAction>()
+        .into_iter()
+        .filter(|action| !matches!(action, crate::xwayland::XwaylandAction::KeyboardFocus))
+        .collect::<Vec<_>>();
     assert!(matches!(
         queued.as_slice(),
         [crate::xwayland::XwaylandAction::Wm { run: 1, event: WmEvent::Reconfigure }]

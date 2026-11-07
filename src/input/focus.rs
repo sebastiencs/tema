@@ -77,6 +77,7 @@ fn set_keyboard_focus_with_snapshot(
 
     let old_focus = state.seat.keyboard_focus;
     state.seat.keyboard_focus = new_focus;
+    dispatcher.dispatch(crate::xwayland::XwaylandAction::KeyboardFocus);
     if let Some(new_focus) = new_focus.filter(|_| !state.session_lock.input_gated()) {
         let root_focus = state
             .root_surface_for_surface(new_focus.surface)
@@ -194,7 +195,7 @@ fn keyboard_focus_is_restorable(state: &State, focus: SurfaceFocus) -> bool {
     if surface.has_lock_surface_role()
         || surface.has_cursor_role()
         || surface.has_dnd_icon_role()
-        || surface.has_xwayland_role()
+        || (surface.has_xwayland_role() && state.window_for_root(focus.surface).is_none())
     {
         return false;
     }

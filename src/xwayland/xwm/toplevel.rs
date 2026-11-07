@@ -10,7 +10,7 @@ use crate::{
     runner::Dispatcher,
     state::{GrabbedObject, State},
     window::{InteractiveSizeConstraints, Toplevel, ToplevelDecorationMode, WindowId},
-    x11::Window,
+    x11::{Atom, Atoms, Window},
     xwayland::XwaylandAction,
 };
 
@@ -38,6 +38,7 @@ pub(crate) struct XToplevel {
     max_size: Option<(i32, i32)>,
     maximized: bool,
     fullscreen_requested: bool,
+    accepts_focus: bool,
 }
 
 impl XToplevel {
@@ -53,16 +54,23 @@ impl XToplevel {
             max_size: None,
             maximized: false,
             fullscreen_requested: false,
+            accepts_focus: true,
         }
     }
 
     /// Copies the fields the layout reads. Returns whether the minimum size changed.
-    pub(super) fn refresh(&mut self, props: &WindowProps, parent: Option<WindowId>) -> bool {
+    pub(super) fn refresh(
+        &mut self,
+        props: &WindowProps,
+        parent: Option<WindowId>,
+        atoms: &Atoms,
+    ) -> bool {
         self.title = props.title.clone().unwrap_or_default();
         self.app_id = props.class.clone().unwrap_or_default();
         self.parent = parent;
         self.maximized = props.maximized_vert && props.maximized_horz;
         self.fullscreen_requested = props.fullscreen;
+        self.accepts_focus = accepts_focus(props, atoms);
         let previous_min = self.min_size;
         self.min_size =
             hinted_size(&props.normal_hints, P_MIN_SIZE, HINT_MIN_WIDTH, HINT_MIN_HEIGHT);
@@ -70,6 +78,29 @@ impl XToplevel {
             hinted_size(&props.normal_hints, P_MAX_SIZE, HINT_MAX_WIDTH, HINT_MAX_HEIGHT);
         previous_min != self.min_size
     }
+}
+
+/// A window takes keyboard focus on click when it has an input model and its type is not one
+/// that only decorates a pointer action.
+fn accepts_focus(props: &WindowProps, atoms: &Atoms) -> bool {
+    let takes_input = props.input_hint || props.protocols.contains(&atoms.WM_TAKE_FOCUS);
+    let never_focus = props
+        .window_types
+        .iter()
+        .any(|ty| never_focus_type(*ty, atoms));
+    takes_input && !never_focus
+}
+
+fn never_focus_type(atom: Atom, atoms: &Atoms) -> bool {
+    atom == atoms._NET_WM_WINDOW_TYPE_COMBO
+        || atom == atoms._NET_WM_WINDOW_TYPE_DND
+        || atom == atoms._NET_WM_WINDOW_TYPE_DROPDOWN_MENU
+        || atom == atoms._NET_WM_WINDOW_TYPE_MENU
+        || atom == atoms._NET_WM_WINDOW_TYPE_NOTIFICATION
+        || atom == atoms._NET_WM_WINDOW_TYPE_POPUP_MENU
+        || atom == atoms._NET_WM_WINDOW_TYPE_SPLASH
+        || atom == atoms._NET_WM_WINDOW_TYPE_TOOLTIP
+        || atom == atoms._NET_WM_WINDOW_TYPE_UTILITY
 }
 
 /// A size pair from `WM_NORMAL_HINTS` when the flag is set and both values are positive.
@@ -124,6 +155,10 @@ impl Toplevel for XToplevel {
         ToplevelDecorationMode::ServerSide
     }
 
+    fn accepts_keyboard_focus(&self) -> bool {
+        self.accepts_focus
+    }
+
     fn request_close(&self, dispatcher: &mut Dispatcher) {
         dispatcher.dispatch(XwaylandAction::Wm {
             run: self.run,
@@ -173,8 +208,17 @@ impl Object for XToplevel {
 mod tests {
     use {
         super::*,
-        crate::{runner::Dispatcher, test_support::state_for_tests},
+        crate::{
+            runner::Dispatcher,
+            test_support::state_for_tests,
+            x11::{Atom, Atoms, NAMES},
+        },
     };
+
+    fn test_atoms() -> Atoms {
+        let values: Vec<Atom> = (0..NAMES.len() as u32).map(Atom).collect();
+        Atoms::from_interned(&values)
+    }
 
     fn sized_hints(flags: u32, min: (u32, u32), max: (u32, u32)) -> Vec<u32> {
         vec![flags, 0, 0, 0, 0, min.0, min.1, max.0, max.1]
@@ -192,8 +236,10 @@ mod tests {
         props.fullscreen = true;
         props.normal_hints = sized_hints(P_MIN_SIZE | P_MAX_SIZE, (80, 40), (800, 600));
 
-        assert!(toplevel.refresh(&props, Some(parent)));
-        assert!(!toplevel.refresh(&props, Some(parent)));
+        let atoms = test_atoms();
+        assert!(toplevel.refresh(&props, Some(parent), &atoms));
+        assert!(!toplevel.refresh(&props, Some(parent), &atoms));
+        assert!(toplevel.accepts_keyboard_focus());
         assert_eq!(toplevel.window(), WindowId::for_tests(3));
         assert_eq!(toplevel.title(), "Term");
         assert_eq!(toplevel.app_id(), "XTerm");
@@ -213,7 +259,8 @@ mod tests {
         props.maximized_vert = true;
         props.normal_hints = sized_hints(0, (80, 40), (800, 600));
 
-        assert!(!toplevel.refresh(&props, None));
+        let atoms = test_atoms();
+        assert!(!toplevel.refresh(&props, None, &atoms));
         assert_eq!(toplevel.title(), "");
         assert_eq!(toplevel.app_id(), "");
         assert!(toplevel.parent_window().is_none());
@@ -223,14 +270,36 @@ mod tests {
         assert_eq!(toplevel.size_constraints().clamp(900, 700), (900, 700));
 
         props.normal_hints = vec![P_MIN_SIZE | P_MAX_SIZE, 1, 2];
-        assert!(!toplevel.refresh(&props, None));
+        let atoms = test_atoms();
+        assert!(!toplevel.refresh(&props, None, &atoms));
         assert_eq!(toplevel.minimum_size(), None);
         assert_eq!(toplevel.size_constraints().clamp(900, 700), (900, 700));
 
         props.normal_hints = sized_hints(P_MIN_SIZE | P_MAX_SIZE, (0, 40), (800, 0));
-        assert!(!toplevel.refresh(&props, None));
+        let atoms = test_atoms();
+        assert!(!toplevel.refresh(&props, None, &atoms));
         assert_eq!(toplevel.minimum_size(), None);
         assert_eq!(toplevel.size_constraints().clamp(900, 700), (900, 700));
+    }
+
+    #[test]
+    fn refresh_refuses_focus_without_input_or_for_a_never_focus_type() {
+        let atoms = test_atoms();
+        let mut toplevel = XToplevel::new(WindowId::for_tests(1), Window(1), 1);
+        let mut props = WindowProps::default();
+        props.input_hint = false;
+        toplevel.refresh(&props, None, &atoms);
+        assert!(!toplevel.accepts_keyboard_focus());
+
+        props.protocols = vec![atoms.WM_TAKE_FOCUS];
+        toplevel.refresh(&props, None, &atoms);
+        assert!(toplevel.accepts_keyboard_focus());
+
+        props.input_hint = true;
+        props.protocols.clear();
+        props.window_types = vec![atoms._NET_WM_WINDOW_TYPE_TOOLTIP];
+        toplevel.refresh(&props, None, &atoms);
+        assert!(!toplevel.accepts_keyboard_focus());
     }
 
     #[test]
@@ -271,7 +340,7 @@ mod tests {
         let mut toplevel = XToplevel::new(WindowId::for_tests(1), Window(1), 1);
         let mut props = WindowProps::default();
         props.fullscreen = true;
-        toplevel.refresh(&props, None);
+        toplevel.refresh(&props, None, &test_atoms());
 
         toplevel.set_requested_fullscreen(false);
         assert!(toplevel.is_fullscreen_requested());

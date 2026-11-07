@@ -17,16 +17,17 @@ use crate::{
     wayland_objects::wl_surface::WlSurface,
     x11::{
         change_property_atoms, change_property_u32s, change_property_utf8,
-        testing::{self, ATOM_BASE, COMPOSITE_MAJOR_OPCODE, RENDER_MAJOR_OPCODE},
-        Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientMessage, ClientMessageData,
-        Colormap, CompositeRedirectSubwindows, ConfigWindow, ConfigureNotify, ConfigureRequest,
-        ConfigureWindow, ConfigureWindowAux, CreateGc, CreateGcAux, CreateNotify, CreatePixmap,
-        CreateWindow, CreateWindowAux, Cursor, DestroyNotify, Directformat, Drawable, Event,
-        EventMask, FreeGc, FreePixmap, Gcontext, GetProperty, ImageFormat, MapNotify, MapRequest,
-        MapWindow, PictType, Pictformat, Pictforminfo, Picture, Pixmap, PropertyNotify,
-        PropertyState, PutImage, Redirect, RenderCreateCursor, RenderCreatePicture,
-        RenderCreatePictureAux, RenderFreePicture, RenderQueryPictFormats, SetSelectionOwner,
-        StackMode, UnmapNotify, Window, WindowClass, XConnection, NAMES,
+        testing::{self, ATOM_BASE, COMPOSITE_MAJOR_OPCODE, RENDER_MAJOR_OPCODE, RES_MAJOR_OPCODE},
+        Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientIdMask, ClientIdSpec,
+        ClientIdValue, ClientMessage, ClientMessageData, Colormap, CompositeRedirectSubwindows,
+        ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux,
+        CreateGc, CreateGcAux, CreateNotify, CreatePixmap, CreateWindow, CreateWindowAux, Cursor,
+        DestroyNotify, Directformat, Drawable, Event, EventMask, FreeGc, FreePixmap, Gcontext,
+        GetProperty, ImageFormat, MapNotify, MapRequest, MapWindow, PictType, Pictformat,
+        Pictforminfo, Picture, Pixmap, PropertyNotify, PropertyState, PutImage, Redirect,
+        RenderCreateCursor, RenderCreatePicture, RenderCreatePictureAux, RenderFreePicture,
+        RenderQueryPictFormats, ResQueryClientIds, ResQueryClientIdsReply, SetSelectionOwner,
+        StackMode, UnmapNotify, Window, WindowClass, XConnection, XReplyError, NAMES,
     },
 };
 
@@ -725,11 +726,107 @@ fn pairing_requests_every_window_property() {
             Atom::Any,
         ]
     );
-    let expected: Vec<Vec<u8>> = loaded
+    let mut expected: Vec<Vec<u8>> = loaded
         .into_iter()
         .map(|(property, ty)| property_request(window, property, ty))
         .collect();
+    expected.push(testing::encode(
+        &ResQueryClientIds {
+            specs: &[ClientIdSpec { client: window.0, mask: ClientIdMask::LocalClientPID }],
+        },
+        RES_MAJOR_OPCODE,
+    ));
     assert_eq!(sent, expected);
+}
+
+#[test]
+fn a_client_pid_reply_stores_the_pid() {
+    let (mut wm, mut state, mut dispatcher, surfaces) = open_wm();
+    let window = Window(0x50);
+    deliver(&mut wm, &mut state, &mut dispatcher, &surfaces, created(window, 1, 2, 3, 4, 0));
+    set_pid(&mut wm, &mut state, &mut dispatcher, &surfaces, window, 4242);
+    assert_eq!(wm.windows.get(&window).unwrap().pid, Some(4242));
+}
+
+#[test]
+fn a_client_pid_error_clears_the_pid() {
+    let (mut wm, mut state, mut dispatcher, surfaces) = open_wm();
+    let window = Window(0x50);
+    deliver(&mut wm, &mut state, &mut dispatcher, &surfaces, created(window, 1, 2, 3, 4, 0));
+    set_pid(&mut wm, &mut state, &mut dispatcher, &surfaces, window, 4242);
+    deliver_client_pid(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        window,
+        Err(XReplyError::MissingReply),
+    );
+    assert_eq!(wm.windows.get(&window).unwrap().pid, None);
+}
+
+#[test]
+fn a_client_pid_reply_without_the_pid_mask_leaves_none() {
+    let (mut wm, mut state, mut dispatcher, surfaces) = open_wm();
+    let window = Window(0x50);
+    deliver(&mut wm, &mut state, &mut dispatcher, &surfaces, created(window, 1, 2, 3, 4, 0));
+    set_pid(&mut wm, &mut state, &mut dispatcher, &surfaces, window, 4242);
+    deliver_client_pid(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        window,
+        Ok(ResQueryClientIdsReply {
+            sequence: 0,
+            ids: vec![ClientIdValue {
+                spec: ClientIdSpec { client: window.0, mask: ClientIdMask::ClientXID },
+                length: 4,
+                value: vec![7],
+            }],
+        }),
+    );
+    assert_eq!(wm.windows.get(&window).unwrap().pid, None);
+}
+
+#[test]
+fn a_client_pid_reply_for_a_destroyed_window_is_dropped() {
+    let (mut wm, mut state, mut dispatcher, surfaces) = open_wm();
+    let window = Window(0x50);
+    let kept = Window(0x51);
+    deliver(&mut wm, &mut state, &mut dispatcher, &surfaces, created(window, 1, 2, 3, 4, 0));
+    deliver(&mut wm, &mut state, &mut dispatcher, &surfaces, created(kept, 1, 2, 3, 4, 0));
+    set_pid(&mut wm, &mut state, &mut dispatcher, &surfaces, kept, 9);
+    deliver(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        Event::DestroyNotify(DestroyNotify {
+            send_event: false,
+            sequence: 0,
+            event: Window(0x100),
+            window,
+        }),
+    );
+    deliver_client_pid(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        window,
+        Ok(ResQueryClientIdsReply {
+            sequence: 0,
+            ids: vec![ClientIdValue {
+                spec: ClientIdSpec { client: window.0, mask: ClientIdMask::LocalClientPID },
+                length: 4,
+                value: vec![4242],
+            }],
+        }),
+    );
+    assert!(wm.windows.get(&window).is_none());
+    assert_eq!(wm.windows.get(&kept).unwrap().pid, Some(9));
+    assert!(matches!(wm.phase, WmPhase::Ready(_)));
 }
 
 #[test]
@@ -809,7 +906,8 @@ fn a_property_reply_fills_the_window_and_a_destroyed_window_drops_it() {
         &surfaces,
         serial_message(window, atoms.WL_SURFACE_SERIAL, 1),
     );
-    let sequence = u16::try_from(wm.conn.test_next_sequence() - 12).unwrap();
+    // Twelve property fetches, then the X-Resource pid query.
+    let sequence = u16::try_from(wm.conn.test_next_sequence() - 13).unwrap();
     feed_read(
         &mut wm,
         &mut state,
@@ -1147,6 +1245,44 @@ fn show_at(
     deliver(wm, state, dispatcher, surfaces, serial_message(window, atom, serial));
     finish_properties(wm, state, dispatcher, surfaces, window);
     surface
+}
+
+pub(super) fn set_pid(
+    wm: &mut Wm,
+    state: &mut crate::State,
+    dispatcher: &mut Dispatcher,
+    surfaces: &SurfaceSerials,
+    window: Window,
+    pid: u32,
+) {
+    deliver_client_pid(
+        wm,
+        state,
+        dispatcher,
+        surfaces,
+        window,
+        Ok(ResQueryClientIdsReply {
+            sequence: 0,
+            ids: vec![ClientIdValue {
+                spec: ClientIdSpec { client: window.0, mask: ClientIdMask::LocalClientPID },
+                length: 4,
+                value: vec![pid],
+            }],
+        }),
+    );
+}
+
+fn deliver_client_pid(
+    wm: &mut Wm,
+    state: &mut crate::State,
+    dispatcher: &mut Dispatcher,
+    surfaces: &SurfaceSerials,
+    window: Window,
+    result: Result<ResQueryClientIdsReply, XReplyError>,
+) {
+    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+    wm.handle(WmEvent::ClientPid { window, result }, &mut ctx)
+        .unwrap();
 }
 
 pub(super) fn deliver_property(
@@ -1558,6 +1694,7 @@ fn complete(
 ) -> XwaylandAction {
     dispatcher.redispatch_to(dispatch_to, result);
     let mut actions = dispatcher.test_take_queued_actions::<XwaylandAction>();
+    actions.retain(|action| !matches!(action, XwaylandAction::KeyboardFocus));
     assert_eq!(actions.len(), 1);
     actions.pop().unwrap()
 }

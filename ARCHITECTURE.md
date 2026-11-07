@@ -557,6 +557,8 @@ If coming back after a long time, this order should restore the mental model qui
    The X11 codec, the sans-IO connection, startup, and the io_uring driver. Section 20 is the XWM that owns them.
 14. `src/xwayland/xwm/` and section 21
     When a normal X window becomes a tema window, how the layout drives `ConfigureWindow`, and how an override-redirect window stays above that content.
+15. `src/xwayland/xwm/focus.rs` and section 22
+    How keyboard focus becomes X input focus: the input model, clicks, map and close, `FocusIn`, and a client's `_NET_ACTIVE_WINDOW`.
 
 ## 14. Vocabulary
 
@@ -1006,7 +1008,7 @@ A missing image, an image with no pixels, a missing format, a request that does 
 
 A window is shown when it has a paired surface and `mapped` is set. An override-redirect window is placed at its X geometry and stays an unmanaged root. A normal window waits for the property batch in section 21 and then becomes a managed window. The layout owns that root's position. `xwayland_shown` stays set for both, so the scene, picking, and output assignment see them. Hiding clears the flag, with `try_grab` because the surface may already be gone, and damages the old rectangle. A hidden X root is skipped. The committed buffer supplies the surface size.
 
-`ConfigureNotify` on an unmanaged window updates that position. `ConfigureRequest` is ignored once the window is shown or managed, so a client cannot drag a window that is already on screen. A click on a managed X window focuses its root. Mapping one does not take keyboard focus, and focus is not sent to X yet. Restoring focus after a disconnect skips an X-role surface.
+`ConfigureNotify` on an unmanaged window updates that position. `ConfigureRequest` is ignored once the window is shown or managed, so a client cannot drag a window that is already on screen. A click focuses the root when section 22 allows it. Mapping a managed window takes keyboard focus under the same policy as an xdg toplevel, and that focus is sent to X. Unlock restores a managed X window. An override-redirect root stays unrestored.
 
 ### Properties
 
@@ -1057,7 +1059,7 @@ Pairing fetches the properties in section 20. Each send increments `props_outsta
 
 `is_managed_root_surface_candidate_common` accepts an X role as well as an xdg surface. The window is live once that root has a committed buffer and a toplevel, the same check as xdg.
 
-On a `wl_surface` commit, a mapped change of an X root that already has a window confirms the map, relayouts inside `with_ungrabbed`, and kicks the animation pump when that opens surfaces. Map and unmap both mark the workspace dirty and dispatch `WorkspaceStateChanged`. There is no `FocusNewToplevel` and no `capture::map_window`. Entering or leaving managed does the same dirty, relayout, pump, and dispatch when the window has a workspace.
+On a `wl_surface` commit, a mapped change of an X root that already has a window confirms the map, relayouts inside `with_ungrabbed`, and kicks the animation pump when that opens surfaces. Map and unmap both mark the workspace dirty and dispatch `WorkspaceStateChanged`. Map also dispatches `FocusNewToplevel`. There is no `capture::map_window`. `enter_managed` focuses the root when it is already mapped and the same policy allows it. One map takes one of those two paths. Entering or leaving managed does the same dirty, relayout, pump, and dispatch when the window has a workspace. Section 22 is the focus that follows.
 
 ### `ConfigureWindow`
 
@@ -1082,7 +1084,7 @@ A floating window is centered on its `WM_TRANSIENT_FOR` parent when that parent 
 
 ### `_NET_WM_STATE` and `WM_CHANGE_STATE`
 
-A `ClientMessage` whose format is not 32, or whose window is unknown, is ignored. The other types stay `WL_SURFACE_SERIAL`, `_NET_WM_STATE`, and `WM_CHANGE_STATE`. `_NET_WM_MOVERESIZE` is advertised and ignored. Only a compositor grab moves or resizes an X window.
+A `ClientMessage` whose format is not 32, or whose window is unknown, is ignored. The handled types are `WL_SURFACE_SERIAL`, `_NET_WM_STATE`, `WM_CHANGE_STATE`, and `_NET_ACTIVE_WINDOW`. `_NET_WM_MOVERESIZE` is advertised and ignored. Only a compositor grab moves or resizes an X window. Section 22 handles `_NET_ACTIVE_WINDOW`.
 
 `_NET_WM_STATE` data `[0]` is 0 remove, 1 add, or 2 toggle. Any other action is ignored. Data `[1]` and `[2]` are atoms. Only modal, fullscreen, maximized vertically, maximized horizontally, and hidden are honored. When nothing changes, the WM stops. A fullscreen change on a managed window calls `set_window_fullscreen` and dispatches `WorkspaceStateChanged`. Hidden going from false to true goes through `request_iconify`. The `XToplevel` is then refreshed and `_NET_WM_STATE` is written from the flags. Modal and maximize are stored only.
 
@@ -1090,11 +1092,13 @@ A `ClientMessage` whose format is not 32, or whose window is unknown, is ignored
 
 `request_iconify` refuses when the seat's keyboard focus is that window's root. It writes `WM_STATE` Normal and leaves hidden false. Otherwise it writes `WM_STATE` Iconic, `[3, 0]`, and sets hidden. Either way it rewrites `_NET_WM_STATE`. The window stays mapped and in the layout.
 
+Every `_NET_WM_STATE` write lists the client flags. When `Wm.focus` is that window, `_NET_WM_STATE_FOCUSED` is appended.
+
 ### Stacking and the client lists
 
 `stack` is bottom to top. `map_order` is map order. Both hold normal windows only. `MapRequest` appends a missing window to `map_order`, moves it to the top of `stack`, and writes `_NET_CLIENT_LIST`. `MapNotify` of a window in `stack` restacks it and writes `_NET_CLIENT_LIST_STACKING`. A window with one below it is `ConfigureWindow` above that sibling. With none below and one above, it is below that sibling. Alone, the stack mode is Above. `UnmapNotify` removes the window from `map_order` and writes `_NET_CLIENT_LIST`. `DestroyNotify` removes it from both lists and writes each list that changed. Both properties are on the root, type `WINDOW`, format 32, mode Replace.
 
-`move_to_top` moves a normal window to the top of `stack` and sends nothing. Raising on activation will call it later.
+`move_to_top` moves a normal window to the top of `stack` and sends nothing by itself. Section 22 calls it when a managed window is activated, and the following restack sends the `ConfigureWindow`.
 
 ### Override-redirect order
 
@@ -1118,3 +1122,75 @@ Run a normal session from a terminal, with `RUST_LOG=debug`. Note `:N` in `Alloc
 6. `xprop -root _NET_CLIENT_LIST _NET_CLIENT_LIST_STACKING` lists the windows.
 7. An `xterm` Ctrl+click menu shows above the window, at the pointer.
 8. After a floating move and resize, a menu opens at the new position.
+
+## 22. X focus
+
+Keyboard focus on a managed X window is X input focus. The code is `src/xwayland/xwm/focus.rs`. One `Wm.focus` follows the seat. Timestamps are `CurrentTime`, which is 0.
+
+### The trigger
+
+`set_keyboard_focus_with_snapshot` stores the new focus and then dispatches `XwaylandAction::KeyboardFocus`. An unchanged focus dispatches nothing. The WM reads the seat when it handles the event, so an action that has been overtaken describes the focus that exists now.
+
+### The target
+
+No keyboard focus clears X focus. A root that has no X role clears it too. Clearing writes `_NET_ACTIVE_WINDOW` as `[0]`, type `WINDOW`, and sends `SetInputFocus` to `Window(0)` with revert `PointerRoot`. An X root that is unmanaged, including an override-redirect window, leaves `Wm.focus` where it is. A managed X root that is not override-redirect is activated.
+
+### The input model
+
+`input_hint` is the ICCCM input flag. `WM_TAKE_FOCUS` in `WM_PROTOCOLS` is the take-focus protocol.
+
+- Neither is set: the WM sends no focus request.
+- Input, and no take-focus: `SetInputFocus`.
+- Both: `SetInputFocus`, then `WM_TAKE_FOCUS`.
+- Take-focus only: `WM_TAKE_FOCUS`.
+
+`SetInputFocus` uses revert `PointerRoot`, the window, and time 0. Its sequence is stored as `last_input_sequence`. `WM_TAKE_FOCUS` is the same `SendEvent` shape as `WM_DELETE_WINDOW` in section 21, with `WM_TAKE_FOCUS` in the first data word.
+
+### Properties and the raise
+
+Activation writes `_NET_ACTIVE_WINDOW` on the root, moves `Wm.focus`, rewrites `_NET_WM_STATE` on the previous window, sends the input-model requests, rewrites `_NET_WM_STATE` on the new window, calls `move_to_top`, and restacks. `_NET_WM_STATE_FOCUSED` is present on the window `Wm.focus` names. An iconic window returns to `WM_STATE` Normal, `[1, 0]`, before the active-window write. The same target as the current `Wm.focus` sends nothing.
+
+`DestroyNotify` of the focused window clears `Wm.focus`, writes each client list that changed, then writes `_NET_ACTIVE_WINDOW` as `[0]` and sends `SetInputFocus` to `None`. Unmap leaves `Wm.focus` until the seat focus moves.
+
+### Map and the successor
+
+A newly mapped managed X window takes keyboard focus when `should_focus_new_toplevel_on_map` allows it, the same policy as an xdg toplevel. The commit path dispatches `FocusNewToplevel` when the buffer maps a window that already exists. `enter_managed` calls `set_keyboard_focus` when `window_is_mapped` is already true. One map uses one of those paths.
+
+`leave_managed`, `DestroyNotify`, and stopping the WM take `focused_window_close` before `destroy_window`, then call `refocus_after_focused_window_unmap`. Hiding an override-redirect root that holds keyboard focus clears it and calls `focus_after_client_disconnect`. Unlock restores a managed X window. An override-redirect root is left unrestored.
+
+### Clicks
+
+`Toplevel::accepts_keyboard_focus` is true for an xdg window. `XToplevel` stores false when neither `input_hint` nor `WM_TAKE_FOCUS` is set, or when `window_types` contains combo, dnd, dropdown menu, menu, notification, popup menu, splash, tooltip, or utility. A press on that window keeps the current keyboard focus. A press on an unmanaged X root keeps the current focus when that focus root already has the X role, and focuses the menu when the current focus is elsewhere. The button event still goes to the hit surface. A decoration grab still focuses its window. Map-time focus still applies to a window that refuses a click.
+
+### The client PID
+
+Pairing sends `ResQueryClientIds` when startup found the X-Resource extension. The spec is `{ client: window id, mask: LocalClientPID }`. The first value with that mask and a non-empty `value` becomes `pid`. An error, or a reply with no such value, stores `None`. The query does not delay management. A missing PID refuses every `FocusIn` handoff and every client activation.
+
+### `FocusIn`
+
+`FocusOut` is ignored. `FocusIn` with mode `Grab` or `Ungrab`, or detail `Pointer`, is ignored. Any other `FocusIn` is accepted when all of these hold:
+
+- The window is known and paired.
+- `Wm.focus` is a known window.
+- Both PIDs are `Some` and equal.
+- `widen_event_sequence` of the event is at least `last_input_sequence`.
+- The window is visible. A managed window's root has protocol visibility. An unmanaged window is `shown`.
+
+Accepting sets `Wm.focus` and rewrites `_NET_WM_STATE` on the previous window when it is managed, and on the new window when it is managed. It does not write `_NET_ACTIVE_WINDOW`. A managed window is raised with `raise_root_surface` and given keyboard focus. The `KeyboardFocus` that follows finds the same target and sends nothing. An override-redirect accept records `Wm.focus` and leaves the seat focus in place. A rejected event calls `send_focus` for the current `Wm.focus`. That resend is the focus requests alone. With `Wm.focus` empty, it is `SetInputFocus` to `None`.
+
+### Client activation
+
+A `ClientMessage` of type `_NET_ACTIVE_WINDOW` ignores its five data words. It acts when the target is managed, `Wm.focus` has a known PID, the target PID equals it, and the target root has protocol visibility. It raises that root and calls `set_keyboard_focus`. The following `KeyboardFocus` sends the activation and the restack. Any other request changes nothing. There is no workspace switch and no attention state. An override-redirect target is one of the requests that change nothing.
+
+### Manual check
+
+Run a normal session from a terminal, with `RUST_LOG=debug`. Note `:N` in `Allocated display :N`. The claim is in section 20.
+
+1. With two `xterm`s, typing goes to the focused one. `FocusNext` moves typing. `xprop -root _NET_ACTIVE_WINDOW` names the focused one.
+2. Clicking a Wayland window sets `_NET_ACTIVE_WINDOW` to `0x0`, and typing goes there.
+3. A new `xterm` takes focus when it maps.
+4. A GTK menu (`GDK_BACKEND=x11`) keeps the app frame active and works from the keyboard.
+5. A GTK dialog takes focus. Closing it returns focus to the parent.
+6. `xprop _NET_WM_STATE` on the focused window lists `_NET_WM_STATE_FOCUSED`.
+7. In a GTK app with two windows, `wmctrl -i -a <other id>` focuses and raises it. From an `xterm`, `wmctrl -a` on another app does nothing.
+8. Lock and unlock the session: focus returns to the X window.

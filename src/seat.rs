@@ -30,6 +30,7 @@ use crate::{
         xdg_surface::xdg_toplevel::{InteractiveSizeConstraints, ToplevelDecorationMode},
         zwlr_layer_surface_v1::LayerLayoutObjectSnapshot,
     },
+    window::Toplevel,
     xkb::KeyboardModifiers,
 };
 
@@ -1571,10 +1572,42 @@ fn keyboard_focus_for_pointer_press(
         }
     }
     let pointer_focus = pointer_focus?;
-    state
+    let root = state
         .root_surface_for_surface(pointer_focus.target.surface)
         .map(SurfaceFocus::new)
-        .or(Some(pointer_focus.target))
+        .unwrap_or(pointer_focus.target);
+    if press_keeps_keyboard_focus(state, root) {
+        return state.seat.keyboard_focus;
+    }
+    Some(root)
+}
+
+/// An unmanaged X root keeps the current focus when that focus already belongs to an X
+/// surface. A window that refuses keyboard focus keeps it too.
+fn press_keeps_keyboard_focus(state: &State, root: SurfaceFocus) -> bool {
+    let Some(surface) = root.surface.try_ref(state) else {
+        return false;
+    };
+    if surface.has_xwayland_role() && state.window_for_root(root.surface).is_none() {
+        return keyboard_focus_root_has_xwayland_role(state);
+    }
+    let Some(window) = state.window_for_root(root.surface) else {
+        return false;
+    };
+    state
+        .toplevel(window)
+        .is_some_and(|toplevel| !toplevel.accepts_keyboard_focus())
+}
+
+fn keyboard_focus_root_has_xwayland_role(state: &State) -> bool {
+    let Some(focus) = state.seat.keyboard_focus else {
+        return false;
+    };
+    let root = state
+        .root_surface_for_surface(focus.surface)
+        .unwrap_or(focus.surface);
+    root.try_ref(state)
+        .is_some_and(|surface| surface.has_xwayland_role())
 }
 
 /// Deliver one scroll frame to the pointer-focused client. Pointer resources expand it according

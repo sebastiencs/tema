@@ -4,6 +4,9 @@
 //! or a failed startup ends the run.
 
 mod cursor;
+mod focus;
+#[cfg(test)]
+mod focus_tests;
 #[cfg(test)]
 mod manage_tests;
 mod props;
@@ -22,8 +25,9 @@ use crate::{
     io_uring::ring::{ReadWriteCompleted, RingId},
     runner::{Dispatcher, Redispatcher},
     x11::{
-        Atoms, Extensions, Property, PropertyError, RenderQueryPictFormatsReply, Startup,
-        StartupEvent, State as ConnectionState, Status, Window, XConnection, XIo, XReplyError,
+        Atoms, Extensions, Property, PropertyError, RenderQueryPictFormatsReply,
+        ResQueryClientIdsReply, Startup, StartupEvent, State as ConnectionState, Status, Window,
+        XConnection, XIo, XReplyError,
     },
     State,
 };
@@ -41,6 +45,10 @@ pub(super) struct Wm {
     windows: BTreeMap<Window, window::XWindow>,
     by_serial: BTreeMap<u64, Window>,
     last_serial: u64,
+    /// The X window that owns input focus.
+    focus: Option<Window>,
+    /// Sequence of the last `SetInputFocus` this WM sent.
+    last_input_sequence: u64,
     /// Normal windows, bottom to top.
     stack: Vec<Window>,
     /// Normal windows in map order.
@@ -94,6 +102,11 @@ pub(crate) enum WmEvent {
         atom: crate::x11::Atom,
         result: Result<Property, PropertyError>,
     },
+    /// The X-Resource pid for one window.
+    ClientPid {
+        window: Window,
+        result: Result<ResQueryClientIdsReply, XReplyError>,
+    },
     /// Ask the X client to close. Applied in a later phase.
     Close {
         window: Window,
@@ -106,6 +119,8 @@ pub(crate) enum WmEvent {
     },
     /// Send `ConfigureWindow` for each managed window whose layout rect changed.
     Reconfigure,
+    /// Keyboard focus changed. The WM reads the seat focus when it handles this.
+    KeyboardFocus,
 }
 
 pub(super) struct WmCtx<'a> {
@@ -146,6 +161,8 @@ impl Wm {
             windows: BTreeMap::new(),
             by_serial: BTreeMap::new(),
             last_serial: 0,
+            focus: None,
+            last_input_sequence: 0,
             stack: Vec::new(),
             map_order: Vec::new(),
             shown_order: 0,
@@ -178,11 +195,13 @@ impl Wm {
                 WmEvent::Property { window, atom, result } => {
                     self.on_property_reply(window, atom, result, ctx)
                 }
+                WmEvent::ClientPid { window, result } => self.on_client_pid(window, result),
                 WmEvent::Close { window } => self.close(window),
                 WmEvent::Resize { window, width, height } => {
                     self.resize(window, width, height, ctx)
                 }
                 WmEvent::Reconfigure => self.reconfigure(ctx),
+                WmEvent::KeyboardFocus => self.on_keyboard_focus(ctx),
             }
         };
         self.io.flush(&mut self.conn, ctx.dispatcher);

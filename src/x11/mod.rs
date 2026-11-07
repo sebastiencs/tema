@@ -24,16 +24,17 @@ pub(crate) use atoms::{AtomCache, Atoms, NAMES};
 pub(crate) use connection::{ConnectionError, Read, State, XConnection, XReplyError};
 #[allow(unused_imports)]
 pub(crate) use generated::{
-    Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientMessage, ClientMessageData,
-    Colormap, CompositeRedirectSubwindows, ConfigWindow, ConfigureNotify, ConfigureRequest,
-    ConfigureWindow, ConfigureWindowAux, CreateGc, CreateGcAux, CreateNotify, CreatePixmap,
-    CreateWindow, CreateWindowAux, Cursor, DestroyNotify, Directformat, Drawable, Event, EventMask,
-    FreeGc, FreePixmap, Gcontext, GetProperty, ImageFormat, KillClient, MapNotify, MapRequest,
-    MapWindow, NoReply, PictType, Pictformat, Pictforminfo, Picture, Pixmap,
-    Property as PropertyState, PropertyNotify, PutImage, Redirect, RenderCreateCursor,
-    RenderCreatePicture, RenderCreatePictureAux, RenderFreePicture, RenderQueryPictFormats,
-    RenderQueryPictFormatsReply, Request, SendEvent, SetSelectionOwner, StackMode, UnmapNotify,
-    Window, WindowClass,
+    Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientIdMask, ClientIdSpec,
+    ClientIdValue, ClientMessage, ClientMessageData, Colormap, CompositeRedirectSubwindows,
+    ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux, CreateGc,
+    CreateGcAux, CreateNotify, CreatePixmap, CreateWindow, CreateWindowAux, Cursor, DestroyNotify,
+    Directformat, Drawable, Event, EventMask, FocusIn, FreeGc, FreePixmap, Gcontext, GetProperty,
+    ImageFormat, InputFocus, KillClient, MapNotify, MapRequest, MapWindow, NoReply, NotifyDetail,
+    NotifyMode, PictType, Pictformat, Pictforminfo, Picture, Pixmap, Property as PropertyState,
+    PropertyNotify, PutImage, Redirect, RenderCreateCursor, RenderCreatePicture,
+    RenderCreatePictureAux, RenderFreePicture, RenderQueryPictFormats, RenderQueryPictFormatsReply,
+    Request, ResQueryClientIds, ResQueryClientIdsReply, SendEvent, SetInputFocus,
+    SetSelectionOwner, StackMode, UnmapNotify, Window, WindowClass,
 };
 #[allow(unused_imports)]
 pub(crate) use io::XIo;

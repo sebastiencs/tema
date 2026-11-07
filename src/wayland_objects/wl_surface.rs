@@ -52,7 +52,10 @@ fn monotonic_time_msec() -> u32 {
     millis.min(u64::from(u32::MAX)) as u32
 }
 
-fn should_focus_new_toplevel_on_map(state: &State, root_surface: Resolved<WlSurfaceId>) -> bool {
+pub(crate) fn should_focus_new_toplevel_on_map(
+    state: &State,
+    root_surface: Resolved<WlSurfaceId>,
+) -> bool {
     if !root_surface.exists(state) {
         return false;
     }
@@ -2330,6 +2333,9 @@ impl WlSurface {
                     if !opened.is_empty() {
                         kick_visual_animation_pump(dispatcher);
                     }
+                    dispatcher.dispatch_post_action(PostWlSurface::FocusNewToplevel {
+                        root_surface: resolved_surface,
+                    });
                 }
                 if let Some(workspace_id) = state.root_surface_workspace(resolved_surface) {
                     crate::tiling::mark_workspace_dirty(state, workspace_id);
@@ -3237,6 +3243,37 @@ impl Object for WlSurface {
             dispatcher.stop_model(waiter_id);
         }
     }
+}
+
+/// Commit one new buffer on an X root and run the map-time focus action.
+#[cfg(test)]
+pub(crate) fn test_commit_new_buffer(
+    client: &mut Client,
+    state: &mut State,
+    dispatcher: &mut crate::runner::Dispatcher,
+    surface: Resolved<WlSurfaceId>,
+    width: i32,
+    height: i32,
+) {
+    let buffer_id = WlBufferId::from(9100);
+    let object_id = crate::test_support::insert_test_shm_buffer(
+        state,
+        client.client_id(),
+        buffer_id,
+        width,
+        height,
+    );
+    let buffer = Resolved::new(client.client_id(), buffer_id, object_id);
+    {
+        let mut wl_surface = surface.grab(state);
+        wl_surface.pending.buffer = Some(Some(buffer));
+    }
+    let mut client_dispatcher = client.test_dispatcher(dispatcher);
+    {
+        let mut wl_surface = surface.grab(state);
+        wl_surface.on_commit(client, state, &mut client_dispatcher);
+    }
+    client_dispatcher.drain_post_actions(client, state);
 }
 
 #[cfg(test)]

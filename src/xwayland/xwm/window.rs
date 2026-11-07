@@ -12,15 +12,16 @@ use crate::{
     drm::request_outputs_for_rect,
     protocol_generated::WlSurfaceId,
     region::RectI,
-    runner::Dispatcher,
+    runner::{Dispatcher, Redispatcher},
     state::ObjectId,
     window::WindowId,
     x11::{
         change_property_atoms, change_property_u32s, event_bytes, Atom, Atoms,
-        ChangeWindowAttributes, ChangeWindowAttributesAux, ClientMessage, ClientMessageData,
-        ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux,
-        CreateNotify, DestroyNotify, Event, EventMask, KillClient, MapNotify, MapRequest,
-        MapWindow, SendEvent, StackMode, UnmapNotify, Window,
+        ChangeWindowAttributes, ChangeWindowAttributesAux, ClientIdMask, ClientIdSpec,
+        ClientMessage, ClientMessageData, ConfigWindow, ConfigureNotify, ConfigureRequest,
+        ConfigureWindow, ConfigureWindowAux, CreateNotify, DestroyNotify, Event, EventMask,
+        KillClient, MapNotify, MapRequest, MapWindow, ResQueryClientIds, ResQueryClientIdsReply,
+        SendEvent, StackMode, UnmapNotify, Window, XReplyError,
     },
     State,
 };
@@ -29,7 +30,7 @@ use super::{
     super::{surfaces::SurfaceSerials, SurfaceEvent},
     props,
     toplevel::XToplevel,
-    Wm, WmCtx, WmFailure, WmPhase,
+    Wm, WmCtx, WmEvent, WmFailure, WmPhase, Xwayland, XwaylandAction,
 };
 
 impl PartialOrd for Window {
@@ -44,7 +45,7 @@ impl Ord for Window {
     }
 }
 
-const NORMAL: u32 = 1;
+pub(super) const NORMAL: u32 = 1;
 const ICONIC: u32 = 3;
 const WITHDRAWN: u32 = 0;
 const NET_WM_STATE_REMOVE: u32 = 0;
@@ -104,6 +105,8 @@ pub(super) struct XWindow {
     pub(super) managed: Option<Managed>,
     pub(super) props_outstanding: usize,
     pub(super) props_loaded: bool,
+    /// Client pid from X-Resource. `None` until a reply names one.
+    pub(super) pid: Option<u32>,
 }
 
 impl Wm {
@@ -132,6 +135,7 @@ impl Wm {
             }
             Event::ClientMessage(event) => self.on_client_message(event, atoms, ctx),
             Event::PropertyNotify(event) => self.on_property_notify(event, ctx),
+            Event::FocusIn(event) => self.on_focus_in(event, ctx),
             _ => Ok(()),
         }
     }
@@ -180,6 +184,7 @@ impl Wm {
                 managed: None,
                 props_outstanding: 0,
                 props_loaded: false,
+                pid: None,
             },
         );
         self.send_request(&ChangeWindowAttributes {
@@ -192,16 +197,32 @@ impl Wm {
     fn forget(&mut self, event: DestroyNotify, ctx: &mut WmCtx<'_>) -> Result<(), WmFailure> {
         let dropped_map = remove_window(&mut self.map_order, event.window);
         let dropped_stack = remove_window(&mut self.stack, event.window);
+        let focused = self.focus == Some(event.window);
         let Some(window) = self.windows.remove(&event.window) else { return Ok(()) };
+        if focused {
+            self.focus = None;
+        }
         if let Some(serial) = window.serial {
             if self.by_serial.get(&serial) == Some(&event.window) {
                 self.by_serial.remove(&serial);
             }
         }
         let managed = window.managed;
+        let close = window
+            .surface
+            .and_then(|root| crate::input::focus::focused_window_close(ctx.state, root));
         if let Some(managed) = managed {
             ctx.state.destroy_window(managed.window);
             ctx.state.remove_object(managed.object);
+        }
+        if let Some(close) = close {
+            crate::input::focus::refocus_after_focused_window_unmap(
+                ctx.state,
+                ctx.dispatcher,
+                close,
+            );
+        } else if window.shown && managed.is_none() {
+            release_unmanaged_keyboard_focus(window.surface, ctx);
         }
         if window.shown || managed.is_some() {
             hide(window.surface, window.geometry, ctx);
@@ -216,6 +237,9 @@ impl Wm {
             if let Some(atoms) = atoms {
                 self.write_stacking_list(atoms)?;
             }
+        }
+        if focused {
+            self.release_x_focus()?;
         }
         Ok(())
     }
@@ -235,6 +259,8 @@ impl Wm {
             self.on_net_wm_state(event, atoms, ctx)
         } else if event.r#type == atoms.WM_CHANGE_STATE {
             self.on_wm_change_state(event, atoms, ctx)
+        } else if event.r#type == atoms._NET_ACTIVE_WINDOW {
+            self.on_net_active_window(event.window, ctx)
         } else {
             Ok(())
         }
@@ -331,11 +357,14 @@ impl Wm {
         ctx.state.root_surface_for_surface(focus.surface) == Some(root)
     }
 
-    fn write_net_wm_state(&mut self, id: Window, atoms: Atoms) -> Result<(), WmFailure> {
+    pub(super) fn write_net_wm_state(&mut self, id: Window, atoms: Atoms) -> Result<(), WmFailure> {
         let Some(props) = self.windows.get(&id).map(|window| window.props.clone()) else {
             return Ok(());
         };
-        let state = props::net_wm_state(&props, &atoms);
+        let mut state = props::net_wm_state(&props, &atoms);
+        if self.focus == Some(id) {
+            state.push(atoms._NET_WM_STATE_FOCUSED);
+        }
         let change = change_property_atoms(id, atoms._NET_WM_STATE, atoms.ATOM, &state);
         self.send_request(&change.request())
     }
@@ -397,7 +426,51 @@ impl Wm {
         };
         log::debug!("X window {id:?} paired with {surface:?}");
         self.sync_presence(id, geometry, None, ctx);
-        self.load_properties(id, ctx)
+        self.load_properties(id, ctx)?;
+        self.query_pid(id, ctx)
+    }
+
+    /// Asks X-Resource for this window's client pid. A missing extension sends nothing.
+    fn query_pid(&mut self, id: Window, ctx: &WmCtx<'_>) -> Result<(), WmFailure> {
+        let WmPhase::Ready(ready) = &self.phase else { return Ok(()) };
+        if ready.extensions.res.is_none() {
+            return Ok(());
+        }
+        let run = ctx.run;
+        let redispatch = Redispatcher::to::<Xwayland>(move |result| XwaylandAction::Wm {
+            run,
+            event: WmEvent::ClientPid { window: id, result },
+        });
+        let spec = ClientIdSpec { client: id.0, mask: ClientIdMask::LocalClientPID };
+        match self
+            .conn
+            .send(&ResQueryClientIds { specs: &[spec] }, redispatch)
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.phase = WmPhase::Failed;
+                Err(WmFailure { reason: error.to_string() })
+            }
+        }
+    }
+
+    pub(super) fn on_client_pid(
+        &mut self,
+        window: Window,
+        result: Result<ResQueryClientIdsReply, XReplyError>,
+    ) -> Result<(), WmFailure> {
+        let Some(tracked) = self.windows.get_mut(&window) else { return Ok(()) };
+        tracked.pid = match result {
+            Err(_) => None,
+            Ok(reply) => reply.ids.into_iter().find_map(|id| {
+                if id.spec.mask.contains(ClientIdMask::LocalClientPID) {
+                    id.value.first().copied()
+                } else {
+                    None
+                }
+            }),
+        };
+        Ok(())
     }
 
     fn unpair(&mut self, id: Window, ctx: &mut WmCtx<'_>) {
@@ -536,8 +609,17 @@ impl Wm {
                     workspaces.push(workspace_id);
                 }
             }
+            let close =
+                surface.and_then(|root| crate::input::focus::focused_window_close(ctx.state, root));
             ctx.state.destroy_window(managed.window);
             ctx.state.remove_object(managed.object);
+            if let Some(close) = close {
+                crate::input::focus::refocus_after_focused_window_unmap(
+                    ctx.state,
+                    ctx.dispatcher,
+                    close,
+                );
+            }
             hide(surface, geometry, &mut ctx);
         }
         for workspace_id in workspaces {
@@ -574,6 +656,7 @@ impl Wm {
         if have == Presence::Managed {
             self.leave_managed(id, surface, geometry, ctx);
         } else if have == Presence::Unmanaged {
+            release_unmanaged_keyboard_focus(surface, ctx);
             hide(surface, geometry, ctx);
             if let Some(window) = self.windows.get_mut(&id) {
                 window.shown = false;
@@ -596,9 +679,12 @@ impl Wm {
             return;
         };
         let parent = self.managed_window(transient);
+        let atoms = self.ready_atoms();
         let window_id = ctx.state.allocate_window_id();
         let mut toplevel = XToplevel::new(window_id, id, ctx.run);
-        toplevel.refresh(&props, parent);
+        if let Some(atoms) = atoms {
+            toplevel.refresh(&props, parent, &atoms);
+        }
         let (_, object) = ctx.state.insert_object(toplevel);
         ctx.state.insert_window(window_id, surface, object);
         reveal(Some(surface), ctx);
@@ -623,6 +709,17 @@ impl Wm {
             ctx.state.set_window_fullscreen(window_id, true);
         }
         self.publish_layout_for(window_id, ctx);
+        if ctx.state.window_is_mapped(window_id)
+            && crate::wayland_objects::wl_surface::should_focus_new_toplevel_on_map(
+                ctx.state, surface,
+            )
+        {
+            crate::input::set_keyboard_focus(
+                ctx.state,
+                ctx.dispatcher,
+                Some(crate::input::SurfaceFocus::new(surface)),
+            );
+        }
     }
 
     fn place_floating(&mut self, id: Window, ctx: &mut WmCtx<'_>) {
@@ -729,8 +826,17 @@ impl Wm {
         }) else {
             return;
         };
+        let close =
+            surface.and_then(|root| crate::input::focus::focused_window_close(ctx.state, root));
         ctx.state.destroy_window(managed.window);
         ctx.state.remove_object(managed.object);
+        if let Some(close) = close {
+            crate::input::focus::refocus_after_focused_window_unmap(
+                ctx.state,
+                ctx.dispatcher,
+                close,
+            );
+        }
         hide(surface, geometry, ctx);
         publish_layout(workspace_id, ctx);
     }
@@ -770,7 +876,9 @@ impl Wm {
             return;
         };
         let parent = self.managed_window(transient);
+        let atoms = self.ready_atoms();
         let minimum_changed = {
+            let Some(atoms) = atoms else { return };
             let Some(toplevel) = ctx
                 .state
                 .objects
@@ -779,7 +887,7 @@ impl Wm {
             else {
                 return;
             };
-            toplevel.refresh(&props, parent)
+            toplevel.refresh(&props, parent, &atoms)
         };
         if minimum_changed
             && (ctx.state.window_is_tiled(window_id) || ctx.state.window_is_fullscreen(window_id))
@@ -909,33 +1017,47 @@ impl Wm {
         else {
             return Ok(());
         };
-        let WmPhase::Ready(ready) = &self.phase else { return Ok(()) };
-        let delete_window = ready.atoms.WM_DELETE_WINDOW;
-        let wm_protocols = ready.atoms.WM_PROTOCOLS;
+        let delete_window = {
+            let WmPhase::Ready(ready) = &self.phase else { return Ok(()) };
+            ready.atoms.WM_DELETE_WINDOW
+        };
         if protocols.contains(&delete_window) {
-            let mut data = ClientMessageData::default();
-            data.set_data32([delete_window.0, 0, 0, 0, 0]);
-            let message = ClientMessage {
-                send_event: true,
-                sequence: 0,
-                format: 32,
-                window: id,
-                r#type: wm_protocols,
-                data,
-            };
-            let event = event_bytes(|writer| message.serialize(writer));
-            self.send_request(&SendEvent {
-                propagate: 0,
-                destination: id,
-                event_mask: EventMask::NoEvent,
-                event: &event,
-            })
+            self.send_protocol_message(id, delete_window)
         } else {
             self.send_request(&KillClient { resource: id.0 })
         }
     }
 
-    /// Moves a normal window to the top of the stack. Activation in M7 calls this.
+    /// `WM_PROTOCOLS` `ClientMessage` delivered with `SendEvent`. The time word is `CurrentTime`.
+    pub(super) fn send_protocol_message(
+        &mut self,
+        id: Window,
+        atom: Atom,
+    ) -> Result<(), WmFailure> {
+        let wm_protocols = {
+            let WmPhase::Ready(ready) = &self.phase else { return Ok(()) };
+            ready.atoms.WM_PROTOCOLS
+        };
+        let mut data = ClientMessageData::default();
+        data.set_data32([atom.0, 0, 0, 0, 0]);
+        let message = ClientMessage {
+            send_event: true,
+            sequence: 0,
+            format: 32,
+            window: id,
+            r#type: wm_protocols,
+            data,
+        };
+        let event = event_bytes(|writer| message.serialize(writer));
+        self.send_request(&SendEvent {
+            propagate: 0,
+            destination: id,
+            event_mask: EventMask::NoEvent,
+            event: &event,
+        })
+    }
+
+    /// Moves a normal window to the top of the stack. Activation calls this.
     pub(super) fn move_to_top(&mut self, id: Window) {
         let normal = self
             .windows
@@ -963,7 +1085,7 @@ impl Wm {
         self.write_client_list(atoms)
     }
 
-    fn restack(&mut self, id: Window, atoms: Atoms) -> Result<(), WmFailure> {
+    pub(super) fn restack(&mut self, id: Window, atoms: Atoms) -> Result<(), WmFailure> {
         let Some(index) = self.stack.iter().position(|window| *window == id) else {
             return Ok(());
         };
@@ -984,7 +1106,7 @@ impl Wm {
         self.write_stacking_list(atoms)
     }
 
-    fn ready_atoms(&self) -> Option<Atoms> {
+    pub(super) fn ready_atoms(&self) -> Option<Atoms> {
         match &self.phase {
             WmPhase::Ready(ready) => Some(ready.atoms),
             _ => None,
@@ -1015,17 +1137,30 @@ impl Wm {
         self.send_request(&change.request())
     }
 
-    fn write_state(&mut self, window: Window, wm_state: Atom, state: u32) -> Result<(), WmFailure> {
+    pub(super) fn write_state(
+        &mut self,
+        window: Window,
+        wm_state: Atom,
+        state: u32,
+    ) -> Result<(), WmFailure> {
         let change = change_property_u32s(window, wm_state, wm_state, &[state, 0]);
         self.send_request(&change.request())
     }
 
-    fn send_request(
+    pub(super) fn send_request(
         &mut self,
         request: &impl crate::x11::Request<Reply = crate::x11::NoReply>,
     ) -> Result<(), WmFailure> {
+        self.send_request_sequence(request).map(|_| ())
+    }
+
+    /// Sends a void request and returns its sequence. A send error fails the WM.
+    pub(super) fn send_request_sequence(
+        &mut self,
+        request: &impl crate::x11::Request<Reply = crate::x11::NoReply>,
+    ) -> Result<u64, WmFailure> {
         match self.conn.send_void(request) {
-            Ok(_) => Ok(()),
+            Ok(sequence) => Ok(sequence),
             Err(error) => {
                 self.phase = WmPhase::Failed;
                 Err(WmFailure { reason: error.to_string() })
@@ -1141,6 +1276,20 @@ fn publish_layout(workspace_id: Option<crate::state::WorkspaceId>, ctx: &mut WmC
         ctx.dispatcher
             .dispatch(crate::clients::ClientManagerAction::WorkspaceStateChanged);
     }
+}
+
+fn release_unmanaged_keyboard_focus(surface: Option<Resolved<WlSurfaceId>>, ctx: &mut WmCtx<'_>) {
+    let Some(surface) = surface else { return };
+    let Some(focus) = ctx.state.seat.keyboard_focus else { return };
+    let root = ctx
+        .state
+        .root_surface_for_surface(focus.surface)
+        .unwrap_or(focus.surface);
+    if root != surface {
+        return;
+    }
+    crate::input::set_keyboard_focus(ctx.state, ctx.dispatcher, None);
+    crate::input::focus::focus_after_client_disconnect(ctx.state, ctx.dispatcher);
 }
 
 fn hide(surface: Option<Resolved<WlSurfaceId>>, geometry: Rect, ctx: &mut WmCtx<'_>) {

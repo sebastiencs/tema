@@ -125,6 +125,8 @@ pub(crate) enum XwaylandAction {
     },
     /// Send `ConfigureWindow` for managed windows whose layout rect changed.
     Reconfigure,
+    /// The seat's keyboard focus changed. The current run's WM reads it.
+    KeyboardFocus,
 }
 
 impl Xwayland {
@@ -605,6 +607,9 @@ impl Model for Xwayland {
             XwaylandAction::Reconfigure => {
                 self.on_wm(self.run, xwm::WmEvent::Reconfigure, state, dispatcher)
             }
+            XwaylandAction::KeyboardFocus => {
+                self.on_wm(self.run, xwm::WmEvent::KeyboardFocus, state, dispatcher)
+            }
         }
         Ok(())
     }
@@ -631,6 +636,14 @@ mod tests {
             .process(&mut state, XwaylandAction::Start, &mut dispatcher)
             .unwrap();
         (xwayland, state, dispatcher)
+    }
+
+    #[test]
+    fn keyboard_focus_before_the_wm_is_running_does_nothing() {
+        let (mut xwayland, mut state, mut dispatcher) = started();
+        xwayland
+            .process(&mut state, XwaylandAction::KeyboardFocus, &mut dispatcher)
+            .unwrap();
     }
 
     fn allocated_display(dispatcher: &Dispatcher) -> u32 {

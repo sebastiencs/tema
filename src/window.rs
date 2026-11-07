@@ -94,6 +94,10 @@ pub trait Toplevel {
     fn is_fullscreen_requested(&self) -> bool;
     /// Frame mode used for geometry and grabs.
     fn decoration_mode(&self) -> ToplevelDecorationMode;
+    /// A pointer press may move keyboard focus to this window.
+    fn accepts_keyboard_focus(&self) -> bool {
+        true
+    }
     /// Ask the client to close this window.
     fn request_close(&self, dispatcher: &mut Dispatcher);
     /// Send the size for an interactive resize.

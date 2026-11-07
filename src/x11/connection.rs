@@ -294,6 +294,19 @@ impl XConnection {
         self.next_sequence
     }
 
+    /// Widens a 16-bit event sequence against the last request this connection sent.
+    ///
+    /// The high bits come from that request. A wire value above it belongs to the
+    /// previous 16-bit block. An event is never newer than the last request sent.
+    pub(crate) fn widen_event_sequence(&self, wire: u16) -> u64 {
+        let sent = self.next_sequence.saturating_sub(1);
+        let mut serial = (sent & !0xffff) | u64::from(wire);
+        if serial > sent {
+            serial = serial.saturating_sub(0x10000);
+        }
+        serial
+    }
+
     /// Bytes waiting to be written. Appends GetInputFocus when void requests trail.
     pub(crate) fn take_outgoing(&mut self) -> Vec<u8> {
         if self.state == State::Ready && self.needs_sync {
@@ -1022,6 +1035,31 @@ mod tests {
             .serialize(&mut Writer::new(&mut alone), 0)
             .unwrap();
         assert_eq!(connection.take_outgoing(), alone);
+    }
+
+    #[test]
+    fn event_sequence_widens_below_and_at_the_last_request() {
+        let (mut connection, _) = ready(65535);
+        for _ in 0..100 {
+            connection
+                .send_void(&DestroyWindow { window: Window(1) })
+                .unwrap();
+        }
+        assert_eq!(connection.widen_event_sequence(50), 50);
+        assert_eq!(connection.widen_event_sequence(100), 100);
+    }
+
+    #[test]
+    fn event_sequence_widens_across_the_16_bit_boundary() {
+        let (mut connection, _) = ready(65535);
+        for _ in 0..65540 {
+            connection
+                .send_void(&DestroyWindow { window: Window(1) })
+                .unwrap();
+        }
+        assert_eq!(connection.widen_event_sequence(0), 65536);
+        assert_eq!(connection.widen_event_sequence(4), 65540);
+        assert_eq!(connection.widen_event_sequence(100), 100);
     }
 
     #[test]
