@@ -61,6 +61,8 @@ pub mod xdg_popup;
 pub mod xdg_positioner;
 pub mod xdg_surface;
 pub mod xdg_wm_base;
+pub mod xwayland_shell_v1;
+pub mod xwayland_surface_v1;
 pub mod zwlr_data_control_device_v1;
 pub mod zwlr_data_control_manager_v1;
 pub mod zwlr_data_control_offer_v1;
@@ -148,8 +150,6 @@ fake_obj! {
     { wp_tearing_control_manager_v1, WpTearingControlManagerV1 },
     { wp_tearing_control_v1, WpTearingControlV1 },
     // { xdg_activation_v1, XdgActivationV1 },
-    { xwayland_shell_v1, XwaylandShellV1 },
-    { xwayland_surface_v1, XwaylandSurfaceV1 },
     // xdg-toplevel-drag not in protocol_generated
     { zwp_linux_buffer_release_v1, ZwpLinuxBufferReleaseV1 },
     { zwp_linux_dmabuf_feedback_v1, ZwpLinuxDmabufFeedbackV1 },

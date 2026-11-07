@@ -60,6 +60,7 @@ fn pick_roots(
             || surface.has_cursor_role()
             || surface.has_dnd_icon_role()
             || surface.has_lock_surface_role()
+            || surface.has_xwayland_role()
         {
             continue;
         }

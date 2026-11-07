@@ -124,6 +124,7 @@ fn collect_unmanaged_scene_entries(
         if surface.has_cursor_role()
             || surface.has_dnd_icon_role()
             || surface.has_lock_surface_role()
+            || surface.has_xwayland_role()
         {
             continue;
         }
@@ -222,6 +223,25 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.role == SceneRole::UnmanagedRoot));
+    }
+
+    #[test]
+    fn excludes_xwayland_roots_from_scene_model() {
+        let mut state = state_for_tests();
+        let surface = insert_root(&mut state, 30);
+        assert!(state
+            .objects
+            .get_mut(surface.object_id())
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .assign_xwayland_role());
+
+        let scene = build_scene_model(&state);
+        assert!(scene.entries.is_empty());
+        assert!(!scene
+            .entries
+            .iter()
+            .any(|entry| entry.root_surface == surface || entry.role == SceneRole::UnmanagedRoot));
     }
 
     #[test]

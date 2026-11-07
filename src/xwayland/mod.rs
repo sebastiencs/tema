@@ -7,6 +7,9 @@ mod launch;
 mod lines;
 mod restart;
 mod socket;
+mod surfaces;
+
+pub(crate) use surfaces::SurfaceEvent;
 
 use std::{
     io::ErrorKind,
@@ -16,12 +19,13 @@ use std::{
 };
 
 use crate::{
-    clients::{ClientId, ClientManagerAction, ClientOrigin},
+    clients::{ClientId, ClientManagerAction, ClientOrigin, Resolved},
     io_uring::{
         model::IoUringAction,
         ring::{PollCompleted, ReadWriteCompleted, RingId},
     },
     process::{pidfd_send_signal, ChildExit, ProcessEvent, ProcessManagerAction},
+    protocol_generated::WlSurfaceId,
     runner::{Dispatcher, Model, Redispatcher},
     State,
 };
@@ -31,6 +35,7 @@ use {
     lines::LineSplitter,
     restart::{Decision, RestartPolicy},
     socket::XDisplay,
+    surfaces::SurfaceSerials,
 };
 
 const DISPLAYFD_BYTES: usize = 64;
@@ -71,6 +76,7 @@ struct Run {
     displayfd: Option<OwnedFd>,
     lines: LineSplitter,
     reads: Vec<RingId>,
+    surfaces: SurfaceSerials,
 }
 
 #[derive(Copy, Clone)]
@@ -88,6 +94,7 @@ pub(crate) enum XwaylandAction {
     ClientClosed { run: u64, id: ClientId },
     DisplayReady { run: u64, read: RingId, result: std::io::Result<ReadWriteCompleted> },
     Stderr { run: u64, read: RingId, result: std::io::Result<ReadWriteCompleted> },
+    Surface { client: ClientId, event: SurfaceEvent },
 }
 
 impl Xwayland {
@@ -215,6 +222,7 @@ impl Xwayland {
             displayfd: Some(displayfd),
             lines: LineSplitter::default(),
             reads: Vec::new(),
+            surfaces: SurfaceSerials::default(),
         });
         self.arm_read(dispatcher, display_fd, DISPLAYFD_BYTES, Pipe::Display);
         self.arm_read(dispatcher, stderr_fd, STDERR_BYTES, Pipe::Stderr);
@@ -272,12 +280,31 @@ impl Xwayland {
         if self.run != run {
             return;
         }
-        let Phase::Running(running) = &self.phase else { return };
+        let Phase::Running(running) = &mut self.phase else { return };
         if running.client.is_some_and(|client| client != id) {
             return;
         }
+        running.surfaces.clear();
         let pidfd = Rc::clone(&running.pidfd);
         self.kill(&pidfd);
+    }
+
+    fn on_surface(&mut self, client: ClientId, event: SurfaceEvent) {
+        let Phase::Running(running) = &mut self.phase else {
+            log::debug!("dropping Xwayland surface event for client {client:?}: not running");
+            return;
+        };
+        if running.client != Some(client) {
+            log::debug!("dropping Xwayland surface event for client {client:?}");
+            return;
+        }
+        running.surfaces.apply(event);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn surface_for_serial(&self, serial: u64) -> Option<Resolved<WlSurfaceId>> {
+        let Phase::Running(running) = &self.phase else { return None };
+        running.surfaces.get(serial)
     }
 
     fn take_child(&mut self) -> Option<Finished> {
@@ -477,6 +504,7 @@ impl Model for Xwayland {
                 self.on_stderr(dispatcher, run, read, result)
             }
             XwaylandAction::Stop => self.stop(dispatcher),
+            XwaylandAction::Surface { client, event } => self.on_surface(client, event),
         }
         Ok(())
     }
@@ -486,7 +514,14 @@ impl Model for Xwayland {
 mod tests {
     use std::{path::Path, rc::Rc};
 
-    use {super::*, crate::test_support::state_for_tests};
+    use {
+        super::*,
+        crate::{protocol_generated::WlSurfaceId, state::ObjectId, test_support::state_for_tests},
+    };
+
+    fn surface(raw: u32) -> Resolved<WlSurfaceId> {
+        Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(raw), ObjectId::from(raw as usize))
+    }
 
     fn started() -> (Xwayland, State, Dispatcher) {
         let mut xwayland = Xwayland::new();
@@ -872,6 +907,106 @@ mod tests {
             )
             .unwrap();
         assert!(pidfd_readable(pidfd.as_ref(), 5_000));
+    }
+
+    #[test]
+    fn a_surface_serial_is_kept_for_the_adopted_client() {
+        let (mut xwayland, mut state, mut dispatcher) = running();
+        let adopted = ClientId::from_raw(7);
+        let other = ClientId::from_raw(8);
+        let assigned = surface(4);
+
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Surface {
+                    client: adopted,
+                    event: SurfaceEvent::SerialAssigned { serial: 1, surface: assigned },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(xwayland.surface_for_serial(1).is_none());
+
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::ClientAdopted { run: 1, id: adopted },
+                &mut dispatcher,
+            )
+            .unwrap();
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Surface {
+                    client: other,
+                    event: SurfaceEvent::SerialAssigned { serial: 2, surface: surface(5) },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Surface {
+                    client: adopted,
+                    event: SurfaceEvent::SerialAssigned { serial: 1, surface: assigned },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        assert_eq!(xwayland.surface_for_serial(1), Some(assigned));
+        assert!(xwayland.surface_for_serial(2).is_none());
+    }
+
+    #[test]
+    fn a_surface_event_is_ignored_when_xwayland_is_not_running() {
+        let (mut xwayland, mut state, mut dispatcher) = started();
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Surface {
+                    client: ClientId::from_raw(7),
+                    event: SurfaceEvent::SerialAssigned { serial: 1, surface: surface(4) },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(xwayland.surface_for_serial(1).is_none());
+    }
+
+    #[test]
+    fn closing_the_client_drops_the_surface_serials() {
+        let (mut xwayland, mut state, mut dispatcher) = running();
+        let adopted = ClientId::from_raw(7);
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::ClientAdopted { run: 1, id: adopted },
+                &mut dispatcher,
+            )
+            .unwrap();
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Surface {
+                    client: adopted,
+                    event: SurfaceEvent::SerialAssigned { serial: 4, surface: surface(4) },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(xwayland.surface_for_serial(4).is_some());
+
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::ClientClosed { run: 1, id: adopted },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(xwayland.surface_for_serial(4).is_none());
     }
 
     #[test]

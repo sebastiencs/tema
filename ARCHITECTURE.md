@@ -542,7 +542,7 @@ If coming back after a long time, this order should restore the mental model qui
 6. `src/wayland_objects/wl_registry.rs`
    Remember how globals are advertised.
 7. `src/wayland_objects/wl_surface.rs`
-   Rebuild the attach/commit model.
+   Rebuild the attach/commit model. The X role and its serial are section 17.
 8. `src/wayland_objects/wl_buffer.rs` and `src/wayland_objects/wl_shm*.rs`
    See where client image data enters the compositor.
 9. `src/render/`
@@ -620,6 +620,8 @@ If coming back after a long time, this order should restore the mental model qui
 - sync point: the GetInputFocus that `take_outgoing` appends after void requests, so those voids can retire
 - atom: a numeric id for a string. `NAMES` are interned at startup. `PREDEFINED` are fixed values from the generated constants
 - XWM: the model M5 adds. It owns the X connection and claims `WM_S0`
+- `xwayland_surface_v1`: the role object that links one `wl_surface` to an X window. The X role remains after the object is destroyed
+- serial: the non-zero `u64` from `set_serial`, low half in `serial_lo` and high half in `serial_hi`. It is pending until `wl_surface.commit`, then stored on the current Xwayland run
 
 ## 15. Final Mental Shortcut
 
@@ -795,7 +797,31 @@ Give-up logs `Xwayland gave up: …`, unlinks both files, and removes `DISPLAY` 
 
 ### Xwayland-only globals
 
-A global may answer `xwayland_only`. The default is no, so every current global stays visible to every client. An Xwayland-only global is offered only to the Xwayland client, both in the first registry dump and when the global appears later. A normal client that binds the name is disconnected with `invalid global name`, the same response as an unknown name. Removal is sent only to registries that were offered the name. No such global is registered yet. M4 adds `xwayland_shell_v1`.
+A global may answer `xwayland_only`. The default is no, so the other globals stay visible to every client. An Xwayland-only global is offered only to the Xwayland client, both in the first registry dump and when the global appears later. A normal client that binds the name is disconnected with `invalid global name`, the same response as an unknown name. Removal is sent only to registries that were offered the name.
+
+### `xwayland_shell_v1`
+
+`xwayland_shell_v1` version 1 is registered from `Globals::initialize`. It is the `xwayland_only` global. A normal client's `wl_registry` omits it, and so does `wayland-info` run as that client. The bind is logged at debug: `Xwayland client ClientId(…) bound xwayland_shell_v1`.
+
+The objects live in `src/wayland_objects/xwayland_shell_v1.rs` and `src/wayland_objects/xwayland_surface_v1.rs`. `get_xwayland_surface` gives the `wl_surface` the X role and links the new `xwayland_surface_v1`. It is `xwayland_shell_v1.role`, and the client is disconnected, when the surface already has another role or already has an `xwayland_surface_v1`. Destroying the shell leaves the child objects in place. There is no `WL_SURFACE_ID` path. Xwayland 24.1 speaks this shell.
+
+### The X surface role
+
+The role is `Role::XwaylandSurface`. `get_xwayland_surface` assigns it, and it stays after `xwayland_surface_v1.destroy`. That destroy clears the link, so a later `get_xwayland_surface` is accepted. A serial already committed stays committed.
+
+`set_serial` builds `serial_lo | (serial_hi << 32)`. Each client remembers the highest serial it has accepted. The memory starts at 0, so 0 and any serial that is not strictly higher are `invalid_serial` and the client is disconnected. The memory moves when `set_serial` is accepted, and the value is stored as pending on the surface. A later `set_serial` before the commit replaces that pending value.
+
+`wl_surface.commit` applies the pending serial after the mapping and sync checks. The committed serial is set, the pending value is cleared, and one `XwaylandAction::Surface` with `SerialAssigned` is queued. A commit with nothing pending queues nothing, and a second commit does not send the serial again. A commit that fails those checks drops the pending serial and leaves the committed serial empty. `set_serial` after a committed serial is `already_associated`.
+
+`wl_surface.destroy` while the `xwayland_surface_v1` still exists is `wl_surface.defunct_role_object`. The client is disconnected, and both objects stay. After the role object is gone, destroying the surface succeeds. A committed serial queues `Destroyed` with that serial and the surface. With no committed serial, that destroy queues nothing.
+
+An X-role root is left out of the scene, pointer picking, rendering, and keyboard focus restore. `register_root_surface` still records it. Drawing waits until M5 and M6 pair the window and map it.
+
+### Surface events
+
+`XwaylandAction::Surface` carries `SerialAssigned` or `Destroyed`, and the client id. The types live in `src/xwayland/surfaces.rs`. The current run applies the event when that client is the adopted Xwayland client. Another client, or an event while Xwayland is not running, is logged at debug and dropped. `Destroyed` removes the serial when the stored surface is the one in the event. `ClientClosed` clears the map. `surface_for_serial` reads it. A successful assign is stored there and is not logged on its own.
+
+M5's XWM pairs the X client message `WL_SURFACE_SERIAL` with that map. The message serial is `data[0] | (data[1] << 32)`, the same packing as `set_serial`. The lookup is `surface_for_serial`.
 
 ### Manual check
 
@@ -803,11 +829,12 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 
 1. `ls /tmp/.X11-unix/XN /tmp/.XN-lock` shows both files. `pgrep -x Xwayland` prints nothing.
 2. Spawn a terminal with the usual keybinding. `echo $DISPLAY` prints `:N`.
-3. Run `xterm`. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, and `Xwayland ready on :N`. `xterm` waits. That lasts until M5.
+3. `Xwayland -version` reports 24.1 or newer. Run `xterm` with `RUST_LOG=debug` on the compositor. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, `Xwayland ready on :N`, and `bound xwayland_shell_v1`. `xterm` still waits, because `WM_S0` is M5, so no window surface is associated and no serial is committed. Nothing is drawn.
 4. `kill -9 $(pgrep -x Xwayland)`. The log shows `Xwayland exited with signal 9`. A new `xterm` starts Xwayland again on the same `:N`, and both files are still there. A signal within ten seconds of becoming ready counts as an early failure, so one kill relaunches, and a third early failure gives up.
 5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
 6. `[xwayland] enabled = false`, then start tema. The log says `Xwayland disabled`. Neither file exists, and a spawned terminal has an empty `DISPLAY`.
 7. Quit tema during a normal session. No `Xwayland` process remains, and both files are gone.
+8. `wayland-info` from a normal client does not list `xwayland_shell_v1`.
 
 ## 18. Windows
 

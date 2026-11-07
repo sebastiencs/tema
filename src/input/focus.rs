@@ -191,7 +191,11 @@ fn keyboard_focus_is_restorable(state: &State, focus: SurfaceFocus) -> bool {
     let Some(surface) = focus.surface.try_ref(state) else {
         return false;
     };
-    if surface.has_lock_surface_role() || surface.has_cursor_role() || surface.has_dnd_icon_role() {
+    if surface.has_lock_surface_role()
+        || surface.has_cursor_role()
+        || surface.has_dnd_icon_role()
+        || surface.has_xwayland_role()
+    {
         return false;
     }
     surface.logical_size().is_some()

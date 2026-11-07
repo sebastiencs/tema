@@ -500,6 +500,8 @@ pub struct Client {
     info: Option<Rc<ProcessInfo>>,
     pending_fds: VecDeque<OwnedFd>,
     next_server_id: u32,
+    /// Highest `xwayland_surface_v1.set_serial` accepted for this client. `0` means none.
+    last_xwayland_serial: u64,
 }
 
 impl ModelInstanceId for ClientId {
@@ -673,6 +675,7 @@ impl Client {
             info: None,
             pending_fds: VecDeque::new(),
             next_server_id: MIN_SERVER_ID,
+            last_xwayland_serial: 0,
         }
     }
 
@@ -694,6 +697,14 @@ impl Client {
 
     pub fn client_id(&self) -> ClientId {
         self.id
+    }
+
+    pub(crate) fn last_xwayland_serial(&self) -> u64 {
+        self.last_xwayland_serial
+    }
+
+    pub(crate) fn set_last_xwayland_serial(&mut self, serial: u64) {
+        self.last_xwayland_serial = serial;
     }
 
     /// Send `wl_display.error` for `object_id` with a protocol error `code`, then disconnect the client.

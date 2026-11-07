@@ -17,6 +17,7 @@ use crate::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1Global,
         wp_presentation::WpPresentationGlobal, wp_viewporter::WpViewporterGlobal,
         xdg_activation_v1::XdgActivationV1Global, xdg_wm_base::XdgWmBaseGlobal,
+        xwayland_shell_v1::XwaylandShellV1Global,
         zwlr_data_control_manager_v1::ZwlrDataControlManagerV1Global,
         zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1Global,
         zwlr_layer_shell_v1::ZwlrLayerShellV1Global,
@@ -132,6 +133,7 @@ impl Globals {
             ZwlrLayerShellV1Global::new,
             ZxdgOutputManagerV1Global::new,
             ExtWorkspaceManagerV1Global::new,
+            XwaylandShellV1Global::new,
         ] {
             self.insert(fun());
         }

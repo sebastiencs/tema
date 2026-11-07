@@ -15,7 +15,7 @@ use crate::{
         wp_viewport, xdg_wm_base, ExtSessionLockSurfaceV1Id, WaylandId, WlBufferId, WlCallbackId,
         WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId, WpFractionalScaleV1Id,
         WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpViewportId, XdgSurfaceId,
-        ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
+        XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
     },
     region::{DamageRegion, RectI, RegionValue},
     scene::visibility::root_participates_in_input,
@@ -35,6 +35,7 @@ use crate::{
         zwp_pointer_constraints_v1::{apply_pointer_constraint_commit, defunct_pointer_constraint},
     },
     window::Toplevel,
+    xwayland::{SurfaceEvent, XwaylandAction},
     ENABLE_DAMAGE,
 };
 
@@ -129,6 +130,7 @@ pub enum Role {
     LayerSurface,
     Subsurface,
     LockSurface,
+    XwaylandSurface,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +213,9 @@ pub struct WlSurface {
     pointer_constraint: Option<SurfacePointerConstraint>,
     idle_inhibitors: Vec<Resolved<ZwpIdleInhibitorV1Id>>,
     lock_surface: Option<Resolved<ExtSessionLockSurfaceV1Id>>,
+    xwayland_surface_object: Option<Resolved<XwaylandSurfaceV1Id>>,
+    /// Serial applied by a successful commit. `None` until then.
+    xwayland_serial: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -229,6 +234,7 @@ struct Pending {
     /// `None` means `set_region` was not called. `Some(None)` is a null region.
     pointer_constraint_region: Option<Option<RegionValue>>,
     pointer_constraint_hint: Option<(f32, f32)>,
+    xwayland_serial: Option<u64>,
 }
 
 impl Default for Pending {
@@ -246,6 +252,7 @@ impl Default for Pending {
             opaque_region: None,
             pointer_constraint_region: None,
             pointer_constraint_hint: None,
+            xwayland_serial: None,
         }
     }
 }
@@ -450,6 +457,8 @@ impl WlSurface {
             pointer_constraint: None,
             idle_inhibitors: Vec::new(),
             lock_surface: None,
+            xwayland_surface_object: None,
+            xwayland_serial: None,
         }
     }
 
@@ -578,6 +587,10 @@ impl WlSurface {
         self.role == Role::LockSurface
     }
 
+    pub fn has_xwayland_role(&self) -> bool {
+        self.role == Role::XwaylandSurface
+    }
+
     pub fn lock_surface(&self) -> Option<Resolved<ExtSessionLockSurfaceV1Id>> {
         self.lock_surface
     }
@@ -604,6 +617,56 @@ impl WlSurface {
         }
         self.role = Role::LockSurface;
         true
+    }
+
+    pub(crate) fn assign_xwayland_role(&mut self) -> bool {
+        if self.role != Role::None && self.role != Role::XwaylandSurface {
+            return false;
+        }
+        self.role = Role::XwaylandSurface;
+        true
+    }
+
+    pub fn xwayland_surface_object(&self) -> Option<Resolved<XwaylandSurfaceV1Id>> {
+        self.xwayland_surface_object
+    }
+
+    pub(crate) fn set_xwayland_surface_object(&mut self, object: Resolved<XwaylandSurfaceV1Id>) {
+        self.xwayland_surface_object = Some(object);
+    }
+
+    pub(crate) fn clear_xwayland_surface_object(&mut self, object: Resolved<XwaylandSurfaceV1Id>) {
+        if self.xwayland_surface_object == Some(object) {
+            self.xwayland_surface_object = None;
+        }
+    }
+
+    pub fn xwayland_serial(&self) -> Option<u64> {
+        self.xwayland_serial
+    }
+
+    pub(crate) fn set_pending_xwayland_serial(&mut self, serial: u64) {
+        self.pending.xwayland_serial = Some(serial);
+    }
+
+    pub(crate) fn pending_xwayland_serial(&self) -> Option<u64> {
+        self.pending.xwayland_serial
+    }
+
+    fn apply_xwayland_serial(
+        &mut self,
+        client: &Client,
+        surface: Resolved<WlSurfaceId>,
+        dispatcher: &mut ClientDispatcher,
+    ) {
+        let Some(serial) = self.pending.xwayland_serial.take() else {
+            return;
+        };
+        self.xwayland_serial = Some(serial);
+        dispatcher.dispatch(XwaylandAction::Surface {
+            client: client.client_id(),
+            event: SurfaceEvent::SerialAssigned { serial, surface },
+        });
     }
 
     pub fn has_attached_or_committed_buffer(&self) -> bool {
@@ -2075,6 +2138,8 @@ impl WlSurface {
             return;
         }
 
+        this.apply_xwayland_serial(client, resolved_surface, dispatcher);
+
         let constraint_region = this.pending.pointer_constraint_region.take();
         let constraint_hint = this.pending.pointer_constraint_hint.take();
         let payload = this.build_commit_payload();
@@ -2918,6 +2983,12 @@ impl WlSurface {
     ) {
         self.complete_release_callbacks_now(client, state, dispatcher);
         let object = client.resolve(self.id, state).unwrap();
+        if let Some(serial) = self.xwayland_serial {
+            dispatcher.dispatch(XwaylandAction::Surface {
+                client: client.client_id(),
+                event: SurfaceEvent::Destroyed { serial, surface: object },
+            });
+        }
         if let Some(window) = state.window_for_root(object) {
             begin_managed_toplevel_close_surface(state, window, object, self, dispatcher);
         }
@@ -2986,7 +3057,18 @@ impl Object for WlSurface {
         use wl_surface::Request::*;
 
         match client.parse::<Self>(req, dispatcher)? {
-            Destroy => self.delete_self(client, state, dispatcher),
+            Destroy => {
+                if self.xwayland_surface_object().is_some() {
+                    client.protocol_violation_disconnect(
+                        dispatcher,
+                        self.id.into(),
+                        wl_surface::Error::DefunctRoleObject as u32,
+                        "wl_surface destroyed before its xwayland_surface_v1",
+                    );
+                    return Ok(());
+                }
+                self.delete_self(client, state, dispatcher);
+            }
             Attach { buffer, x, y } => {
                 self.on_attach(client, state, buffer, x, y, dispatcher);
             }
@@ -3130,9 +3212,9 @@ mod tests {
             io_uring::model::IoUringAction,
             object::{Object, RequestResult},
             protocol_generated::{
-                xdg_wm_base, WlBufferId, WlSubsurfaceId, WlSurfaceId, WpFractionalScaleV1Id,
-                WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpViewportId, XdgSurfaceId,
-                XdgToplevelId, XdgWmBaseId,
+                xdg_wm_base, WaylandId, WlBufferId, WlSubsurfaceId, WlSurfaceId,
+                WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId,
+                WpViewportId, XdgSurfaceId, XdgToplevelId, XdgWmBaseId, XwaylandSurfaceV1Id,
             },
             region::{DamageRegion, RectI, RegionSpec, RegionValue},
             runner::Dispatcher,
@@ -3158,6 +3240,7 @@ mod tests {
                     XdgSurface,
                 },
             },
+            xwayland::{SurfaceEvent, XwaylandAction},
         },
     };
 
@@ -3364,6 +3447,307 @@ mod tests {
             surface.set_role(Role::XdgSurface, &mut client_dispatcher),
             Err(xdg_wm_base::Error::Role)
         );
+    }
+
+    #[test]
+    fn xwayland_role_is_assignable_and_conflicts_with_cursor_and_xdg() {
+        let mut surface = WlSurface::new(WlSurfaceId::from(1), ClientId::from_raw(3), 6);
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+
+        assert!(surface.assign_xwayland_role());
+        assert!(surface.has_xwayland_role());
+        assert_eq!(surface.role(), Role::XwaylandSurface);
+        assert!(surface.assign_xwayland_role());
+        assert_eq!(
+            surface.set_role(Role::XdgSurface, &mut client_dispatcher),
+            Err(xdg_wm_base::Error::Role)
+        );
+        assert!(surface.has_xwayland_role());
+        assert!(surface.set_cursor_role(&mut client_dispatcher).is_err());
+        assert!(surface.has_xwayland_role());
+
+        let object = Resolved::new(
+            ClientId::from_raw(3),
+            XwaylandSurfaceV1Id::from(8),
+            ObjectId::from(8usize),
+        );
+        let other = Resolved::new(
+            ClientId::from_raw(3),
+            XwaylandSurfaceV1Id::from(9),
+            ObjectId::from(9usize),
+        );
+        assert!(surface.xwayland_surface_object().is_none());
+        surface.set_xwayland_surface_object(object);
+        assert_eq!(surface.xwayland_surface_object(), Some(object));
+        surface.clear_xwayland_surface_object(other);
+        assert_eq!(surface.xwayland_surface_object(), Some(object));
+        surface.clear_xwayland_surface_object(object);
+        assert!(surface.xwayland_surface_object().is_none());
+
+        assert!(surface.xwayland_serial().is_none());
+        surface.set_pending_xwayland_serial(7);
+        assert_eq!(surface.pending.xwayland_serial, Some(7));
+        assert!(surface.xwayland_serial().is_none());
+
+        let mut cursor = WlSurface::new(WlSurfaceId::from(2), ClientId::from_raw(3), 6);
+        assert!(cursor.set_cursor_role(&mut client_dispatcher).is_ok());
+        assert!(!cursor.assign_xwayland_role());
+        assert!(cursor.has_cursor_role());
+
+        let mut xdg = WlSurface::new(WlSurfaceId::from(3), ClientId::from_raw(3), 6);
+        assert!(xdg
+            .set_role(Role::XdgSurface, &mut client_dispatcher)
+            .is_ok());
+        assert!(!xdg.assign_xwayland_role());
+        assert_eq!(xdg.role(), Role::XdgSurface);
+    }
+
+    struct XwaylandCommit {
+        state: State,
+        client: Client,
+        dispatcher: Dispatcher,
+        surface: Resolved<WlSurfaceId>,
+    }
+
+    impl XwaylandCommit {
+        fn new() -> Self {
+            let mut state = state_for_tests();
+            let mut client = Client::new_xwayland_for_tests(ClientId::from_raw(4));
+            let surface = client
+                .insert_object(
+                    &mut state,
+                    WlSurface::new(WlSurfaceId::from(4), client.client_id(), 6),
+                )
+                .0;
+            assert!(surface.grab(&mut state).assign_xwayland_role());
+            let (xsurface, _) = client.insert_object(
+                &mut state,
+                crate::wayland_objects::xwayland_surface_v1::XwaylandSurfaceV1::new(
+                    XwaylandSurfaceV1Id::from(5),
+                    surface,
+                ),
+            );
+            surface
+                .grab(&mut state)
+                .set_xwayland_surface_object(xsurface);
+            Self { state, client, dispatcher: Dispatcher::default(), surface }
+        }
+
+        fn set_serial(&mut self, serial_lo: u32, serial_hi: u32) {
+            let mut event = RawEvent::new(XwaylandSurfaceV1Id::from(5).into(), 0, 2);
+            event.uint(serial_lo);
+            event.uint(serial_hi);
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            client_dispatcher
+                .set_requester_object_id_for_tests(XwaylandSurfaceV1Id::from(5).into());
+            self.client
+                .grab_object(XwaylandSurfaceV1Id::from(5), &mut self.state)
+                .on(
+                    &mut self.client,
+                    &mut self.state,
+                    (&*event.into_bytes()).try_into().unwrap(),
+                    &mut client_dispatcher,
+                );
+        }
+
+        fn commit(&mut self) {
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            let mut surface = self.surface.grab(&mut self.state);
+            surface.on_commit(&mut self.client, &mut self.state, &mut client_dispatcher);
+        }
+
+        fn surface_events(&self) -> usize {
+            self.dispatcher
+                .test_count_queued_action(|action: &XwaylandAction| {
+                    matches!(action, XwaylandAction::Surface { .. })
+                })
+        }
+
+        fn request<K>(&mut self, object: K, opcode: u16)
+        where
+            K: crate::object::IdToObject + Into<WaylandId> + Copy,
+        {
+            let event = RawEvent::new(object.into(), opcode, 0);
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(object.into());
+            self.client.grab_object(object, &mut self.state).on(
+                &mut self.client,
+                &mut self.state,
+                (&*event.into_bytes()).try_into().unwrap(),
+                &mut client_dispatcher,
+            );
+        }
+
+        fn destroy_role(&mut self) {
+            self.request(XwaylandSurfaceV1Id::from(5), 1);
+        }
+
+        fn destroy_surface(&mut self) {
+            self.request(WlSurfaceId::from(4), 0);
+        }
+    }
+
+    #[test]
+    fn a_pending_serial_is_committed_once() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.set_serial(7, 0);
+        assert!(xwayland
+            .surface
+            .rref(&xwayland.state)
+            .xwayland_serial()
+            .is_none());
+        assert_eq!(xwayland.surface_events(), 0);
+
+        xwayland.commit();
+
+        let client_id = xwayland.client.client_id();
+        let surface = xwayland.surface;
+        assert_eq!(xwayland.surface.rref(&xwayland.state).xwayland_serial(), Some(7));
+        assert!(xwayland
+            .surface
+            .rref(&xwayland.state)
+            .pending_xwayland_serial()
+            .is_none());
+        assert_eq!(xwayland.surface_events(), 1);
+        assert!(xwayland
+            .dispatcher
+            .test_has_queued_action(|action: &XwaylandAction| {
+                matches!(
+                    action,
+                    XwaylandAction::Surface {
+                        client,
+                        event: SurfaceEvent::SerialAssigned { serial: 7, surface: assigned },
+                    } if *client == client_id && *assigned == surface
+                )
+            }));
+
+        xwayland.commit();
+        assert_eq!(xwayland.surface_events(), 1);
+    }
+
+    #[test]
+    fn a_commit_without_a_pending_serial_queues_nothing() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.commit();
+        assert!(xwayland
+            .surface
+            .rref(&xwayland.state)
+            .xwayland_serial()
+            .is_none());
+        assert_eq!(xwayland.surface_events(), 0);
+    }
+
+    #[test]
+    fn a_rejected_commit_keeps_the_serial_uncommitted() {
+        let mut xwayland = XwaylandCommit::new();
+        {
+            let mut surface = xwayland.surface.grab(&mut xwayland.state);
+            surface.syncobj_surface_object = Some(Resolved::new(
+                xwayland.client.client_id(),
+                WpLinuxDrmSyncobjSurfaceV1Id::from(9),
+                ObjectId::from(9usize),
+            ));
+            surface.pending.sync.acquire = crate::sync::AcquireSync::SyncFile(std::rc::Rc::new(
+                std::fs::File::open("/dev/null").unwrap().into(),
+            ));
+            surface.set_pending_xwayland_serial(7);
+        }
+
+        xwayland.commit();
+
+        assert!(xwayland
+            .surface
+            .rref(&xwayland.state)
+            .xwayland_serial()
+            .is_none());
+        assert!(xwayland
+            .surface
+            .rref(&xwayland.state)
+            .pending_xwayland_serial()
+            .is_none());
+        assert_eq!(xwayland.surface_events(), 0);
+    }
+
+    #[test]
+    fn set_serial_after_commit_is_already_associated() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.set_serial(7, 0);
+        xwayland.commit();
+        xwayland.set_serial(8, 0);
+
+        let client_id = xwayland.client.client_id();
+        assert!(xwayland
+            .dispatcher
+            .test_has_queued_action(|action: &ClientManagerAction| {
+                matches!(action, ClientManagerAction::Close { id } if *id == client_id)
+            }));
+        assert_eq!(xwayland.surface.rref(&xwayland.state).xwayland_serial(), Some(7));
+        assert_eq!(xwayland.surface_events(), 1);
+    }
+
+    #[test]
+    fn destroying_the_surface_before_its_xwayland_role_object_disconnects() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.destroy_surface();
+
+        let client_id = xwayland.client.client_id();
+        assert!(xwayland
+            .dispatcher
+            .test_has_queued_action(|action: &ClientManagerAction| {
+                matches!(action, ClientManagerAction::Close { id } if *id == client_id)
+            }));
+        assert!(xwayland
+            .client
+            .contains_object(WlSurfaceId::from(4), &xwayland.state));
+        assert!(xwayland
+            .client
+            .contains_object(XwaylandSurfaceV1Id::from(5), &xwayland.state));
+        assert_eq!(xwayland.surface_events(), 0);
+    }
+
+    #[test]
+    fn destroying_a_committed_xwayland_surface_reports_the_serial() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.set_serial(7, 0);
+        xwayland.commit();
+        let surface = xwayland.surface;
+        xwayland.destroy_role();
+        xwayland.destroy_surface();
+
+        assert!(!xwayland
+            .client
+            .contains_object(WlSurfaceId::from(4), &xwayland.state));
+        assert!(xwayland
+            .dispatcher
+            .test_has_queued_action(|action: &XwaylandAction| {
+                matches!(
+                    action,
+                    XwaylandAction::Surface {
+                        event: SurfaceEvent::Destroyed { serial: 7, surface: destroyed },
+                        ..
+                    } if *destroyed == surface
+                )
+            }));
+    }
+
+    #[test]
+    fn destroying_an_xwayland_surface_without_a_serial_reports_nothing() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.destroy_role();
+        xwayland.destroy_surface();
+
+        assert!(!xwayland
+            .client
+            .contains_object(WlSurfaceId::from(4), &xwayland.state));
+        assert!(!xwayland
+            .dispatcher
+            .test_has_queued_action(|action: &XwaylandAction| {
+                matches!(
+                    action,
+                    XwaylandAction::Surface { event: SurfaceEvent::Destroyed { .. }, .. }
+                )
+            }));
     }
 
     #[test]
