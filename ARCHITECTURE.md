@@ -553,6 +553,8 @@ If coming back after a long time, this order should restore the mental model qui
    Understand output buffer allocation.
 12. `src/input.rs`, `src/udev.rs`, `src/dbus.rs`
    Rebuild device discovery and session/device access.
+13. `src/x11/` and section 19
+   The X11 codec, the sans-IO connection, startup, and the io_uring driver. M5's XWM model is the owner.
 
 ## 14. Vocabulary
 
@@ -609,6 +611,15 @@ If coming back after a long time, this order should restore the mental model qui
 - connector: output endpoint such as HDMI or DP
 - CRTC: display timing and scanout engine
 - plane: hardware image layer attached to a CRTC
+
+### X11
+
+- X connection: `XConnection`, the sans-IO core. The owner moves the bytes
+- sequence: the 64-bit count of requests on one connection. The wire carries the low 16 bits
+- pending queue: sent requests, in order, waiting for a later sequence to retire them
+- sync point: the GetInputFocus that `take_outgoing` appends after void requests, so those voids can retire
+- atom: a numeric id for a string. `NAMES` are interned at startup. `PREDEFINED` are fixed values from the generated constants
+- XWM: the model M5 adds. It owns the X connection and claims `WM_S0`
 
 ## 15. Final Mental Shortcut
 
@@ -780,7 +791,7 @@ Give-up logs `Xwayland gave up: …`, unlinks both files, and removes `DISPLAY` 
 
 ### `WM_S0`
 
-`-wm 5` is always passed, and our end of that socket stays open. Xwayland accepts clients on the listen socket only once a window manager owns the `WM_S0` selection. Nothing here claims it yet. That arrives in M5. Until then `xterm` starts Xwayland, the server becomes ready, and the X client waits.
+`-wm 5` is always passed, and our end of that socket stays open. Xwayland accepts clients on the listen socket only once a window manager owns the `WM_S0` selection. Nothing here claims it yet. That arrives in M5, on the connection in section 19. Until then `xterm` starts Xwayland, the server becomes ready, and the X client waits.
 
 ### Xwayland-only globals
 
@@ -833,3 +844,79 @@ These maps stay keyed by the root surface: the geometry cache, output membership
 ### X windows
 
 M6 adds X windows on this same path. The X role object stays in `state.objects` and implements `Toplevel`. Creating the window calls `insert_window`. Destroying it calls `destroy_window`. Layout, grabs, snapshots, keybindings, and capture then see it as a window.
+
+## 19. The X11 connection
+
+`src/x11/` is the library M5's window-manager model will own. The running compositor still only launches Xwayland, as section 17 describes, and the `-wm` socket stays open. This library is what will speak on it.
+
+The owner keeps an `XConnection` and an `XIo` beside the model that drives them. `send` takes a `Redispatcher`, and the reply comes back as an action.
+
+### Codegen
+
+`src/x11/generated.rs` is checked in. The generator lives in `src/x11/gen/` and is compiled only for tests. It reads `/usr/share/xcb/xproto.xml`, `composite.xml`, `xfixes.xml`, `res.xml`, and `render.xml`. `quick-xml` is a dev-dependency. A normal build uses the checked-in file. The test `generated_source_matches_installed_xcb` compares a fresh generation with that file, and returns immediately when `xproto.xml` is absent.
+
+Rewrite the checked-in file with:
+
+```text
+cargo test --offline --bin tema regenerate_x11_generated -- --ignored
+```
+
+`src/x11/wire.rs` writes the machine's native byte order. The setup request announces that order as `l` or `B`, protocol 11.0, with empty authorization. Every generated struct, reply, and event can both serialize and parse, so a test can play the server. The requests and events that are emitted are the const list in `src/x11/gen/emit.rs`: the core window, property, atom, and selection requests this compositor will use, plus Composite, XFIXES, RENDER, and X-Resource, and the types those items reference.
+
+### The connection
+
+`XConnection::new` returns the core and the setup bytes. The owner writes those bytes. `on_read` accumulates and parses the handshake: 8 bytes, plus the `u16` at bytes 6..8 times 4. Success keeps `roots[0]`, its root window and root visual, `maximum_request_length`, and the resource-id base and mask. The states are Handshake, Ready, and Dead.
+
+Resource ids are `base | (counter & mask)`, stepping by `1 << mask.trailing_zeros()`. The id with every mask bit set is handed out. The next call fails with `IdExhausted`.
+
+`send` and `send_void` append to an outgoing buffer and return the sequence. The first request is sequence 1. A request longer than `maximum_request_length * 4` bytes is `RequestTooLong` and consumes no sequence. An extension request needs `set_extension` first, or `send` returns `ExtensionMissing`.
+
+### Sequences and the pending queue
+
+The wire sequence is 16 bits. The core widens it against the last sequence that carried one: `serial = (last & !0xffff) | wire`, and if that result is below `last`, it adds `0x10000`.
+
+KeymapNotify, code 11, carries no sequence. It leaves `last` where it is and retires nothing.
+
+Every sent request sits in a queue in send order. A message with sequence N retires every entry older than N. A void request retires as success. A request that expected a reply fails with `MissingReply`. The entry whose sequence is N is then taken.
+
+Response type 0 is an error and type 1 is a reply. A reply is parsed and handed to the `Redispatcher` from `send`. Bytes left over after a parsed reply kill the connection, and that waiter receives `Dead`. An error for a waiting request is `Protocol`. An error for a void request, for the sync reply, or for a sequence nobody is waiting on is logged as `X request {name} failed with {label}`.
+
+An event keeps the send-event flag, bit 7 of the first byte, and the parser sees the code with that bit cleared. Code 35 is a Generic Event. Its extra length is the `u32` at bytes 4..8, and it arrives as `Event::Unknown`. Ordinary frames are 32 bytes. Replies and Generic Events add `length * 4` bytes after that.
+
+A read error, end of file, malformed bytes, or a write error marks the connection Dead. Every pending reply then fails with `Dead`, and `Read.dead` carries the reason once. Later reads leave `dead` empty. `send` and `generate_id` return the stored failure.
+
+### Sync points
+
+`take_outgoing` is the flush. When the last committed request was void, it appends a GetInputFocus and records that request as a sync. The reply is discarded. Its sequence retires the void requests in front of it, and the widened sequence keeps moving.
+
+### The io driver
+
+`XIo` holds the `-wm` descriptor. The caller closes it. The owner passes two factories, and each factory builds the `Redispatcher` for one completion, tagged with the generation and, for a read, the `RingId`.
+
+`start` arms one `ReadSome` of 64 KiB. A second `start` while that read is armed replaces the factories and leaves the single read in place. `queue_bytes` takes the setup bytes from `XConnection::new`, which sit outside the outgoing buffer. `flush` calls `take_outgoing` and queues one `Write`. One write is in flight. The ring retries a short write, so a successful completion means the whole buffer was written. Further bytes wait until `on_written`.
+
+A completion whose generation or read id differs from the armed one is dropped. An empty read or a read error logs, disconnects the core once, and stops I/O. When `on_read` has already marked the core dead, `XIo` keeps that first reason. A write error disconnects and cancels the armed read. `stop` cancels the armed read, drops bytes that have not been submitted, bumps the generation, and leaves the core connected. The factories stay, so a later `start` can arm again.
+
+### Startup and atoms
+
+`Startup` is a state machine the owner drives. `start` sends `QueryExtension` for Composite, XFIXES, RENDER, and X-Resource. `QueryVersion` follows for each one that is present: Composite 0.4, XFIXES 6.0, RENDER 0.11, and X-Resource 1.2. A server older than the requested version fails. A newer server version is kept. Composite, XFIXES, and RENDER are required. X-Resource may be absent, and a present copy that is too old still fails. Each present extension is registered on the connection before its version request, so later events and errors use those bases.
+
+The intern batch follows the version replies. Each name in `NAMES` goes out as an `InternAtom` with `only_if_exists` 0, back to back. Replies are stored by the index they were tagged with. One error fails the batch. `PREDEFINED` is copied from the generated `Atom` constants, among them `WM_NAME`, `WM_CLASS`, `STRING`, `CARDINAL`, `ATOM`, and `WINDOW`. Ready means both steps succeeded: `Status::Ready(Bringup { extensions, atoms })`. A startup failure leaves the X connection up. `AtomCache` looks a name up in either direction, and `intern_more` sends names the cache has yet to see.
+
+### Properties
+
+`get_property` sends one `GetProperty`. `long_offset` is 0, `delete` is 0, and `long_length` is `max_bytes / 4`. The reply becomes a `Property` with its type, format, bytes, and `truncated` set when `bytes_after` is non-zero. `Atom::Any` keeps the type the server returns. A requested type that differs, on a property that exists, is a type error. Format 0 is an absent property. `as_u32s`, `as_atoms`, and `as_windows` read native-endian format 32 words. `as_utf8` replaces invalid sequences. `as_latin1` maps each byte to a character. The change helpers build a `Replace` `ChangeProperty`. `delete_property` builds `DeleteProperty`.
+
+### Who owns it in M5
+
+M5's XWM model owns the `XConnection` and the `XIo`. It writes the setup, runs `Startup`, and passes a `Redispatcher` that turns each reply into an action of that model. The `WM_S0` claim from section 17 happens on this connection once startup is ready.
+
+### Trying it against Xwayland
+
+The live test is ignored. Under a Wayland compositor:
+
+```text
+WAYLAND_DISPLAY=<socket> cargo test --offline --bin tema x11::live:: -- --ignored --test-threads=1
+```
+
+It spawns `/usr/bin/Xwayland :N -rootless -wm <fd> -displayfd <fd>`, drives the connection with `poll`, `read`, and `write`, runs startup, and reads `WM_NAME` on the root. The spawn runs when `WAYLAND_DISPLAY` is set.

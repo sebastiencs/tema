@@ -48,6 +48,7 @@ shaderc-dyn = "0.10"
 
 [dev-dependencies]
 mktemp = "0.5.0"
+quick-xml = "0.39"
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.5"

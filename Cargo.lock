@@ -929,6 +929,7 @@ dependencies = [
  "nix",
  "once_cell",
  "owo-colors",
+ "quick-xml 0.39.2",
  "rand",
  "serde",
  "shaderc-dyn",
