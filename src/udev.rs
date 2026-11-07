@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::{
-        fd::{AsRawFd, OwnedFd, RawFd},
+        fd::{AsFd, AsRawFd, OwnedFd, RawFd},
         unix::prelude::OsStrExt,
     },
     path::PathBuf,
@@ -537,7 +537,7 @@ impl Udev {
                 .insert(devnum, ParkedSessionDevice { kind: ParkedKind::Input, fd: Some(fd) });
             return;
         }
-        set_non_blocking(fd.as_raw_fd());
+        set_non_blocking(&fd);
         dispatcher.dispatch(LibinputAction::OpenInput { devnode, fd, devnum: devnum as u64 });
     }
 
@@ -584,7 +584,7 @@ impl Udev {
         let Some(fd) = self.take_input_fd(devnum) else {
             return;
         };
-        set_non_blocking(fd.as_raw_fd());
+        set_non_blocking(&fd);
         dispatcher.dispatch(LibinputAction::Quiesce { devnum: devnum as u64 });
         dispatcher.dispatch(LibinputAction::OpenInput { devnode, fd, devnum: devnum as u64 });
     }
@@ -905,7 +905,7 @@ impl Udev {
     }
 }
 
-fn set_non_blocking(fd: RawFd) {
+fn set_non_blocking(fd: &impl AsFd) {
     let flags = fcntl::fcntl(fd, F_GETFL).unwrap();
     let flags = OFlag::from_bits_retain(flags);
 

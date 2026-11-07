@@ -38,13 +38,23 @@ impl MyLogger {
 
 #[cfg(not(test))]
 fn redirect_to_file(file: Option<&std::fs::File>) -> std::io::Result<()> {
-    use {nix::fcntl::OFlag, std::os::fd::AsRawFd};
+    use std::{
+        mem,
+        os::fd::{FromRawFd, OwnedFd},
+    };
+
+    use nix::fcntl::OFlag;
 
     let Some(file) = file else { return Ok(()) };
 
-    // Redirect std{out,err} to the file
-    nix::unistd::dup3(file.as_raw_fd(), 1, OFlag::O_CLOEXEC)?;
-    nix::unistd::dup3(file.as_raw_fd(), 2, OFlag::O_CLOEXEC)?;
+    // `dup3` replaces the destination. Dropping the `OwnedFd` it writes
+    // through would close stdout or stderr, so that owner is forgotten.
+    for slot in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        let mut installed = unsafe { OwnedFd::from_raw_fd(slot) };
+        let result = nix::unistd::dup3(file, &mut installed, OFlag::O_CLOEXEC);
+        mem::forget(installed);
+        result?;
+    }
     Ok(())
 }
 

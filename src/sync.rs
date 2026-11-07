@@ -176,11 +176,7 @@ impl AcquireSync {
     fn export_sync_file(&self) -> io::Result<OwnedFd> {
         match self {
             Self::None => Err(io::Error::new(io::ErrorKind::InvalidInput, "no acquire sync")),
-            Self::SyncFile(fd) => {
-                let raw = dup(fd.as_fd().as_raw_fd())
-                    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-                Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-            }
+            Self::SyncFile(fd) => dup(fd.as_fd()).map_err(io::Error::from),
             Self::TimelinePoint { timeline, point } => {
                 export_timeline_point_sync_file(timeline.drm(), timeline.handle(), *point)
             }

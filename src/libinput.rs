@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd},
     path::Path,
     sync::{Arc, Mutex},
     time::Instant,
@@ -48,8 +48,8 @@ impl LibinputInterface for Interface {
                 log::error!("No session fd cached for libinput device {:?}", path);
                 return Err(-1);
             };
-            match dup(fd.as_raw_fd()) {
-                Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+            match dup(fd) {
+                Ok(fd) => fd,
                 Err(e) => {
                     log::error!("Failed to dup libinput device fd for {:?}: {:?}", path, e);
                     return Err(-1);

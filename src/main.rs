@@ -180,6 +180,7 @@ mod io_uring;
 mod libinput;
 mod logger;
 mod object;
+mod process;
 mod protocol;
 mod protocol_generated;
 mod queue;
@@ -222,11 +223,26 @@ fn make_timer(duration: Duration) -> TimerFd {
 }
 
 fn main() -> std::process::ExitCode {
+    let reaper = process::become_reaped();
+    match process::count_threads() {
+        Ok(1) => {}
+        Ok(threads) => abort_startup(&format!(
+            "tema: expected one thread before starting the forker, found {threads}"
+        )),
+        Err(error) => abort_startup(&format!("tema: could not count threads: {error}")),
+    }
+    let forker = process::spawn_forker(Some(reaper));
     if let Err(error) = logger::install() {
         eprintln!("failed to install logger: {error}");
+        if let Err(error) = &forker {
+            eprintln!("failed to start the forker: {error}");
+        }
         return std::process::ExitCode::from(1);
     }
-    match start_compositor() {
+    if let Err(error) = &forker {
+        log::error!("failed to start the forker: {error}");
+    }
+    match start_compositor(forker.ok()) {
         Ok(outcome) => {
             log::info!("compositor stopped: {outcome}");
             log::logger().flush();
@@ -240,7 +256,13 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn start_compositor() -> Result<ExitOutcome, StartupError> {
+fn abort_startup(message: &str) -> ! {
+    eprintln!("{message}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    std::process::abort();
+}
+
+fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome, StartupError> {
     // use std::any::Any;
 
     // dbus2::init().unwrap();
@@ -362,9 +384,14 @@ fn start_compositor() -> Result<ExitOutcome, StartupError> {
     runner.add_model(Box::new(drm::VisualAnimationPump::new()));
     let signals = Box::new(signals::SignalHandler::install().map_err(StartupError::Signals)?);
     runner.add_model(signals);
+    runner.add_model(Box::new(process::ProcessManager::new(forker)));
 
     let mut dispatcher = Dispatcher::default();
     dispatcher.start::<ClientManager>();
+    dispatcher.start::<process::ProcessManager>();
+    for (key, value) in process::default_environment() {
+        dispatcher.dispatch(process::ProcessManagerAction::SetEnv { key, value: Some(value) });
+    }
     dispatcher.start::<libinput::Libinput>();
     dispatcher.start::<scheduler::IdleScheduler>();
     dispatcher.start::<config::ConfigWatcher>();

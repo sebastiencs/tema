@@ -17,12 +17,13 @@ use {
 
 use crate::{
     animation_config::{compile as compile_animations, AnimationsConfig, AnimationsConfigFile},
-    clients::{ClientManagerAction, Resolved, WAYLAND_DISPLAY_NAME},
+    clients::{ClientManagerAction, Resolved},
     drm::{kick_visual_animation_pump, request_outputs, request_outputs_for_points},
     io_uring::{
         model::IoUringAction,
         ring::{PollCompleted, RingId},
     },
+    process::{ChildExit, ProcessEvent, ProcessManager, ProcessManagerAction, SpawnRequest},
     protocol_generated::WlSurfaceId,
     runner::{Dispatcher, Model, Redispatcher, ShutdownReason},
     state::{FractionalScale, ManagedWindowMode, State, WorkspaceGroupId, WorkspaceId},
@@ -1192,18 +1193,30 @@ pub fn apply_output_settings(state: &mut State, dispatcher: &mut Dispatcher) {
     }
 }
 
+fn log_spawn(command: &str, event: &ProcessEvent) {
+    match event {
+        ProcessEvent::Failed { error } => log::warn!("failed to spawn `{command}`: {error}"),
+        ProcessEvent::Exited { exit: ChildExit::Code(0) } | ProcessEvent::Spawned { .. } => {}
+        ProcessEvent::Exited { exit } => log::debug!("spawn `{command}` exited {exit:?}"),
+        // The forker's own death is already logged. One line per child adds nothing.
+        ProcessEvent::Lost => {}
+    }
+}
+
 pub fn execute_action(state: &mut State, dispatcher: &mut Dispatcher, action: CompositorAction) {
     match action {
         CompositorAction::Spawn { command } => {
-            let result = std::process::Command::new("sh")
-                .arg("-lc")
-                .arg(&command)
-                .env("WAYLAND_DISPLAY", WAYLAND_DISPLAY_NAME)
-                .env_remove("DISPLAY")
-                .spawn();
-            if let Err(error) = result {
-                log::warn!("failed to spawn `{}`: {:?}", command, error);
-            }
+            let logged = command.clone();
+            dispatcher.dispatch(ProcessManagerAction::Spawn(SpawnRequest {
+                program: "sh".into(),
+                args: vec!["-lc".into(), command],
+                env: Vec::new(),
+                fds: Vec::new(),
+                notify: Some(Redispatcher::to::<ProcessManager>(move |event| {
+                    log_spawn(&logged, &event);
+                    ProcessManagerAction::Logged
+                })),
+            }));
         }
         CompositorAction::Quit => {
             log::info!("quitting compositor from keybinding");
@@ -2686,6 +2699,30 @@ mod tests {
 
         state.managed_root_surfaces.remove(&surface);
         assert!(focused_managed_root(&state).is_none());
+    }
+
+    #[test]
+    fn spawn_queues_a_shell_command() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        execute_action(
+            &mut state,
+            &mut dispatcher,
+            CompositorAction::Spawn { command: "foo".into() },
+        );
+        assert!(dispatcher.test_has_queued_action::<ProcessManagerAction>(|action| {
+            let ProcessManagerAction::Spawn(request) = action else {
+                return false;
+            };
+            request.program == "sh"
+                && request.args.len() == 2
+                && request.args[0] == "-lc"
+                && request.args[1] == "foo"
+                && request.env.is_empty()
+                && request.fds.is_empty()
+                && request.notify.is_some()
+        }));
+        assert_eq!(dispatcher.test_count_queued_action::<ProcessManagerAction>(|_| true), 1);
     }
 
     #[test]

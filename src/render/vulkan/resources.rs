@@ -2,7 +2,6 @@ use std::{
     any::Any,
     cell::Cell,
     fmt::{self, Debug},
-    os::fd::AsRawFd,
     rc::Rc,
 };
 
@@ -463,7 +462,7 @@ impl Drop for OutputTarget {
 }
 
 pub(super) fn plane_file(plane: &DmaBufPlane) -> Result<(u64, u64), RendererError> {
-    let stat = nix::sys::stat::fstat(plane.fd.as_raw_fd()).map_err(|error| {
+    let stat = nix::sys::stat::fstat(&plane.fd).map_err(|error| {
         log::error!("failed to stat a dma-buf plane: {error}");
         RendererError::ImportFailed
     })?;

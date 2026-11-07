@@ -492,7 +492,7 @@ mod tests {
         drop(target);
     }
 
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::os::fd::{AsFd, AsRawFd};
 
     #[repr(C)]
     struct DrmSyncobjHandle {
@@ -632,8 +632,7 @@ mod tests {
     }
 
     fn dup_fd(fd: &OwnedFd) -> OwnedFd {
-        let raw = nix::unistd::dup(fd.as_raw_fd()).expect("dup sync file");
-        unsafe { OwnedFd::from_raw_fd(raw) }
+        nix::unistd::dup(fd).expect("dup sync file")
     }
 
     fn held_green_frame(renderer: &mut VulkanRenderer, quad: FrameElement, release: impl FnOnce()) {

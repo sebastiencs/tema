@@ -68,6 +68,7 @@ That same stack can also be read as a pipeline:
 These files are the most important anchors:
 
 - `src/main.rs`: startup and wiring.
+- `src/process/`: reaper, forker, and the `ProcessManager` model. See section 16.
 - `src/runner.rs`: the event/action engine.
 - `src/state.rs`: shared compositor state.
 - `src/clients.rs`: Wayland server socket, client connections, protocol dispatch.
@@ -104,14 +105,16 @@ So this is not just "a compositor that happens to use async I/O". It is closer t
 
 At startup:
 
-1. `main.rs` initializes EGL, XKB, globals, and shared `State`.
-2. It creates models for:
+1. The original process becomes the reaper and forks the compositor. The compositor then starts the forker. Both forks happen before EGL, while the process is still one thread. Section 16 describes the tree.
+2. `main.rs` initializes EGL, XKB, globals, and shared `State`.
+3. It creates models for:
    - `IoUringState`
    - `Dbus`
    - `Udev`
    - `Libinput`
    - `Clients`
-3. `ClientManagerAction::Start` starts the Wayland socket accept loop and also starts D-Bus and udev.
+   - `ProcessManager`
+4. `ClientManagerAction::Start` starts the Wayland socket accept loop and also starts D-Bus and udev. `ProcessManager` starts next and sends the default environment to the forker.
 
 At runtime:
 
@@ -524,8 +527,8 @@ That is the entire stack in motion.
 
 If coming back after a long time, this order should restore the mental model quickly:
 
-1. `src/main.rs`
-   Understand startup and which subsystems exist.
+1. `src/main.rs` and section 16
+   Understand startup, including the reaper and the forker, and which subsystems exist.
 2. `src/runner.rs`
    Understand the action-driven runtime.
 3. `src/state.rs`
@@ -616,3 +619,89 @@ When this repository feels too abstract, reduce it to this:
 - connector, CRTC, and plane are the hardware display graph.
 
 That is the whole system.
+
+## 16. Processes
+
+The compositor does not fork. The process that was started from the terminal becomes a reaper, and a helper process, the forker, creates every child. Keybinding commands use this path now. Xwayland will use it later.
+
+```text
+tema reaper          original pid, child subreaper, terminal process group
+├── tema             compositor, death signal SIGKILL
+└── tema forker      double-forked, reparented to the reaper, own session,
+                     death signal SIGKILL
+    └── sh -lc …     own process group, then the requested program
+```
+
+`ps -o pid,ppid,pgid,sid,comm` shows those names. `comm` is at most 15 characters. The compositor keeps the binary name `tema`. The reaper and the compositor stay in the terminal's process group. The forker calls `setsid`, so its session id is its own pid. Each spawned child calls `setpgid(0, 0)` before `exec`, so its process group is its own pid.
+
+Startup order in `main`, before the logger and before EGL:
+
+1. `become_reaped` resets signals, marks this process a child subreaper, and forks. The subreaper flag is not inherited, so only the reaper has it.
+2. The child sets `PDEATHSIG` to `SIGKILL` and continues only if its parent is still the reaper.
+3. The parent names itself `tema reaper`, forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to the compositor, and `wait`s. The handler only calls `kill`. Forwarding `SIGINT` matters: the default action would kill the reaper, and the compositor's death signal would then `SIGKILL` it before DRM and logind cleanup.
+4. The compositor checks that it still has one thread, then starts the forker. A second thread aborts. The forker is double-forked so the reaper, not the compositor, is its parent.
+5. If the forker cannot be created, that error is logged after the logger is installed and startup continues.
+
+The reaper and the compositor keep the terminal's standard streams. The forker puts `/dev/null` on descriptors 0, 1, and 2, moves its socket to descriptor 3 with close-on-exec, and closes everything from 4 up. Children inherit `/dev/null` unless a spawn passes its own descriptors for those slots. A keybinding spawn passes none.
+
+The reaper exits when the compositor exits, with the same code, or `128 + signal`. A status that does not fit in a byte becomes 1. It does not wait for other children. Programs that are still running are reparented and keep running. The forker dies with the reaper because of its death signal. While the reaper is alive it reaps every child, including a daemon whose parent already exited.
+
+On shutdown the runner stops `ProcessManager` immediately after `ClientManager`. That drops the socket. The forker sees the close and exits 0.
+
+### File descriptors
+
+| Owner | What it holds |
+| --- | --- |
+| Reaper | The terminal's standard streams. No extra descriptors. |
+| Compositor | The terminal's standard streams, one end of the forker socket, and a pidfd for the forker. A `Spawned` reply also carries a pidfd for that child. A keybinding drops that pidfd after logging. The forker keeps its own copy and is the one that reports the exit. |
+| Forker | Socket on descriptor 3, close-on-exec. `/dev/null` on 0–2, inherited across `exec`. One pidfd per live child. The exec-error pipe exists only until `exec`. |
+| Child | Descriptors named by the spawn's slot list, or `/dev/null` on 0–2. |
+
+One seqpacket is one message. Descriptors travel beside the bytes with `SCM_RIGHTS`, at most 32 of them. The bytes are bincode, little-endian, fixed-width integers, at most 32 KiB, with no trailing bytes. Variant order is the numeric tag, so the variants stay in the order below.
+
+Sends are one at a time. An `io_uring` completion can arrive out of submission order, and a `SetEnv` has to reach the forker before a later `Spawn`.
+
+### Messages
+
+Compositor to forker:
+
+- `SetEnv { key, value }`. `value` absent removes `key` from the forker. Later spawns inherit the result.
+- `Spawn { token, program, args, env, slots }`. `args` does not include `argv[0]`. `slots[i]` is the child descriptor number of the i-th attached descriptor. `env` overrides the forker's environment for this child only.
+
+Forker to compositor:
+
+- `Log { level, message }`. `level` is `log::Level` as a byte (`Error` is 1). Logged as `forker: …`.
+- `Spawned { token, pid }`, plus the child's pidfd.
+- `SpawnFailed { token, error }`. The child never reached `exec`.
+- `Exited { token, exit }`. `exit` is `Code(n)` or `Signal(n)`.
+
+The forker removes `DISPLAY` and `WAYLAND_DISPLAY` from itself and sets `XDG_SESSION_TYPE=wayland`. After `ProcessManager` starts, the compositor sends:
+
+- `WAYLAND_DISPLAY=tema-0`
+- `XDG_CURRENT_DESKTOP=tema`
+- `_JAVA_AWT_WM_NONREPARENTING=1`
+
+`DISPLAY` is not sent again, so a compositor nested under X does not pass that outer display to new programs.
+
+A keybinding runs `sh -lc <command>` with no extra environment and no extra descriptors. Failure is a warning: `failed to spawn`, the command in backticks, then the error. A non-zero exit, including death by signal, is a debug line. A zero exit is quiet.
+
+### Degraded mode
+
+The compositor keeps running when the forker is missing.
+
+- `spawn_forker` fails at startup: one error in the log. `ProcessManager` has no socket.
+- The forker's pidfd poll fires, a receive fails, or a read returns no bytes: an error in the log, the poll is removed, and the socket is dropped. A spawn that has not reached `Spawned` fails with `forker died`. A child that was already running is marked lost. Its exit will not arrive, and a keybinding does not log that again.
+- Any later spawn fails immediately with the warning `forker is unavailable`.
+
+`Stop` uses the same notification with `forker stopped`. That is a normal shutdown, not a death.
+
+### Manual check
+
+Run a normal session from a terminal, with the example bindings (`Super+Return` spawns `alacritty`).
+
+1. `ps -o pid,ppid,pgid,sid,comm` shows `tema reaper` as the parent of both `tema` and `tema forker`. The forker's session id is its own pid.
+2. `Super+Return`. The new process is in its own process group, and `ls -l /proc/<pid>/fd/0 /proc/<pid>/fd/1 /proc/<pid>/fd/2` points all three at `/dev/null`.
+3. Ctrl+C in the terminal. The session exits 130. The forker is gone. `ps` shows no leftover `tema` zombie.
+4. Start again and `kill -9` the compositor pid. The reaper exits 137 and the forker dies.
+5. Start again and `kill -9` the forker pid. The compositor logs `forker died` and stays up. Another `Super+Return` warns `forker is unavailable`.
+6. Spawn `sleep 300 &` from a keybinding (`sh -lc` is added by the compositor, so the command itself is `sleep 300 &`). `ps -o pid,ppid,comm` shows that `sleep` is a child of `tema reaper`.

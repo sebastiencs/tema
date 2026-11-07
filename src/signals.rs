@@ -1,8 +1,10 @@
 //! Process signals delivered through `signalfd`.
 //!
-//! The mask matches Jay's `src/sighand.rs`: `SIGINT` and `SIGTERM` request
-//! shutdown, and `SIGPIPE` is blocked so a client disconnect cannot kill the
-//! process. Cleanup stays on the runner thread; nothing runs in a signal handler.
+//! `SIGINT`, `SIGTERM`, and `SIGHUP` request shutdown. `SIGHUP` is included
+//! because the reaper forwards a terminal hangup, and the default disposition
+//! would kill the process before cleanup. `SIGPIPE` is blocked so a client
+//! disconnect cannot kill the process. Cleanup stays on the runner thread;
+//! nothing runs in a signal handler.
 
 use std::{fmt, os::fd::AsRawFd};
 
@@ -52,6 +54,7 @@ impl SignalHandler {
         let mut mask = SigSet::empty();
         mask.add(Signal::SIGINT);
         mask.add(Signal::SIGTERM);
+        mask.add(Signal::SIGHUP);
         mask.add(Signal::SIGPIPE);
         mask.thread_block().map_err(SignalInstallError::Block)?;
         let fd = match SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK) {
@@ -107,7 +110,7 @@ impl SignalHandler {
 
 pub(crate) fn reason_for_signal(signo: i32) -> Option<ShutdownReason> {
     match signo {
-        libc::SIGINT | libc::SIGTERM => Some(ShutdownReason::Signal(signo)),
+        libc::SIGINT | libc::SIGTERM | libc::SIGHUP => Some(ShutdownReason::Signal(signo)),
         _ => None,
     }
 }
@@ -155,9 +158,11 @@ mod tests {
 
     #[test]
     fn signal_numbers_map_to_shell_exit_codes() {
+        assert_eq!(crate::runner::exit_code(&ShutdownReason::Signal(libc::SIGHUP)), 129);
         assert_eq!(crate::runner::exit_code(&ShutdownReason::Signal(libc::SIGINT)), 130);
         assert_eq!(crate::runner::exit_code(&ShutdownReason::Signal(libc::SIGTERM)), 143);
         assert_eq!(reason_for_signal(libc::SIGPIPE), None);
+        assert_eq!(reason_for_signal(libc::SIGHUP), Some(ShutdownReason::Signal(libc::SIGHUP)));
         assert_eq!(reason_for_signal(libc::SIGTERM), Some(ShutdownReason::Signal(libc::SIGTERM)));
     }
 
@@ -193,6 +198,7 @@ mod tests {
                 let mut mask = SigSet::empty();
                 mask.add(Signal::SIGINT);
                 mask.add(Signal::SIGTERM);
+                mask.add(Signal::SIGHUP);
                 mask.add(Signal::SIGPIPE);
                 let _ = mask.thread_unblock();
             }

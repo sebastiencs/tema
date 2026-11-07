@@ -2,7 +2,7 @@ use std::{
     any::Any,
     cell::{Cell, RefCell, UnsafeCell},
     ffi::{c_char, CStr, CString},
-    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, FromRawFd, OwnedFd},
     rc::Rc,
 };
 
@@ -620,7 +620,7 @@ fn abandon(device: Device, pool: Option<vk::CommandPool>) {
 }
 
 fn drm_node(drm: &impl AsFd) -> Result<(u64, u64), String> {
-    let stat = nix::sys::stat::fstat(drm.as_fd().as_raw_fd())
+    let stat = nix::sys::stat::fstat(drm)
         .map_err(|error| format!("failed to stat the drm node: {error}"))?;
     Ok((nix::sys::stat::major(stat.st_rdev), nix::sys::stat::minor(stat.st_rdev)))
 }
