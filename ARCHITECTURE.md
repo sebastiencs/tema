@@ -559,6 +559,8 @@ If coming back after a long time, this order should restore the mental model qui
     When a normal X window becomes a tema window, how the layout drives `ConfigureWindow`, and how an override-redirect window stays above that content.
 15. `src/xwayland/xwm/focus.rs` and section 22
     How keyboard focus becomes X input focus: the input model, clicks, map and close, `FocusIn`, and a client's `_NET_ACTIVE_WINDOW`.
+16. `src/capture.rs` and section 23
+    How a managed X window is announced to taskbars and copied by toplevel image capture.
 
 ## 14. Vocabulary
 
@@ -1059,7 +1061,7 @@ Pairing fetches the properties in section 20. Each send increments `props_outsta
 
 `is_managed_root_surface_candidate_common` accepts an X role as well as an xdg surface. The window is live once that root has a committed buffer and a toplevel, the same check as xdg.
 
-On a `wl_surface` commit, a mapped change of an X root that already has a window confirms the map, relayouts inside `with_ungrabbed`, and kicks the animation pump when that opens surfaces. Map and unmap both mark the workspace dirty and dispatch `WorkspaceStateChanged`. Map also dispatches `FocusNewToplevel`. There is no `capture::map_window`. `enter_managed` focuses the root when it is already mapped and the same policy allows it. One map takes one of those two paths. Entering or leaving managed does the same dirty, relayout, pump, and dispatch when the window has a workspace. Section 22 is the focus that follows.
+On a `wl_surface` commit, a mapped change of an X root that already has a window confirms the map, relayouts inside `with_ungrabbed`, and kicks the animation pump when that opens surfaces. Map and unmap both mark the workspace dirty and dispatch `WorkspaceStateChanged`. Map also dispatches `FocusNewToplevel`. Section 23 is the taskbar announcement on that commit. `enter_managed` focuses the root when it is already mapped and the same policy allows it. One map takes one of those two paths. Entering or leaving managed does the same dirty, relayout, pump, and dispatch when the window has a workspace. Section 22 is the focus that follows.
 
 ### `ConfigureWindow`
 
@@ -1194,3 +1196,46 @@ Run a normal session from a terminal, with `RUST_LOG=debug`. Note `:N` in `Alloc
 6. `xprop _NET_WM_STATE` on the focused window lists `_NET_WM_STATE_FOCUSED`.
 7. In a GTK app with two windows, `wmctrl -i -a <other id>` focuses and raises it. From an `xterm`, `wmctrl -a` on another app does nothing.
 8. Lock and unlock the session: focus returns to the X window.
+
+## 23. X windows in taskbars and capture
+
+A managed X window is listed like an xdg toplevel. An override-redirect window has no `WindowId`, so menus and tooltips stay off both foreign-toplevel protocols. The calls live in `src/xwayland/xwm/window.rs` and the X-role commit in `src/wayland_objects/wl_surface.rs`. The records live in `src/capture.rs`.
+
+### Announced and closed
+
+`enter_managed` calls `capture::map_window` when the root already has a committed buffer. The X-role commit calls it when the window is already mapped and the buffer arrives later. `map_window` is idempotent. Title and app id come from the `Toplevel` trait. The next map after a close allocates a new `WindowId` and a new toplevel key.
+
+`leave_managed` calls `capture::unmap_window` before `destroy_window`. `DestroyNotify` and stopping the WM do the same, through `forget` and `release_managed`. A commit that clears the buffer calls it too. `unmap_window` closes the record, drops pending updates for that key, fails queued capture jobs, stops open image-copy sessions, and fails open frames.
+
+### Title, class, and parent
+
+`refresh_managed` copies the title, the app id, and the parent out of the `XToplevel`, then calls `retitle_window`, `reapp_window`, and `note_window_parent`. The title is the UTF-8 name from section 20. The app id is the `WM_CLASS` class, the second NUL-separated field, on both ext-foreign-toplevel-list and zwlr-foreign-toplevel-management. An unchanged value queues nothing. A later `PropertyNotify` resends the new value.
+
+The parent is the managed window named by `WM_TRANSIENT_FOR`. zwlr version 3 sends it. `enter_managed` and `leave_managed` finish by calling `refresh_transient_children`, so a child gains that parent when the named window becomes managed and loses it when that window leaves. `forget` and `release_managed` leave children for their own next refresh.
+
+### The zwlr state
+
+`sync_layout_shell_state` stores maximized clear and fullscreen from `window_is_fullscreen`, which reads the layout. `enter_managed` and the X-role commit call it after `map_window`. `Wm::reconfigure` calls it again for every managed window, so a fullscreen the layout applies during that pass reaches the record. The `_NET_WM_STATE` maximized flags stay on the `XToplevel`. The handle's maximized bit stays clear.
+
+`set_keyboard_focus` calls `sync_activated_from_keyboard_focus` on both the unchanged-focus path and the change path. The activated record is the managed window whose root holds keyboard focus. Focus on a Wayland surface, or on an override-redirect menu, leaves no X record activated.
+
+Output membership follows the root. `refresh_surface_outputs` calls `sync_toplevel_outputs` for the window of that root.
+
+### Taskbar requests
+
+The zwlr handle in `src/wayland_objects/zwlr_foreign_toplevel_handle_v1.rs` is shell-neutral. Activate shows the window's workspace, raises the root, and focuses it. The following `KeyboardFocus` is section 22, so an iconic window returns to `WM_STATE` Normal. Close calls `request_window_close`, which is section 21. `set_fullscreen` and `unset_fullscreen` change the layout on the current workspace. `XToplevel::set_requested_fullscreen` does nothing, so the WM writes no `_NET_WM_STATE` for that request. The next `reconfigure` copies the layout bit onto the handle. `set_maximized`, `set_minimized`, and `set_rectangle` are checked and discarded. A request on a closed handle does nothing.
+
+### Image capture
+
+`toplevel_rendered_bounds` unions the root's scene bounds, its popup tree, and the server-side decoration influence. `submit_toplevel_capture` queues a job of that size. An override-redirect menu is its own root, so the copy leaves it out. Closing the toplevel fails a queued job, stops an open session, and fails an open frame. A new image-capture source on the closed handle disconnects the client.
+
+### Manual check
+
+Run a normal session from a terminal. The display number is in section 20.
+
+1. `waybar` with `wlr/taskbar`, or `lswt`, lists an `xterm` with its title and class `XTerm`.
+2. `printf '\033]2;renamed\007'` in that `xterm` updates the title.
+3. Clicking the taskbar entry focuses the `xterm`, and typing reaches it.
+4. Closing from the taskbar closes it.
+5. A GTK menu (`GDK_BACKEND=x11`) adds no entry.
+6. `grim` through a toplevel picker, or an xdg-desktop-portal window share, captures the `xterm` with its decorations.

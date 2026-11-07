@@ -598,7 +598,7 @@ fn press(state: &mut crate::State, dispatcher: &mut Dispatcher, surface: Resolve
     crate::seat::handle_pointer_button(state, dispatcher, 0x110, 1, 100);
 }
 
-fn show_menu(
+pub(super) fn show_menu(
     wm: &mut Wm,
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,
@@ -626,7 +626,7 @@ fn show_menu(
     surface
 }
 
-fn focus_surface(
+pub(super) fn focus_surface(
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,
     raw: u32,

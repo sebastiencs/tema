@@ -3,6 +3,8 @@
 //! It owns the `-wm` connection. Displayfd readiness starts it. A dead connection
 //! or a failed startup ends the run.
 
+#[cfg(test)]
+mod capture_tests;
 mod cursor;
 mod focus;
 #[cfg(test)]

@@ -14,7 +14,7 @@ use crate::{
     region::RectI,
     runner::{Dispatcher, Redispatcher},
     state::ObjectId,
-    window::WindowId,
+    window::{Toplevel, WindowId},
     x11::{
         change_property_atoms, change_property_u32s, event_bytes, Atom, Atoms,
         ChangeWindowAttributes, ChangeWindowAttributesAux, ClientIdMask, ClientIdSpec,
@@ -212,6 +212,7 @@ impl Wm {
             .surface
             .and_then(|root| crate::input::focus::focused_window_close(ctx.state, root));
         if let Some(managed) = managed {
+            crate::capture::unmap_window(ctx.state, ctx.dispatcher, managed.window);
             ctx.state.destroy_window(managed.window);
             ctx.state.remove_object(managed.object);
         }
@@ -611,6 +612,7 @@ impl Wm {
             }
             let close =
                 surface.and_then(|root| crate::input::focus::focused_window_close(ctx.state, root));
+            crate::capture::unmap_window(ctx.state, ctx.dispatcher, managed.window);
             ctx.state.destroy_window(managed.window);
             ctx.state.remove_object(managed.object);
             if let Some(close) = close {
@@ -709,6 +711,14 @@ impl Wm {
             ctx.state.set_window_fullscreen(window_id, true);
         }
         self.publish_layout_for(window_id, ctx);
+        if surface
+            .try_ref(ctx.state)
+            .is_some_and(|surface| surface.has_committed_buffer())
+        {
+            crate::capture::map_window(ctx.state, ctx.dispatcher, window_id);
+            crate::capture::sync_layout_shell_state(ctx.state, ctx.dispatcher, window_id);
+            crate::capture::sync_activated_from_keyboard_focus(ctx.state, ctx.dispatcher);
+        }
         if ctx.state.window_is_mapped(window_id)
             && crate::wayland_objects::wl_surface::should_focus_new_toplevel_on_map(
                 ctx.state, surface,
@@ -720,6 +730,7 @@ impl Wm {
                 Some(crate::input::SurfaceFocus::new(surface)),
             );
         }
+        self.refresh_transient_children(id, ctx);
     }
 
     fn place_floating(&mut self, id: Window, ctx: &mut WmCtx<'_>) {
@@ -828,6 +839,7 @@ impl Wm {
         };
         let close =
             surface.and_then(|root| crate::input::focus::focused_window_close(ctx.state, root));
+        crate::capture::unmap_window(ctx.state, ctx.dispatcher, managed.window);
         ctx.state.destroy_window(managed.window);
         ctx.state.remove_object(managed.object);
         if let Some(close) = close {
@@ -839,6 +851,7 @@ impl Wm {
         }
         hide(surface, geometry, ctx);
         publish_layout(workspace_id, ctx);
+        self.refresh_transient_children(id, ctx);
     }
 
     fn show_unmanaged(
@@ -877,7 +890,7 @@ impl Wm {
         };
         let parent = self.managed_window(transient);
         let atoms = self.ready_atoms();
-        let minimum_changed = {
+        let (minimum_changed, title, app_id, parent_window) = {
             let Some(atoms) = atoms else { return };
             let Some(toplevel) = ctx
                 .state
@@ -887,8 +900,17 @@ impl Wm {
             else {
                 return;
             };
-            toplevel.refresh(&props, parent, &atoms)
+            let minimum_changed = toplevel.refresh(&props, parent, &atoms);
+            (
+                minimum_changed,
+                toplevel.title().to_string(),
+                toplevel.app_id().to_string(),
+                toplevel.parent_window(),
+            )
         };
+        crate::capture::retitle_window(ctx.state, ctx.dispatcher, window_id, title);
+        crate::capture::reapp_window(ctx.state, ctx.dispatcher, window_id, app_id);
+        crate::capture::note_window_parent(ctx.state, ctx.dispatcher, window_id, parent_window);
         if minimum_changed
             && (ctx.state.window_is_tiled(window_id) || ctx.state.window_is_fullscreen(window_id))
         {
@@ -901,6 +923,21 @@ impl Wm {
             }
             ctx.dispatcher
                 .dispatch(crate::clients::ClientManagerAction::WorkspaceStateChanged);
+        }
+    }
+
+    /// Refresh every managed window that names `parent` in `WM_TRANSIENT_FOR`.
+    fn refresh_transient_children(&mut self, parent: Window, ctx: &mut WmCtx<'_>) {
+        let children = self
+            .windows
+            .iter()
+            .filter(|(_, window)| {
+                window.props.transient_for == Some(parent) && window.managed.is_some()
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for child in children {
+            self.refresh_managed(child, ctx);
         }
     }
 
@@ -923,6 +960,14 @@ impl Wm {
         let ids = self.windows.keys().copied().collect::<Vec<_>>();
         for id in ids {
             self.reconfigure_window(id, ctx)?;
+        }
+        let managed = self
+            .windows
+            .values()
+            .filter_map(|window| window.managed.map(|managed| managed.window))
+            .collect::<Vec<_>>();
+        for window in managed {
+            crate::capture::sync_layout_shell_state(ctx.state, ctx.dispatcher, window);
         }
         Ok(())
     }

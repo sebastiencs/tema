@@ -38,7 +38,7 @@ fn blank() -> crate::x11::Property {
     }
 }
 
-fn text(ty: Atom, bytes: &[u8]) -> crate::x11::Property {
+pub(super) fn text(ty: Atom, bytes: &[u8]) -> crate::x11::Property {
     crate::x11::Property {
         r#type: ty,
         format: 8,
@@ -47,7 +47,7 @@ fn text(ty: Atom, bytes: &[u8]) -> crate::x11::Property {
     }
 }
 
-fn transient(parent: Window) -> crate::x11::Property {
+pub(super) fn transient(parent: Window) -> crate::x11::Property {
     crate::x11::Property {
         r#type: Atom(0),
         format: 32,
@@ -56,7 +56,7 @@ fn transient(parent: Window) -> crate::x11::Property {
     }
 }
 
-fn pair_mapped(
+pub(super) fn pair_mapped(
     wm: &mut Wm,
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,

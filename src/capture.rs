@@ -2232,6 +2232,17 @@ pub(crate) fn note_window_state(
     note_shell_state(state, dispatcher, key, maximized, fullscreen);
 }
 
+/// Copy the layout's fullscreen bit onto a window whose role publishes no configure.
+///
+/// The maximized bit stays clear. An unchanged record queues nothing.
+pub(crate) fn sync_layout_shell_state(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    window: WindowId,
+) {
+    note_window_state(state, dispatcher, window, false, state.window_is_fullscreen(window));
+}
+
 pub(crate) fn note_window_parent(
     state: &mut State,
     dispatcher: &mut Dispatcher,
@@ -2780,8 +2791,8 @@ fn send_wlr_parent(
 
 /// Publish one mapped window. A later map gets a new identifier.
 ///
-/// Title and app id come from the toplevel trait. Shell bits are the last configure the
-/// xdg role published; another shell leaves them unset.
+/// Title and app id come from the toplevel trait. Shell bits come from the xdg role's last
+/// configure. Another role sets them through [`sync_layout_shell_state`].
 pub(crate) fn map_window(state: &mut State, dispatcher: &mut Dispatcher, window: WindowId) {
     if state.capture.by_window.contains_key(&window) {
         return;
@@ -2994,6 +3005,85 @@ fn dispatch_deliver(dispatcher: &mut Dispatcher, clients: BTreeSet<ClientId>) {
     for client_id in clients {
         dispatcher.dispatch_to(client_id, ClientAction::DeliverCaptureEvents);
     }
+}
+
+/// One open foreign-toplevel record, for tests.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestToplevel {
+    pub(crate) key: ToplevelKey,
+    pub(crate) title: String,
+    pub(crate) app_id: String,
+    pub(crate) activated: bool,
+    pub(crate) maximized: bool,
+    pub(crate) fullscreen: bool,
+    pub(crate) parent: Option<ToplevelKey>,
+    pub(crate) outputs: BTreeSet<OutputId>,
+    pub(crate) ext_handles: Vec<Resolved<ExtForeignToplevelHandleV1Id>>,
+    pub(crate) wlr_handles: Vec<Resolved<ZwlrForeignToplevelHandleV1Id>>,
+}
+
+/// The open record for `window`. A missing map, or a closed record, is `None`.
+#[cfg(test)]
+pub(crate) fn test_toplevel_for_window(state: &State, window: WindowId) -> Option<TestToplevel> {
+    let key = state.capture.by_window.get(&window).copied()?;
+    let record = state.capture.toplevels.get(&key)?;
+    if record.closed {
+        return None;
+    }
+    let ext_handles = state
+        .capture
+        .handles_for(key)
+        .into_iter()
+        .filter(|handle| {
+            handle
+                .try_ref(state)
+                .is_some_and(|handle| !handle.is_closed())
+        })
+        .collect();
+    let wlr_handles = state
+        .capture
+        .wlr_handles_for(key)
+        .into_iter()
+        .map(|slot| slot.handle)
+        .collect();
+    Some(TestToplevel {
+        key,
+        title: record.title.clone(),
+        app_id: record.app_id.clone(),
+        activated: record.activated,
+        maximized: record.maximized,
+        fullscreen: record.fullscreen,
+        parent: record.parent,
+        outputs: record.outputs.clone(),
+        ext_handles,
+        wlr_handles,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_toplevel_is_open(state: &State, key: ToplevelKey) -> bool {
+    state.capture.toplevel_is_open(key)
+}
+
+/// Size and status of one queued or finished copy.
+#[cfg(test)]
+pub(crate) struct TestCaptureJob {
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) queued: bool,
+    pub(crate) failed: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_capture_job(state: &State, id: CaptureJobId) -> Option<TestCaptureJob> {
+    let job = state.capture.jobs.get(&id)?;
+    Some(TestCaptureJob {
+        width: job.width,
+        height: job.height,
+        queued: job.status == CaptureJobStatus::Queued,
+        failed: job.status == CaptureJobStatus::Failed,
+    })
 }
 
 #[cfg(test)]
@@ -4382,6 +4472,71 @@ mod tests {
         state.insert_window(window, root, toplevel.object_id());
         toplevel.ref_mut(state).test_set_identity("Terminal", "app");
         (window, toplevel)
+    }
+
+    fn pending_shell_states(state: &State, key: ToplevelKey) -> usize {
+        state
+            .capture
+            .pending
+            .values()
+            .flatten()
+            .filter(
+                |item| matches!(item, Pending::ShellState { key: queued, .. } if *queued == key),
+            )
+            .count()
+    }
+
+    #[test]
+    fn the_test_accessor_reads_a_mapped_window_and_drops_a_closed_one() {
+        let (mut client, mut dispatcher, mut state) = client_state();
+        let (window, _toplevel) = insert_toplevel(&mut client, &mut state);
+        assert!(test_toplevel_for_window(&state, window).is_none());
+
+        map_window(&mut state, &mut dispatcher, window);
+        let record = test_toplevel_for_window(&state, window).expect("mapped record");
+        assert_eq!(record.title, "Terminal");
+        assert_eq!(record.app_id, "app");
+        assert!(test_toplevel_is_open(&state, record.key));
+        assert!(record.ext_handles.is_empty());
+        assert!(record.wlr_handles.is_empty());
+
+        let key = record.key;
+        unmap_window(&mut state, &mut dispatcher, window);
+        assert!(test_toplevel_for_window(&state, window).is_none());
+        assert!(!test_toplevel_is_open(&state, key));
+    }
+
+    #[test]
+    fn sync_layout_shell_state_publishes_fullscreen_once() {
+        let (mut client, mut dispatcher, mut state) = client_state();
+        insert_output(&mut client, &mut state);
+        let (surface, key) = mapped_window(&mut client, &mut state, &mut dispatcher);
+        test_deliver(&mut client, &mut state, &mut dispatcher);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            surface
+                .ref_mut(&mut state)
+                .set_role(
+                    crate::wayland_objects::wl_surface::Role::XdgSurface,
+                    &mut client_dispatcher,
+                )
+                .expect("xdg role");
+        }
+        let window = window_for_key(&state, key);
+        assert!(state.set_window_fullscreen(window, true));
+
+        sync_layout_shell_state(&mut state, &mut dispatcher, window);
+        let record = test_toplevel_for_window(&state, window).expect("mapped record");
+        assert!(record.fullscreen);
+        assert!(!record.maximized);
+        assert_eq!(pending_shell_states(&state, key), 1);
+
+        test_deliver(&mut client, &mut state, &mut dispatcher);
+        sync_layout_shell_state(&mut state, &mut dispatcher, window);
+        assert_eq!(pending_shell_states(&state, key), 0);
+        let again = test_toplevel_for_window(&state, window).expect("mapped record");
+        assert!(again.fullscreen);
+        assert!(!again.maximized);
     }
 
     #[test]

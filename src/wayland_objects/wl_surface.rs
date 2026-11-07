@@ -2337,6 +2337,15 @@ impl WlSurface {
                         root_surface: resolved_surface,
                     });
                 }
+                if let Some(window) = state.window_for_root(resolved_surface) {
+                    if is_mapped {
+                        crate::capture::map_window(state, dispatcher, window);
+                        crate::capture::sync_layout_shell_state(state, dispatcher, window);
+                        crate::capture::sync_activated_from_keyboard_focus(state, dispatcher);
+                    } else {
+                        crate::capture::unmap_window(state, dispatcher, window);
+                    }
+                }
                 if let Some(workspace_id) = state.root_surface_workspace(resolved_surface) {
                     crate::tiling::mark_workspace_dirty(state, workspace_id);
                 }
