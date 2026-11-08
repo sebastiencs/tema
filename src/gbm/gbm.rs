@@ -369,6 +369,7 @@ fn try_export_dmabuf(bo: *mut libc::c_void) -> Option<DmaBuf> {
             format,
             modifier: Modifier(sys::gbm_bo_get_modifier(bo)),
             planes: planes.into_boxed_slice(),
+            sampling_device: None,
         })
     }
 }

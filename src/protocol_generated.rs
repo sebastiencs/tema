@@ -31,7 +31,46 @@ pub struct NewId(u32);
     derive_more::Into,
     derive_more::Deref,
 )]
-pub struct Array(pub Vec<u32>);
+pub struct Array(pub Vec<u8>);
+
+impl Array {
+    /// Native-endian `u32` words. Wayland arrays use the host endianness.
+    pub fn from_u32s(words: &[u32]) -> Self {
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for word in words {
+            bytes.extend_from_slice(&word.to_ne_bytes());
+        }
+        Self(bytes)
+    }
+
+    /// Native-endian `u32` words. The byte length must be a multiple of 4.
+    ///
+    /// Read a client array whose length is not a word count with [`Self::as_bytes`].
+    pub fn to_u32s(&self) -> Vec<u32> {
+        assert!(
+            self.0.len().is_multiple_of(4),
+            "array byte length {} is not a multiple of 4",
+            self.0.len()
+        );
+        self.0
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Tightly packed native-endian `u16`s. The wire writer pads to 32 bits.
+    pub fn from_u16s(words: &[u16]) -> Self {
+        let mut bytes = Vec::with_capacity(words.len() * 2);
+        for word in words {
+            bytes.extend_from_slice(&word.to_ne_bytes());
+        }
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 wayland_id! {
   WlDisplayId,

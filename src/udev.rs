@@ -197,6 +197,9 @@ impl Model for Udev {
             }
             UdevAction::FinalizeBackendRemoval { drm_id } => {
                 let _ = state.drm.remove(drm_id);
+                crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::refresh_dmabuf_feedback(
+                    state, dispatcher,
+                );
             }
             UdevAction::PauseDevice { devnum, kind } => {
                 self.resumed_fds.remove(&devnum);
@@ -646,6 +649,9 @@ impl Udev {
                 "resumed primary DRM device {devnum}: kept the primary fd; allocator {allocator} remains open"
             );
             let failed = resume_drm_backend(state, dispatcher, drm_id);
+            crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::refresh_dmabuf_feedback(
+                state, dispatcher,
+            );
             for crtc_id in failed {
                 if let Some(output_id) = state.output_id_for_drm_crtc(drm_id, crtc_id) {
                     self.remove_output_node(output_id, state, dispatcher);
@@ -822,6 +828,12 @@ impl Udev {
             });
         }
         sync_color_control_globals(state, dispatcher);
+        crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::refresh_dmabuf_feedback(
+            state, dispatcher,
+        );
+        crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::reorder_surface_feedback(
+            state, dispatcher,
+        );
         self.settle_initial_drm(devnum, state)
     }
 

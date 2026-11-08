@@ -3279,6 +3279,7 @@ impl WlSurface {
         let constraint = self.pointer_constraint.take();
         defunct_pointer_constraint(constraint, state, dispatcher, true, Some(geometry));
         self.release_idle_inhibitors(state);
+        crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::retire_surface(state, object);
         self.discard_all_presentation_feedbacks(client, state, dispatcher);
         for child_surface in self.child_surface_ids() {
             Self::detach_subsurface_tree(child_surface, client, state, dispatcher);
@@ -3465,6 +3466,7 @@ impl Object for WlSurface {
         dispatcher: &mut ClientDispatcher,
     ) {
         if let Some(resolved) = client.resolve(self.id, state) {
+            crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::retire_surface(state, resolved);
             if let Some(window) = state.window_for_root(resolved) {
                 begin_managed_toplevel_close_surface(state, window, resolved, self, dispatcher);
             }

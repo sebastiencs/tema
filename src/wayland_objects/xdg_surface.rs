@@ -921,7 +921,7 @@ pub mod xdg_toplevel {
                 proto_xdg_toplevel::Event::Configure {
                     width: self.current_width,
                     height: self.current_height,
-                    states: Array(self.effective_states()),
+                    states: Array::from_u32s(&self.effective_states()),
                 },
                 dispatcher,
             );
@@ -1065,7 +1065,7 @@ pub mod xdg_toplevel {
                 proto_xdg_toplevel::Event::Configure {
                     width,
                     height,
-                    states: Array(states.clone()),
+                    states: Array::from_u32s(&states),
                 },
                 dispatcher,
             );
@@ -1349,7 +1349,7 @@ pub mod xdg_toplevel {
                 proto_xdg_toplevel::Event::Configure {
                     width,
                     height,
-                    states: Array(states.clone()),
+                    states: Array::from_u32s(&states),
                 },
                 dispatcher,
             );
@@ -1426,7 +1426,7 @@ pub mod xdg_toplevel {
                 [WmCapabilities::Fullscreen as u32, WmCapabilities::Maximize as u32];
             self.send_event(
                 proto_xdg_toplevel::Event::WmCapabilities {
-                    capabilities: Array(capabilities_list.to_vec()),
+                    capabilities: Array::from_u32s(&capabilities_list),
                 },
                 dispatcher,
             );

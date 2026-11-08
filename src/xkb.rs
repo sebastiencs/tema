@@ -72,7 +72,7 @@ impl KeyboardState {
     }
 
     pub fn pressed_keys(&self) -> Array {
-        Array(self.pressed_keys.clone())
+        Array::from_u32s(&self.pressed_keys)
     }
 
     pub fn modifiers(&self) -> KeyboardModifiers {

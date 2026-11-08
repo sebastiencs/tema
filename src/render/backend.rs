@@ -174,6 +174,12 @@ pub trait Renderer: Debug {
 
     fn import_dmabuf(&mut self, source: &DmaBuf) -> Result<Rc<dyn Texture>, RendererError>;
 
+    /// Import `source` and drop it. A failure here is a bad client buffer, not a later hot-unplug.
+    fn test_import_dmabuf(&mut self, source: &DmaBuf) -> Result<(), RendererError> {
+        self.make_current();
+        self.import_dmabuf(source).map(drop)
+    }
+
     fn import_shm(&mut self, image: ShmImage<'_>) -> Result<Rc<dyn Texture>, RendererError>;
 
     /// Upload tightly packed RGBA bytes, four bytes per pixel.

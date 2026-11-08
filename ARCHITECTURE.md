@@ -196,6 +196,8 @@ That metadata includes:
 
 In this repository, that description lives in `src/dmabuf.rs`.
 
+Clients learn which formats this compositor can sample through `zwp_linux_dmabuf_v1`, advertised at version 6. Binding version 4 or newer does not receive the old flat format list. The client creates a `zwp_linux_dmabuf_feedback_v1` instead. That object sends a sealed table of format and modifier pairs (`src/dmabuf_feedback.rs`), then one tranche per GPU. Version 6 marks each tranche for sampling and does not send a main device. Feedback for a surface lists that surface's GPU first. A client that still binds version 3 receives the first GPU's formats on the global, as before.
+
 Practical meaning:
 
 - a client, decoder, compositor, or GPU component can all refer to the same underlying image

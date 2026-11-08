@@ -100,7 +100,7 @@ impl ExtWorkspaceHandleV1 {
         if self.sent_coordinates.as_ref() != Some(&workspace.coordinates) {
             self.send_event(
                 ext_workspace_handle_v1::Event::Coordinates {
-                    coordinates: Array(workspace.coordinates.clone()),
+                    coordinates: Array::from_u32s(&workspace.coordinates),
                 },
                 dispatcher,
             );

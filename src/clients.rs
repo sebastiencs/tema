@@ -696,6 +696,10 @@ pub enum ClientAction {
         id: crate::protocol_generated::ExtIdleNotificationV1Id,
         notice: crate::wayland_objects::ext_idle_notification_v1::IdleNotice,
     },
+    /// Resend the current dmabuf feedback table to one feedback object.
+    SendDmabufFeedback {
+        id: crate::protocol_generated::ZwpLinuxDmabufFeedbackV1Id,
+    },
 }
 
 #[derive(Debug)]
@@ -2676,6 +2680,9 @@ fn refresh_surface_tree_outputs(
         surface_obj.send_preferred_fractional_scale_for_output(fractional_scale, state, dispatcher);
         surface_obj.send_preferred_buffer_state_for_output(scale, transform, dispatcher);
     }
+    crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::refresh_surface_feedback(
+        state, dispatcher, surface,
+    );
 
     for entry in stack {
         if let crate::wayland_objects::wl_surface::StackEntry::Child(child_surface) = entry {
@@ -3195,6 +3202,25 @@ impl Model for Client {
                         .send_notice(notice, &mut dispatcher);
                 }
             }
+            SendDmabufFeedback { id } => {
+                let Some(resolved) = self.resolve(id, state) else {
+                    return Ok(());
+                };
+                if !state
+                    .dmabuf_feedbacks
+                    .iter()
+                    .any(|live| live.object == resolved)
+                {
+                    return Ok(());
+                }
+                if let Some(mut feedback) = resolved.try_grab(state) {
+                    crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::send_current(
+                        &mut feedback,
+                        state,
+                        &mut dispatcher,
+                    );
+                }
+            }
             DeliverCaptureEvents => {
                 crate::capture::deliver(self, state, &mut dispatcher);
             }
@@ -3556,10 +3582,18 @@ impl RawEvent {
     }
 
     pub fn array(&mut self, array: Array) {
-        let len: u32 = array.len().try_into().unwrap();
-        self.push(len * 4); // len in number of bytes
-        for word in array.iter() {
-            self.push(*word);
+        let bytes = array.as_bytes();
+        let len: u32 = bytes.len().try_into().unwrap();
+        self.push(len);
+        let mut chunks = bytes.chunks_exact(4);
+        for chunk in chunks.by_ref() {
+            self.push(u32::from_ne_bytes(chunk.try_into().unwrap()));
+        }
+        let remainder = chunks.remainder();
+        if !remainder.is_empty() {
+            let mut padded = [0u8; 4];
+            padded[..remainder.len()].copy_from_slice(remainder);
+            self.push(u32::from_ne_bytes(padded));
         }
     }
 
@@ -3722,12 +3756,12 @@ impl Arguments {
     pub fn array(&mut self) -> Result<Array, ParserError> {
         let len = self.uint()? as usize;
         let nwords = len.next_multiple_of(4) / 4;
-        let mut words = Vec::with_capacity(nwords);
+        let mut bytes = Vec::with_capacity(nwords * 4);
         for _ in 0..nwords {
-            words.push(self.pop()?);
+            bytes.extend_from_slice(&self.pop()?.to_ne_bytes());
         }
-        words.truncate(len / 4);
-        Ok(Array(words))
+        bytes.truncate(len);
+        Ok(Array(bytes))
     }
 
     pub fn fd(&mut self) -> Result<RawFd, ParserError> {
@@ -3744,7 +3778,10 @@ mod clients_wire_tests {
         rc::Rc,
     };
 
-    use super::{Arguments, ParserError, RawRequest};
+    use {
+        super::{Arguments, ParserError, RawEvent, RawRequest},
+        crate::protocol_generated::{Array, WaylandId},
+    };
 
     #[test]
     fn arguments_array_reads_padded_words() {
@@ -3753,14 +3790,76 @@ mod clients_wire_tests {
         args.push_back(0x1111);
         args.push_back(0x2222);
         let mut args = Arguments::from_words(args);
-        assert_eq!(args.array().unwrap().0, vec![0x1111, 0x2222]);
+        assert_eq!(args.array().unwrap().to_u32s(), vec![0x1111, 0x2222]);
 
         let mut partial = VecDeque::new();
         partial.push_back(2);
         partial.push_back(u32::from_ne_bytes([1, 2, 0, 0]));
         let mut partial = Arguments::from_words(partial);
-        assert!(partial.array().unwrap().0.is_empty());
+        assert_eq!(partial.array().unwrap().as_bytes(), &[1, 2]);
         assert!(partial.uint().is_err());
+    }
+
+    fn array_message(payload: &[u8]) -> Box<[u8]> {
+        let mut event = RawEvent::new(WaylandId::from(1), 0, 1);
+        event.array(Array(payload.to_vec()));
+        event.into_bytes()
+    }
+
+    #[test]
+    fn array_byte_lengths_round_trip_with_zero_padding() {
+        for len in [0usize, 2, 4, 6, 8, 9] {
+            let payload: Vec<u8> = (0..len)
+                .map(|index| (index as u8).wrapping_add(1))
+                .collect();
+            let bytes = array_message(&payload);
+            let declared = u32::from_ne_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            assert_eq!(declared, payload.len(), "declared length for {len} bytes");
+            let padded = payload.len().next_multiple_of(4);
+            let body = &bytes[12..12 + padded];
+            assert_eq!(&body[..payload.len()], payload.as_slice());
+            assert!(body[payload.len()..].iter().all(|byte| *byte == 0));
+
+            let mut request = RawRequest::try_from(bytes.as_ref()).unwrap();
+            assert_eq!(request.array().unwrap().as_bytes(), payload.as_slice());
+            assert!(request.uint().is_err());
+        }
+    }
+
+    #[test]
+    fn array_u32_words_keep_their_wire_words() {
+        let words = [0x1111u32, 0x2222];
+        let mut event = RawEvent::new(WaylandId::from(1), 0, 1);
+        event.array(Array::from_u32s(&words));
+        let bytes = event.into_bytes();
+        let body: Vec<u32> = bytes[8..]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(body, vec![8, 0x1111, 0x2222]);
+        assert_eq!(Array::from_u32s(&words).to_u32s(), words);
+    }
+
+    #[test]
+    fn array_u16_indices_pack_without_padding_in_the_length() {
+        let indices = [1u16, 2, 3];
+        let array = Array::from_u16s(&indices);
+        assert_eq!(array.as_bytes().len(), 6);
+        let bytes = array_message(array.as_bytes());
+        let declared = u32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(declared, 6);
+        let mut packed = Vec::new();
+        for index in indices {
+            packed.extend_from_slice(&index.to_ne_bytes());
+        }
+        assert_eq!(&bytes[12..18], packed.as_slice());
+        assert_eq!(&bytes[18..20], &[0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of 4")]
+    fn array_to_u32s_rejects_a_partial_word() {
+        let _ = Array(vec![1, 2]).to_u32s();
     }
 
     fn arguments_string_rejects_invalid_utf8() {

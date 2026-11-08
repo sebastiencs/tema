@@ -44,6 +44,8 @@ pub struct WlBuffer {
     id: WlBufferId,
     owner_client_id: ClientId,
     destroyed: bool,
+    /// `create_immed` import failure. The id exists, but the pixels are not usable.
+    import_rejected: bool,
     backing: BufferBacking,
 }
 
@@ -168,6 +170,7 @@ impl WlBuffer {
             id,
             owner_client_id,
             destroyed: false,
+            import_rejected: false,
             backing: BufferBacking::Shm {
                 offset: offset
                     .try_into()
@@ -191,8 +194,17 @@ impl WlBuffer {
             id,
             owner_client_id,
             destroyed: false,
+            import_rejected: false,
             backing: BufferBacking::Dmabuf { dmabuf, y_inverted },
         })
+    }
+
+    pub(crate) fn mark_import_rejected(&mut self) {
+        self.import_rejected = true;
+    }
+
+    pub(crate) fn import_rejected(&self) -> bool {
+        self.import_rejected
     }
 
     pub fn send_release(&mut self, dispatcher: &mut ClientDispatcher) {
@@ -366,6 +378,7 @@ impl WlBuffer {
             id,
             owner_client_id,
             destroyed: false,
+            import_rejected: false,
             backing: BufferBacking::Shm {
                 offset: 0,
                 width: width as usize,

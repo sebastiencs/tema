@@ -167,6 +167,8 @@ pub struct Drm {
     supports_syncobj_eventfd: bool,
     /// Bumped on each in-place restore. Flip events armed earlier are ignored.
     event_generation: u64,
+    /// A modeset may have changed the primary plane's scanout formats.
+    scanout_feedback_dirty: bool,
 }
 
 impl Drop for Drm {
@@ -290,6 +292,8 @@ struct SceneItem {
     opaque: bool,
     sync: crate::sync::SurfaceSyncState,
     direct_scanout: Option<DrmFrameBuffer>,
+    /// Geometric direct-scanout match. The buffer format may still be wrong.
+    scanout_candidate: bool,
     presentation_feedbacks: Vec<SurfacePresentationFeedback>,
 }
 
@@ -844,6 +848,7 @@ struct FramePlan {
     presentation_feedbacks: Vec<SubmissionPresentationFeedback>,
     damage: DamageRegion,
     direct_scanout: Option<DirectScanoutCandidate>,
+    scanout_candidate: Option<Resolved<WlSurfaceId>>,
     cursor_plane: Option<CursorPlaneCandidate>,
     preserve_contents: bool,
     /// This frame is the lock blank and lock surfaces. Its page flip may satisfy the barrier.
@@ -1761,6 +1766,7 @@ impl Drm {
             supports_syncobj_timeline,
             supports_syncobj_eventfd,
             event_generation: 0,
+            scanout_feedback_dirty: false,
         };
         let drm_output_ids = drm_backend.outputs.keys().copied().collect::<Vec<_>>();
         for drm_output_id in drm_output_ids {
@@ -1793,6 +1799,19 @@ impl Drm {
 
     pub fn devnum(&self) -> Option<libc::dev_t> {
         self.device.devnum()
+    }
+
+    pub(crate) fn take_scanout_feedback_dirty(&mut self) -> bool {
+        let dirty = self.scanout_feedback_dirty;
+        self.scanout_feedback_dirty = false;
+        dirty
+    }
+
+    pub(crate) fn test_import_client_dmabuf(
+        &mut self,
+        dmabuf: &crate::dmabuf::DmaBuf,
+    ) -> Result<(), crate::render::RendererError> {
+        self.renderer.test_import_dmabuf(dmabuf)
     }
 
     /// Best-effort atomic disable of every active output. A failed commit does
@@ -2099,6 +2118,37 @@ impl Drm {
 
     pub fn supports_linux_drm_syncobj(&self) -> bool {
         self.supports_syncobj_timeline && self.supports_syncobj_eventfd
+    }
+
+    /// Opaque sample pairs the primary plane can also scan out.
+    /// A plane that lists `INVALID` accepts every sample modifier of that format.
+    pub(crate) fn opaque_primary_scanout_pairs(&self, drm_crtc_id: u32) -> Vec<(u32, u64)> {
+        let Some(output) = self.output(drm_crtc_id) else {
+            return Vec::new();
+        };
+        let plane = &output.in_use.planes[output.in_use.primary_plane_index];
+        let mut pairs = Vec::new();
+        for sample in &self.renderer.capabilities().sample_formats {
+            let Some(mapped) = FORMATS_MAP.get(&sample.fourcc) else {
+                continue;
+            };
+            if mapped.has_alpha {
+                continue;
+            }
+            let Some(plane_format) = plane.formats.get(&sample.fourcc) else {
+                continue;
+            };
+            let implicit = plane_format.modifiers.contains(&Modifier::INVALID);
+            for modifier in &sample.modifiers {
+                let modifier = Modifier(*modifier);
+                if implicit || plane_format.modifiers.contains(&modifier) {
+                    pairs.push((mapped.drm as u32, modifier.0));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
     }
 
     pub fn supported_dmabuf_read_formats(&self) -> Vec<(&'static Format, BTreeSet<Modifier>)> {
@@ -2577,6 +2627,7 @@ impl Drm {
                             retired_mode_blob(previous, crtc_state.mode_blob_id)
                         });
                         self.output_mut(drm_crtc_id).unwrap().pending_modeset = None;
+                        self.scanout_feedback_dirty = true;
                         if let Some(blob) = retired {
                             let _ = self.fd.destroy_property_blob(blob);
                         }
@@ -4990,13 +5041,33 @@ impl DrmOutputModel {
                 mut presentation_feedbacks,
                 mut damage,
                 mut direct_scanout,
+                mut scanout_candidate,
                 mut cursor_plane,
                 mut preserve_contents,
                 protected,
             } = frame;
             if crate::capture::output_capture_pending(state, self.output_id) {
                 direct_scanout = None;
+                scanout_candidate = None;
             }
+            let drm_ids: Vec<_> = state.drm.iter().map(|(drm_id, _)| drm_id).collect();
+            let mut formats_changed = false;
+            for drm_id in drm_ids {
+                if state.drm.get_mut(drm_id).take_scanout_feedback_dirty() {
+                    formats_changed = true;
+                }
+            }
+            if formats_changed {
+                crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::refresh_dmabuf_feedback(
+                    state, dispatcher,
+                );
+            }
+            crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::set_scanout_candidate(
+                state,
+                dispatcher,
+                self.output_id,
+                scanout_candidate,
+            );
             // The cursor is blended into a painted SHM copy only. A protected frame has no
             // desktop cursor in its composition, so it does not receive one here either.
             let capture_cursor = if protected {
@@ -5802,6 +5873,7 @@ fn lock_blank_item(drm: &mut Drm, bounds: RectI, red: bool) -> Option<SceneItem>
         opaque: true,
         sync: crate::sync::SurfaceSyncState::default(),
         direct_scanout: None,
+        scanout_candidate: false,
         presentation_feedbacks: Vec::new(),
     })
 }
@@ -6070,6 +6142,7 @@ fn collect_named_cursor_render_item(
                     opaque: false,
                     sync: crate::sync::SurfaceSyncState::default(),
                     direct_scanout: None,
+                    scanout_candidate: false,
                     presentation_feedbacks: Vec::new(),
                 },
                 next_frame_in_msec,
@@ -6178,6 +6251,10 @@ fn rgba_to_drm_argb8888(
 }
 
 fn import_client_texture(drm: &mut Drm, buffer: &WlBuffer) -> Option<Rc<dyn Texture>> {
+    if buffer.import_rejected() {
+        log::warn!("skipping dma-buf wl_buffer rejected at creation");
+        return None;
+    }
     if let Some(dmabuf) = buffer.dmabuf() {
         return match drm.renderer.import_dmabuf(dmabuf) {
             Ok(texture) => Some(texture),
@@ -6283,17 +6360,16 @@ fn push_scene_items_from_snapshots(
                 || drm
                     .output(drm_crtc_id)
                     .is_some_and(|output| output.in_use.primary_plane().0.in_fence_fd.is_some()));
-        let direct_scanout = if surface_allows_direct_scanout(root_clip, alpha)
+        let scanout_candidate = surface_allows_direct_scanout(root_clip, alpha)
             && allow_direct_scanout
             && buffer.dmabuf().is_some()
             && !buffer.y_inverted()
-            && !buffer.format().has_alpha
             && bounds == output_bounds
             && buffer_width == bounds.width
             && buffer_height == bounds.height
             && tex_transform == transform::Mat3::identity()
-            && scanout_sync_ok
-        {
+            && scanout_sync_ok;
+        let direct_scanout = if scanout_candidate && !buffer.format().has_alpha {
             buffer.dmabuf().and_then(|dmabuf| {
                 let primary_plane = drm.output(drm_crtc_id)?.in_use.primary_plane().0;
                 let plane_format = primary_plane.formats.get(&dmabuf.format.drm)?;
@@ -6346,6 +6422,7 @@ fn push_scene_items_from_snapshots(
             opaque,
             sync: surface_state.sync,
             direct_scanout,
+            scanout_candidate,
             presentation_feedbacks: surface_state.presentation_feedbacks,
         });
     }
@@ -7190,6 +7267,7 @@ fn append_closing_snapshots(
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         });
         frame_elements
@@ -8666,6 +8744,7 @@ mod window_animation_tests {
             opaque: true,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
         let mut elements = vec![super::RecordedFrameElement::Effect {
@@ -9336,6 +9415,7 @@ mod render_recipe_tests {
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
 
@@ -9382,6 +9462,7 @@ mod render_recipe_tests {
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
 
@@ -9516,6 +9597,7 @@ mod render_recipe_tests {
                 opaque: false,
                 sync: crate::sync::SurfaceSyncState::default(),
                 direct_scanout: None,
+                scanout_candidate: false,
                 presentation_feedbacks: Vec::new(),
             },
             SceneItem {
@@ -9544,6 +9626,7 @@ mod render_recipe_tests {
                 opaque: false,
                 sync: crate::sync::SurfaceSyncState::default(),
                 direct_scanout: None,
+                scanout_candidate: false,
                 presentation_feedbacks: Vec::new(),
             },
         ];
@@ -9723,6 +9806,7 @@ mod render_recipe_tests {
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
         let mut frame_elements = vec![
@@ -9890,6 +9974,7 @@ mod presentation_timing_tests {
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            scanout_candidate: false,
             presentation_feedbacks: feedbacks,
         }
     }
@@ -10060,6 +10145,7 @@ mod presentation_timing_tests {
             format: ARGB8888,
             modifier,
             planes: Box::new([DmaBufPlane { offset: 0, stride: (width as u32) * 4, fd }]),
+            sampling_device: None,
         }
     }
 

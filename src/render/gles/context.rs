@@ -23,7 +23,7 @@ use {
         dmabuf::DmaBuf,
         drm::{DrmFd, Format, Modifier, FORMATS_MAP},
         gbm::GbmDevice,
-        render::RenderDeviceId,
+        render::{RenderDeviceId, RendererError},
     },
 };
 
@@ -129,9 +129,13 @@ impl EglContext {
         })
     }
 
-    pub fn import_dmabuf(&self, buf: &DmaBuf) -> EglImage {
-        let egl_format = self.formats.get(&buf.format.drm).unwrap();
-        let egl_modifier = egl_format.modifiers.get(&buf.modifier).unwrap();
+    pub fn import_dmabuf(&self, buf: &DmaBuf) -> Result<EglImage, RendererError> {
+        let Some(egl_format) = self.formats.get(&buf.format.drm) else {
+            return Err(RendererError::UnsupportedFormat);
+        };
+        let Some(egl_modifier) = egl_format.modifiers.get(&buf.modifier) else {
+            return Err(RendererError::UnsupportedFormat);
+        };
 
         struct PlaneKey {
             fd: egl::Int,
@@ -190,14 +194,14 @@ impl EglContext {
         let image = self
             .egl
             .create_image_khr(self.display, egl::LINUX_DMA_BUF_EXT as _, &attribs)
-            .unwrap();
+            .map_err(|_| RendererError::ImportFailed)?;
 
-        EglImage {
+        Ok(EglImage {
             display: self.display,
             image,
             external_only: egl_modifier.external_only,
             destroyed: false,
-        }
+        })
     }
 
     pub fn make_fb_from_image(&self, image: &EglImage, dmabuf: &DmaBuf) -> EglFrameBuffer {

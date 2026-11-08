@@ -174,24 +174,27 @@ pub(super) fn build_frame_plan(
         }
     }
 
-    let direct_scanout =
-        if super::direct_scanout_blocked(output.pending_modeset.is_some(), protected) {
-            None
-        } else if !has_effects
-            && items.len() == 1
-            && items[0].state.bounds == output_bounds
-            && !super::scene_item_requires_compositor_compositing(&items[0])
-            && !output.pipeline.is_waiting_for_flip()
-        {
-            let bounds = items[0].state.bounds;
-            let sync = items[0].sync.clone();
-            items[0]
-                .direct_scanout
-                .take()
-                .map(|framebuffer| super::DirectScanoutCandidate { bounds, sync, framebuffer })
-        } else {
-            None
-        };
+    let scanout_blocked =
+        super::direct_scanout_blocked(output.pending_modeset.is_some(), protected);
+    let sole_fullscreen = !has_effects
+        && items.len() == 1
+        && items[0].state.bounds == output_bounds
+        && !super::scene_item_requires_compositor_compositing(&items[0])
+        && items[0].scanout_candidate;
+    // A flip still in flight does not change who the candidate is. Clearing it
+    // here would send feedback again on every frame.
+    let scanout_candidate =
+        if !scanout_blocked && sole_fullscreen { items[0].state.surface_key } else { None };
+    let direct_scanout = if scanout_candidate.is_some() && !output.pipeline.is_waiting_for_flip() {
+        let bounds = items[0].state.bounds;
+        let sync = items[0].sync.clone();
+        items[0]
+            .direct_scanout
+            .take()
+            .map(|framebuffer| super::DirectScanoutCandidate { bounds, sync, framebuffer })
+    } else {
+        None
+    };
 
     super::FramePlan {
         items,
@@ -202,6 +205,7 @@ pub(super) fn build_frame_plan(
         presentation_feedbacks,
         damage: base_damage,
         direct_scanout,
+        scanout_candidate,
         cursor_plane,
         preserve_contents: crate::ENABLE_DAMAGE
             && output.preserve_render_buffer_contents()
@@ -453,6 +457,7 @@ mod tests {
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }
     }

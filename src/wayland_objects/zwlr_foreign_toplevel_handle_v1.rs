@@ -103,7 +103,7 @@ impl ZwlrForeignToplevelHandleV1 {
     pub(crate) fn send_state(&self, state: Vec<u32>, dispatcher: &mut ClientDispatcher) {
         self.send_event(
             zwlr_foreign_toplevel_handle_v1::Event::State {
-                state: crate::protocol_generated::Array(state),
+                state: crate::protocol_generated::Array::from_u32s(&state),
             },
             dispatcher,
         );

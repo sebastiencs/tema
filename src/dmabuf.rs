@@ -33,6 +33,8 @@ pub struct DmaBuf {
     pub format: &'static Format,
     pub modifier: Modifier,
     pub planes: Box<[DmaBufPlane]>,
+    /// Device the client asked the compositor to import into. Phase 5 uses it.
+    pub sampling_device: Option<libc::dev_t>,
 }
 
 /// `DMA_BUF_SYNC_READ` from `linux/dma-buf.h`. A read fence blocks later writers.

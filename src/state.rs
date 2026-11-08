@@ -1018,6 +1018,16 @@ pub struct State {
     pub session_active: bool,
     /// Live `ext_idle_notification_v1` objects. Destroying the manager does not clear this.
     pub idle_notifications: Vec<Resolved<ExtIdleNotificationV1Id>>,
+    /// Shared linux-dmabuf format table. `None` until the first refresh.
+    pub dmabuf_feedback: Option<Rc<crate::dmabuf_feedback::DmabufFeedbackTable>>,
+    /// Live feedback objects. A surface entry is removed when that surface dies.
+    pub dmabuf_feedbacks:
+        Vec<crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::LiveDmabufFeedback>,
+    /// Surface that could be scanned out on each output. Format may still be wrong.
+    pub scanout_candidates: std::collections::BTreeMap<OutputId, Resolved<WlSurfaceId>>,
+    /// Replaces `drm` for linux-dmabuf import tests. `None` uses the real devices.
+    #[cfg(test)]
+    pub dmabuf_importers: Option<Vec<crate::render::mock::MockDmabufImporter>>,
     /// Live `zwp_idle_inhibitor_v1` objects, including ones left inert after surface destruction.
     pub idle_inhibitors: Vec<Resolved<ZwpIdleInhibitorV1Id>>,
     /// Last result of the visibility policy. Inhibitor-aware notifications follow this bit.
@@ -1113,6 +1123,11 @@ impl State {
             backend_syncobj_globals: Default::default(),
             session_active: true,
             idle_notifications: Vec::new(),
+            dmabuf_feedback: None,
+            dmabuf_feedbacks: Vec::new(),
+            scanout_candidates: Default::default(),
+            #[cfg(test)]
+            dmabuf_importers: None,
             idle_inhibitors: Vec::new(),
             idle_inhibitors_honored: false,
             session_lock: Default::default(),
@@ -3769,6 +3784,12 @@ impl State {
         if self.active_output == Some(output_id) {
             self.active_output = self.outputs.iter().next().map(|(other_id, _)| other_id);
         }
+        crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::refresh_dmabuf_feedback(
+            self, dispatcher,
+        );
+        crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::reorder_surface_feedback(
+            self, dispatcher,
+        );
         Some(removed)
     }
 

@@ -79,6 +79,7 @@ pub mod zwp_confined_pointer_v1;
 pub mod zwp_idle_inhibit_manager_v1;
 pub mod zwp_idle_inhibitor_v1;
 pub mod zwp_linux_buffer_params_v1;
+pub mod zwp_linux_dmabuf_feedback_v1;
 pub mod zwp_linux_dmabuf_v1;
 pub mod zwp_locked_pointer_v1;
 pub mod zwp_pointer_constraints_v1;
@@ -152,7 +153,6 @@ fake_obj! {
     // { xdg_activation_v1, XdgActivationV1 },
     // xdg-toplevel-drag not in protocol_generated
     { zwp_linux_buffer_release_v1, ZwpLinuxBufferReleaseV1 },
-    { zwp_linux_dmabuf_feedback_v1, ZwpLinuxDmabufFeedbackV1 },
     { zwp_linux_explicit_synchronization_v1, ZwpLinuxExplicitSynchronizationV1 },
     { zwp_linux_surface_synchronization_v1, ZwpLinuxSurfaceSynchronizationV1 },
     { zwp_tablet_manager_v2, ZwpTabletManagerV2 },

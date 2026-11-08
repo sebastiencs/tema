@@ -144,7 +144,7 @@ impl Renderer for GlesRenderer {
             return Ok(texture);
         }
         self.context.bind();
-        let image = self.context.import_dmabuf(source);
+        let image = self.context.import_dmabuf(source)?;
         let texture = image
             .into_texture(self.context.device_id())
             .map(|texture| Rc::new(texture) as Rc<dyn Texture>)
@@ -152,6 +152,12 @@ impl Renderer for GlesRenderer {
         self.dmabuf_textures
             .insert(source.id, Rc::downgrade(&texture));
         Ok(texture)
+    }
+
+    fn test_import_dmabuf(&mut self, source: &DmaBuf) -> Result<(), RendererError> {
+        self.context.bind();
+        let _image = self.context.import_dmabuf(source)?;
+        Ok(())
     }
 
     fn import_shm(&mut self, image: ShmImage<'_>) -> Result<Rc<dyn Texture>, RendererError> {
@@ -199,7 +205,7 @@ impl Renderer for GlesRenderer {
                 .collect::<Vec<_>>()
         );
         self.context.bind();
-        let image = self.context.import_dmabuf(source);
+        let image = self.context.import_dmabuf(source)?;
         log::debug!("GLES output import created EGL image: id={:?}", source.id);
         let mut framebuffer = self.context.make_fb_from_image(&image, source);
         log::debug!("GLES output import created framebuffer: id={:?}", source.id);

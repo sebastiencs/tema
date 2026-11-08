@@ -170,6 +170,7 @@ mod config;
 mod cursor;
 mod dbus;
 mod dmabuf;
+mod dmabuf_feedback;
 mod drm;
 mod gbm;
 mod globals;

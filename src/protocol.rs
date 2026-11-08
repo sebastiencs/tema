@@ -348,6 +348,50 @@ fn write_constants(f: &mut impl Write, interface: &Interface) -> std::io::Result
     Ok(())
 }
 
+fn write_array_impl(f: &mut impl Write) -> std::io::Result<()> {
+    writeln!(f, "impl Array {{")?;
+    writeln!(f, "    /// Native-endian `u32` words. Wayland arrays use the host endianness.")?;
+    writeln!(f, "    pub fn from_u32s(words: &[u32]) -> Self {{")?;
+    writeln!(f, "        let mut bytes = Vec::with_capacity(words.len() * 4);")?;
+    writeln!(f, "        for word in words {{")?;
+    writeln!(f, "            bytes.extend_from_slice(&word.to_ne_bytes());")?;
+    writeln!(f, "        }}")?;
+    writeln!(f, "        Self(bytes)")?;
+    writeln!(f, "    }}")?;
+    writeln!(f)?;
+    writeln!(f, "    /// Native-endian `u32` words. The byte length must be a multiple of 4.")?;
+    writeln!(f, "    ///")?;
+    writeln!(
+        f,
+        "    /// Read a client array whose length is not a word count with [`Self::as_bytes`]."
+    )?;
+    writeln!(f, "    pub fn to_u32s(&self) -> Vec<u32> {{")?;
+    writeln!(f, "        assert!(")?;
+    writeln!(f, "            self.0.len().is_multiple_of(4),")?;
+    writeln!(f, "            \"array byte length {{}} is not a multiple of 4\", self.0.len()")?;
+    writeln!(f, "        );")?;
+    writeln!(
+        f,
+        "        self.0.chunks_exact(4).map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap())).collect()"
+    )?;
+    writeln!(f, "    }}")?;
+    writeln!(f)?;
+    writeln!(f, "    /// Tightly packed native-endian `u16`s. The wire writer pads to 32 bits.")?;
+    writeln!(f, "    pub fn from_u16s(words: &[u16]) -> Self {{")?;
+    writeln!(f, "        let mut bytes = Vec::with_capacity(words.len() * 2);")?;
+    writeln!(f, "        for word in words {{")?;
+    writeln!(f, "            bytes.extend_from_slice(&word.to_ne_bytes());")?;
+    writeln!(f, "        }}")?;
+    writeln!(f, "        Self(bytes)")?;
+    writeln!(f, "    }}")?;
+    writeln!(f)?;
+    writeln!(f, "    pub fn as_bytes(&self) -> &[u8] {{")?;
+    writeln!(f, "        &self.0")?;
+    writeln!(f, "    }}")?;
+    writeln!(f, "}}")?;
+    Ok(())
+}
+
 pub fn gen() -> std::io::Result<()> {
     // dnf install wayland-protocols-devel wlr-protocols-devel hyprland-protocols-devel
     let paths = [
@@ -466,7 +510,10 @@ pub fn gen() -> std::io::Result<()> {
     let derive_str =
         "#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, derive_more::From, derive_more::Into, derive_more::Deref)]";
     writeln!(f, "{}", derive_str)?;
-    writeln!(f, "pub struct Array(pub Vec<u32>);\n")?;
+    writeln!(f, "pub struct Array(pub Vec<u8>);")?;
+    writeln!(f)?;
+    write_array_impl(f)?;
+    writeln!(f)?;
 
     writeln!(f, "wayland_id! {{")?;
     for protocol in &protocols {

@@ -80,6 +80,7 @@ pub(crate) struct MockRenderer {
     live_targets: Rc<Cell<usize>>,
     output_imports: Cell<usize>,
     fail_output_import_at: Option<usize>,
+    fail_dmabuf_import: bool,
     target_size_override: Option<(i32, i32)>,
 }
 
@@ -95,6 +96,7 @@ impl Default for MockRenderer {
             live_targets: Rc::new(Cell::new(0)),
             output_imports: Cell::new(0),
             fail_output_import_at: None,
+            fail_dmabuf_import: false,
             target_size_override: None,
         }
     }
@@ -113,6 +115,10 @@ impl MockRenderer {
         self.fail_output_import_at = Some(index);
     }
 
+    pub(crate) fn fail_dmabuf_import(&mut self) {
+        self.fail_dmabuf_import = true;
+    }
+
     pub(crate) fn override_target_size(&mut self, width: i32, height: i32) {
         self.target_size_override = Some((width, height));
     }
@@ -128,6 +134,10 @@ impl MockRenderer {
     pub(crate) fn live_targets(&self) -> usize {
         self.live_targets.get()
     }
+
+    pub(crate) fn made_current(&self) -> bool {
+        self.calls.borrow().contains(&Call::MakeCurrent)
+    }
 }
 
 impl Renderer for MockRenderer {
@@ -142,6 +152,14 @@ impl Renderer for MockRenderer {
     fn import_dmabuf(&mut self, _dmabuf: &DmaBuf) -> Result<Rc<dyn Texture>, RendererError> {
         self.record(Call::ImportDmabuf);
         Ok(Rc::new(MockTexture))
+    }
+
+    fn test_import_dmabuf(&mut self, dmabuf: &DmaBuf) -> Result<(), RendererError> {
+        self.make_current();
+        if self.fail_dmabuf_import {
+            return Err(RendererError::ImportFailed);
+        }
+        self.import_dmabuf(dmabuf).map(drop)
     }
 
     fn import_shm(&mut self, _image: ShmImage<'_>) -> Result<Rc<dyn Texture>, RendererError> {
@@ -231,6 +249,15 @@ impl Renderer for MockRenderer {
     }
 }
 
+/// One fake DRM device for linux-dmabuf create tests. `render_dev` is the
+/// advertised render node; `primary_dev` is the primary node.
+#[derive(Debug)]
+pub(crate) struct MockDmabufImporter {
+    pub render_dev: Option<libc::dev_t>,
+    pub primary_dev: Option<libc::dev_t>,
+    pub renderer: MockRenderer,
+}
+
 fn sample_dmabuf() -> DmaBuf {
     let fd = OwnedFd::from(std::fs::File::open("/dev/null").expect("dev null"));
     DmaBuf {
@@ -240,6 +267,7 @@ fn sample_dmabuf() -> DmaBuf {
         format: ARGB8888,
         modifier: Modifier::LINEAR,
         planes: Box::new([DmaBufPlane { offset: 0, stride: 4, fd }]),
+        sampling_device: None,
     }
 }
 

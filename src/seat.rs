@@ -1726,7 +1726,7 @@ pub fn gate_for_session_lock(state: &mut State, dispatcher: &mut Dispatcher) {
     if state.seat.pointer_interactive_grab.is_some() {
         abort_pointer_interactive_grab(state, dispatcher, time);
     }
-    let keys = state.keyboard.pressed_keys().0;
+    let keys = state.keyboard.pressed_keys().to_u32s();
     let buttons: Vec<u32> = state.seat.pressed_buttons.iter().copied().collect();
     for key in keys {
         handle_keyboard_key(state, dispatcher, key, 0, time);
@@ -1746,7 +1746,7 @@ pub fn quiesce_for_session_pause(state: &mut State, dispatcher: &mut Dispatcher)
     if state.seat.pointer_interactive_grab.is_some() {
         abort_pointer_interactive_grab(state, dispatcher, time);
     }
-    let keys = state.keyboard.pressed_keys().0;
+    let keys = state.keyboard.pressed_keys().to_u32s();
     let buttons: Vec<u32> = state.seat.pressed_buttons.iter().copied().collect();
     for key in keys {
         handle_keyboard_key(state, dispatcher, key, 0, time);
@@ -2299,7 +2299,7 @@ where
 }
 
 pub fn empty_keys() -> Array {
-    Array(Vec::new())
+    Array::from_u32s(&[])
 }
 
 fn dispatch_modifiers(
