@@ -61,6 +61,7 @@ atoms! {
         COMPOUND_TEXT,
         DELETE,
         INCR,
+        MULTIPLE,
         _MOTIF_WM_HINTS,
         _NET_ACTIVE_WINDOW,
         _NET_CLIENT_LIST,
@@ -134,6 +135,7 @@ atoms! {
         WM_CLASS = Atom::WM_CLASS,
         WM_TRANSIENT_FOR = Atom::WM_TRANSIENT_FOR,
         STRING = Atom::STRING,
+        INTEGER = Atom::INTEGER,
         CARDINAL = Atom::CARDINAL,
         ATOM = Atom::ATOM,
     }
@@ -486,7 +488,9 @@ mod tests {
             assert!(PREDEFINED.contains(&name), "{name}");
             assert!(!NAMES.contains(&name), "{name} would be interned");
         }
-        assert_eq!(NAMES.len() + PREDEFINED.len(), 67 + 11);
+        assert_eq!(NAMES.len() + PREDEFINED.len(), 68 + 12);
+        assert!(NAMES.contains(&"MULTIPLE"));
+        assert!(PREDEFINED.contains(&"INTEGER"));
         assert!(NAMES.contains(&"XdndSelection"));
         assert!(NAMES.contains(&"_NET_WM_NAME"));
     }

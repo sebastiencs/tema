@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    clients::{Client, ClientAction, ClientDispatcher, ClientId, Resolved},
+    clients::{Client, ClientAction, ClientId, Resolved},
     config,
     cursor::{CursorSourceRef, CursorState},
     drm::request_outputs_for_points,
@@ -283,6 +283,10 @@ pub(crate) struct SeatClientRemovalResult {
     pub cursor_changed: bool,
     pub interactive_grab_cleared: bool,
     pub keyboard_focus_cleared: bool,
+    /// The removed client owned the clipboard through an X selection source.
+    pub selection_cleared: bool,
+    /// The removed client owned the primary selection through an X selection source.
+    pub primary_selection_cleared: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -377,6 +381,40 @@ impl Default for SeatState {
             intercepted_keyboard_keys: BTreeSet::default(),
             intercepted_pointer_buttons: BTreeSet::default(),
             last_real_input: None,
+        }
+    }
+}
+
+/// Install or clear the compositor-owned source for one X selection.
+///
+/// The seat serial advances, the previous source is cancelled, and the new
+/// value is published to the focused client and to data-control devices.
+pub(crate) fn install_x_selection(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    kind: crate::xwayland::SelectionKind,
+    source: Option<crate::state::XSelectionSource>,
+) {
+    let serial = state.seat.next_serial();
+    match kind {
+        crate::xwayland::SelectionKind::Clipboard => {
+            let previous = state
+                .seat
+                .replace_selection_source(source.map(SelectionSourceState::Xwayland), serial);
+            if let Some(previous) = previous {
+                previous.cancelled(dispatcher);
+            }
+            state.seat.publish_clipboard_selection(dispatcher, None);
+        }
+        crate::xwayland::SelectionKind::Primary => {
+            let previous = state.seat.replace_primary_selection_source(
+                source.map(PrimarySelectionSourceState::Xwayland),
+                serial,
+            );
+            if let Some(previous) = previous {
+                previous.cancelled(dispatcher);
+            }
+            state.seat.publish_primary_selection(dispatcher, None);
         }
     }
 }
@@ -567,11 +605,7 @@ impl SeatState {
 
     /// Tell the focused `wl_data_device` and every data-control device that the clipboard changed.
     /// `skip` is a client whose socket is already going away.
-    pub fn publish_clipboard_selection(
-        &self,
-        dispatcher: &mut ClientDispatcher,
-        skip: Option<ClientId>,
-    ) {
+    pub fn publish_clipboard_selection(&self, dispatcher: &mut Dispatcher, skip: Option<ClientId>) {
         if let Some(focus) = self.keyboard_focus() {
             if skip != Some(focus.client_id()) {
                 dispatcher.dispatch_to(focus.client_id(), ClientAction::RefreshDataDeviceSelection);
@@ -589,6 +623,9 @@ impl SeatState {
             }
             dispatcher.dispatch_to(client_id, ClientAction::RefreshExtDataControlSelection);
         }
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::SelectionChanged(
+            crate::xwayland::SelectionKind::Clipboard,
+        ));
     }
 
     pub fn register_primary_selection_device(
@@ -626,11 +663,7 @@ impl SeatState {
     /// devices keep their current offer until focus moves. The data-control
     /// refresh skips version-1 devices. `skip` is a client whose socket is
     /// already going away.
-    pub fn publish_primary_selection(
-        &self,
-        dispatcher: &mut ClientDispatcher,
-        skip: Option<ClientId>,
-    ) {
+    pub fn publish_primary_selection(&self, dispatcher: &mut Dispatcher, skip: Option<ClientId>) {
         if let Some(focus) = self.keyboard_focus() {
             if skip != Some(focus.client_id()) {
                 dispatcher.dispatch_to(focus.client_id(), ClientAction::RefreshPrimarySelection);
@@ -648,6 +681,9 @@ impl SeatState {
             }
             dispatcher.dispatch_to(client_id, ClientAction::RefreshExtDataControlPrimarySelection);
         }
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::SelectionChanged(
+            crate::xwayland::SelectionKind::Primary,
+        ));
     }
 
     pub fn primary_selection_source(&self) -> Option<PrimarySelectionSourceState> {
@@ -991,17 +1027,18 @@ impl SeatState {
             self.active_pointer_confine = None;
         }
         self.keyboard_resources.remove(&client_id);
-        if self
-            .selection_source
-            .is_some_and(|selection| selection.owner_client_id() == client_id)
-        {
-            self.selection_source = None;
+        if let Some(selection) = self.selection_source {
+            if selection.owner_client_id() == client_id {
+                result.selection_cleared = matches!(selection, SelectionSourceState::Xwayland(_));
+                self.selection_source = None;
+            }
         }
-        if self
-            .primary_selection_source
-            .is_some_and(|selection| selection.owner_client_id() == client_id)
-        {
-            self.primary_selection_source = None;
+        if let Some(selection) = self.primary_selection_source {
+            if selection.owner_client_id() == client_id {
+                result.primary_selection_cleared =
+                    matches!(selection, PrimarySelectionSourceState::Xwayland(_));
+                self.primary_selection_source = None;
+            }
         }
         if self
             .pointer_focus

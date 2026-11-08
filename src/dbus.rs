@@ -497,6 +497,7 @@ impl Dbus {
 
         let msg = msg.encode().unwrap();
         let action = IoUringAction::Write {
+            id: None,
             fd: self.socket.as_raw_fd(),
             offset: 0,
             buffer: Box::from(&msg[..]),
@@ -834,6 +835,7 @@ impl Dbus {
             }
         };
         dispatcher.dispatch(IoUringAction::Write {
+            id: None,
             fd: self.socket.as_raw_fd(),
             offset: 0,
             buffer: Box::from(&encoded[..]),
@@ -860,6 +862,7 @@ impl Dbus {
             }
         };
         dispatcher.dispatch(IoUringAction::Write {
+            id: None,
             fd: self.socket.as_raw_fd(),
             offset: 0,
             buffer: Box::from(&encoded[..]),
@@ -878,6 +881,7 @@ impl Dbus {
         let serial = DbusSerial(msg.get_serial());
         let encoded = msg.encode().unwrap();
         dispatcher.dispatch(IoUringAction::Write {
+            id: None,
             fd: self.socket.as_raw_fd(),
             offset: 0,
             buffer: Box::from(&encoded[..]),

@@ -136,6 +136,10 @@ impl Wm {
             Event::ClientMessage(event) => self.on_client_message(event, atoms, ctx),
             Event::PropertyNotify(event) => self.on_property_notify(event, ctx),
             Event::FocusIn(event) => self.on_focus_in(event, ctx),
+            Event::XFixesSelectionNotify(event) => self.on_selection_owner(event, ctx),
+            Event::SelectionNotify(event) => self.on_selection_notify(event, ctx),
+            Event::SelectionClear(event) => self.on_selection_clear(event, ctx),
+            Event::SelectionRequest(event) => self.on_selection_request(event, ctx),
             _ => Ok(()),
         }
     }
@@ -165,7 +169,10 @@ impl Wm {
     }
 
     fn on_create(&mut self, event: CreateNotify, check: Window) -> Result<(), WmFailure> {
-        if event.window == check || self.windows.contains_key(&event.window) {
+        if event.window == check
+            || self.selection_window(event.window)
+            || self.windows.contains_key(&event.window)
+        {
             return Ok(());
         }
         let rect = Rect::from_event(event.x, event.y, event.width, event.height);
@@ -195,6 +202,7 @@ impl Wm {
     }
 
     fn forget(&mut self, event: DestroyNotify, ctx: &mut WmCtx<'_>) -> Result<(), WmFailure> {
+        self.drop_outgoing_requestor(event.window, ctx)?;
         let dropped_map = remove_window(&mut self.map_order, event.window);
         let dropped_stack = remove_window(&mut self.stack, event.window);
         let focused = self.focus == Some(event.window);
@@ -589,7 +597,7 @@ impl Wm {
     /// Drops every tema window this WM created.
     pub(super) fn release_managed(&mut self, state: &mut State, dispatcher: &mut Dispatcher) {
         let surfaces = SurfaceSerials::default();
-        let mut ctx = WmCtx { run: 0, state, dispatcher, surfaces: &surfaces };
+        let mut ctx = WmCtx { run: 0, state, dispatcher, surfaces: &surfaces, client: None };
         let leaving = self
             .windows
             .values_mut()

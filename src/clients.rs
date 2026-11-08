@@ -3014,6 +3014,16 @@ impl Model for Client {
                     let _ = state.remove_object(object_id);
                 }
                 let seat_removal = state.seat.remove_client(self.id);
+                if seat_removal.selection_cleared {
+                    state
+                        .seat
+                        .publish_clipboard_selection(&mut dispatcher, Some(self.id));
+                }
+                if seat_removal.primary_selection_cleared {
+                    state
+                        .seat
+                        .publish_primary_selection(&mut dispatcher, Some(self.id));
+                }
                 if seat_removal.interactive_grab_cleared {
                     crate::seat::recover_pointer_after_interactive_grab_loss(
                         state,

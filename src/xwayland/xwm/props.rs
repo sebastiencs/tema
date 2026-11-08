@@ -196,8 +196,14 @@ impl Wm {
     pub(super) fn on_property_notify(
         &mut self,
         event: crate::x11::PropertyNotify,
-        ctx: &WmCtx<'_>,
+        ctx: &mut WmCtx<'_>,
     ) -> Result<(), WmFailure> {
+        if self.on_selection_property(event, ctx)? {
+            return Ok(());
+        }
+        if self.on_outgoing_delete(event, ctx)? {
+            return Ok(());
+        }
         if !self.windows.contains_key(&event.window) {
             return Ok(());
         }

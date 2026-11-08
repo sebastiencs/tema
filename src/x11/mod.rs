@@ -19,29 +19,32 @@ mod wire;
 
 // Later phases send and parse through these types.
 #[allow(unused_imports)]
-pub(crate) use atoms::{AtomCache, Atoms, NAMES};
+pub(crate) use atoms::{AtomCache, AtomInternEvent, Atoms, NAMES};
 #[allow(unused_imports)]
 pub(crate) use connection::{ConnectionError, Read, State, XConnection, XReplyError};
 #[allow(unused_imports)]
 pub(crate) use generated::{
     Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientIdMask, ClientIdSpec,
     ClientIdValue, ClientMessage, ClientMessageData, Colormap, CompositeRedirectSubwindows,
-    ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux, CreateGc,
-    CreateGcAux, CreateNotify, CreatePixmap, CreateWindow, CreateWindowAux, Cursor, DestroyNotify,
-    Directformat, Drawable, Event, EventMask, FocusIn, FreeGc, FreePixmap, Gcontext, GetProperty,
-    ImageFormat, InputFocus, KillClient, MapNotify, MapRequest, MapWindow, NoReply, NotifyDetail,
-    NotifyMode, PictType, Pictformat, Pictforminfo, Picture, Pixmap, Property as PropertyState,
-    PropertyNotify, PutImage, Redirect, RenderCreateCursor, RenderCreatePicture,
-    RenderCreatePictureAux, RenderFreePicture, RenderQueryPictFormats, RenderQueryPictFormatsReply,
-    Request, ResQueryClientIds, ResQueryClientIdsReply, SendEvent, SetInputFocus,
-    SetSelectionOwner, StackMode, UnmapNotify, Window, WindowClass,
+    ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux,
+    ConvertSelection, CreateGc, CreateGcAux, CreateNotify, CreatePixmap, CreateWindow,
+    CreateWindowAux, Cursor, DeleteProperty, DestroyNotify, Directformat, Drawable, Event,
+    EventMask, FocusIn, FreeGc, FreePixmap, Gcontext, GetAtomName, GetAtomNameReply, GetProperty,
+    ImageFormat, InputFocus, InternAtom, InternAtomReply, KillClient, MapNotify, MapRequest,
+    MapWindow, NoReply, NotifyDetail, NotifyMode, PictType, Pictformat, Pictforminfo, Picture,
+    Pixmap, PropMode, Property as PropertyState, PropertyNotify, PutImage, Redirect,
+    RenderCreateCursor, RenderCreatePicture, RenderCreatePictureAux, RenderFreePicture,
+    RenderQueryPictFormats, RenderQueryPictFormatsReply, Request, ResQueryClientIds,
+    ResQueryClientIdsReply, SelectionClear, SelectionEvent, SelectionEventMask, SelectionNotify,
+    SelectionRequest, SendEvent, SetInputFocus, SetSelectionOwner, StackMode, UnmapNotify, Window,
+    WindowClass, XFixesSelectSelectionInput, XFixesSelectionNotify,
 };
 #[allow(unused_imports)]
 pub(crate) use io::XIo;
 #[allow(unused_imports)]
 pub(crate) use property::{
     change_property_atoms, change_property_u32s, change_property_u8s, change_property_utf8,
-    delete_property, get_property, Property, PropertyChange, PropertyError,
+    delete_property, get_property, get_property_deleting, Property, PropertyChange, PropertyError,
 };
 #[allow(unused_imports)]
 pub(crate) use startup::{

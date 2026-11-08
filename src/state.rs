@@ -760,16 +760,25 @@ pub enum DataOfferRole {
     Drag,
 }
 
+/// One X selection published as a Wayland source. The bytes live on the object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XSelectionSource {
+    pub client: ClientId,
+    pub object: ObjectId,
+}
+
 /// Clipboard selection owner. Drag-and-drop stays on [`DragSource`].
 ///
 /// `DataControl` is the `zwlr_data_control_source_v1` and `Ext` the
-/// `ext_data_control_source_v1` that own the clipboard. Primary selection stays
-/// a separate seat slot.
+/// `ext_data_control_source_v1` that own the clipboard. `Xwayland` is the
+/// compositor-owned source for an X selection. Primary selection stays a
+/// separate seat slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionSourceState {
     WlData(Resolved<WlDataSourceId>),
     DataControl(Resolved<crate::protocol_generated::ZwlrDataControlSourceV1Id>),
     Ext(Resolved<crate::protocol_generated::ExtDataControlSourceV1Id>),
+    Xwayland(XSelectionSource),
 }
 
 impl SelectionSourceState {
@@ -778,6 +787,7 @@ impl SelectionSourceState {
             Self::WlData(source) => source.client_id(),
             Self::DataControl(source) => source.client_id(),
             Self::Ext(source) => source.client_id(),
+            Self::Xwayland(source) => source.client,
         }
     }
 
@@ -786,6 +796,7 @@ impl SelectionSourceState {
             Self::WlData(source) => source.object_id(),
             Self::DataControl(source) => source.object_id(),
             Self::Ext(source) => source.object_id(),
+            Self::Xwayland(source) => source.object,
         }
     }
 }
@@ -796,6 +807,7 @@ pub enum PrimarySelectionSourceState {
     Zwp(Resolved<crate::protocol_generated::ZwpPrimarySelectionSourceV1Id>),
     DataControl(Resolved<crate::protocol_generated::ZwlrDataControlSourceV1Id>),
     Ext(Resolved<crate::protocol_generated::ExtDataControlSourceV1Id>),
+    Xwayland(XSelectionSource),
 }
 
 impl PrimarySelectionSourceState {
@@ -804,6 +816,7 @@ impl PrimarySelectionSourceState {
             Self::Zwp(source) => source.client_id(),
             Self::DataControl(source) => source.client_id(),
             Self::Ext(source) => source.client_id(),
+            Self::Xwayland(source) => source.client,
         }
     }
 
@@ -812,6 +825,7 @@ impl PrimarySelectionSourceState {
             Self::Zwp(source) => source.object_id(),
             Self::DataControl(source) => source.object_id(),
             Self::Ext(source) => source.object_id(),
+            Self::Xwayland(source) => source.object,
         }
     }
 }

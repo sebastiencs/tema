@@ -181,7 +181,13 @@ impl XIo {
         self.next_write = self.next_write.wrapping_add(1);
         let buffer = std::mem::take(&mut self.pending).into_boxed_slice();
         self.write_in_flight = Some(token);
-        dispatcher.dispatch(IoUringAction::Write { fd: self.fd, offset: 0, buffer, dispatch_to });
+        dispatcher.dispatch(IoUringAction::Write {
+            id: None,
+            fd: self.fd,
+            offset: 0,
+            buffer,
+            dispatch_to,
+        });
     }
 
     fn fail(&mut self, core: &mut XConnection, dispatcher: &mut Dispatcher) -> Read {

@@ -561,6 +561,8 @@ If coming back after a long time, this order should restore the mental model qui
     How keyboard focus becomes X input focus: the input model, clicks, map and close, `FocusIn`, and a client's `_NET_ACTIVE_WINDOW`.
 16. `src/capture.rs` and section 23
     How a managed X window is announced to taskbars and copied by toplevel image capture.
+17. `src/xwayland/xwm/selection.rs`, `src/xwayland/xwm/transfer.rs`, and section 24
+    How `CLIPBOARD` and `PRIMARY` move between X clients and Wayland clients.
 
 ## 14. Vocabulary
 
@@ -943,6 +945,10 @@ The intern batch follows the version replies. Each name in `NAMES` goes out as a
 
 `get_property` sends one `GetProperty`. `long_offset` is 0, `delete` is 0, and `long_length` is `max_bytes / 4`. The reply becomes a `Property` with its type, format, bytes, and `truncated` set when `bytes_after` is non-zero. `Atom::Any` keeps the type the server returns. A requested type that differs, on a property that exists, is a type error. Format 0 is an absent property. `as_u32s`, `as_atoms`, and `as_windows` read native-endian format 32 words. `as_utf8` replaces invalid sequences. `as_latin1` maps each byte to a character. The change helpers build a `Replace` `ChangeProperty`. `delete_property` builds `DeleteProperty`.
 
+### Selections
+
+`ConvertSelection`, deleting `GetProperty`, `ChangeProperty`, `SetSelectionOwner`, `SendEvent`, `SelectionNotify`, `SelectionRequest`, `SelectionClear`, and `XFixesSelectSelectionInput` are in use. The clipboard and primary bridge that drives them is section 24.
+
 ### Who owns it
 
 The XWM in section 20 owns the `XConnection` and the `XIo` for the current run. Displayfd readiness starts it. It writes the setup, runs `Startup`, and passes a `Redispatcher` that turns each reply into `XwaylandAction::Wm`. The `WM_S0` claim runs on this connection once startup is ready.
@@ -1239,3 +1245,62 @@ Run a normal session from a terminal. The display number is in section 20.
 4. Closing from the taskbar closes it.
 5. A GTK menu (`GDK_BACKEND=x11`) adds no entry.
 6. `grim` through a toplevel picker, or an xdg-desktop-portal window share, captures the `xterm` with its decorations.
+
+## 24. Clipboard and primary selection
+
+`CLIPBOARD` and `PRIMARY` move both ways between X clients and Wayland clients. The clipboard is `wl_data_device`. The primary selection is `zwp_primary_selection_v1`. Data-control devices receive the same offers. The windows and the owner tracking live in `src/xwayland/xwm/selection.rs`. The bytes live in `src/xwayland/xwm/transfer.rs`. MIME names live in `src/xwayland/xwm/mime.rs`.
+
+### The two windows
+
+The claim in section 20 creates one `InputOnly` 10×10 window for `CLIPBOARD` and one for `PRIMARY`. Each has `PropertyChange`. `XFixesSelectSelectionInput` on each window selects `SetSelectionOwner`, `SelectionWindowDestroy`, and `SelectionClientClose`. `CreateNotify` for either window is ignored.
+
+### The two echo breaks
+
+An `XFixesSelectionNotify` whose owner is that selection's own window stores `own_timestamp` from `selection_timestamp`. A foreign owner, including owner `None`, drops the Wayland source this bridge had published for that selection. A real foreign window then receives `ConvertSelection` of `TARGETS`. The property is `_WL_SELECTION` on that selection's window, and the time is the notify's `timestamp`.
+
+A Wayland clipboard or primary change whose seat slot already holds the source this bridge published leaves the X owner in place. `become_ready` runs both changes after the claim, so a selection that is already on the seat is owned on X for the new run.
+
+### Focus and ownership
+
+Every Wayland clipboard or primary change takes the matching X selection with `SetSelectionOwner`, owner the selection window and time 0, including while a Wayland window is focused. An empty Wayland selection, while this WM owns that X selection, sends `SetSelectionOwner` with owner `None`. `SelectionClear` for our window clears `owned` and the outgoing offer.
+
+An X owner is published once its `TARGETS` reply has become a non-empty MIME list, the keyboard-focus root has the Xwayland role, and the run's Xwayland client has connected. The root of the focused surface is what is checked, so an override-redirect menu counts. `install_x_selection` offers the result to the focused data device and to data-control devices. The source is an `XSelectionSourceObject` kept outside any client map.
+
+A `SelectionRequest` while the focus root is a Wayland surface is refused.
+
+### MIME types
+
+From X to Wayland, `UTF8_STRING` is `text/plain;charset=utf-8`, `STRING` is `text/plain`, and any other atom whose name contains `/` is that name. Other atoms are skipped. Duplicates are dropped and the order is kept.
+
+From Wayland to X, `text/plain;charset=utf-8` is `UTF8_STRING` and `TEXT`, `text/plain` is `STRING`, and any other MIME type is an interned atom of that name. `TEXT` and `UTF8_STRING` both carry the UTF-8 bytes. A `SelectionRequest` that arrives while one of those atoms is still being interned waits, and is answered when the last intern for that offer completes.
+
+### `TARGETS`, `TIMESTAMP`, and refusal
+
+A request whose property is `None` is answered on the target atom. `TARGETS` is a `ChangeProperty` of type `ATOM` and format 32: `TARGETS`, `TIMESTAMP`, then the offered atoms. `TIMESTAMP` is type `INTEGER`, format 32, and the single word `own_timestamp`. Each is followed by `SelectionNotify` naming that property.
+
+`MULTIPLE`, a target that was not offered, and a missing offer are refused, and so is a request without X focus. The refusal is `SendEvent` of `SelectionNotify` with property `None`, propagate 0, destination the requestor, and an empty event mask.
+
+### Transfers
+
+One X-to-Wayland conversion runs per selection. Further `receive` calls wait in a FIFO, and the front entry is the one in flight. The data `ConvertSelection` uses time 0 and the same `_WL_SELECTION` property. The bytes are written to the pipe the Wayland client passed. A property of type `INCR` switches that transfer to incremental mode. The deleting `GetProperty` has already told the owner to start, and the header itself is left out of the pipe. Each later `NewValue` is fetched with another deleting `GetProperty` after the previous chunk's pipe write has completed. An empty value ends the transfer.
+
+Wayland to X reads the source through one `pipe2` pipe. The write end is handed to the source once. The read is `ReadSome` of 65536 bytes, and a zero-length read is end of file. A value that fits in one chunk is one `ChangeProperty` of format 8 and the target type, then `SelectionNotify`.
+
+The chunk is `min(65536, maximum_request_length * 4 - 24)` bytes. When the buffer reaches that size before end of file, a requestor that is already tracked already has `PropertyChange`, and any other requestor receives `ChangeWindowAttributes` with that mask. The WM then writes an `INCR` property of format 32 holding the chunk size, sends `SelectionNotify`, and waits. Each `Delete` on that property writes the next chunk. The next pipe read is issued when the buffer holds less than a chunk and end of file has not arrived. The `Delete` after end of file and the last chunk writes a zero-length property and ends the transfer. `DestroyNotify` of the requestor drops its transfers.
+
+### Idle timeout and teardown
+
+`src/xwayland/xwm/timer.rs` keeps one timerfd. Every transfer step, in both directions and including an `INCR` wait, sets a 5 second deadline. A transfer runs to any size, and a step that stays idle expires. An incoming timeout drops that receive and starts the next queued one. An outgoing timeout before `SelectionNotify` refuses the request. After `SelectionNotify`, it cancels the read and drops the transfer.
+
+`Wm::stop` cancels every pipe read and write, drops those fds, removes the `XSelectionSourceObject`s, and clears a clipboard or primary slot that still holds one. That clear publishes `selection(null)` to the focused data device. The transfer timer then stops, and `release_managed` from section 20 runs. The next run starts with empty selection windows and takes ownership of the Wayland selection that is on the seat.
+
+### Manual check
+
+Run a normal session from a terminal. The display number is in section 20.
+
+1. `echo hi | xclip -selection clipboard` with an X window focused, then `wl-paste` prints `hi`.
+2. `wl-copy hello`, then `xclip -o -selection clipboard` from a focused `xterm` prints `hello`.
+3. Selecting text in an `xterm` and middle-clicking in a GTK Wayland app pastes it. The reverse works too.
+4. `head -c 5M /dev/urandom | wl-copy`, then `xclip -o -selection clipboard | wc -c` prints 5242880. The reverse goes through `xclip -i` and `wl-paste | wc -c`.
+5. With focus on a Wayland window, `xclip -o` from a background X client returns nothing.
+6. `wl-copy --clear` makes `xclip -o -selection clipboard` fail.

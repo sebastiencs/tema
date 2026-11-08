@@ -6,9 +6,12 @@
 mod launch;
 mod lines;
 mod restart;
+mod selection_source;
 mod socket;
 mod surfaces;
 mod xwm;
+
+pub(crate) use {selection_source::XSelectionSourceObject, xwm::selection::SelectionKind};
 
 pub(crate) use surfaces::SurfaceEvent;
 
@@ -127,6 +130,18 @@ pub(crate) enum XwaylandAction {
     Reconfigure,
     /// The seat's keyboard focus changed. The current run's WM reads it.
     KeyboardFocus,
+    /// A Wayland client asked for the bytes of an X selection.
+    SelectionSend {
+        source: crate::state::ObjectId,
+        mime_type: String,
+        fd: std::rc::Rc<std::os::fd::OwnedFd>,
+    },
+    /// The compositor replaced or dropped an X selection source.
+    SelectionCancelled {
+        source: crate::state::ObjectId,
+    },
+    /// The Wayland clipboard or primary selection changed.
+    SelectionChanged(SelectionKind),
 }
 
 impl Xwayland {
@@ -343,9 +358,9 @@ impl Xwayland {
         }
         running.surfaces.apply(event);
         let result = {
-            let Run { wm, surfaces, .. } = running;
+            let Run { client: xwayland_client, wm, surfaces, .. } = running;
             let Some(wm) = wm.as_mut() else { return };
-            let mut ctx = xwm::WmCtx { run, state, dispatcher, surfaces };
+            let mut ctx = xwm::WmCtx { run, state, dispatcher, surfaces, client: *xwayland_client };
             wm.on_surface_event(&event, &mut ctx)
         };
         if let Err(failure) = result {
@@ -519,9 +534,9 @@ impl Xwayland {
         }
         let Phase::Running(running) = &mut self.phase else { return };
         let result = {
-            let Run { wm, surfaces, .. } = running;
+            let Run { client, wm, surfaces, .. } = running;
             let Some(wm) = wm.as_mut() else { return };
-            let mut ctx = xwm::WmCtx { run, state, dispatcher, surfaces };
+            let mut ctx = xwm::WmCtx { run, state, dispatcher, surfaces, client: *client };
             wm.handle(event, &mut ctx)
         };
         if let Err(failure) = result {
@@ -609,6 +624,18 @@ impl Model for Xwayland {
             }
             XwaylandAction::KeyboardFocus => {
                 self.on_wm(self.run, xwm::WmEvent::KeyboardFocus, state, dispatcher)
+            }
+            XwaylandAction::SelectionSend { source, mime_type, fd } => self.on_wm(
+                self.run,
+                xwm::WmEvent::SelectionSend { source, mime_type, fd },
+                state,
+                dispatcher,
+            ),
+            XwaylandAction::SelectionCancelled { source } => {
+                self.on_wm(self.run, xwm::WmEvent::SelectionCancelled { source }, state, dispatcher)
+            }
+            XwaylandAction::SelectionChanged(kind) => {
+                self.on_wm(self.run, xwm::WmEvent::SelectionChanged(kind), state, dispatcher)
             }
         }
         Ok(())

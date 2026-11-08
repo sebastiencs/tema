@@ -11,23 +11,32 @@ mod focus;
 mod focus_tests;
 #[cfg(test)]
 mod manage_tests;
+mod mime;
 mod props;
+pub(super) mod selection;
+#[cfg(test)]
+mod selection_tests;
 mod setup;
 mod tests;
+mod timer;
 mod toplevel;
+mod transfer;
 mod window;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt::{self, Display, Formatter},
-    os::fd::RawFd,
+    os::fd::{OwnedFd, RawFd},
+    rc::Rc,
+    time::Instant,
 };
 
 use crate::{
     io_uring::ring::{ReadWriteCompleted, RingId},
     runner::{Dispatcher, Redispatcher},
+    state::ObjectId,
     x11::{
-        Atoms, Extensions, Property, PropertyError, RenderQueryPictFormatsReply,
+        AtomCache, Atoms, Extensions, Property, PropertyError, RenderQueryPictFormatsReply,
         ResQueryClientIdsReply, Startup, StartupEvent, State as ConnectionState, Status, Window,
         XConnection, XIo, XReplyError,
     },
@@ -57,6 +66,11 @@ pub(super) struct Wm {
     map_order: Vec<Window>,
     /// Increments each time an override-redirect window is shown. Later is higher.
     shown_order: u64,
+    timer: timer::TransferTimer,
+    incoming: BTreeMap<selection::SelectionKind, VecDeque<transfer::Incoming>>,
+    outgoing: BTreeMap<u64, transfer::Outgoing>,
+    /// Ids for incoming and outgoing transfers. One counter keeps timer ids unique.
+    next_transfer: u64,
 }
 
 enum WmPhase {
@@ -72,6 +86,8 @@ struct Ready {
     root: Window,
     check_window: Window,
     cursor: Option<crate::cursor::CursorImage>,
+    selections: selection::Selections,
+    atom_cache: AtomCache,
 }
 
 /// Why the XWM stopped. The run is killed after this.
@@ -123,6 +139,52 @@ pub(crate) enum WmEvent {
     Reconfigure,
     /// Keyboard focus changed. The WM reads the seat focus when it handles this.
     KeyboardFocus,
+    /// A Wayland `receive` asked for the bytes of an X selection.
+    SelectionSend {
+        source: ObjectId,
+        mime_type: String,
+        fd: Rc<OwnedFd>,
+    },
+    /// The seat dropped an X selection source.
+    SelectionCancelled {
+        source: ObjectId,
+    },
+    /// The Wayland clipboard or primary selection changed.
+    SelectionChanged(selection::SelectionKind),
+    /// The transfer timerfd read completed.
+    TransferTimer,
+    /// A deleting `GetProperty` of a selection window's `TARGETS` reply.
+    SelectionTargets {
+        kind: selection::SelectionKind,
+        result: Result<crate::x11::Property, crate::x11::PropertyError>,
+    },
+    /// `InternAtom` for a MIME type a Wayland source offered.
+    Interned {
+        name: Vec<u8>,
+        result: Result<crate::x11::InternAtomReply, crate::x11::XReplyError>,
+    },
+    /// `GetAtomName` for an atom listed in `TARGETS`.
+    AtomName {
+        kind: selection::SelectionKind,
+        generation: u64,
+        atom: crate::x11::Atom,
+        result: Result<crate::x11::GetAtomNameReply, crate::x11::XReplyError>,
+    },
+    /// A deleting `GetProperty` of a selection window's data reply.
+    IncomingProperty {
+        kind: selection::SelectionKind,
+        result: Result<Property, PropertyError>,
+    },
+    /// The pipe write of one selection chunk finished.
+    IncomingWritten {
+        id: u64,
+        result: Completion,
+    },
+    /// The pipe read of one Wayland selection request finished.
+    OutgoingRead {
+        id: u64,
+        result: Completion,
+    },
 }
 
 pub(super) struct WmCtx<'a> {
@@ -130,6 +192,8 @@ pub(super) struct WmCtx<'a> {
     pub(super) state: &'a mut State,
     pub(super) dispatcher: &'a mut Dispatcher,
     pub(super) surfaces: &'a SurfaceSerials,
+    /// The Xwayland Wayland client for this run, once it has connected.
+    pub(super) client: Option<crate::clients::ClientId>,
 }
 
 impl Wm {
@@ -168,6 +232,10 @@ impl Wm {
             stack: Vec::new(),
             map_order: Vec::new(),
             shown_order: 0,
+            timer: timer::TransferTimer::new(run),
+            incoming: BTreeMap::new(),
+            outgoing: BTreeMap::new(),
+            next_transfer: 0,
         }
     }
 
@@ -204,6 +272,32 @@ impl Wm {
                 }
                 WmEvent::Reconfigure => self.reconfigure(ctx),
                 WmEvent::KeyboardFocus => self.on_keyboard_focus(ctx),
+                WmEvent::SelectionSend { source, mime_type, fd } => {
+                    self.on_selection_send(source, mime_type, fd, ctx)
+                }
+                WmEvent::SelectionCancelled { source } => {
+                    ctx.state.remove_object(source);
+                    Ok(())
+                }
+                WmEvent::SelectionChanged(kind) => self.on_selection_changed(kind, ctx),
+                WmEvent::SelectionTargets { kind, result } => {
+                    self.on_selection_targets(kind, result, ctx)
+                }
+                WmEvent::AtomName { kind, generation, atom, result } => {
+                    self.on_atom_name(kind, generation, atom, result, ctx)
+                }
+                WmEvent::Interned { name, result } => self.on_interned(name, result, ctx),
+                WmEvent::IncomingProperty { kind, result } => {
+                    self.on_incoming_property(kind, result, ctx)
+                }
+                WmEvent::IncomingWritten { id, result } => {
+                    self.on_incoming_written(id, result, ctx)
+                }
+                WmEvent::OutgoingRead { id, result } => self.on_outgoing_read(id, result, ctx),
+                WmEvent::TransferTimer => {
+                    self.timer.read_finished();
+                    self.expire_transfers(Instant::now(), ctx)
+                }
             }
         };
         self.io.flush(&mut self.conn, ctx.dispatcher);
@@ -214,11 +308,29 @@ impl Wm {
         self.io.flush(&mut self.conn, dispatcher);
     }
 
-    /// Cancels the armed read and releases managed windows. The caller drops the `-wm` fd.
+    /// Cancels selection transfers, drops published X sources, stops the transfer
+    /// timer, and releases managed windows. The caller drops the `-wm` fd.
     pub(super) fn stop(&mut self, state: &mut State, dispatcher: &mut Dispatcher) {
+        self.cancel_transfers(dispatcher);
+        self.clear_published_sources(state, dispatcher);
+        self.timer.stop(dispatcher);
         self.release_managed(state, dispatcher);
         self.io.stop(dispatcher);
         self.phase = WmPhase::Failed;
+    }
+
+    fn expire_transfers(&mut self, now: Instant, ctx: &mut WmCtx<'_>) -> Result<(), WmFailure> {
+        for id in self.timer.expire(now) {
+            self.transfer_timed_out(id, ctx)?;
+        }
+        self.timer.arm(ctx.dispatcher);
+        Ok(())
+    }
+
+    /// Expire transfer deadlines at `now` and arm whatever remains.
+    #[cfg(test)]
+    pub(super) fn test_expire_transfers(&mut self, now: Instant, ctx: &mut WmCtx<'_>) {
+        self.expire_transfers(now, ctx).expect("transfer timer");
     }
 
     fn after_read(&mut self, read: crate::x11::Read, ctx: &mut WmCtx<'_>) -> Result<(), WmFailure> {
@@ -272,12 +384,16 @@ impl Wm {
         ctx: &mut WmCtx<'_>,
     ) -> Result<(), WmFailure> {
         let root = self.conn.root().expect("a ready connection has a root");
+        let mut atom_cache = AtomCache::default();
+        atom_cache.seed(&bringup.atoms);
         let mut ready = Ready {
             atoms: bringup.atoms,
             extensions: bringup.extensions,
             root,
             check_window: Window(0),
             cursor: None,
+            selections: selection::Selections::pending(&bringup.atoms),
+            atom_cache,
         };
         if let Err(error) = setup::claim(&mut self.conn, &mut ready) {
             self.phase = WmPhase::Failed;
@@ -285,6 +401,8 @@ impl Wm {
         }
         log::info!("XWM ready on :{}", self.display);
         self.phase = WmPhase::Ready(ready);
+        self.on_selection_changed(selection::SelectionKind::Clipboard, ctx)?;
+        self.on_selection_changed(selection::SelectionKind::Primary, ctx)?;
         self.begin_cursor(ctx)
     }
 }

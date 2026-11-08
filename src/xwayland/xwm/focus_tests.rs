@@ -27,7 +27,7 @@ use super::{
     Wm, WmEvent,
 };
 
-fn focus_root(
+pub(super) fn focus_root(
     wm: &mut Wm,
     state: &mut crate::State,
     dispatcher: &mut Dispatcher,

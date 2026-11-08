@@ -74,6 +74,35 @@ pub(crate) fn get_property(
     )
 }
 
+/// Reads a property and deletes it. The type is [`Atom::Any`] and the offset is 0.
+///
+/// `long_length` is the largest count of 4-byte units that fits in the request field.
+pub(crate) fn get_property_deleting(
+    connection: &mut XConnection,
+    window: Window,
+    property: Atom,
+    redispatch: Redispatcher<Result<Property, PropertyError>>,
+) -> Result<u64, ConnectionError> {
+    let slot = Redispatcher::to_any(move |result| {
+        let decoded = decode(Atom::Any, result);
+        redispatch
+            .clone()
+            .make(decoded)
+            .unwrap_or_else(AnyAction::empty)
+    });
+    connection.send(
+        &GetProperty {
+            delete: 1,
+            window,
+            property,
+            r#type: Atom::Any,
+            long_offset: 0,
+            long_length: u32::MAX / 4,
+        },
+        slot,
+    )
+}
+
 fn decode(
     requested: Atom,
     result: Result<GetPropertyReply, XReplyError>,
@@ -243,7 +272,7 @@ mod tests {
     use {
         super::{
             change_property_atoms, change_property_u32s, change_property_u8s, change_property_utf8,
-            delete_property, get_property, Property, PropertyError,
+            delete_property, get_property, get_property_deleting, Property, PropertyError,
         },
         crate::{
             runner::{AnyAction, Dispatcher, Redispatcher},
@@ -443,6 +472,39 @@ mod tests {
         assert!(partial.truncated);
         assert_eq!(partial.as_latin1().unwrap(), "xy");
         assert_eq!(partial.data, b"xy");
+    }
+
+    #[test]
+    fn get_property_deleting_requests_the_whole_property() {
+        let mut connection = ready();
+        let mut dispatcher = Dispatcher::default();
+        assert_eq!(
+            get_property_deleting(
+                &mut connection,
+                Window(7),
+                Atom::WM_NAME,
+                Redispatcher::to_any(AnyAction::from),
+            )
+            .unwrap(),
+            1
+        );
+        let outgoing = connection.take_outgoing();
+        let sent = requests(&outgoing);
+        assert_eq!(sent.len(), 1);
+        let request = sent[0];
+        assert_eq!(request[0], 20);
+        assert_eq!(request[1], 1);
+        assert_eq!(u32_at(request, 4), 7);
+        assert_eq!(u32_at(request, 8), Atom::WM_NAME.0);
+        assert_eq!(u32_at(request, 12), 0);
+        assert_eq!(u32_at(request, 16), 0);
+        assert_eq!(u32_at(request, 20), u32::MAX / 4);
+
+        let wire = reply(1, 8, Atom::STRING, 0, b"hi");
+        assert!(connection.on_read(&wire, &mut dispatcher).dead.is_none());
+        let property = results(&dispatcher).remove(0).unwrap();
+        assert_eq!(property.as_utf8().unwrap(), "hi");
+        assert!(!property.truncated);
     }
 
     #[test]

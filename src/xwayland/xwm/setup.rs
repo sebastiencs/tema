@@ -5,11 +5,18 @@
 use crate::x11::{
     change_property_atoms, change_property_u32s, change_property_utf8, Atom,
     ChangeWindowAttributes, ChangeWindowAttributesAux, CompositeRedirectSubwindows,
-    ConnectionError, CreateWindow, CreateWindowAux, EventMask, Redirect, SetSelectionOwner, Window,
-    WindowClass, XConnection,
+    ConnectionError, CreateWindow, CreateWindowAux, EventMask, Redirect, SelectionEventMask,
+    SetSelectionOwner, Window, WindowClass, XConnection, XFixesSelectSelectionInput,
 };
 
-use super::Ready;
+use super::{
+    selection::{SelectionKind, SelectionSide, Selections},
+    Ready,
+};
+
+const SELECTION_EVENTS: SelectionEventMask = SelectionEventMask::SetSelectionOwner
+    .union(SelectionEventMask::SelectionWindowDestroy)
+    .union(SelectionEventMask::SelectionClientClose);
 
 const ROOT_EVENTS: EventMask = EventMask::SubstructureNotify
     .union(EventMask::SubstructureRedirect)
@@ -57,6 +64,12 @@ pub(super) fn claim(
         selection: atoms._NET_WM_CM_S0,
         time: 0,
     })?;
+    let clipboard = selection_window(connection, root, atoms.CLIPBOARD)?;
+    let primary = selection_window(connection, root, atoms.PRIMARY)?;
+    ready.selections = Selections {
+        clipboard: SelectionSide::new(SelectionKind::Clipboard, atoms.CLIPBOARD, clipboard),
+        primary: SelectionSide::new(SelectionKind::Primary, atoms.PRIMARY, primary),
+    };
     let supported =
         change_property_atoms(root, atoms._NET_SUPPORTED, atoms.ATOM, &supported_atoms(&atoms));
     connection.send_void(&supported.request())?;
@@ -64,6 +77,33 @@ pub(super) fn claim(
     connection.send_void(&active.request())?;
     ready.check_window = check;
     Ok(check)
+}
+
+fn selection_window(
+    connection: &mut XConnection,
+    parent: Window,
+    selection: Atom,
+) -> Result<Window, ConnectionError> {
+    let window = Window(connection.generate_id()?);
+    connection.send_void(&CreateWindow {
+        depth: 0,
+        wid: window,
+        parent,
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+        border_width: 0,
+        class: WindowClass::InputOnly,
+        visual: 0,
+        value_list: CreateWindowAux::default().event_mask(EventMask::PropertyChange),
+    })?;
+    connection.send_void(&XFixesSelectSelectionInput {
+        window,
+        selection,
+        event_mask: SELECTION_EVENTS,
+    })?;
+    Ok(window)
 }
 
 fn supported_atoms(atoms: &crate::x11::Atoms) -> [Atom; 11] {

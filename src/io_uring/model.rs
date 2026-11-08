@@ -56,6 +56,7 @@ pub enum IoUringAction {
         target: RingId,
     },
     Write {
+        id: Option<RingId>,
         fd: RawFd,
         offset: usize,
         buffer: Box<[u8]>,
@@ -115,8 +116,9 @@ impl std::fmt::Debug for IoUringAction {
                 .debug_struct("PollRemove")
                 .field("target", target)
                 .finish(),
-            Self::Write { fd, offset, buffer, dispatch_to } => f
+            Self::Write { id, fd, offset, buffer, dispatch_to } => f
                 .debug_struct("Write")
+                .field("id", id)
                 .field("fd", fd)
                 .field("offset", offset)
                 .field("buffer_len", &buffer.len())
@@ -231,8 +233,8 @@ impl Model for IoUringState {
                 let id = self.next_id();
                 self.push_op(Operation::Cancel { id, target });
             }
-            IoUringAction::Write { fd, offset, buffer, dispatch_to } => {
-                let id = self.next_id();
+            IoUringAction::Write { id, fd, offset, buffer, dispatch_to } => {
+                let id = id.unwrap_or_else(RingId::fresh);
                 let kind = ReadOrWrite::Write;
                 let nbytes_processed = 0;
                 let neof = 0;
@@ -712,6 +714,89 @@ mod drain_tests {
                 AnyAction::from(IoUringAction::Completion)
             }),
         }
+    }
+
+    fn fill_pipe(write: &OwnedFd) {
+        let flags = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let chunk = [0u8; 4096];
+        loop {
+            let written =
+                unsafe { libc::write(write.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) };
+            if written < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+        assert_eq!(unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, flags) }, 0);
+    }
+
+    #[test]
+    fn cancel_drops_a_blocked_write_completion() {
+        let Ok(mut ring) = IoUringState::try_new() else {
+            return;
+        };
+        let (read, write) = pipe();
+        fill_pipe(&write);
+        let hit = Rc::new(Cell::new(false));
+        let id = RingId::fresh();
+        let mut state = crate::test_support::state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let callback = hit.clone();
+        ring.process(
+            &mut state,
+            IoUringAction::Write {
+                id: Some(id),
+                fd: write.as_raw_fd(),
+                offset: 0,
+                buffer: vec![1u8; 4096].into_boxed_slice(),
+                dispatch_to: Redispatcher::to_any(move |_| {
+                    callback.set(true);
+                    AnyAction::from(IoUringAction::Completion)
+                }),
+            },
+            &mut dispatcher,
+        )
+        .unwrap();
+        ring.ring.submit(Submit::All).unwrap();
+        ring.process(&mut state, IoUringAction::Cancel { target: id }, &mut dispatcher)
+            .unwrap();
+        ring.ring.submit(Submit::All).unwrap();
+
+        for _ in 0..50 {
+            while let Some(completed) = ring.ring.pop() {
+                ring.completed.push_back(completed);
+            }
+            if !ring.completed.is_empty() {
+                ring.process(&mut state, IoUringAction::Completion, &mut dispatcher)
+                    .unwrap();
+            }
+            for action in dispatcher.test_take_queued_actions::<IoUringAction>() {
+                ring.process(&mut state, action, &mut dispatcher).unwrap();
+            }
+            if ring.pending.is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        if !ring.pending.is_empty() {
+            let mut byte = [0u8; 1];
+            let _ = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), byte.len()) };
+            ring.process(&mut state, IoUringAction::WaitForCompletion, &mut dispatcher)
+                .unwrap();
+            for action in dispatcher.test_take_queued_actions::<IoUringAction>() {
+                ring.process(&mut state, action, &mut dispatcher).unwrap();
+            }
+        }
+
+        assert!(!hit.get());
+        assert!(ring.pending.is_empty());
+        drop(read);
     }
 
     #[test]

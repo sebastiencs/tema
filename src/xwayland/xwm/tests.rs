@@ -17,7 +17,10 @@ use crate::{
     wayland_objects::wl_surface::WlSurface,
     x11::{
         change_property_atoms, change_property_u32s, change_property_utf8,
-        testing::{self, ATOM_BASE, COMPOSITE_MAJOR_OPCODE, RENDER_MAJOR_OPCODE, RES_MAJOR_OPCODE},
+        testing::{
+            self, ATOM_BASE, COMPOSITE_MAJOR_OPCODE, RENDER_MAJOR_OPCODE, RES_MAJOR_OPCODE,
+            XFIXES_MAJOR_OPCODE,
+        },
         Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientIdMask, ClientIdSpec,
         ClientIdValue, ClientMessage, ClientMessageData, Colormap, CompositeRedirectSubwindows,
         ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux,
@@ -26,8 +29,9 @@ use crate::{
         GetProperty, ImageFormat, MapNotify, MapRequest, MapWindow, PictType, Pictformat,
         Pictforminfo, Picture, Pixmap, PropertyNotify, PropertyState, PutImage, Redirect,
         RenderCreateCursor, RenderCreatePicture, RenderCreatePictureAux, RenderFreePicture,
-        RenderQueryPictFormats, ResQueryClientIds, ResQueryClientIdsReply, SetSelectionOwner,
-        StackMode, UnmapNotify, Window, WindowClass, XConnection, XReplyError, NAMES,
+        RenderQueryPictFormats, ResQueryClientIds, ResQueryClientIdsReply, SelectionEventMask,
+        SetSelectionOwner, StackMode, UnmapNotify, Window, WindowClass, XConnection,
+        XFixesSelectSelectionInput, XReplyError, NAMES,
     },
 };
 
@@ -80,10 +84,24 @@ fn the_claim_matches_the_encoded_requests_and_uses_the_resource_base() {
     let WmPhase::Ready(ready) = &wm.phase else { panic!("ready") };
     let base = Window(0x20);
     assert_eq!(ready.check_window, base);
+    assert_eq!(ready.selections.clipboard.window, Window(base.0 + 1));
+    assert_eq!(ready.selections.primary.window, Window(base.0 + 2));
+    assert_eq!(ready.selections.clipboard.atom, ready.atoms.CLIPBOARD);
+    assert_eq!(ready.selections.primary.atom, ready.atoms.PRIMARY);
+    assert!(!ready.selections.clipboard.owned);
+    assert_eq!(ready.selections.clipboard.own_timestamp, 0);
+    assert_eq!(ready.atom_cache.atom(b"CLIPBOARD"), Some(ready.atoms.CLIPBOARD));
+    assert_eq!(ready.atom_cache.name(ready.atoms.PRIMARY), Some(b"PRIMARY".as_slice()));
     let io = drain_io(&mut dispatcher);
     assert_eq!(io.writes.len(), 1);
     let sent = testing::split_requests(&io.writes[0].0);
-    let expected = claim_requests(ready.root, ready.check_window, &ready.atoms);
+    let expected = claim_requests(
+        ready.root,
+        ready.check_window,
+        ready.selections.clipboard.window,
+        ready.selections.primary.window,
+        &ready.atoms,
+    );
     assert_eq!(&sent[..expected.len()], expected.as_slice());
     assert_eq!(sent.len(), expected.len() + 1);
     assert_eq!(sent.last().unwrap()[0], 43);
@@ -928,6 +946,7 @@ fn a_property_reply_fills_the_window_and_a_destroyed_window_drops_it() {
             state: &mut state,
             dispatcher: &mut dispatcher,
             surfaces: &surfaces,
+            client: None,
         };
         wm.on_core_event(
             Event::DestroyNotify(DestroyNotify {
@@ -1101,7 +1120,7 @@ pub(super) fn deliver(
     event: Event,
 ) -> Vec<Vec<u8>> {
     {
-        let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+        let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces, client: None };
         wm.on_core_event(event, &mut ctx).unwrap();
     }
     wm.io.flush(&mut wm.conn, dispatcher);
@@ -1134,7 +1153,7 @@ pub(super) fn handle_event(
     event: WmEvent,
 ) -> Vec<Vec<u8>> {
     {
-        let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+        let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces, client: None };
         wm.handle(event, &mut ctx).unwrap();
     }
     take_writes(wm, state, dispatcher, surfaces)
@@ -1280,7 +1299,7 @@ fn deliver_client_pid(
     window: Window,
     result: Result<ResQueryClientIdsReply, XReplyError>,
 ) {
-    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces, client: None };
     wm.handle(WmEvent::ClientPid { window, result }, &mut ctx)
         .unwrap();
 }
@@ -1294,7 +1313,7 @@ pub(super) fn deliver_property(
     atom: Atom,
     result: Result<crate::x11::Property, crate::x11::PropertyError>,
 ) {
-    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces, client: None };
     wm.handle(WmEvent::Property { window, atom, result }, &mut ctx)
         .unwrap();
 }
@@ -1406,7 +1425,7 @@ pub(super) fn note_surface(
     surfaces: &SurfaceSerials,
     event: &SurfaceEvent,
 ) {
-    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces, client: None };
     wm.on_surface_event(event, &mut ctx).unwrap();
 }
 
@@ -1437,12 +1456,20 @@ pub(super) fn configure_request(
 fn drive_to_ready(
     cursor: Option<crate::cursor::CursorImage>,
 ) -> (Wm, crate::State, Dispatcher, SurfaceSerials) {
+    drive_prepared(cursor, |_| {})
+}
+
+pub(super) fn drive_prepared(
+    cursor: Option<crate::cursor::CursorImage>,
+    prepare: impl FnOnce(&mut crate::State),
+) -> (Wm, crate::State, Dispatcher, SurfaceSerials) {
     let fd = std::fs::File::open("/dev/null").unwrap();
     let mut state = state_for_tests();
     state.seat.test_block_cursor_icons(&["default", "left_ptr"]);
     if let Some(image) = cursor {
         state.seat.test_cache_cursor_icon("default", image);
     }
+    prepare(&mut state);
     let mut dispatcher = Dispatcher::default();
     let mut wm = Wm::start(fd.as_raw_fd(), 1, 1, &mut dispatcher);
     let surfaces = SurfaceSerials::default();
@@ -1492,7 +1519,13 @@ fn drive_to_ready(
     panic!("startup did not become ready");
 }
 
-fn claim_requests(root: Window, check: Window, atoms: &crate::x11::Atoms) -> Vec<Vec<u8>> {
+pub(super) fn claim_requests(
+    root: Window,
+    check: Window,
+    clipboard: Window,
+    primary: Window,
+    atoms: &crate::x11::Atoms,
+) -> Vec<Vec<u8>> {
     let mask = EventMask::SubstructureNotify
         .union(EventMask::SubstructureRedirect)
         .union(EventMask::PropertyChange);
@@ -1552,16 +1585,60 @@ fn claim_requests(root: Window, check: Window, atoms: &crate::x11::Atoms) -> Vec
             &SetSelectionOwner { owner: check, selection: atoms._NET_WM_CM_S0, time: 0 },
             0,
         ),
+        selection_window_request(clipboard, root),
+        testing::encode(
+            &XFixesSelectSelectionInput {
+                window: clipboard,
+                selection: atoms.CLIPBOARD,
+                event_mask: selection_event_mask(),
+            },
+            XFIXES_MAJOR_OPCODE,
+        ),
+        selection_window_request(primary, root),
+        testing::encode(
+            &XFixesSelectSelectionInput {
+                window: primary,
+                selection: atoms.PRIMARY,
+                event_mask: selection_event_mask(),
+            },
+            XFIXES_MAJOR_OPCODE,
+        ),
         testing::encode(&advertised.request(), 0),
         testing::encode(&active.request(), 0),
     ]
 }
 
+fn selection_event_mask() -> SelectionEventMask {
+    SelectionEventMask::SetSelectionOwner
+        .union(SelectionEventMask::SelectionWindowDestroy)
+        .union(SelectionEventMask::SelectionClientClose)
+}
+
+fn selection_window_request(window: Window, parent: Window) -> Vec<u8> {
+    testing::encode(
+        &CreateWindow {
+            depth: 0,
+            wid: window,
+            parent,
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+            border_width: 0,
+            class: WindowClass::InputOnly,
+            visual: 0,
+            value_list: CreateWindowAux::default().event_mask(EventMask::PropertyChange),
+        },
+        0,
+    )
+}
+
 fn cursor_requests(image: &CursorImage) -> Vec<Vec<u8>> {
-    let pixmap = Pixmap(0x21);
-    let gc = Gcontext(0x22);
-    let picture = Picture(0x23);
-    let cursor = Cursor(0x24);
+    // 0x20 is the check window. 0x21 and 0x22 are the selection windows.
+    let pixmap = Pixmap(0x23);
+    let gc = Gcontext(0x24);
+    let picture = Picture(0x25);
+    let cursor = Cursor(0x26);
     let root = Drawable(0x100);
     let pixels = super::cursor::argb_words(image);
     let width = u16::try_from(image.width).unwrap();
@@ -1683,7 +1760,7 @@ fn apply(
     action: XwaylandAction,
 ) -> Result<(), super::WmFailure> {
     let XwaylandAction::Wm { event, .. } = action else { panic!("x11 completion is a wm event") };
-    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces };
+    let mut ctx = WmCtx { run: 1, state, dispatcher, surfaces, client: None };
     wm.handle(event, &mut ctx)
 }
 
@@ -1694,7 +1771,14 @@ fn complete(
 ) -> XwaylandAction {
     dispatcher.redispatch_to(dispatch_to, result);
     let mut actions = dispatcher.test_take_queued_actions::<XwaylandAction>();
-    actions.retain(|action| !matches!(action, XwaylandAction::KeyboardFocus));
+    actions.retain(|action| {
+        !matches!(
+            action,
+            XwaylandAction::KeyboardFocus
+                | XwaylandAction::SelectionChanged(_)
+                | XwaylandAction::SelectionCancelled { .. }
+        )
+    });
     assert_eq!(actions.len(), 1);
     actions.pop().unwrap()
 }

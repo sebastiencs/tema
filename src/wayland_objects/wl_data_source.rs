@@ -7,6 +7,7 @@ use crate::{
     },
     object::{Object, Parser, RequestResult},
     protocol_generated::{wl_data_device_manager, wl_data_source, WaylandId, WlDataSourceId},
+    runner::Dispatcher,
     seat,
     state::{GrabbedObject, SelectionSourceState, State},
     wayland_objects::wl_display::WlDisplay,
@@ -51,6 +52,12 @@ impl WlDataSource {
 
     pub fn mime_types(&self) -> &[String] {
         &self.mime_types
+    }
+
+    pub(crate) fn offer(&mut self, mime_type: String) {
+        if !self.mime_types.contains(&mime_type) {
+            self.mime_types.push(mime_type);
+        }
     }
 
     pub fn dnd_actions(&self) -> u32 {
@@ -129,11 +136,7 @@ impl Object for WlDataSource {
         use wl_data_source::Request::*;
 
         match client.parse::<Self>(req, dispatcher)? {
-            Offer { mime_type } => {
-                if !self.mime_types.contains(&mime_type) {
-                    self.mime_types.push(mime_type);
-                }
-            }
+            Offer { mime_type } => self.offer(mime_type),
             Destroy => {
                 destroy_source(client, state, dispatcher, self.id);
                 client.delete_id(&WlDisplay::default(), state, dispatcher, self.id.into());
@@ -238,10 +241,15 @@ impl SelectionSourceState {
             Self::Ext(source) => source
                 .try_ref(state)
                 .map(|source| source.mime_types().to_vec()),
+            Self::Xwayland(source) => state
+                .objects
+                .try_get(source.object)
+                .and_then(|object| object.downcast_ref::<crate::xwayland::XSelectionSourceObject>())
+                .map(|object| object.mime_types().to_vec()),
         }
     }
 
-    pub fn send(self, mime_type: String, fd: Rc<OwnedFd>, dispatcher: &mut ClientDispatcher) {
+    pub fn send(self, mime_type: String, fd: Rc<OwnedFd>, dispatcher: &mut Dispatcher) {
         match self {
             Self::WlData(source) => {
                 dispatcher.dispatch_to(
@@ -270,10 +278,17 @@ impl SelectionSourceState {
                     },
                 );
             }
+            Self::Xwayland(source) => {
+                dispatcher.dispatch(crate::xwayland::XwaylandAction::SelectionSend {
+                    source: source.object,
+                    mime_type,
+                    fd,
+                });
+            }
         }
     }
 
-    pub fn cancelled(self, dispatcher: &mut ClientDispatcher) {
+    pub fn cancelled(self, dispatcher: &mut crate::runner::Dispatcher) {
         match self {
             Self::WlData(source) => {
                 dispatcher.dispatch_to(
@@ -301,6 +316,11 @@ impl SelectionSourceState {
                         event: crate::clients::ExtDataControlSourceEvent::Cancelled,
                     },
                 );
+            }
+            Self::Xwayland(source) => {
+                dispatcher.dispatch(crate::xwayland::XwaylandAction::SelectionCancelled {
+                    source: source.object,
+                });
             }
         }
     }
