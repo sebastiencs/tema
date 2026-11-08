@@ -1836,7 +1836,9 @@ pub mod xdg_toplevel {
                         .root_surface_workspace(root_surface)
                         .map(|workspace_id| state.workspace_output_ids(workspace_id))
                         .unwrap_or_default();
-                    if state.set_window_fullscreen(self.window, true) {
+                    let window = self.window;
+                    drop(self);
+                    if state.set_window_fullscreen(window, true) {
                         if !affected_outputs.is_empty() {
                             request_outputs(state, affected_outputs.into_iter(), dispatcher);
                         }
@@ -1855,7 +1857,9 @@ pub mod xdg_toplevel {
                         .root_surface_workspace(root_surface)
                         .map(|workspace_id| state.workspace_output_ids(workspace_id))
                         .unwrap_or_default();
-                    if state.set_window_fullscreen(self.window, false) {
+                    let window = self.window;
+                    drop(self);
+                    if state.set_window_fullscreen(window, false) {
                         if !affected_outputs.is_empty() {
                             request_outputs(state, affected_outputs.into_iter(), dispatcher);
                         }
