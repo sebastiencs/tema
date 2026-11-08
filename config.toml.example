@@ -17,7 +17,8 @@ renderer = "opengl"
 outer_gap = 10
 inner_gap = 10
 
-# Xwayland starts lazily on the first X connection. Changing `enabled` requires a restart.
+# Xwayland starts lazily on the first X connection.
+# Changes apply on reload; disabling lets running X apps finish.
 [xwayland]
 enabled = true
 

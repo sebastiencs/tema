@@ -377,6 +377,24 @@ impl Dispatcher {
             .count()
     }
 
+    /// Queue indexes of every `T` that matches, in the order the runner would run them.
+    pub(crate) fn test_queued_positions<T: 'static>(
+        &self,
+        predicate: impl Fn(&T) -> bool,
+    ) -> Vec<usize> {
+        self.queue
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| {
+                action
+                    .ptr
+                    .downcast_ref::<T>()
+                    .filter(|action| predicate(action))
+                    .map(|_| index)
+            })
+            .collect()
+    }
+
     /// Removes every queued `T` and returns those values. Other actions stay queued.
     pub(crate) fn test_take_queued_actions<T: 'static>(&mut self) -> Vec<T> {
         let mut kept = VecDeque::new();

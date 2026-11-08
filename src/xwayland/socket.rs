@@ -40,6 +40,13 @@ impl XDisplay {
     pub(crate) fn listener(&self) -> &Rc<OwnedFd> {
         &self.listener
     }
+
+    /// Remove the socket path. The lock file stays until this display is dropped,
+    /// so no other server takes the number while a drained Xwayland still runs.
+    /// Removing a path that is already gone is a no-op.
+    pub(crate) fn unlink_socket(&mut self) {
+        unlink_path(&self.socket_path);
+    }
 }
 
 impl Drop for XDisplay {

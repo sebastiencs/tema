@@ -53,6 +53,11 @@ pub(crate) struct Xwayland {
     run: u64,
     /// `Stop` has run. A pid that arrives afterwards is killed, and nothing is relaunched.
     stopped: bool,
+    /// The live value of `[xwayland] enabled`. `Start` copies it from the config.
+    enabled: bool,
+    /// Set when Xwayland is enabled again while a drained server is still running.
+    /// The exit path allocates a fresh display instead of staying off.
+    restart_after_drain: bool,
 }
 
 enum Phase {
@@ -144,6 +149,8 @@ pub(crate) enum XwaylandAction {
     },
     /// The Wayland clipboard or primary selection changed.
     SelectionChanged(SelectionKind),
+    /// Follow a change of `[xwayland] enabled`.
+    SetEnabled(bool),
 }
 
 impl Xwayland {
@@ -154,14 +161,16 @@ impl Xwayland {
             policy: RestartPolicy::default(),
             run: 0,
             stopped: false,
+            enabled: false,
+            restart_after_drain: false,
         }
     }
 
-    fn start(&mut self, state: &State, dispatcher: &mut Dispatcher) {
+    fn start(&mut self, dispatcher: &mut Dispatcher) {
         if self.stopped || !matches!(self.phase, Phase::Disabled) || self.display.is_some() {
             return;
         }
-        if !state.config.xwayland.enabled {
+        if !self.enabled {
             log::info!("Xwayland disabled");
             return;
         }
@@ -174,9 +183,13 @@ impl Xwayland {
         };
         let number = display.number();
         log::info!("Allocated display :{number}");
+        let value = format!(":{number}");
         dispatcher.dispatch(ProcessManagerAction::SetEnv {
             key: "DISPLAY".to_string(),
-            value: Some(format!(":{number}")),
+            value: Some(value.clone()),
+        });
+        dispatcher.dispatch(ProcessManagerAction::ExportEnv {
+            vars: vec![("DISPLAY".to_string(), value)],
         });
         self.display = Some(display);
         self.arm_poll(dispatcher);
@@ -235,6 +248,20 @@ impl Xwayland {
         dispatcher: &mut Dispatcher,
         reason: &str,
     ) {
+        if self.restart_after_drain {
+            self.restart_after_drain = false;
+            self.enabled = true;
+            self.display = None;
+            self.phase = Phase::Disabled;
+            self.start(dispatcher);
+            return;
+        }
+        if !self.enabled {
+            self.display = None;
+            self.phase = Phase::Disabled;
+            log::info!("Xwayland exited after being disabled");
+            return;
+        }
         match self.policy.on_exit(ready, exit, ran_for) {
             Decision::Relaunch => self.arm_poll(dispatcher),
             Decision::GiveUp => self.give_up(dispatcher, reason),
@@ -560,8 +587,72 @@ impl Xwayland {
         log::error!("Xwayland gave up: {reason}");
         self.phase = Phase::GivenUp;
         self.display = None;
+        self.release_display(dispatcher);
+    }
+
+    fn set_enabled(&mut self, enabled: bool, dispatcher: &mut Dispatcher) {
+        if self.stopped {
+            return;
+        }
+        if enabled {
+            self.enable(dispatcher);
+        } else {
+            self.disable(dispatcher);
+        }
+    }
+
+    fn enable(&mut self, dispatcher: &mut Dispatcher) {
+        if self.enabled {
+            return;
+        }
+        if matches!(self.phase, Phase::Launching { .. } | Phase::Running(_)) {
+            self.enabled = true;
+            self.restart_after_drain = true;
+            return;
+        }
+        if matches!(self.phase, Phase::Disabled | Phase::GivenUp) && self.display.is_none() {
+            self.enabled = true;
+            self.restart_after_drain = false;
+            self.policy = RestartPolicy::default();
+            self.phase = Phase::Disabled;
+            self.start(dispatcher);
+            return;
+        }
+        self.enabled = true;
+    }
+
+    fn disable(&mut self, dispatcher: &mut Dispatcher) {
+        let waiting = if let Phase::Waiting { poll } = &self.phase { Some(*poll) } else { None };
+        if let Some(poll) = waiting {
+            dispatcher.dispatch(IoUringAction::PollRemove { target: poll });
+            self.display = None;
+            self.release_display(dispatcher);
+            self.phase = Phase::Disabled;
+            self.enabled = false;
+            self.restart_after_drain = false;
+            log::info!("Xwayland disabled");
+            return;
+        }
+        if matches!(self.phase, Phase::Launching { .. } | Phase::Running(_)) {
+            if self.enabled {
+                self.enabled = false;
+                self.restart_after_drain = false;
+                if let Some(display) = self.display.as_mut() {
+                    display.unlink_socket();
+                }
+                self.release_display(dispatcher);
+                log::info!("Xwayland disabled; waiting for X clients to exit");
+            }
+            return;
+        }
+        self.enabled = false;
+    }
+
+    fn release_display(&self, dispatcher: &mut Dispatcher) {
         dispatcher
             .dispatch(ProcessManagerAction::SetEnv { key: "DISPLAY".to_string(), value: None });
+        dispatcher
+            .dispatch(ProcessManagerAction::UnexportEnv { keys: vec!["DISPLAY".to_string()] });
     }
 }
 
@@ -593,7 +684,14 @@ impl Model for Xwayland {
         dispatcher: &mut Dispatcher,
     ) -> std::result::Result<(), crate::runner::ModelFailure> {
         match action {
-            XwaylandAction::Start => self.start(state, dispatcher),
+            XwaylandAction::Start => {
+                if !self.stopped && self.display.is_none() && matches!(self.phase, Phase::Disabled)
+                {
+                    self.enabled = state.config.xwayland.enabled;
+                }
+                self.start(dispatcher);
+            }
+            XwaylandAction::SetEnabled(enabled) => self.set_enabled(enabled, dispatcher),
             XwaylandAction::ListenReadable { result } => self.on_listen(result, dispatcher),
             XwaylandAction::Process { run, event } => {
                 if run != self.run {
@@ -748,6 +846,14 @@ mod tests {
             1
         );
         assert_eq!(count_spawn(&dispatcher), 0);
+        assert_eq!(count_export(&dispatcher, "DISPLAY"), 1);
+        let mut exported = None;
+        dispatcher.test_for_each_queued_action::<ProcessManagerAction>(|action| {
+            if let ProcessManagerAction::ExportEnv { vars } = action {
+                exported = Some(vars.clone());
+            }
+        });
+        assert_eq!(exported, Some(vec![("DISPLAY".to_string(), format!(":{number}"))]));
         drop(xwayland);
         assert!(!Path::new(&socket).exists());
         assert!(!Path::new(&lock).exists());
@@ -987,6 +1093,8 @@ mod tests {
             2
         );
         assert_eq!(count_unset_display(&dispatcher), 0);
+        assert_eq!(count_export(&dispatcher, "DISPLAY"), 1);
+        assert_eq!(count_unexport(&dispatcher, "DISPLAY"), 0);
         assert!(Path::new(&socket).exists());
         assert!(Path::new(&lock).exists());
     }
@@ -1016,6 +1124,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(count_unset_display(&dispatcher), 1);
+        assert_eq!(count_unexport(&dispatcher, "DISPLAY"), 1);
         assert!(!Path::new(&socket).exists());
         assert!(!Path::new(&lock).exists());
     }
@@ -1033,6 +1142,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count_unset_display(&dispatcher), 1);
+        assert_eq!(count_unexport(&dispatcher, "DISPLAY"), 1);
         assert!(!Path::new(&socket).exists());
         assert!(!Path::new(&lock).exists());
     }
@@ -1171,6 +1281,7 @@ mod tests {
         assert!(!Path::new(&socket).exists());
         assert!(!Path::new(&lock).exists());
         assert_eq!(count_unset_display(&dispatcher), 0);
+        assert_eq!(count_unexport(&dispatcher, "DISPLAY"), 0);
         assert_eq!(
             count_kind::<IoUringAction>(&dispatcher, |action| {
                 matches!(action, IoUringAction::PollRemove { .. })
@@ -1199,6 +1310,229 @@ mod tests {
             }),
             2
         );
+    }
+
+    #[test]
+    fn enabling_after_a_disabled_start_allocates_a_display() {
+        let mut xwayland = Xwayland::new();
+        let mut state = state_for_tests();
+        state.config.xwayland.enabled = false;
+        let mut dispatcher = Dispatcher::default();
+        xwayland
+            .process(&mut state, XwaylandAction::Start, &mut dispatcher)
+            .unwrap();
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(true), &mut dispatcher)
+            .unwrap();
+        let number = allocated_display(&dispatcher);
+        let (socket, lock) = display_paths(number);
+        assert!(Path::new(&socket).exists());
+        assert!(Path::new(&lock).exists());
+        assert_eq!(count_set_display(&dispatcher), 1);
+        assert_eq!(count_export(&dispatcher, "DISPLAY"), 1);
+        assert_eq!(count_poll(&dispatcher), 1);
+        drop(xwayland);
+    }
+
+    #[test]
+    fn disabling_while_waiting_removes_the_display() {
+        let (mut xwayland, mut state, mut dispatcher) = started();
+        let number = allocated_display(&dispatcher);
+        let (socket, lock) = display_paths(number);
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(false), &mut dispatcher)
+            .unwrap();
+        assert!(!Path::new(&socket).exists());
+        assert!(!Path::new(&lock).exists());
+        assert_eq!(count_unset_display(&dispatcher), 1);
+        assert_eq!(count_unexport(&dispatcher, "DISPLAY"), 1);
+        assert_eq!(
+            count_kind::<IoUringAction>(&dispatcher, |action| {
+                matches!(action, IoUringAction::PollRemove { .. })
+            }),
+            1
+        );
+        drop(xwayland);
+    }
+
+    #[test]
+    fn disabling_a_running_server_drains_until_it_exits() {
+        let _lock = crate::process::lock_forks();
+        let (pidfd, _reap) = sleeping_child();
+        let (mut xwayland, mut state, mut dispatcher) = running_with(Rc::clone(&pidfd));
+        let number = allocated_display(&dispatcher);
+        let (socket, lock) = display_paths(number);
+        let polls = count_poll(&dispatcher);
+        let spawns = count_spawn(&dispatcher);
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(false), &mut dispatcher)
+            .unwrap();
+        assert!(!Path::new(&socket).exists());
+        assert!(Path::new(&lock).exists());
+        assert_eq!(count_unset_display(&dispatcher), 1);
+        assert_eq!(count_unexport(&dispatcher, "DISPLAY"), 1);
+        assert!(!pidfd_readable(pidfd.as_ref(), 50));
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Process {
+                    run: 1,
+                    event: ProcessEvent::Exited { exit: ChildExit::Code(0) },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(!Path::new(&lock).exists());
+        assert_eq!(count_poll(&dispatcher), polls);
+        assert_eq!(count_spawn(&dispatcher), spawns);
+        assert_eq!(count_unset_display(&dispatcher), 1);
+    }
+
+    #[test]
+    fn enabling_during_the_drain_allocates_again_when_the_server_exits() {
+        let (mut xwayland, mut state, mut dispatcher) = running();
+        let polls = count_poll(&dispatcher);
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(false), &mut dispatcher)
+            .unwrap();
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(true), &mut dispatcher)
+            .unwrap();
+        assert_eq!(count_poll(&dispatcher), polls);
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Process {
+                    run: 1,
+                    event: ProcessEvent::Exited { exit: ChildExit::Code(0) },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let number = allocated_display(&dispatcher);
+        let (socket, lock) = display_paths(number);
+        assert!(Path::new(&socket).exists());
+        assert!(Path::new(&lock).exists());
+        assert_eq!(count_poll(&dispatcher), polls + 1);
+        assert_eq!(count_set_display(&dispatcher), 2);
+        assert_eq!(count_export(&dispatcher, "DISPLAY"), 2);
+        drop(xwayland);
+    }
+
+    #[test]
+    fn enabling_after_giving_up_resets_the_restart_policy() {
+        let (mut xwayland, mut state, mut dispatcher) = started();
+        for run in 1..=3 {
+            fail_launch(&mut xwayland, &mut state, &mut dispatcher, run);
+        }
+        assert_eq!(count_unset_display(&dispatcher), 1);
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(false), &mut dispatcher)
+            .unwrap();
+        assert_eq!(count_unset_display(&dispatcher), 1);
+        assert_eq!(count_unexport(&dispatcher, "DISPLAY"), 1);
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(true), &mut dispatcher)
+            .unwrap();
+        let number = allocated_display(&dispatcher);
+        let (socket, lock) = display_paths(number);
+        assert!(Path::new(&socket).exists());
+        for run in 4..=5 {
+            fail_launch(&mut xwayland, &mut state, &mut dispatcher, run);
+            assert!(Path::new(&socket).exists());
+            assert!(Path::new(&lock).exists());
+        }
+        fail_launch(&mut xwayland, &mut state, &mut dispatcher, 6);
+        assert_eq!(count_unset_display(&dispatcher), 2);
+        assert!(!Path::new(&socket).exists());
+        assert!(!Path::new(&lock).exists());
+    }
+
+    #[test]
+    fn enabling_after_stop_does_nothing() {
+        let (mut xwayland, mut state, mut dispatcher) = started();
+        let number = allocated_display(&dispatcher);
+        let (socket, lock) = display_paths(number);
+        xwayland
+            .process(&mut state, XwaylandAction::Stop, &mut dispatcher)
+            .unwrap();
+        let polls = count_poll(&dispatcher);
+        let sets = count_set_display(&dispatcher);
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(true), &mut dispatcher)
+            .unwrap();
+        assert_eq!(count_poll(&dispatcher), polls);
+        assert_eq!(count_set_display(&dispatcher), sets);
+        assert_eq!(count_export(&dispatcher, "DISPLAY"), 1);
+        assert!(!Path::new(&socket).exists());
+        assert!(!Path::new(&lock).exists());
+    }
+
+    #[test]
+    fn a_spawn_that_arrives_while_draining_is_adopted() {
+        let _lock = crate::process::lock_forks();
+        let (pidfd, _reap) = sleeping_child();
+        let (mut xwayland, mut state, mut dispatcher) = launched();
+        xwayland
+            .process(&mut state, XwaylandAction::SetEnabled(false), &mut dispatcher)
+            .unwrap();
+        xwayland
+            .process(
+                &mut state,
+                XwaylandAction::Process {
+                    run: 1,
+                    event: ProcessEvent::Spawned { pid: 42, pidfd: Rc::clone(&pidfd) },
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(!pidfd_readable(pidfd.as_ref(), 50));
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::clients::ClientManagerAction>(|action| {
+                matches!(action, crate::clients::ClientManagerAction::AdoptClient { .. })
+            }),
+            1
+        );
+    }
+
+    fn fail_launch(
+        xwayland: &mut Xwayland,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        run: u64,
+    ) {
+        xwayland
+            .process(
+                state,
+                XwaylandAction::ListenReadable { result: Ok(PollCompleted {}) },
+                dispatcher,
+            )
+            .unwrap();
+        xwayland
+            .process(
+                state,
+                XwaylandAction::Process {
+                    run,
+                    event: ProcessEvent::Failed { error: "spawn failed".to_string() },
+                },
+                dispatcher,
+            )
+            .unwrap();
+    }
+
+    fn count_poll(dispatcher: &Dispatcher) -> usize {
+        count_kind::<IoUringAction>(dispatcher, |action| {
+            matches!(action, IoUringAction::Poll { .. })
+        })
+    }
+
+    fn count_set_display(dispatcher: &Dispatcher) -> usize {
+        dispatcher.test_count_queued_action::<ProcessManagerAction>(|action| {
+            matches!(
+                action,
+                ProcessManagerAction::SetEnv { key, value: Some(_) } if key == "DISPLAY"
+            )
+        })
     }
 
     fn launched() -> (Xwayland, State, Dispatcher) {
@@ -1253,6 +1587,18 @@ mod tests {
     fn count_unset_display(dispatcher: &Dispatcher) -> usize {
         dispatcher.test_count_queued_action::<ProcessManagerAction>(|action| {
             matches!(action, ProcessManagerAction::SetEnv { key, value: None } if key == "DISPLAY")
+        })
+    }
+
+    fn count_export(dispatcher: &Dispatcher, key: &str) -> usize {
+        dispatcher.test_count_queued_action::<ProcessManagerAction>(|action| {
+            matches!(action, ProcessManagerAction::ExportEnv { vars } if vars.iter().any(|(name, _)| name == key))
+        })
+    }
+
+    fn count_unexport(dispatcher: &Dispatcher, key: &str) -> usize {
+        dispatcher.test_count_queued_action::<ProcessManagerAction>(|action| {
+            matches!(action, ProcessManagerAction::UnexportEnv { keys } if keys.iter().any(|name| name == key))
         })
     }
 

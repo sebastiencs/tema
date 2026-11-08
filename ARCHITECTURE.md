@@ -675,7 +675,7 @@ The reaper and the compositor keep the terminal's standard streams. The forker p
 
 The reaper exits when the compositor exits, with the same code, or `128 + signal`. A status that does not fit in a byte becomes 1. It does not wait for other children. Programs that are still running are reparented and keep running. The forker dies with the reaper because of its death signal. While the reaper is alive it reaps every child, including a daemon whose parent already exited.
 
-On shutdown the runner stops Xwayland, then `ClientManager`, then `ProcessManager`. Stopping the process manager drops the socket. The forker sees the close and exits 0.
+On shutdown the runner stops Xwayland, then `ClientManager`, then `ProcessManager`. The process manager sends the activation unset below, then drops the socket. The forker sees the close and exits 0.
 
 ### File descriptors
 
@@ -724,6 +724,38 @@ The compositor keeps running when the forker is missing.
 
 `Stop` uses the same notification with `forker stopped`. That is a normal shutdown, not a death.
 
+### Activation environment
+
+D-Bus-activated programs and systemd user units do not inherit the forker. tema publishes a separate copy, one helper at a time, through the forker.
+
+At startup, after the Wayland socket exists and after the forker `SetEnv`s, one job exports:
+
+- `WAYLAND_DISPLAY=tema-0`
+- `XDG_CURRENT_DESKTOP=tema`
+- `XDG_SESSION_TYPE=wayland`
+
+`_JAVA_AWT_WM_NONREPARENTING=1` stays on the forker. Section 17 adds `DISPLAY=:N` when a display is allocated, and removes it on give-up or disable. A restart on the same display exports nothing new. `Xwayland`'s `Stop` leaves `DISPLAY` in place. The shutdown unset below removes it with the rest.
+
+A set is `sh -c` with this script, `$0` set to `tema-activation`, and one `K=V` argument per variable:
+
+```text
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    exec dbus-update-activation-environment --systemd "$@"
+else
+    exec systemctl --user set-environment "$@"
+fi
+```
+
+An unset is `systemctl --user unset-environment K=V…`, using the value tema exported. systemd removes the variable when it still has that value, so another tema that exported a different value keeps its own.
+
+Exporting a value that is already recorded queues nothing. The next job starts when the previous helper has exited, failed, or been lost. A missing forker fails the job through the usual spawn path, and the queue continues with the next one.
+
+On shutdown, `ProcessManager::stop` sends `SIGKILL` to a helper that is still running, so an export cannot land after the unset. It then writes one unset spawn, listing every variable still exported, straight onto the forker socket, and then drops the socket. The forker runs a spawn it has already read before it treats the close as exit. The helper finishes after tema is gone. `EAGAIN` or any other send error logs `could not unset the activation environment: …` and shutdown continues.
+
+When `DISPLAY` is already set in tema's own environment, tema is nested under X. The process manager is created with export turned off, and every export and unset is dropped.
+
+D-Bus `UpdateActivationEnvironment` stores an empty value as `K=`. Removing a name is the systemd unset. With dbus-broker, and with dbus-daemon in systemd mode, activation goes through systemd, so that unset is what later services see. dbus-daemon without systemd keeps the old activation value.
+
 ### Manual check
 
 Run a normal session from a terminal, with the example bindings (`Super+Return` spawns `alacritty`).
@@ -737,21 +769,23 @@ Run a normal session from a terminal, with the example bindings (`Super+Return` 
 
 ## 17. Xwayland
 
-Xwayland is enabled by default. At startup the compositor claims one X display and publishes it to the forker as `DISPLAY=:N`. No Xwayland process exists yet. The first connection to the listening socket is what spawns it. The compositor's own environment stays as it was, including when tema is nested under an outer X server. Only programs the forker starts receive `:N`.
+Xwayland is enabled by default. At startup the compositor claims one X display and publishes it to the forker as `DISPLAY=:N`, and exports that same value through section 16. No Xwayland process exists yet. The first connection to the listening socket is what spawns it. The compositor's own environment stays as it was, including when tema is nested under an outer X server. Programs the forker starts receive `:N`. Section 16 also publishes it, except when tema is nested.
 
 ```toml
 [xwayland]
 enabled = true
 ```
 
-`enabled = false` logs `Xwayland disabled` and skips the display. A reload that flips `enabled` logs the requested value and the running value, then keeps the running one. Changing it takes a restart. `scaling_mode` is `default` or `downscaled`. A reload applies it live. Section 25 is that mode.
+`enabled = false` at startup logs `Xwayland disabled` and skips the display. A reload that changes `enabled` logs `xwayland.enabled changed to true` or `false` and applies it. `SetEnabled` is queued before a `scaling_mode` change from the same reload. `scaling_mode` is `default` or `downscaled`. A reload applies it live. Section 25 is that mode.
+
+Turning `enabled` on from off, or from give-up, resets the early-failure count, allocates a display, sets and exports `DISPLAY=:N`, and polls. Turning it off while only listening removes the poll, both files, and `DISPLAY`, and logs `Xwayland disabled`. Turning it off while Xwayland is launching or running unlinks the socket, keeps the lock, clears and unexports `DISPLAY`, and logs `Xwayland disabled; waiting for X clients to exit`. That server keeps running, including its window manager, until its clients leave. A spawn that arrives after the disable is adopted and left running. When that server exits, the lock is dropped and the log says `Xwayland exited after being disabled`. Enabling again during that wait leaves `DISPLAY` unset until the exit, then allocates a fresh display, usually the same number, and exports it. After `Stop`, a later enable does nothing. A lost forker still gives up. A second unexport of a name that is already gone is ignored.
 
 ```text
 Start
   disabled, or no display available → stay down, no DISPLAY
   otherwise                         → Waiting
                                       /tmp/.X11-unix/XN and /tmp/.XN-lock
-                                      forker DISPLAY=:N
+                                      forker DISPLAY=:N, and export DISPLAY=:N
                                       poll the socket, no Xwayland process
 
 connection
@@ -763,13 +797,33 @@ connection
   displayfd text → ready, log "Xwayland ready on :N"
   Wayland client drops → SIGKILL that run; the exit follows
 
-exit of a good run → Waiting again, same :N, same files
+exit of a good run → Waiting again, same :N, same files, no new export
 early failure      → Waiting again, until the third in a row
 third early failure, a listen error, or a lost forker
                    → GivenUp
-                     unlink both files, clear forker DISPLAY
+                     unlink both files, clear forker DISPLAY, unexport DISPLAY
+
+Waiting → Disabled
+  disable: remove the poll, unlink both files, clear and unexport DISPLAY
+  log "Xwayland disabled"
+
+Running or Launching → Draining
+  disable: unlink the socket, keep the lock, clear and unexport DISPLAY
+  log "Xwayland disabled; waiting for X clients to exit"
+  the server and its window manager keep running
+
+Draining → Disabled
+  the server exits: drop the lock
+  log "Xwayland exited after being disabled"
+
+Draining → Waiting
+  enable again, then the server exits: allocate a display, export DISPLAY, poll
+
+Disabled or GivenUp → Waiting
+  enable: reset the early-failure count, allocate, export DISPLAY, poll
 
 Stop → unlink both files, SIGKILL a running server, leave DISPLAY set
+       section 16 unsets it with the rest of the activation environment
 ```
 
 A completion tagged with an older launch is ignored. A pid that arrives after `Stop` is killed and not adopted.
@@ -794,7 +848,7 @@ Displays `500` through `1499` are tried in order. Display `N` is the filesystem 
 
 The lock is created exclusively, mode `0444`. Its text is the compositor pid in ten columns and a newline, because the compositor owns the display across Xwayland restarts. A lock whose pid is dead is removed and the number is tried again. A live pid, or a file that is not a pid, is left in place and the search moves on. A number whose socket cannot be bound is skipped the same way. The listen backlog is 4096.
 
-Dropping the display unlinks both files. Restart keeps them. Give-up and `Stop` drop them.
+Dropping the display unlinks both files. Restart keeps them. Give-up and `Stop` drop them. Disabling while a server is still running unlinks the socket and keeps the lock until that server exits.
 
 ### Restart
 
@@ -802,7 +856,7 @@ A run fails early when it never becomes ready, or when it became ready and then 
 
 A failed `exec` counts, because the server never became ready. The listening socket still has the unaccepted connection, so the new poll wakes at once and the next attempt follows immediately. A listen error, and a lost forker, give up on the spot. The lost-forker path kills the running server first.
 
-Give-up logs `Xwayland gave up: …`, unlinks both files, and removes `DISPLAY` from the forker. `Stop` leaves `DISPLAY` set, because the forker is stopping too.
+Give-up logs `Xwayland gave up: …`, unlinks both files, removes `DISPLAY` from the forker, and unexports it. `Stop` leaves `DISPLAY` set on the forker. Section 16 clears the activation environment when the process manager stops.
 
 ### `WM_S0`
 
@@ -845,7 +899,15 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 3. `Xwayland -version` reports 24.1 or newer. Run `xterm` with `RUST_LOG=debug` on the compositor. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, `Xwayland ready on :N`, `bound xwayland_shell_v1`, and `XWM ready on :N`. The window checks are in sections 20 and 21.
 4. `kill -9 $(pgrep -x Xwayland)`. The log shows `Xwayland exited with signal 9`. A new `xterm` starts Xwayland again on the same `:N`, and both files are still there. A signal within ten seconds of becoming ready counts as an early failure, so one kill relaunches, and a third early failure gives up.
 5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
-6. `[xwayland] enabled = false`, then start tema. The log says `Xwayland disabled`. Neither file exists, and a spawned terminal has an empty `DISPLAY`.
+6. Activation environment and the live `enabled` switch. Items 1–7 are a session that is not nested under X. Item 8 is a nested one.
+   1. Start tema. `systemctl --user show-environment | grep -E 'DISPLAY|WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE'` shows `WAYLAND_DISPLAY=tema-0`, `DISPLAY=:N`, `XDG_CURRENT_DESKTOP=tema`, and `XDG_SESSION_TYPE=wayland`. Restart a D-Bus-activated service with `systemctl --user restart xdg-desktop-portal` and read `tr '\0' '\n' < /proc/$(pgrep -xf '.*xdg-desktop-portal')/environ`.
+   2. Open `xterm`. Set `enabled = false` and save. The log shows `waiting for X clients to exit`. `ls /tmp/.X11-unix/XN` is gone and `/tmp/.XN-lock` remains. A new terminal has no `DISPLAY`. `systemctl --user show-environment` has no `DISPLAY`. The open `xterm` still works. `xterm -display :N` fails.
+   3. Close `xterm`. Xwayland exits, the lock file is gone, and nothing relaunches.
+   4. Set `enabled = true`. `DISPLAY=:N` is back in a new terminal and in systemd. `xterm` starts Xwayland on the first connection.
+   5. With `xterm` open, set `enabled` false and then true before it exits. After closing `xterm`, a fresh display is allocated and `DISPLAY` is exported again.
+   6. Start with `enabled = false`, then set it true and save. This matches item 4. The startup log says `Xwayland disabled`, and neither file exists until the reload.
+   7. Quit tema. `systemctl --user show-environment` no longer has `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, or `XDG_SESSION_TYPE`, unless another instance exported a different value.
+   8. Run tema nested under X11. `systemctl --user show-environment` is unchanged.
 7. Quit tema during a normal session. No `Xwayland` process remains, and both files are gone.
 8. `wayland-info` from a normal client does not list `xwayland_shell_v1`.
 

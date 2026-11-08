@@ -1219,18 +1219,15 @@ pub fn reload_from_disk(
         );
         next.general.renderer = state.config.general.renderer;
     }
-    if next.xwayland.enabled != state.config.xwayland.enabled {
-        log::warn!(
-            "xwayland.enabled is {requested} in {path} and the running value is {running}; restart the compositor to change it",
-            requested = next.xwayland.enabled,
-            path = path.display(),
-            running = state.config.xwayland.enabled,
-        );
-        next.xwayland.enabled = state.config.xwayland.enabled;
-    }
+    let enabled_changed = next.xwayland.enabled != state.config.xwayland.enabled;
     let scaling_mode_changed = next.xwayland.scaling_mode != state.config.xwayland.scaling_mode;
     let changed = state.config != next;
     state.config = next;
+    if enabled_changed {
+        let enabled = state.config.xwayland.enabled;
+        log::info!("xwayland.enabled changed to {enabled}");
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::SetEnabled(enabled));
+    }
     if scaling_mode_changed {
         // Ahead of `apply_output_settings`, so `SetWireScale` is queued before
         // the output broadcasts that function may add.
@@ -2412,7 +2409,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_keeps_running_xwayland_enabled_and_applies_other_settings() {
+    fn reload_applies_a_changed_xwayland_enabled() {
         let temp_dir = mktemp::Temp::new_dir().unwrap();
         let path = temp_dir.to_path_buf().join("config.toml");
         fs::write(
@@ -2449,12 +2446,18 @@ mod tests {
             reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
 
         assert!(changed);
-        assert!(state.config.xwayland.enabled);
+        assert!(!state.config.xwayland.enabled);
         assert_eq!(state.config.general.outer_gap, 16);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::SetEnabled(false))
+            }),
+            1
+        );
     }
 
     #[test]
-    fn reload_applies_a_changed_scaling_mode_and_keeps_running_enabled() {
+    fn reload_applies_a_changed_scaling_mode_and_enabled() {
         let temp_dir = mktemp::Temp::new_dir().unwrap();
         let path = temp_dir.to_path_buf().join("config.toml");
         fs::write(&path, "[xwayland]\nenabled = false\nscaling_mode = \"default\"\n").unwrap();
@@ -2472,7 +2475,17 @@ mod tests {
 
         assert!(changed);
         assert_eq!(state.config.xwayland.scaling_mode, XwaylandScalingMode::Downscaled);
-        assert!(!state.config.xwayland.enabled);
+        assert!(state.config.xwayland.enabled);
+        let enabled_at =
+            dispatcher.test_queued_positions::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::SetEnabled(true))
+            });
+        let scale_at = dispatcher.test_queued_positions::<ClientManagerAction>(|action| {
+            matches!(action, ClientManagerAction::XwaylandWireScaleChanged)
+        });
+        assert_eq!(enabled_at.len(), 1);
+        assert_eq!(scale_at.len(), 1);
+        assert!(enabled_at[0] < scale_at[0]);
     }
 
     #[test]
@@ -2557,7 +2570,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_ignores_an_xwayland_only_change() {
+    fn reload_applies_an_xwayland_only_change() {
         let temp_dir = mktemp::Temp::new_dir().unwrap();
         let path = temp_dir.to_path_buf().join("config.toml");
         fs::write(&path, "[xwayland]\nenabled = false\n").unwrap();
@@ -2573,8 +2586,62 @@ mod tests {
         let changed =
             reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
 
-        assert!(!changed);
-        assert!(!state.config.xwayland.enabled);
+        assert!(changed);
+        assert!(state.config.xwayland.enabled);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::SetEnabled(true))
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn reload_leaves_an_unchanged_xwayland_enabled_alone() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            [general]
+            outer_gap = 4
+
+            [xwayland]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(
+            &path,
+            r#"
+            [general]
+            outer_gap = 16
+
+            [xwayland]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        assert!(state.config.xwayland.enabled);
+        assert_eq!(state.config.general.outer_gap, 16);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::SetEnabled(_))
+            }),
+            0
+        );
     }
 
     #[test]

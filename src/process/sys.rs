@@ -217,6 +217,30 @@ pub(crate) fn send_with_fds(
     }
 }
 
+/// Send one datagram without blocking and without attaching descriptors.
+///
+/// `MSG_DONTWAIT` returns `EAGAIN` instead of stalling the compositor during
+/// shutdown. `MSG_NOSIGNAL` keeps a closed peer from raising `SIGPIPE`.
+pub(crate) fn send_now(sock: &impl AsRawFd, bytes: &[u8]) -> std::io::Result<()> {
+    let iov = [IoSlice::new(bytes)];
+    loop {
+        match sendmsg::<()>(
+            sock.as_raw_fd(),
+            &iov,
+            &[],
+            MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT,
+            None,
+        ) {
+            Ok(sent) if sent == bytes.len() => return Ok(()),
+            Ok(_) => {
+                return Err(Error::new(ErrorKind::WriteZero, "short send on a datagram socket"));
+            }
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// Receive one datagram and the descriptors attached to it.
 ///
 /// A length of zero and no descriptors means the peer closed a seqpacket

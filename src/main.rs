@@ -349,7 +349,7 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     runner.add_model(Box::new(drm::VisualAnimationPump::new()));
     let signals = Box::new(signals::SignalHandler::install().map_err(StartupError::Signals)?);
     runner.add_model(signals);
-    runner.add_model(Box::new(process::ProcessManager::new(forker)));
+    runner.add_model(Box::new(process::ProcessManager::new(forker, !utils::is_x11())));
     runner.add_model(Box::new(xwayland::Xwayland::new()));
 
     let mut dispatcher = Dispatcher::default();
@@ -358,8 +358,12 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     for (key, value) in process::default_environment() {
         dispatcher.dispatch(process::ProcessManagerAction::SetEnv { key, value: Some(value) });
     }
-    // After the forker has the default environment, so DISPLAY is queued
-    // before any later spawn. The compositor's own environment is unchanged.
+    // After the forker has the default environment, and before Xwayland, so
+    // DISPLAY is queued ahead of any later spawn. The compositor's own
+    // environment is unchanged. The Wayland socket already exists.
+    dispatcher.dispatch(process::ProcessManagerAction::ExportEnv {
+        vars: process::activation_environment(),
+    });
     dispatcher.start::<xwayland::Xwayland>();
     dispatcher.start::<libinput::Libinput>();
     dispatcher.start::<scheduler::IdleScheduler>();

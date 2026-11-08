@@ -243,6 +243,9 @@ fn event_loop(socket: OwnedFd) -> ! {
         drop(polls);
         if socket_ready {
             match recv_with_fds(&socket, &mut buffer) {
+                // A datagram already queued is dispatched on an earlier
+                // iteration. This zero-length read is the peer closing, so the
+                // final activation unset has already been spawned.
                 Ok((0, fds)) if fds.is_empty() => unsafe { libc::_exit(0) },
                 Ok((len, fds)) => dispatch(&socket, &buffer[..len], fds, &mut children),
                 Err(_) => unsafe { libc::_exit(0) },
