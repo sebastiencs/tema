@@ -726,15 +726,19 @@ The compositor keeps running when the forker is missing.
 
 ### Activation environment
 
-D-Bus-activated programs and systemd user units do not inherit the forker. tema publishes a separate copy, one helper at a time, through the forker.
+D-Bus-activated programs and systemd user units do not inherit the forker. tema publishes a separate copy, one helper at a time, through the forker. `[general] import_environment` controls that export. It defaults to `true`. A nested session never exports or unsets, whatever the config says.
 
-At startup, after the Wayland socket exists and after the forker `SetEnv`s, one job exports:
+At startup, after the Wayland socket exists and after the forker `SetEnv`s, tema applies the config value and records the session variables. While the switch is on, one job exports:
 
 - `WAYLAND_DISPLAY=tema-0`
 - `XDG_CURRENT_DESKTOP=tema`
 - `XDG_SESSION_TYPE=wayland`
 
-`_JAVA_AWT_WM_NONREPARENTING=1` stays on the forker. Section 17 adds `DISPLAY=:N` when a display is allocated, and removes it on give-up or disable. A restart on the same display exports nothing new. `Xwayland`'s `Stop` leaves `DISPLAY` in place. The shutdown unset below removes it with the rest.
+`_JAVA_AWT_WM_NONREPARENTING=1` stays on the forker. Section 17 adds `DISPLAY=:N` when a display is allocated, and removes it on give-up or disable. A restart on the same display exports nothing new. `Xwayland`'s `Stop` leaves `DISPLAY` in place. The shutdown unset below removes it with the rest, when it was exported.
+
+Every export and unexport is recorded as what tema wants published. A job is queued only while the session is allowed to export and the switch is on. The exported set is what a helper was asked to set.
+
+A reload that changes the switch logs `general.import_environment changed to true` or `false` and applies it. Turning it on publishes the wanted set in one job. Turning it off unsets the exported set in one value-matched job. A set that is still waiting stays ahead of that unset. The action is queued before `xwayland.enabled` from the same reload, so the session variables go out before `DISPLAY`.
 
 A set is `sh -c` with this script, `$0` set to `tema-activation`, and one `K=V` argument per variable:
 
@@ -750,9 +754,9 @@ An unset is `systemctl --user unset-environment K=V…`, using the value tema ex
 
 Exporting a value that is already recorded queues nothing. The next job starts when the previous helper has exited, failed, or been lost. A missing forker fails the job through the usual spawn path, and the queue continues with the next one.
 
-On shutdown, `ProcessManager::stop` sends `SIGKILL` to a helper that is still running, so an export cannot land after the unset. It then writes one unset spawn, listing every variable still exported, straight onto the forker socket, and then drops the socket. The forker runs a spawn it has already read before it treats the close as exit. The helper finishes after tema is gone. `EAGAIN` or any other send error logs `could not unset the activation environment: …` and shutdown continues.
+On shutdown, `ProcessManager::stop` sends `SIGKILL` to a helper that is still running, so an export cannot land after the unset. It then writes one unset spawn, listing every variable still exported, straight onto the forker socket, and then drops the socket. Only what was exported is unset, so a session with the switch off sends nothing. The forker runs a spawn it has already read before it treats the close as exit. The helper finishes after tema is gone. `EAGAIN` or any other send error logs `could not unset the activation environment: …` and shutdown continues.
 
-When `DISPLAY` is already set in tema's own environment, tema is nested under X. The process manager is created with export turned off, and every export and unset is dropped.
+When `DISPLAY` is already set in tema's own environment, tema is nested under X. The process manager is created with export not allowed. The config switch cannot override it.
 
 D-Bus `UpdateActivationEnvironment` stores an empty value as `K=`. Removing a name is the systemd unset. With dbus-broker, and with dbus-daemon in systemd mode, activation goes through systemd, so that unset is what later services see. dbus-daemon without systemd keeps the old activation value.
 
@@ -769,7 +773,7 @@ Run a normal session from a terminal, with the example bindings (`Super+Return` 
 
 ## 17. Xwayland
 
-Xwayland is enabled by default. At startup the compositor claims one X display and publishes it to the forker as `DISPLAY=:N`, and exports that same value through section 16. No Xwayland process exists yet. The first connection to the listening socket is what spawns it. The compositor's own environment stays as it was, including when tema is nested under an outer X server. Programs the forker starts receive `:N`. Section 16 also publishes it, except when tema is nested.
+Xwayland is enabled by default. At startup the compositor claims one X display and publishes it to the forker as `DISPLAY=:N`, and exports that same value through section 16. No Xwayland process exists yet. The first connection to the listening socket is what spawns it. The compositor's own environment stays as it was, including when tema is nested under an outer X server. Programs the forker starts receive `:N`. Section 16 publishes it while `[general] import_environment` is on and the session is not nested.
 
 ```toml
 [xwayland]
@@ -899,7 +903,7 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 3. `Xwayland -version` reports 24.1 or newer. Run `xterm` with `RUST_LOG=debug` on the compositor. The log shows Xwayland starting, `new client_id=… xwayland=true`, one or more `Xwayland:` lines, `Xwayland ready on :N`, `bound xwayland_shell_v1`, and `XWM ready on :N`. The window checks are in sections 20 and 21.
 4. `kill -9 $(pgrep -x Xwayland)`. The log shows `Xwayland exited with signal 9`. A new `xterm` starts Xwayland again on the same `:N`, and both files are still there. A signal within ten seconds of becoming ready counts as an early failure, so one kill relaunches, and a third early failure gives up.
 5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
-6. Activation environment and the live `enabled` switch. Items 1–7 are a session that is not nested under X. Item 8 is a nested one.
+6. Activation environment, the live `import_environment` switch, and the live `enabled` switch. Items 1–7 and 9–11 are a session that is not nested under X. Item 8 is a nested one.
    1. Start tema. `systemctl --user show-environment | grep -E 'DISPLAY|WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE'` shows `WAYLAND_DISPLAY=tema-0`, `DISPLAY=:N`, `XDG_CURRENT_DESKTOP=tema`, and `XDG_SESSION_TYPE=wayland`. Restart a D-Bus-activated service with `systemctl --user restart xdg-desktop-portal` and read `tr '\0' '\n' < /proc/$(pgrep -xf '.*xdg-desktop-portal')/environ`.
    2. Open `xterm`. Set `enabled = false` and save. The log shows `waiting for X clients to exit`. `ls /tmp/.X11-unix/XN` is gone and `/tmp/.XN-lock` remains. A new terminal has no `DISPLAY`. `systemctl --user show-environment` has no `DISPLAY`. The open `xterm` still works. `xterm -display :N` fails.
    3. Close `xterm`. Xwayland exits, the lock file is gone, and nothing relaunches.
@@ -907,7 +911,10 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
    5. With `xterm` open, set `enabled` false and then true before it exits. After closing `xterm`, a fresh display is allocated and `DISPLAY` is exported again.
    6. Start with `enabled = false`, then set it true and save. This matches item 4. The startup log says `Xwayland disabled`, and neither file exists until the reload.
    7. Quit tema. `systemctl --user show-environment` no longer has `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, or `XDG_SESSION_TYPE`, unless another instance exported a different value.
-   8. Run tema nested under X11. `systemctl --user show-environment` is unchanged.
+   8. Run tema nested under X11. `systemctl --user show-environment` is unchanged. `import_environment = true` leaves it unchanged too.
+   9. Start with `import_environment = false`. `systemctl --user show-environment` has none of `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, or `XDG_SESSION_TYPE`. `xterm` still works. Quitting changes nothing.
+   10. Set `import_environment = true` and save. The four variables appear, and `DISPLAY` is the current `:N`.
+   11. Set it back to `false` and save. Those variables are removed. A second tema instance's different values stay.
 7. Quit tema during a normal session. No `Xwayland` process remains, and both files are gone.
 8. `wayland-info` from a normal client does not list `xwayland_shell_v1`.
 

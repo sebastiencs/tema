@@ -78,6 +78,8 @@ pub(crate) enum ProcessManagerAction {
     ActivationJob {
         event: ProcessEvent,
     },
+    /// Follow `[general] import_environment`.
+    SetExportEnabled(bool),
 }
 
 struct Outgoing {
@@ -98,13 +100,15 @@ pub(crate) struct ProcessManager {
     /// Tokens start at 1.
     next_token: u64,
     children: BTreeMap<u64, Child>,
+    /// The session is not nested. Fixed for the process lifetime.
+    export_allowed: bool,
     activation: Activation,
     /// Pidfd of the activation helper that is running, if it has spawned.
     activation_pidfd: Option<Rc<OwnedFd>>,
 }
 
 impl ProcessManager {
-    pub(crate) fn new(forker: Option<ForkerHandle>, export_environment: bool) -> Self {
+    pub(crate) fn new(forker: Option<ForkerHandle>, export_allowed: bool) -> Self {
         Self {
             handle: forker,
             poll_op_id: None,
@@ -112,7 +116,8 @@ impl ProcessManager {
             outgoing: VecDeque::new(),
             next_token: 1,
             children: BTreeMap::new(),
-            activation: Activation::new(export_environment),
+            export_allowed,
+            activation: Activation::new(export_allowed),
             activation_pidfd: None,
         }
     }
@@ -393,6 +398,22 @@ impl ProcessManager {
         }
     }
 
+    fn set_export_enabled(&mut self, enabled: bool, dispatcher: &mut Dispatcher) {
+        if !self.activation.set_enabled(enabled) {
+            return;
+        }
+        if self.export_allowed {
+            if enabled {
+                log::info!("importing the session environment into D-Bus and systemd");
+            } else {
+                log::info!("removing the session environment from D-Bus and systemd");
+            }
+        } else if enabled {
+            log::debug!("nested session: not importing the environment");
+        }
+        self.pump(dispatcher);
+    }
+
     /// Start the next activation job when the previous one has finished.
     ///
     /// The spawn joins `outgoing`, so it stays behind a `SetEnv` already queued.
@@ -484,6 +505,9 @@ impl Model for ProcessManager {
                 self.pump(dispatcher);
             }
             ProcessManagerAction::ActivationJob { event } => self.activation_job(event, dispatcher),
+            ProcessManagerAction::SetExportEnabled(enabled) => {
+                self.set_export_enabled(enabled, dispatcher)
+            }
         }
         Ok(())
     }
@@ -571,6 +595,10 @@ mod tests {
 
     fn sent(manager: &mut ProcessManager, dispatcher: &mut Dispatcher) {
         drive(manager, ProcessManagerAction::Sent(Ok(SendmsgCompleted { fd: 0 })), dispatcher);
+    }
+
+    fn enable_export(manager: &mut ProcessManager, dispatcher: &mut Dispatcher) {
+        drive(manager, ProcessManagerAction::SetExportEnabled(true), dispatcher);
     }
 
     fn drive(
@@ -723,6 +751,7 @@ mod tests {
     fn an_export_spawns_sh_and_the_next_waits_until_it_exits() {
         let mut manager = mock();
         let mut dispatcher = Dispatcher::default();
+        enable_export(&mut manager, &mut dispatcher);
         drive(
             &mut manager,
             ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
@@ -761,6 +790,7 @@ mod tests {
     fn an_unexport_spawns_systemctl_after_the_export_exits() {
         let mut manager = mock();
         let mut dispatcher = Dispatcher::default();
+        enable_export(&mut manager, &mut dispatcher);
         drive(
             &mut manager,
             ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
@@ -791,12 +821,13 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_activation_queues_nothing() {
+    fn a_nested_session_queues_nothing() {
         let (socket, _peer) = socketpair_seqpacket().unwrap();
         let (pidfd, _write) = pipe_cloexec().unwrap();
         let mut manager =
             ProcessManager::new(Some(super::ForkerHandle { socket, pidfd, pid: -1 }), false);
         let mut dispatcher = Dispatcher::default();
+        drive(&mut manager, ProcessManagerAction::SetExportEnabled(true), &mut dispatcher);
         drive(
             &mut manager,
             ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
@@ -814,6 +845,7 @@ mod tests {
     fn a_failed_helper_does_not_block_the_next_job() {
         let mut manager = mock();
         let mut dispatcher = Dispatcher::default();
+        enable_export(&mut manager, &mut dispatcher);
         drive(
             &mut manager,
             ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
@@ -867,6 +899,7 @@ mod tests {
     fn stop_writes_one_unset_for_everything_exported() {
         let (mut manager, peer) = paired(true);
         let mut dispatcher = Dispatcher::default();
+        enable_export(&mut manager, &mut dispatcher);
         drive(
             &mut manager,
             ProcessManagerAction::ExportEnv {
@@ -915,6 +948,93 @@ mod tests {
             ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
             &mut dispatcher,
         );
+        drive(&mut manager, ProcessManagerAction::Stop, &mut dispatcher);
+        assert!(peer_message(&peer).is_none());
+    }
+
+    #[test]
+    fn an_export_waits_until_importing_is_enabled() {
+        let mut manager = mock();
+        let mut dispatcher = Dispatcher::default();
+        drive(
+            &mut manager,
+            ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
+            &mut dispatcher,
+        );
+        assert!(sendmsg_spawns(&dispatcher).is_empty());
+        drive(&mut manager, ProcessManagerAction::SetExportEnabled(true), &mut dispatcher);
+        let spawns = sendmsg_spawns(&dispatcher);
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, b"sh");
+        assert_eq!(spawns[0].1[0], b"-c");
+        assert_eq!(spawns[0].1[3], b"DISPLAY=:500");
+    }
+
+    #[test]
+    fn disabling_import_spawns_an_unset_after_the_export_finishes() {
+        let mut manager = mock();
+        let mut dispatcher = Dispatcher::default();
+        enable_export(&mut manager, &mut dispatcher);
+        drive(
+            &mut manager,
+            ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
+            &mut dispatcher,
+        );
+        sent(&mut manager, &mut dispatcher);
+        drive(
+            &mut manager,
+            ProcessManagerAction::ActivationJob {
+                event: ProcessEvent::Exited { exit: ChildExit::Code(0) },
+            },
+            &mut dispatcher,
+        );
+        drive(&mut manager, ProcessManagerAction::SetExportEnabled(false), &mut dispatcher);
+        let spawns = sendmsg_spawns(&dispatcher);
+        assert_eq!(spawns.len(), 2);
+        assert_eq!(spawns[1].0, b"systemctl");
+        assert_eq!(
+            spawns[1].1,
+            vec![b"--user".to_vec(), b"unset-environment".to_vec(), b"DISPLAY=:500".to_vec()]
+        );
+    }
+
+    #[test]
+    fn disabling_import_waits_for_the_running_export() {
+        let mut manager = mock();
+        let mut dispatcher = Dispatcher::default();
+        enable_export(&mut manager, &mut dispatcher);
+        drive(
+            &mut manager,
+            ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
+            &mut dispatcher,
+        );
+        sent(&mut manager, &mut dispatcher);
+        drive(&mut manager, ProcessManagerAction::SetExportEnabled(false), &mut dispatcher);
+        assert_eq!(sendmsg_spawns(&dispatcher).len(), 1);
+        drive(
+            &mut manager,
+            ProcessManagerAction::ActivationJob {
+                event: ProcessEvent::Exited { exit: ChildExit::Code(0) },
+            },
+            &mut dispatcher,
+        );
+        let spawns = sendmsg_spawns(&dispatcher);
+        assert_eq!(spawns.len(), 2);
+        assert_eq!(spawns[1].0, b"systemctl");
+        assert_eq!(spawns[1].1.last().map(Vec::as_slice), Some(b"DISPLAY=:500".as_slice()));
+    }
+
+    #[test]
+    fn stop_after_disabling_import_writes_nothing() {
+        let (mut manager, peer) = paired(true);
+        let mut dispatcher = Dispatcher::default();
+        enable_export(&mut manager, &mut dispatcher);
+        drive(
+            &mut manager,
+            ProcessManagerAction::ExportEnv { vars: vec![("DISPLAY".into(), ":500".into())] },
+            &mut dispatcher,
+        );
+        drive(&mut manager, ProcessManagerAction::SetExportEnabled(false), &mut dispatcher);
         drive(&mut manager, ProcessManagerAction::Stop, &mut dispatcher);
         assert!(peer_message(&peer).is_none());
     }

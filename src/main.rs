@@ -338,6 +338,7 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     let config_watcher =
         Box::new(config::ConfigWatcher::try_new(&state.config).map_err(StartupError::Config)?);
 
+    let import_environment = state.config.general.import_environment;
     let mut runner = Runner::with_state(state);
     runner.add_model(uring);
     runner.add_model(dbus);
@@ -361,6 +362,7 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     // After the forker has the default environment, and before Xwayland, so
     // DISPLAY is queued ahead of any later spawn. The compositor's own
     // environment is unchanged. The Wayland socket already exists.
+    dispatcher.dispatch(process::ProcessManagerAction::SetExportEnabled(import_environment));
     dispatcher.dispatch(process::ProcessManagerAction::ExportEnv {
         vars: process::activation_environment(),
     });

@@ -115,6 +115,7 @@ pub struct GeneralConfig {
     pub outer_gap: i32,
     pub inner_gap: i32,
     pub renderer: RendererSelection,
+    pub import_environment: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -549,6 +550,7 @@ struct GeneralConfigFile {
     outer_gap: i32,
     inner_gap: i32,
     renderer: String,
+    import_environment: bool,
 }
 
 impl RuntimeConfig {
@@ -658,6 +660,7 @@ impl RuntimeConfig {
                 outer_gap: sanitize_non_negative_i32(parsed.general.outer_gap),
                 inner_gap: sanitize_non_negative_i32(parsed.general.inner_gap),
                 renderer: parse_renderer(&parsed.general.renderer)?,
+                import_environment: parsed.general.import_environment,
             },
             xwayland: XwaylandConfig {
                 enabled: parsed.xwayland.enabled,
@@ -693,6 +696,7 @@ impl RuntimeConfig {
                 outer_gap: 0,
                 inner_gap: 0,
                 renderer: RendererSelection::OpenGl,
+                import_environment: GeneralConfig::default_import_environment(),
             },
             xwayland: XwaylandConfig::default(),
             tiling: TilingConfig::default(),
@@ -792,6 +796,10 @@ impl GeneralConfig {
 
     pub fn default_inner_gap() -> i32 {
         0
+    }
+
+    pub fn default_import_environment() -> bool {
+        true
     }
 }
 
@@ -898,6 +906,7 @@ impl Default for GeneralConfigFile {
             outer_gap: GeneralConfig::default_outer_gap(),
             inner_gap: GeneralConfig::default_inner_gap(),
             renderer: RendererSelection::default().to_string(),
+            import_environment: GeneralConfig::default_import_environment(),
         }
     }
 }
@@ -1221,8 +1230,15 @@ pub fn reload_from_disk(
     }
     let enabled_changed = next.xwayland.enabled != state.config.xwayland.enabled;
     let scaling_mode_changed = next.xwayland.scaling_mode != state.config.xwayland.scaling_mode;
+    let import_changed = next.general.import_environment != state.config.general.import_environment;
     let changed = state.config != next;
     state.config = next;
+    if import_changed {
+        let import_environment = state.config.general.import_environment;
+        log::info!("general.import_environment changed to {import_environment}");
+        dispatcher
+            .dispatch(crate::process::ProcessManagerAction::SetExportEnabled(import_environment));
+    }
     if enabled_changed {
         let enabled = state.config.xwayland.enabled;
         log::info!("xwayland.enabled changed to {enabled}");
@@ -2333,6 +2349,143 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(state.config.general.renderer, RendererSelection::Auto);
+    }
+
+    #[test]
+    fn import_environment_defaults_to_true_and_parses_false() {
+        let xkb = Xkb::new();
+        assert!(RuntimeConfig::default().general.import_environment);
+        assert!(
+            RuntimeConfig::parse_for_test("", &xkb)
+                .unwrap()
+                .general
+                .import_environment
+        );
+        assert!(
+            RuntimeConfig::parse_for_test("[general]\nimport_environment = true\n", &xkb)
+                .unwrap()
+                .general
+                .import_environment
+        );
+        let disabled =
+            RuntimeConfig::parse_for_test("[general]\nimport_environment = false\n", &xkb).unwrap();
+        assert!(!disabled.general.import_environment);
+
+        let error =
+            RuntimeConfig::parse_for_test("[general]\nimport_environment = \"yes\"\n", &xkb)
+                .unwrap_err();
+        assert!(error.to_string().contains("import_environment"), "{error:#}");
+    }
+
+    #[test]
+    fn reload_applies_a_changed_import_environment() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[general]\nimport_environment = true\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[general]\nimport_environment = false\n").unwrap();
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        assert!(!state.config.general.import_environment);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::process::ProcessManagerAction>(|action| {
+                matches!(action, crate::process::ProcessManagerAction::SetExportEnabled(false))
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn reload_enables_import_environment() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[general]\nimport_environment = false\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[general]\nimport_environment = true\n").unwrap();
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        assert!(state.config.general.import_environment);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::process::ProcessManagerAction>(|action| {
+                matches!(action, crate::process::ProcessManagerAction::SetExportEnabled(true))
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn reload_leaves_an_unchanged_import_environment_alone() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[general]\nimport_environment = true\nouter_gap = 4\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[general]\nimport_environment = true\nouter_gap = 16\n").unwrap();
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        assert!(state.config.general.import_environment);
+        assert_eq!(state.config.general.outer_gap, 16);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::process::ProcessManagerAction>(|action| {
+                matches!(action, crate::process::ProcessManagerAction::SetExportEnabled(_))
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn reload_dispatches_import_environment_before_xwayland_enabled() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[general]\nimport_environment = true\n\n[xwayland]\nenabled = true\n")
+            .unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[general]\nimport_environment = false\n\n[xwayland]\nenabled = false\n")
+            .unwrap();
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        let import_at =
+            dispatcher.test_queued_positions::<crate::process::ProcessManagerAction>(|action| {
+                matches!(action, crate::process::ProcessManagerAction::SetExportEnabled(false))
+            });
+        let enabled_at =
+            dispatcher.test_queued_positions::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::SetEnabled(false))
+            });
+        assert_eq!(import_at.len(), 1);
+        assert_eq!(enabled_at.len(), 1);
+        assert!(import_at[0] < enabled_at[0]);
     }
 
     #[test]

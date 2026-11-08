@@ -12,6 +12,11 @@ cursor_size = 24
 # Changing this requires a restart; a running compositor keeps its current renderer.
 renderer = "opengl"
 
+# Publish WAYLAND_DISPLAY, DISPLAY, XDG_CURRENT_DESKTOP and XDG_SESSION_TYPE to
+# D-Bus activation and systemd --user, so portals and user services find the session.
+# Turn off when a session manager does this already. Ignored when nested. Applies on reload.
+import_environment = false
+
 # Tiling gaps (logical pixels). Outer gap shrinks the tiling region inside the usable area;
 # inner gap is space between sibling tiles. Fullscreen ignores gaps.
 outer_gap = 10
