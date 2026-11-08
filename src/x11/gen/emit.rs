@@ -617,6 +617,7 @@ use super::wire::{Reader, WireError, Writer};
                         ListLen::Dynamic(expr) => expr_usize(expr, header, &parsed, "", self)?,
                     };
                     let count_name = format!("{}_count", strip_raw(&field.rust_name));
+                    let count_expr = strip_outer_parens(&count_expr);
                     push(out, 2, &format!("let {count_name} = {count_expr};"));
                     if is_byte_blob(&field.wire) {
                         match len {
@@ -1353,6 +1354,7 @@ use super::wire::{Reader, WireError, Writer};
             }
         };
         let count_name = format!("{}_count", strip_raw(&field.rust_name));
+        let count_expr = strip_outer_parens(&count_expr);
         push(out, 2, &format!("let {count_name} = {count_expr};"));
         if is_byte_blob(&field.wire) {
             match count {
@@ -2643,6 +2645,28 @@ fn expr_usize(
             Ok(format!("({left} {} {right})", op_symbol(*op)))
         }
     }
+}
+
+/// Drops parentheses that wrap an entire expression. Nested parentheses stay.
+fn strip_outer_parens(expr: &str) -> &str {
+    let expr = expr.trim();
+    if !expr.starts_with('(') || !expr.ends_with(')') {
+        return expr;
+    }
+    let mut depth = 0i32;
+    for (index, ch) in expr.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && index != expr.len() - 1 {
+                    return expr;
+                }
+            }
+            _ => {}
+        }
+    }
+    &expr[1..expr.len() - 1]
 }
 
 fn numeric_usize(wire: &Wire, expr: &str) -> Option<String> {

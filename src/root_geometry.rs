@@ -11,7 +11,6 @@ use {
             wl_surface::WlSurface,
             xdg_surface::{xdg_toplevel::ToplevelDecorationMode, XdgSurface},
         },
-        window::Toplevel,
     },
     std::cell::Cell,
 };

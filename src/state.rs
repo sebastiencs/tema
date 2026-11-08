@@ -35,7 +35,7 @@ use crate::{
         xdg_surface::{xdg_toplevel::ToplevelDecorationMode, XdgSurface},
         zwlr_layer_surface_v1::{output_usable_bounds_with_snapshot, LayerLayoutObjectSnapshot},
     },
-    window::{Toplevel, WindowEntry, WindowId},
+    window::{WindowEntry, WindowId},
     xkb::{KeyboardState, Xkb},
 };
 

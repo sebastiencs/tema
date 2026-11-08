@@ -13,19 +13,22 @@ pub(crate) mod mock;
 
 pub use factory::create_renderer;
 
+#[cfg(test)]
+pub use {backend::inert_texture, visual::rounded_ring};
+
 pub use {
     backend::{
-        inert_texture, FormatSupport, GraphicsApi, OffscreenTarget, RenderCompletion,
-        RenderDeviceId, RenderFrame, RenderSyncMode, RenderTarget, Renderer, RendererCapabilities,
-        RendererError, ShmImage, Texture,
+        FormatSupport, GraphicsApi, OffscreenTarget, RenderCompletion, RenderDeviceId, RenderFrame,
+        RenderSyncMode, RenderTarget, Renderer, RendererCapabilities, RendererError, ShmImage,
+        Texture,
     },
     recipe::{
         EffectElement, FrameElement, FramePhase, OutputFrameRecipe, TextureElement, TextureMask,
         TextureSource,
     },
     visual::{
-        map_layout_point, map_layout_rect, place_visual_frame, rounded_ring, shadow_geometry,
-        unmap_layout_point, BlurVisualStyle, BorderGradient, BorderVisualStyle,
-        RootSurfaceVisualState, RoundedRing, ShadowVisualStyle, SurfaceEffectStyle, WindowClip,
+        map_layout_point, map_layout_rect, place_visual_frame, shadow_geometry, unmap_layout_point,
+        BlurVisualStyle, BorderGradient, BorderVisualStyle, RootSurfaceVisualState, RoundedRing,
+        ShadowVisualStyle, SurfaceEffectStyle, WindowClip,
     },
 };

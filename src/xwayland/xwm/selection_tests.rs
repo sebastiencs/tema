@@ -2106,7 +2106,6 @@ fn focus_data_device(
 }
 
 #[test]
-#[test]
 fn an_unknown_selection_request_is_left_unanswered() {
     let (mut wm, mut state, mut dispatcher, surfaces) = focused_x_window();
     let ready = atoms(&wm);

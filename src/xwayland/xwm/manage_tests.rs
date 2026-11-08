@@ -5,7 +5,7 @@ use crate::{
     region::RectI,
     runner::Dispatcher,
     scene::SceneRole,
-    window::{Toplevel, ToplevelDecorationMode},
+    window::ToplevelDecorationMode,
     x11::{
         change_property_atoms, change_property_u32s, event_bytes, testing, Atom, Atoms,
         ClientMessage, ClientMessageData, ConfigWindow, ConfigureNotify, ConfigureWindow,

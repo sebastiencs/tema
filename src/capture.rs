@@ -13,8 +13,7 @@ use crate::{
     protocol_generated::{
         ExtForeignToplevelHandleV1Id, ExtForeignToplevelListV1Id, ExtImageCopyCaptureFrameV1Id,
         ExtImageCopyCaptureSessionV1Id, WlBufferId, WlOutputId, WlPointerId, WlSurfaceId,
-        XdgToplevelId, ZwlrForeignToplevelHandleV1Id, ZwlrForeignToplevelManagerV1Id,
-        ZwlrScreencopyFrameV1Id,
+        ZwlrForeignToplevelHandleV1Id, ZwlrForeignToplevelManagerV1Id, ZwlrScreencopyFrameV1Id,
     },
     region::RectI,
     runner::Dispatcher,

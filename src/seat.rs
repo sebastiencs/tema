@@ -30,7 +30,6 @@ use crate::{
         xdg_surface::xdg_toplevel::{InteractiveSizeConstraints, ToplevelDecorationMode},
         zwlr_layer_surface_v1::LayerLayoutObjectSnapshot,
     },
-    window::Toplevel,
     xkb::KeyboardModifiers,
 };
 

@@ -18,7 +18,6 @@ use crate::{
         ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
         ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
         ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
-        ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
         wl_buffer::{NewWlBufferParams, WlBuffer},
         wl_seat::WlSeat,
         wl_surface::{test_commit_new_buffer, WlSurface},

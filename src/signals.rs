@@ -171,7 +171,7 @@ mod tests {
         let mut mask = SigSet::empty();
         mask.add(Signal::SIGTERM);
         mask.thread_block().unwrap();
-        let mut fd =
+        let fd =
             SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK).unwrap();
         unsafe { libc::raise(libc::SIGTERM) };
         let info = fd.read_signal().unwrap().expect("pending SIGTERM");

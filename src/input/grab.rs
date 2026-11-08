@@ -12,7 +12,7 @@ use crate::{
     state::State,
     tiling::ExtractedTiledLeaf,
     wayland_objects::xdg_surface::xdg_toplevel::InteractiveSizeConstraints,
-    window::{Toplevel, WindowId},
+    window::WindowId,
 };
 
 use super::{

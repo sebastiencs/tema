@@ -29,7 +29,7 @@ use super::{
     sys::{
         close_range_from, dup_to, pidfd_open, pipe_cloexec, recv_with_fds, reset_signals,
         send_with_fds, set_cloexec, set_pdeathsig, set_process_name, socketpair_dgram,
-        socketpair_seqpacket, waitid_pidfd, ChildExit, MAX_ATTACHED_FDS,
+        socketpair_seqpacket, waitid_pidfd, MAX_ATTACHED_FDS,
     },
 };
 
@@ -527,7 +527,10 @@ mod tests {
         unistd::{self, Pid},
     };
 
-    use {super::*, crate::process::sys::waitid_pidfd};
+    use {
+        super::*,
+        crate::process::sys::{waitid_pidfd, ChildExit},
+    };
 
     pub(super) static FORK: Mutex<()> = Mutex::new(());
 

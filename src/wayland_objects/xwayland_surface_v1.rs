@@ -39,7 +39,6 @@ impl Object for XwaylandSurfaceV1 {
                     return Ok(());
                 };
                 if surface.xwayland_serial().is_some() {
-                    drop(surface);
                     client.protocol_violation_disconnect(
                         dispatcher,
                         self.id.into(),
@@ -49,7 +48,6 @@ impl Object for XwaylandSurfaceV1 {
                     return Ok(());
                 }
                 if serial <= client.last_xwayland_serial() {
-                    drop(surface);
                     client.protocol_violation_disconnect(
                         dispatcher,
                         self.id.into(),

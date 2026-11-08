@@ -312,7 +312,7 @@ impl Depth {
         reader.skip(1)?;
         let visuals_len = reader.get_u16()?;
         reader.skip(4)?;
-        let visuals_count = (visuals_len as usize);
+        let visuals_count = visuals_len as usize;
         let mut visuals = Vec::with_capacity(visuals_count);
         for _ in 0..visuals_count {
             visuals.push(Visualtype::parse(reader)?);
@@ -424,7 +424,7 @@ impl Screen {
         let save_unders = reader.get_u8()?;
         let root_depth = reader.get_u8()?;
         let allowed_depths_len = reader.get_u8()?;
-        let allowed_depths_count = (allowed_depths_len as usize);
+        let allowed_depths_count = allowed_depths_len as usize;
         let mut allowed_depths = Vec::with_capacity(allowed_depths_count);
         for _ in 0..allowed_depths_count {
             allowed_depths.push(Depth::parse(reader)?);
@@ -493,10 +493,10 @@ impl SetupRequest {
         let authorization_protocol_name_len = reader.get_u16()?;
         let authorization_protocol_data_len = reader.get_u16()?;
         reader.skip(2)?;
-        let authorization_protocol_name_count = (authorization_protocol_name_len as usize);
+        let authorization_protocol_name_count = authorization_protocol_name_len as usize;
         let authorization_protocol_name = reader.bytes(authorization_protocol_name_count)?.to_vec();
         reader.align(4)?;
-        let authorization_protocol_data_count = (authorization_protocol_data_len as usize);
+        let authorization_protocol_data_count = authorization_protocol_data_len as usize;
         let authorization_protocol_data = reader.bytes(authorization_protocol_data_count)?.to_vec();
         reader.align(4)?;
         Ok(Self {
@@ -538,7 +538,7 @@ impl SetupFailed {
         let protocol_major_version = reader.get_u16()?;
         let protocol_minor_version = reader.get_u16()?;
         let length = reader.get_u16()?;
-        let reason_count = (reason_len as usize);
+        let reason_count = reason_len as usize;
         let reason = reader.bytes(reason_count)?.to_vec();
         Ok(Self {
             status,
@@ -571,7 +571,7 @@ impl SetupAuthenticate {
         let status = reader.get_u8()?;
         reader.skip(5)?;
         let length = reader.get_u16()?;
-        let reason_count = ((length as usize) * 4usize);
+        let reason_count = (length as usize) * 4usize;
         let reason = reader.bytes(reason_count)?.to_vec();
         Ok(Self { status, length, reason })
     }
@@ -666,15 +666,15 @@ impl Setup {
         let min_keycode = reader.get_u8()?;
         let max_keycode = reader.get_u8()?;
         reader.skip(4)?;
-        let vendor_count = (vendor_len as usize);
+        let vendor_count = vendor_len as usize;
         let vendor = reader.bytes(vendor_count)?.to_vec();
         reader.align(4)?;
-        let pixmap_formats_count = (pixmap_formats_len as usize);
+        let pixmap_formats_count = pixmap_formats_len as usize;
         let mut pixmap_formats = Vec::with_capacity(pixmap_formats_count);
         for _ in 0..pixmap_formats_count {
             pixmap_formats.push(Format::parse(reader)?);
         }
-        let roots_count = (roots_len as usize);
+        let roots_count = roots_len as usize;
         let mut roots = Vec::with_capacity(roots_count);
         for _ in 0..roots_count {
             roots.push(Screen::parse(reader)?);
@@ -1137,7 +1137,7 @@ impl ClientIdValue {
     pub(crate) fn parse(reader: &mut Reader<'_>) -> Result<Self, WireError> {
         let spec = ClientIdSpec::parse(reader)?;
         let length = reader.get_u32()?;
-        let value_count = ((length as usize) / 4usize);
+        let value_count = (length as usize) / 4usize;
         let mut value = Vec::with_capacity(value_count);
         for _ in 0..value_count {
             value.push(reader.get_u32()?);
@@ -1356,7 +1356,7 @@ impl Pictdepth {
         reader.skip(1)?;
         let num_visuals = reader.get_u16()?;
         reader.skip(4)?;
-        let visuals_count = (num_visuals as usize);
+        let visuals_count = num_visuals as usize;
         let mut visuals = Vec::with_capacity(visuals_count);
         for _ in 0..visuals_count {
             visuals.push(Pictvisual::parse(reader)?);
@@ -1385,7 +1385,7 @@ impl Pictscreen {
     pub(crate) fn parse(reader: &mut Reader<'_>) -> Result<Self, WireError> {
         let num_depths = reader.get_u32()?;
         let fallback = Pictformat::parse(reader)?;
-        let depths_count = (num_depths as usize);
+        let depths_count = num_depths as usize;
         let mut depths = Vec::with_capacity(depths_count);
         for _ in 0..depths_count {
             depths.push(Pictdepth::parse(reader)?);
@@ -2241,7 +2241,7 @@ impl QueryTreeReply {
         let parent = Window::parse(reader)?;
         let children_len = reader.get_u16()?;
         reader.skip(14)?;
-        let children_count = (children_len as usize);
+        let children_count = children_len as usize;
         let mut children = Vec::with_capacity(children_count);
         for _ in 0..children_count {
             children.push(Window::parse(reader)?);
@@ -2348,7 +2348,7 @@ impl GetAtomNameReply {
         let _length = reader.get_u32()?;
         let name_len = reader.get_u16()?;
         reader.skip(22)?;
-        let name_count = (name_len as usize);
+        let name_count = name_len as usize;
         let name = reader.bytes(name_count)?.to_vec();
         reader.finish_reply()?;
         Ok(Self { sequence, name })
@@ -2469,7 +2469,7 @@ impl GetPropertyReply {
         let bytes_after = reader.get_u32()?;
         let value_len = reader.get_u32()?;
         reader.skip(12)?;
-        let value_count = ((value_len as usize) * ((format as usize) / 8usize));
+        let value_count = (value_len as usize) * ((format as usize) / 8usize);
         let value = reader.bytes(value_count)?.to_vec();
         reader.finish_reply()?;
         Ok(Self { sequence, format, r#type, bytes_after, value_len, value })
@@ -3391,7 +3391,7 @@ impl ResQueryClientIdsReply {
         let _length = reader.get_u32()?;
         let num_ids = reader.get_u32()?;
         reader.skip(20)?;
-        let ids_count = (num_ids as usize);
+        let ids_count = num_ids as usize;
         let mut ids = Vec::with_capacity(ids_count);
         for _ in 0..ids_count {
             ids.push(ClientIdValue::parse(reader)?);
@@ -3528,17 +3528,17 @@ impl RenderQueryPictFormatsReply {
         let num_visuals = reader.get_u32()?;
         let num_subpixel = reader.get_u32()?;
         reader.skip(4)?;
-        let formats_count = (num_formats as usize);
+        let formats_count = num_formats as usize;
         let mut formats = Vec::with_capacity(formats_count);
         for _ in 0..formats_count {
             formats.push(Pictforminfo::parse(reader)?);
         }
-        let screens_count = (num_screens as usize);
+        let screens_count = num_screens as usize;
         let mut screens = Vec::with_capacity(screens_count);
         for _ in 0..screens_count {
             screens.push(Pictscreen::parse(reader)?);
         }
-        let subpixels_count = (num_subpixel as usize);
+        let subpixels_count = num_subpixel as usize;
         let mut subpixels = Vec::with_capacity(subpixels_count);
         for _ in 0..subpixels_count {
             subpixels.push(SubPixel(reader.get_u32()?));

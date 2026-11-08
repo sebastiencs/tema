@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn spawned_adopts_the_wayland_socket_and_reads_both_pipes() {
-        let (mut xwayland, mut state, mut dispatcher) = running();
+        let (xwayland, state, dispatcher) = running();
         assert_eq!(
             dispatcher.test_count_queued_action::<ClientManagerAction>(|action| {
                 matches!(

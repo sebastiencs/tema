@@ -8,7 +8,6 @@ use crate::{
         wl_surface::{Role, StackEntry, WlSurface},
         xdg_surface::xdg_toplevel::ToplevelDecorationMode,
     },
-    window::Toplevel,
 };
 
 use super::{

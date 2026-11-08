@@ -240,7 +240,6 @@ impl Wm {
             tracked.props_outstanding -= 1;
             tracked.props_outstanding == 0
         };
-        drop(tracked);
         self.note_property_batch(window, finished, ctx);
         Ok(())
     }

@@ -5,7 +5,6 @@ use crate::{
     runner::Dispatcher,
     test_support::state_for_tests,
     wayland_objects::wl_surface::{test_commit_new_buffer, WlSurface},
-    window::Toplevel,
     x11::{
         testing, Atom, Atoms, ConfigureWindow, ConfigureWindowAux, DestroyNotify, Event, FocusIn,
         InputFocus, MapNotify, NotifyDetail, NotifyMode, Property, SetInputFocus, StackMode,
