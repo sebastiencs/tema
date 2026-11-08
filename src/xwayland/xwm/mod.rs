@@ -17,6 +17,7 @@ pub(super) mod selection;
 #[cfg(test)]
 mod selection_tests;
 mod setup;
+#[cfg(test)]
 mod tests;
 mod timer;
 mod toplevel;

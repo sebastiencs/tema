@@ -1173,6 +1173,7 @@ impl State {
         managed
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_managed_window(
         &mut self,
         root: Resolved<WlSurfaceId>,
