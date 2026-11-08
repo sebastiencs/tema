@@ -48,8 +48,12 @@ impl ZxdgOutputV1 {
         let Some(output) = self.output(state) else {
             return;
         };
+        let wire_scale = dispatcher.wire_scale();
         self.send_event(
-            zxdg_output_v1::Event::LogicalPosition { x: output.x, y: output.y },
+            zxdg_output_v1::Event::LogicalPosition {
+                x: wire_scale.to_wire(output.x),
+                y: wire_scale.to_wire(output.y),
+            },
             dispatcher,
         );
     }
@@ -58,8 +62,15 @@ impl ZxdgOutputV1 {
         let Some(output) = self.output(state) else {
             return;
         };
+        let wire_scale = dispatcher.wire_scale();
         let (width, height) = output.logical_size();
-        self.send_event(zxdg_output_v1::Event::LogicalSize { width, height }, dispatcher);
+        self.send_event(
+            zxdg_output_v1::Event::LogicalSize {
+                width: wire_scale.to_wire(width),
+                height: wire_scale.to_wire(height),
+            },
+            dispatcher,
+        );
     }
 
     pub fn send_name(&self, state: &State, dispatcher: &mut ClientDispatcher) {
@@ -113,5 +124,100 @@ impl Object for ZxdgOutputV1 {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            clients::ClientAction,
+            io_uring::model::IoUringAction,
+            runner::{Dispatcher, Model},
+            state::{BackendOutputRef, DrmId, FractionalScale, OutputId},
+            test_support::{state_for_tests, test_client_and_dispatcher, test_output},
+            wire_scale::WireScale,
+        },
+    };
+
+    /// A 2x output: mode 2560x1440 gives a logical size of 1280x720.
+    fn output_state() -> (State, OutputId) {
+        let mut state = state_for_tests();
+        let output_id = state.insert_output(test_output(
+            BackendOutputRef::new(DrmId::from(1usize)),
+            1,
+            1280,
+            0,
+            2560,
+            1440,
+            "test-output",
+        ));
+        state.outputs.try_get_mut(output_id).unwrap().scale = FractionalScale::TWO;
+        (state, output_id)
+    }
+
+    const XDG_OUTPUT_ID: u32 = 14;
+
+    fn queued_state(scale: WireScale) -> Dispatcher {
+        let (state, output_id) = output_state();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        client.set_wire_scale_for_tests(scale);
+        let xdg_output = ZxdgOutputV1::new(ZxdgOutputV1Id::from(XDG_OUTPUT_ID), output_id, 3);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            xdg_output.send_state(&state, &mut client_dispatcher);
+        }
+        dispatcher
+    }
+
+    /// Argument words of the first queued event with the given object/opcode.
+    fn event_args(dispatcher: &Dispatcher, object: u32, opcode: u32) -> Vec<u32> {
+        let mut args = Vec::new();
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            if let IoUringAction::Sendmsg { buffer, .. } = action {
+                let words: Vec<u32> = buffer
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                if words.len() >= 2 && words[0] == object && (words[1] & 0xffff) == opcode {
+                    args = words[2..].to_vec();
+                }
+            }
+        });
+        args
+    }
+
+    #[test]
+    fn wire_scaled_client_gets_doubled_logical_position_and_size() {
+        let dispatcher = queued_state(WireScale::new(2));
+        assert_eq!(&event_args(&dispatcher, XDG_OUTPUT_ID, 0)[0..2], &[2560, 0]);
+        assert_eq!(&event_args(&dispatcher, XDG_OUTPUT_ID, 1)[0..2], &[2560, 1440]);
+    }
+
+    #[test]
+    fn normal_client_logical_position_and_size_match_today() {
+        let dispatcher = queued_state(WireScale::ONE);
+        assert_eq!(&event_args(&dispatcher, XDG_OUTPUT_ID, 0)[0..2], &[1280, 0]);
+        assert_eq!(&event_args(&dispatcher, XDG_OUTPUT_ID, 1)[0..2], &[1280, 720]);
+    }
+
+    #[test]
+    fn set_wire_scale_resends_xdg_output_at_the_new_scale() {
+        let (mut state, output_id) = output_state();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        client.insert_object(
+            &mut state,
+            ZxdgOutputV1::new(ZxdgOutputV1Id::from(XDG_OUTPUT_ID), output_id, 3),
+        );
+        client
+            .process(
+                &mut state,
+                ClientAction::SetWireScale { scale: WireScale::new(2) },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert_eq!(&event_args(&dispatcher, XDG_OUTPUT_ID, 0)[0..2], &[2560, 0]);
+        assert_eq!(&event_args(&dispatcher, XDG_OUTPUT_ID, 1)[0..2], &[2560, 1440]);
     }
 }

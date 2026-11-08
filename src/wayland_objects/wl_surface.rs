@@ -35,6 +35,7 @@ use crate::{
         zwp_pointer_constraints_v1::{apply_pointer_constraint_commit, defunct_pointer_constraint},
     },
     window::Toplevel,
+    wire_scale::WireScale,
     xwayland::{SurfaceEvent, XwaylandAction},
     ENABLE_DAMAGE,
 };
@@ -277,6 +278,25 @@ struct SurfaceCommitPayload {
     input_region: RegionValue,
     opaque_region: RegionValue,
     release_callbacks: Vec<Resolved<WlCallbackId>>,
+    /// The raw wire inputs behind the normalized values above, filled only for
+    /// wire-scaled clients. Travels with the payload so synchronized (cached)
+    /// and blocked commits store the same raw inputs they were normalized from.
+    wire_inputs: Option<WireInputs>,
+}
+
+/// The raw (wire-unit) inputs of a wire-scaled client's commit: its own
+/// `buffer_scale`, the viewport and the regions exactly as the client sent
+/// them, plus the `WireScale` they were normalized with. Kept on the on-screen
+/// state so a later phase can recompute the logical size, viewport and regions
+/// when S changes, and so a commit without a new region request falls back to
+/// the raw regions instead of re-normalizing the on-screen ones (M11).
+#[derive(Clone, Debug)]
+struct WireInputs {
+    scale: WireScale,
+    buffer_scale: i32,
+    viewport: SurfaceViewport,
+    input_region: RegionValue,
+    opaque_region: RegionValue,
 }
 
 #[derive(Clone, Debug)]
@@ -297,6 +317,8 @@ struct OnScreen {
     input_region: RegionValue,
     opaque_region: RegionValue,
     release_callbacks: Vec<Resolved<WlCallbackId>>,
+    /// Raw wire inputs of the last wire-scaled commit; `None` for normal clients.
+    wire_inputs: Option<WireInputs>,
 }
 
 impl Default for OnScreen {
@@ -318,6 +340,7 @@ impl Default for OnScreen {
             input_region: RegionValue::infinite(),
             opaque_region: RegionValue::empty(),
             release_callbacks: Vec::new(),
+            wire_inputs: None,
         }
     }
 }
@@ -355,6 +378,9 @@ struct BlockedSurfaceState {
     input_region: RegionValue,
     opaque_region: RegionValue,
     release_callbacks: Vec<Resolved<WlCallbackId>>,
+    /// Travels from the payload so activating a blocked commit stores the raw
+    /// wire inputs of the commit that produced this state.
+    wire_inputs: Option<WireInputs>,
 }
 
 struct SurfaceChanges {
@@ -368,6 +394,67 @@ struct DamageRect {
     y: i32,
     width: i32,
     height: i32,
+}
+
+/// Convert one `wl_surface.damage` rectangle from wire units to logical units,
+/// rounding outward so no damaged pixel is missed. Invalid rects (negative
+/// sizes) are kept as-is; the damage collection drops them anyway.
+/// Viewport source and destination in logical pixels. The same conversion a
+/// wire-scaled commit applies.
+fn logical_viewport(mut viewport: SurfaceViewport, scale: WireScale) -> SurfaceViewport {
+    if scale.is_one() {
+        return viewport;
+    }
+    if let Some(src) = viewport.src.as_mut() {
+        src.x = scale.to_logical_f64(src.x as f64) as f32;
+        src.y = scale.to_logical_f64(src.y as f64) as f32;
+        src.width = scale.to_logical_f64(src.width as f64) as f32;
+        src.height = scale.to_logical_f64(src.height as f64) as f32;
+    }
+    if let Some(dst) = viewport.dst.as_mut() {
+        dst.width = scale.size_to_logical(dst.width);
+        dst.height = scale.size_to_logical(dst.height);
+    }
+    viewport
+}
+
+/// Input regions cover everything the wire region covers. Opaque regions stay
+/// inside it. Empty rects are dropped so they do not grow or linger.
+fn logical_regions(
+    input: RegionValue,
+    opaque: RegionValue,
+    scale: WireScale,
+) -> (RegionValue, RegionValue) {
+    if scale.is_one() {
+        return (input, opaque);
+    }
+    let input = scale.region_to_logical_outward(input);
+    let opaque =
+        opaque.map_rects(
+            |rect| {
+                if rect.is_empty() {
+                    None
+                } else {
+                    scale.rect_to_logical_inward(rect)
+                }
+            },
+        );
+    (input, opaque)
+}
+
+fn damage_rect_to_logical(rect: DamageRect, scale: WireScale) -> DamageRect {
+    match RectI::new(rect.x, rect.y, rect.width, rect.height) {
+        None => rect,
+        Some(valid) => {
+            let mapped = scale.rect_to_logical_outward(valid);
+            DamageRect {
+                x: mapped.x,
+                y: mapped.y,
+                width: mapped.width,
+                height: mapped.height,
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -921,7 +1008,13 @@ impl WlSurface {
         let Some(object_id) = self.fractional_scale_object else {
             return;
         };
-        let scale = scale.as_v120();
+        // A wire-scaled client renders its buffers at scale 1, so advertise the
+        // 1.0 scale (120/120) instead of the output's fractional scale.
+        let scale = if dispatcher.wire_scale().is_one() {
+            scale.as_v120()
+        } else {
+            FractionalScale::ONE.as_v120()
+        };
         if self.preferred_fractional_scale_sent == Some(scale) {
             return;
         }
@@ -938,6 +1031,9 @@ impl WlSurface {
         transform: u32,
         dispatcher: &mut ClientDispatcher,
     ) {
+        // A wire-scaled client renders its buffers at scale 1 (tema applies S
+        // when reading them), so advertise 1 regardless of the output scale.
+        let scale = if dispatcher.wire_scale().is_one() { scale } else { 1 };
         if self.version >= wl_surface::PREFERRED_BUFFER_SCALE_SINCE {
             if self.preferred_buffer_scale_sent != Some(scale) {
                 self.send_event(
@@ -1317,10 +1413,33 @@ impl WlSurface {
             input_region: self.on_screen.input_region.clone(),
             opaque_region: self.on_screen.opaque_region.clone(),
             release_callbacks: Vec::new(),
+            wire_inputs: self.on_screen.wire_inputs.clone(),
         };
     }
 
-    fn build_commit_payload(&mut self) -> SurfaceCommitPayload {
+    /// Build the payload from the pending state. A wire-scaled client's
+    /// payload always carries raw (wire-unit) regions: without a new region
+    /// request this commit, the fallback reads the raw regions that produced
+    /// the on-screen ones (`WireInputs`) instead of the already-normalized
+    /// on-screen regions, which would be scaled a second time. Before the
+    /// first region-carrying commit the on-screen regions are the
+    /// scale-invariant defaults. Normal clients keep today's fallback.
+    fn build_commit_payload(&mut self, wire_scale: WireScale) -> SurfaceCommitPayload {
+        let raw_regions = (!wire_scale.is_one())
+            .then(|| self.on_screen.wire_inputs.as_ref())
+            .flatten();
+        let input_region = self
+            .pending
+            .input_region
+            .take()
+            .or_else(|| raw_regions.map(|raw| raw.input_region.clone()))
+            .unwrap_or_else(|| self.on_screen.input_region.clone());
+        let opaque_region = self
+            .pending
+            .opaque_region
+            .take()
+            .or_else(|| raw_regions.map(|raw| raw.opaque_region.clone()))
+            .unwrap_or_else(|| self.on_screen.opaque_region.clone());
         SurfaceCommitPayload {
             buffer: self.pending.buffer.take(),
             offset: std::mem::take(&mut self.pending.offset),
@@ -1330,18 +1449,109 @@ impl WlSurface {
             viewport: self.pending.viewport,
             damage_surface: std::mem::take(&mut self.pending.damage_surface),
             damage_buffer: std::mem::take(&mut self.pending.damage_buffer),
-            input_region: self
-                .pending
-                .input_region
-                .take()
-                .unwrap_or_else(|| self.on_screen.input_region.clone()),
-            opaque_region: self
-                .pending
-                .opaque_region
-                .take()
-                .unwrap_or_else(|| self.on_screen.opaque_region.clone()),
+            input_region,
+            opaque_region,
             release_callbacks: std::mem::take(&mut self.pending_release_callbacks),
+            wire_inputs: None,
         }
+    }
+
+    /// Normalize a payload built for a wire-scaled client from wire units to
+    /// logical units, once, right after it is built. Everything downstream -
+    /// the effective buffer scale and logical size, damage, hit-testing and the
+    /// renderer - then works in logical units with no further changes. Buffer
+    /// damage needs no conversion: it maps through the effective buffer scale.
+    /// The raw values are stored first so a later phase can recompute with a
+    /// new S. Returns the payload unchanged for a normal client.
+    fn normalize_commit_payload(
+        mut payload: SurfaceCommitPayload,
+        scale: WireScale,
+    ) -> SurfaceCommitPayload {
+        if scale.is_one() {
+            return payload;
+        }
+        let raw_buffer_scale = payload.buffer_scale;
+        let raw_viewport = payload.viewport;
+        let raw_input = payload.input_region.clone();
+        let raw_opaque = payload.opaque_region.clone();
+        payload.wire_inputs = Some(WireInputs {
+            scale,
+            buffer_scale: raw_buffer_scale,
+            viewport: raw_viewport,
+            input_region: raw_input.clone(),
+            opaque_region: raw_opaque.clone(),
+        });
+        // Effective buffer scale: the client renders at scale 1 (or its own
+        // scale), tema reads the buffer as if it were S times denser.
+        payload.buffer_scale = raw_buffer_scale.saturating_mul(scale.get() as i32);
+        payload.viewport = logical_viewport(raw_viewport, scale);
+        payload.damage_surface = payload
+            .damage_surface
+            .iter()
+            .map(|rect| damage_rect_to_logical(*rect, scale))
+            .collect();
+        payload.offset =
+            (scale.pos_to_logical(payload.offset.0), scale.pos_to_logical(payload.offset.1));
+        (payload.input_region, payload.opaque_region) =
+            logical_regions(raw_input, raw_opaque, scale);
+        payload
+    }
+
+    /// Recompute the on-screen logical size, viewport and regions for a new
+    /// wire scale, without a new commit. A commit made at scale 1 has no stored
+    /// raw inputs: the on-screen values are those inputs. Returns whether the
+    /// on-screen state changed.
+    pub(crate) fn recompute_for_wire_scale(&mut self, state: &State, scale: WireScale) -> bool {
+        if self
+            .on_screen
+            .wire_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.scale == scale)
+        {
+            return false;
+        }
+        if self.on_screen.wire_inputs.is_none() && scale.is_one() {
+            return false;
+        }
+        let raw = self.on_screen.wire_inputs.clone().unwrap_or(WireInputs {
+            scale: WireScale::ONE,
+            buffer_scale: self.on_screen.buffer_scale,
+            viewport: self.on_screen.viewport,
+            input_region: self.on_screen.input_region.clone(),
+            opaque_region: self.on_screen.opaque_region.clone(),
+        });
+        let buffer_scale = raw.buffer_scale.saturating_mul(scale.get() as i32);
+        let viewport = logical_viewport(raw.viewport, scale);
+        if let Some(buffer_id) = self.on_screen.buffer_object_id {
+            if let Some(buffer) = buffer_id.try_ref(state) {
+                let (width, height) = buffer.dimensions();
+                let buffer_size = SizeI { width, height };
+                self.on_screen.logical_size = Some(transform::derive_logical_size(
+                    buffer_size,
+                    self.on_screen.buffer_transform,
+                    buffer_scale,
+                    viewport,
+                ));
+                self.on_screen.sample_transform = transform::surface_sample_transform(
+                    buffer_size,
+                    self.on_screen.buffer_transform,
+                    buffer_scale,
+                    viewport,
+                );
+            }
+        }
+        let (input_region, opaque_region) =
+            logical_regions(raw.input_region.clone(), raw.opaque_region.clone(), scale);
+        self.on_screen.buffer_scale = buffer_scale;
+        self.on_screen.viewport = viewport;
+        self.on_screen.input_region = input_region;
+        self.on_screen.opaque_region = opaque_region;
+        if scale.is_one() {
+            self.on_screen.wire_inputs = None;
+        } else {
+            self.on_screen.wire_inputs = Some(WireInputs { scale, ..raw });
+        }
+        true
     }
 
     fn cache_commit_payload(
@@ -1388,6 +1598,7 @@ impl WlSurface {
                 cached.payload.damage_buffer.extend(payload.damage_buffer);
                 cached.payload.input_region = payload.input_region;
                 cached.payload.opaque_region = payload.opaque_region;
+                cached.payload.wire_inputs = payload.wire_inputs;
                 cached.frame_callbacks.extend(frame_callbacks);
                 return std::mem::replace(
                     &mut cached.presentation_feedbacks,
@@ -1629,6 +1840,7 @@ impl WlSurface {
             input_region: payload.input_region.clone(),
             opaque_region: payload.opaque_region.clone(),
             release_callbacks: payload.release_callbacks.clone(),
+            wire_inputs: payload.wire_inputs.clone(),
         })
     }
 
@@ -1852,6 +2064,7 @@ impl WlSurface {
                     input_region: payload.input_region.clone(),
                     opaque_region: payload.opaque_region.clone(),
                     release_callbacks: Vec::new(),
+                    wire_inputs: payload.wire_inputs.clone(),
                 };
                 if let Some(resolved) = resolved {
                     crate::input::pointer_lock::release_pointer_lock_for_surface(
@@ -1929,6 +2142,7 @@ impl WlSurface {
                     input_region: self.on_screen.input_region.clone(),
                     opaque_region: self.on_screen.opaque_region.clone(),
                     release_callbacks: Vec::new(),
+                    wire_inputs: self.on_screen.wire_inputs.clone(),
                 },
             ) else {
                 log::warn!("failed to recompute mapped state for current surface {:?}", self.id);
@@ -1945,6 +2159,7 @@ impl WlSurface {
         if !commit_blocked {
             self.on_screen.input_region = payload.input_region.clone();
             self.on_screen.opaque_region = payload.opaque_region.clone();
+            self.on_screen.wire_inputs = payload.wire_inputs.clone();
             committed_damage = self.committed_damage_region(
                 state,
                 payload,
@@ -2172,7 +2387,14 @@ impl WlSurface {
 
         let constraint_region = this.pending.pointer_constraint_region.take();
         let constraint_hint = this.pending.pointer_constraint_hint.take();
-        let payload = this.build_commit_payload();
+        // The payload of a wire-scaled client is normalized to logical units
+        // here, once, before it is cached or applied, so synchronized
+        // subsurfaces and the on-screen state both work in logical units.
+        // The pending state above was validated in the client's own wire
+        // units, exactly as the client sent it.
+        let wire_scale = dispatcher.wire_scale();
+        let payload =
+            WlSurface::normalize_commit_payload(this.build_commit_payload(wire_scale), wire_scale);
         apply_pointer_constraint_commit(&this, state, constraint_region, constraint_hint);
         if this.pointer_constraint().is_some() {
             dispatcher.dispatch_post_action(crate::input::pointer_lock::RecheckPointerLock);
@@ -2838,6 +3060,7 @@ impl WlSurface {
             input_region: RegionValue::infinite(),
             opaque_region: RegionValue::empty(),
             release_callbacks: Vec::new(),
+            wire_inputs: None,
         };
     }
 
@@ -2914,6 +3137,7 @@ impl WlSurface {
             input_region: next.input_region,
             opaque_region: next.opaque_region,
             release_callbacks: next.release_callbacks,
+            wire_inputs: next.wire_inputs,
         };
     }
 
@@ -3293,7 +3517,10 @@ mod tests {
             WlSurface,
         },
         crate::{
-            clients::{Client, ClientId, ClientManagerAction, RawEvent, RawRequest, Resolved},
+            capture::{test_sent_arg, test_sent_opcodes},
+            clients::{
+                Client, ClientAction, ClientId, ClientManagerAction, RawEvent, RawRequest, Resolved,
+            },
             cursor::CursorSourceRef,
             drm::VisualAnimationPumpAction,
             input::{focus::set_keyboard_focus, SurfaceFocus},
@@ -3305,9 +3532,10 @@ mod tests {
                 WpViewportId, XdgSurfaceId, XdgToplevelId, XdgWmBaseId, XwaylandSurfaceV1Id,
             },
             region::{DamageRegion, RectI, RegionSpec, RegionValue},
-            runner::Dispatcher,
+            runner::{Dispatcher, Model},
             state::{
-                BackendOutputRef, DrmId, FractionalScale, ObjectId, Output, OutputMode, State,
+                BackendOutputRef, DrmId, FractionalScale, ObjectId, Output, OutputId, OutputMode,
+                State,
             },
             sync::SurfaceSyncState,
             test_support::{
@@ -3328,6 +3556,7 @@ mod tests {
                     XdgSurface,
                 },
             },
+            wire_scale::WireScale,
             xwayland::{SurfaceEvent, XwaylandAction},
         },
     };
@@ -3351,6 +3580,7 @@ mod tests {
             input_region: RegionValue::infinite(),
             opaque_region: RegionValue::empty(),
             release_callbacks: Vec::new(),
+            wire_inputs: None,
         };
         surface
     }
@@ -5645,6 +5875,454 @@ mod tests {
         )));
     }
 
+    const SURFACE_ID: u32 = 9;
+    const FRACTIONAL_ID: u32 = 77;
+
+    /// A 2x output: mode 2560x1440 gives a logical size of 1280x720.
+    fn two_x_state() -> (State, OutputId) {
+        let mut state = state_for_tests();
+        let output_id = state.insert_output(test_output_with_crtc_name(
+            BackendOutputRef::new(DrmId::from(1usize)),
+            1,
+            0,
+            0,
+            2560,
+            1440,
+        ));
+        state.outputs.try_get_mut(output_id).unwrap().scale = FractionalScale::TWO;
+        (state, output_id)
+    }
+
+    /// A surface whose fractional-scale object lives in `state`, matching the
+    /// object the `get_fractional_scale` manager send uses.
+    fn fractional_surface() -> (State, OutputId, WlSurface) {
+        let (mut state, output_id) = two_x_state();
+        let surface_object_id = insert_surface(
+            &mut state,
+            WlSurface::new(WlSurfaceId::from(SURFACE_ID), ClientId::from_raw(9), 6),
+        );
+        let fractional_object_id = attach_fractional_scale_object(&mut state, surface_object_id);
+        let mut surface = WlSurface::new(WlSurfaceId::from(SURFACE_ID), ClientId::from_raw(9), 6);
+        surface.fractional_scale_object = Some(Resolved::new(
+            ClientId::from_raw(1),
+            WpFractionalScaleV1Id::from(FRACTIONAL_ID),
+            fractional_object_id,
+        ));
+        (state, output_id, surface)
+    }
+
+    #[test]
+    fn wire_scaled_client_gets_preferred_buffer_scale_one() {
+        let (state, output_id) = two_x_state();
+        let mut surface = WlSurface::new(WlSurfaceId::from(SURFACE_ID), ClientId::from_raw(9), 6);
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        client.set_wire_scale_for_tests(WireScale::new(2));
+        {
+            let mut cd = client.test_dispatcher(&mut dispatcher);
+            surface.send_preferred_buffer_state_for_object(&state, Some(output_id), &mut cd);
+        }
+        assert!(test_sent_arg(&dispatcher, SURFACE_ID, 2, 1));
+        assert_eq!(surface.preferred_buffer_scale_sent, Some(1));
+
+        // The cache holds the value that was sent, so a second call is quiet.
+        let mut again = Dispatcher::default();
+        {
+            let mut cd = client.test_dispatcher(&mut again);
+            surface.send_preferred_buffer_state_for_object(&state, Some(output_id), &mut cd);
+        }
+        assert!(test_sent_opcodes(&again, SURFACE_ID).is_empty());
+    }
+
+    #[test]
+    fn normal_client_gets_preferred_buffer_scale_from_output() {
+        let (state, output_id) = two_x_state();
+        let mut surface = WlSurface::new(WlSurfaceId::from(SURFACE_ID), ClientId::from_raw(9), 6);
+        let (client, mut dispatcher) = test_client_and_dispatcher(9);
+        {
+            let mut cd = client.test_dispatcher(&mut dispatcher);
+            surface.send_preferred_buffer_state_for_object(&state, Some(output_id), &mut cd);
+        }
+        assert!(test_sent_arg(&dispatcher, SURFACE_ID, 2, 2));
+        assert_eq!(surface.preferred_buffer_scale_sent, Some(2));
+    }
+
+    #[test]
+    fn wire_scaled_client_gets_preferred_fractional_scale_120() {
+        let (state, output_id, mut surface) = fractional_surface();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        client.set_wire_scale_for_tests(WireScale::new(2));
+        {
+            let mut cd = client.test_dispatcher(&mut dispatcher);
+            surface.send_preferred_fractional_scale_for_object(&state, Some(output_id), &mut cd);
+        }
+        assert!(test_sent_arg(&dispatcher, FRACTIONAL_ID, 0, 120));
+        assert_eq!(surface.preferred_fractional_scale_sent, Some(120));
+
+        // The cache holds the value that was sent, so a second call is quiet.
+        let mut again = Dispatcher::default();
+        {
+            let mut cd = client.test_dispatcher(&mut again);
+            surface.send_preferred_fractional_scale_for_object(&state, Some(output_id), &mut cd);
+        }
+        assert!(test_sent_opcodes(&again, FRACTIONAL_ID).is_empty());
+    }
+
+    #[test]
+    fn normal_client_gets_preferred_fractional_scale_240() {
+        let (state, output_id, mut surface) = fractional_surface();
+        let (client, mut dispatcher) = test_client_and_dispatcher(9);
+        {
+            let mut cd = client.test_dispatcher(&mut dispatcher);
+            surface.send_preferred_fractional_scale_for_object(&state, Some(output_id), &mut cd);
+        }
+        assert!(test_sent_arg(&dispatcher, FRACTIONAL_ID, 0, 240));
+        assert_eq!(surface.preferred_fractional_scale_sent, Some(240));
+    }
+
+    /// An Xwayland client committing through the full `on_commit` path, like
+    /// [`XwaylandCommit`] but with a wire scale and an attachable buffer.
+    struct WireScaledCommit {
+        state: State,
+        client: Client,
+        dispatcher: Dispatcher,
+        surface: Resolved<WlSurfaceId>,
+    }
+
+    impl WireScaledCommit {
+        fn new(scale: WireScale) -> Self {
+            let mut state = state_for_tests();
+            let mut client = Client::new_xwayland_for_tests(ClientId::from_raw(4));
+            client.set_wire_scale_for_tests(scale);
+            let surface = client
+                .insert_object(
+                    &mut state,
+                    WlSurface::new(WlSurfaceId::from(4), client.client_id(), 6),
+                )
+                .0;
+            assert!(surface.grab(&mut state).assign_xwayland_role());
+            Self { state, client, dispatcher: Dispatcher::default(), surface }
+        }
+
+        fn with_surface(&mut self, with: impl FnOnce(&mut WlSurface)) {
+            with(&mut self.surface.grab(&mut self.state));
+        }
+
+        fn attach_buffer(&mut self, id: u32, width: i32, height: i32) {
+            let buffer_id = WlBufferId::from(id);
+            let object_id = insert_test_shm_buffer(
+                &mut self.state,
+                self.client.client_id(),
+                buffer_id,
+                width,
+                height,
+            );
+            let buffer = Resolved::new(self.client.client_id(), buffer_id, object_id);
+            self.with_surface(|surface| surface.pending.buffer = Some(Some(buffer)));
+        }
+
+        fn commit(&mut self) {
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            let mut surface = self.surface.grab(&mut self.state);
+            surface.on_commit(&mut self.client, &mut self.state, &mut client_dispatcher);
+        }
+
+        fn check(&self, check: impl FnOnce(&OnScreen)) {
+            check(&self.surface.rref(&self.state).on_screen);
+        }
+
+        fn stays_connected(&self) -> bool {
+            let client_id = self.client.client_id();
+            !self.dispatcher.test_has_queued_action(|action: &ClientManagerAction| {
+                matches!(action, ClientManagerAction::Close { id } if *id == client_id)
+            })
+        }
+    }
+
+    #[test]
+    fn wire_scaled_commit_reads_the_buffer_at_the_effective_scale() {
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.attach_buffer(9100, 200, 100);
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 100, height: 50 }));
+            assert_eq!(on_screen.buffer_scale, 2);
+            let wire = on_screen.wire_inputs.as_ref().unwrap();
+            assert_eq!(wire.scale, WireScale::new(2));
+            assert_eq!(wire.buffer_scale, 1);
+            assert_eq!(wire.viewport, SurfaceViewport::default());
+            assert_eq!(wire.input_region, RegionValue::infinite());
+            assert_eq!(wire.opaque_region, RegionValue::empty());
+        });
+
+        // An odd wire size rounds up to the next logical pixel.
+        commit.attach_buffer(9101, 201, 101);
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 101, height: 51 }));
+        });
+    }
+
+    #[test]
+    fn changing_the_wire_scale_recomputes_an_on_screen_buffer_without_a_new_commit() {
+        let mut commit = WireScaledCommit::new(WireScale::ONE);
+        commit.attach_buffer(9100, 200, 100);
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 200, height: 100 }));
+            assert!(on_screen.wire_inputs.is_none());
+        });
+
+        commit
+            .client
+            .process(
+                &mut commit.state,
+                ClientAction::SetWireScale { scale: WireScale::new(2) },
+                &mut commit.dispatcher,
+            )
+            .unwrap();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 100, height: 50 }));
+            assert_eq!(on_screen.buffer_scale, 2);
+            assert_eq!(on_screen.wire_inputs.as_ref().unwrap().buffer_scale, 1);
+        });
+        assert!(commit.dispatcher.test_has_queued_action(
+            |action: &crate::xwayland::XwaylandAction| {
+                matches!(action, crate::xwayland::XwaylandAction::Reconfigure)
+            }
+        ));
+
+        let queued = commit
+            .dispatcher
+            .test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::Reconfigure)
+            });
+        commit
+            .client
+            .process(
+                &mut commit.state,
+                ClientAction::SetWireScale { scale: WireScale::new(2) },
+                &mut commit.dispatcher,
+            )
+            .unwrap();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 100, height: 50 }));
+        });
+        assert_eq!(
+            commit
+                .dispatcher
+                .test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                    matches!(action, crate::xwayland::XwaylandAction::Reconfigure)
+                }),
+            queued,
+        );
+    }
+
+    #[test]
+    fn wire_scaled_commit_multiplies_the_clients_own_buffer_scale() {
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.with_surface(|surface| surface.pending.buffer_scale = 2);
+        commit.attach_buffer(9100, 200, 100);
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 50, height: 25 }));
+            assert_eq!(on_screen.buffer_scale, 4);
+            assert_eq!(on_screen.wire_inputs.as_ref().unwrap().buffer_scale, 2);
+        });
+    }
+
+    #[test]
+    fn wire_scaled_surface_damage_rounds_outward() {
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.attach_buffer(9100, 200, 100);
+        commit.commit();
+        commit.with_surface(|surface| {
+            surface
+                .pending
+                .damage_surface
+                .push(DamageRect { x: 1, y: 1, width: 3, height: 3 });
+            // Drop the first commit's full damage so the explicit rect shows.
+            surface.on_screen.damage.clear();
+        });
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.damage.rects(), &[RectI { x: 0, y: 0, width: 2, height: 2 }]);
+        });
+    }
+
+    #[test]
+    fn wire_scaled_input_region_rounds_outward_and_opaque_region_inward() {
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.attach_buffer(9100, 200, 100);
+        commit.with_surface(|surface| {
+            surface.pending.input_region = Some(region_value(0, 0, 200, 100));
+            surface.pending.opaque_region = Some(region_value(1, 0, 2, 2));
+        });
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.input_region, region_value(0, 0, 100, 50));
+            assert!(on_screen.input_region.contains(49, 24));
+            assert!(!on_screen.input_region.contains(100, 50));
+            // The inward rect shrinks to nothing: not opaque at all.
+            assert_eq!(on_screen.opaque_region, RegionValue::empty());
+            let wire = on_screen.wire_inputs.as_ref().unwrap();
+            assert_eq!(wire.input_region, region_value(0, 0, 200, 100));
+            assert_eq!(wire.opaque_region, region_value(1, 0, 2, 2));
+        });
+    }
+
+    #[test]
+    fn wire_scaled_regions_fall_back_to_the_raw_wire_inputs() {
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.attach_buffer(9100, 200, 100);
+        commit.with_surface(|surface| {
+            surface.pending.input_region = Some(region_value(0, 0, 100, 100));
+        });
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.input_region, region_value(0, 0, 50, 50));
+        });
+
+        // A commit with a new buffer and no region request falls back to the
+        // raw region and normalizes it exactly once: still (0,0,50,50), not
+        // (0,0,25,25).
+        commit.attach_buffer(9101, 200, 100);
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.input_region, region_value(0, 0, 50, 50));
+            assert_eq!(
+                on_screen.wire_inputs.as_ref().unwrap().input_region,
+                region_value(0, 0, 100, 100),
+            );
+        });
+    }
+
+    #[test]
+    fn wire_scaled_viewport_destination_rounds_to_logical() {
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.attach_buffer(9100, 200, 100);
+        commit.with_surface(|surface| {
+            surface.pending.viewport.dst = Some(SizeI { width: 400, height: 200 });
+        });
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 200, height: 100 }));
+            assert_eq!(on_screen.viewport.dst, Some(SizeI { width: 200, height: 100 }));
+            assert_eq!(
+                on_screen.wire_inputs.as_ref().unwrap().viewport.dst,
+                Some(SizeI { width: 400, height: 200 }),
+            );
+        });
+    }
+
+    #[test]
+    fn wire_scaled_viewport_source_keeps_the_clients_integer_request() {
+        // The client sends an integer source of (0, 0, 201, 101) with no
+        // destination. The raw pending values pass the mapping validation;
+        // the normalized source becomes fractional (100.5 x 50.5) and the
+        // logical size rounds up.
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.attach_buffer(9100, 201, 101);
+        commit.with_surface(|surface| {
+            surface.pending.viewport.src =
+                Some(transform::RectF { x: 0.0, y: 0.0, width: 201.0, height: 101.0 });
+        });
+        commit.commit();
+        assert!(commit.stays_connected());
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 101, height: 51 }));
+            assert_eq!(
+                on_screen.viewport.src,
+                Some(transform::RectF { x: 0.0, y: 0.0, width: 100.5, height: 50.5 }),
+            );
+            assert_eq!(
+                on_screen.wire_inputs.as_ref().unwrap().viewport.src,
+                Some(transform::RectF { x: 0.0, y: 0.0, width: 201.0, height: 101.0 }),
+            );
+        });
+    }
+
+    #[test]
+    fn wire_scaled_offset_moves_in_logical_units() {
+        let mut commit = WireScaledCommit::new(WireScale::new(2));
+        commit.attach_buffer(9100, 200, 100);
+        commit.commit();
+        commit.check(|on_screen| assert_eq!((on_screen.x, on_screen.y), (0, 0)));
+
+        commit.attach_buffer(9101, 200, 100);
+        commit.with_surface(|surface| surface.pending.offset = (3, 5));
+        commit.commit();
+        commit.check(|on_screen| assert_eq!((on_screen.x, on_screen.y), (1, 2)));
+    }
+
+    #[test]
+    fn wire_scale_one_is_the_identity_on_commit() {
+        let mut commit = WireScaledCommit::new(WireScale::ONE);
+        commit.attach_buffer(9100, 200, 100);
+        commit.with_surface(|surface| {
+            surface.pending.input_region = Some(region_value(0, 0, 100, 100));
+            surface.pending.opaque_region = Some(region_value(1, 0, 2, 2));
+        });
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.logical_size, Some(SizeI { width: 200, height: 100 }));
+            assert_eq!(on_screen.buffer_scale, 1);
+            assert_eq!(on_screen.input_region, region_value(0, 0, 100, 100));
+            assert_eq!(on_screen.opaque_region, region_value(1, 0, 2, 2));
+            assert!(on_screen.wire_inputs.is_none());
+        });
+
+        commit.with_surface(|surface| {
+            surface
+                .pending
+                .damage_surface
+                .push(DamageRect { x: 1, y: 1, width: 3, height: 3 });
+            surface.on_screen.damage.clear();
+        });
+        commit.commit();
+        commit.check(|on_screen| {
+            assert_eq!(on_screen.damage.rects(), &[RectI { x: 1, y: 1, width: 3, height: 3 }]);
+        });
+    }
+
+    #[test]
+    fn a_normal_client_is_never_normalized() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface = client
+            .insert_object(&mut state, WlSurface::new(WlSurfaceId::from(9), client.client_id(), 6))
+            .0;
+        let buffer_id = WlBufferId::from(9100);
+        let object_id = insert_test_shm_buffer(&mut state, client.client_id(), buffer_id, 200, 100);
+        {
+            let mut surface = surface.grab(&mut state);
+            surface.pending.buffer =
+                Some(Some(Resolved::new(client.client_id(), buffer_id, object_id)));
+            surface.pending.input_region = Some(region_value(0, 0, 100, 100));
+        }
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = surface.grab(&mut state);
+            surface.on_commit(&mut client, &mut state, &mut client_dispatcher);
+        }
+
+        let on_screen = &surface.rref(&state).on_screen;
+        assert_eq!(on_screen.logical_size, Some(SizeI { width: 200, height: 100 }));
+        assert_eq!(on_screen.buffer_scale, 1);
+        assert_eq!(on_screen.input_region, region_value(0, 0, 100, 100));
+        assert!(on_screen.wire_inputs.is_none());
+
+        // A commit without a region request keeps today's on-screen fallback.
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = surface.grab(&mut state);
+            surface.pending.buffer = None;
+            surface.on_commit(&mut client, &mut state, &mut client_dispatcher);
+        }
+        let on_screen = &surface.rref(&state).on_screen;
+        assert_eq!(on_screen.input_region, region_value(0, 0, 100, 100));
+        assert!(on_screen.wire_inputs.is_none());
+    }
+
     #[test]
     fn pending_null_like_regions_can_be_committed_explicitly() {
         let mut surface = make_surface();
@@ -5994,6 +6672,7 @@ mod tests {
                 input_region: RegionValue::infinite(),
                 opaque_region: RegionValue::empty(),
                 release_callbacks: Vec::new(),
+                wire_inputs: None,
             },
             vec![resolved_callback(7)],
             vec![feedback(17, 2)],
@@ -6012,6 +6691,7 @@ mod tests {
                 input_region: RegionValue::empty(),
                 opaque_region: RegionValue::infinite(),
                 release_callbacks: Vec::new(),
+                wire_inputs: None,
             },
             vec![resolved_callback(8)],
             vec![feedback(18, 2)],

@@ -63,7 +63,8 @@ impl ZwpPointerConstraintsV1 {
             return Ok(None);
         };
         let region = client.resolve_or_disconnect(region, state, dispatcher)?;
-        Ok(Some(region.rref(state).snapshot()))
+        let snapshot = region.rref(state).snapshot();
+        Ok(Some(dispatcher.wire_scale().region_to_logical_outward(snapshot)))
     }
 
     fn reject_constraint(
@@ -535,5 +536,100 @@ mod tests {
         assert!(fixture
             .client
             .contains_object(ZwpLockedPointerV1Id::from(7), &fixture.state));
+    }
+
+    fn rect_region(x: i32, y: i32, width: i32, height: i32) -> crate::region::RegionValue {
+        let mut spec = crate::region::RegionSpec::default();
+        spec.add_rect(crate::region::RectI::new(x, y, width, height).unwrap());
+        crate::region::RegionValue::from_spec(spec)
+    }
+
+    fn add_region(fixture: &mut Fixture, id: u32, x: i32, y: i32, width: i32, height: i32) {
+        let (region, _) = fixture.client.insert_object(
+            &mut fixture.state,
+            WlRegion::new(crate::protocol_generated::WlRegionId::from(id)),
+        );
+        dispatch(
+            &mut fixture.state,
+            &mut fixture.client,
+            &mut fixture.dispatcher,
+            region.object_id(),
+            request(id, 1, &[x as u32, y as u32, width as u32, height as u32]),
+        );
+    }
+
+    #[test]
+    fn a_wire_scaled_confine_region_is_stored_in_logical_units() {
+        let mut scaled = fixture();
+        scaled
+            .client
+            .set_wire_scale_for_tests(crate::wire_scale::WireScale::new(2));
+        add_region(&mut scaled, 9, 0, 0, 100, 100);
+        let object = scaled.constraints.object_id();
+        dispatch(
+            &mut scaled.state,
+            &mut scaled.client,
+            &mut scaled.dispatcher,
+            object,
+            request(6, 2, &[8, 4, 5, 9, zwp_pointer_constraints_v1::Lifetime::Persistent as u32]),
+        );
+        let confine = scaled
+            .client
+            .resolve(ZwpConfinedPointerV1Id::from(8), &scaled.state)
+            .unwrap();
+        assert_eq!(confine.rref(&scaled.state).region(), Some(&rect_region(0, 0, 50, 50)));
+
+        let mut at_one = fixture();
+        add_region(&mut at_one, 9, 0, 0, 100, 100);
+        let object = at_one.constraints.object_id();
+        dispatch(
+            &mut at_one.state,
+            &mut at_one.client,
+            &mut at_one.dispatcher,
+            object,
+            request(6, 2, &[8, 4, 5, 9, zwp_pointer_constraints_v1::Lifetime::Oneshot as u32]),
+        );
+        let confine = at_one
+            .client
+            .resolve(ZwpConfinedPointerV1Id::from(8), &at_one.state)
+            .unwrap();
+        assert_eq!(confine.rref(&at_one.state).region(), Some(&rect_region(0, 0, 100, 100)));
+    }
+
+    #[test]
+    fn a_wire_scaled_set_region_and_hint_are_divided_on_commit() {
+        let mut fixture = fixture();
+        fixture
+            .client
+            .set_wire_scale_for_tests(crate::wire_scale::WireScale::new(2));
+        add_region(&mut fixture, 9, 0, 0, 100, 100);
+        lock(&mut fixture, 7, 0, zwp_pointer_constraints_v1::Lifetime::Persistent as u32);
+        let lock = fixture
+            .client
+            .resolve(ZwpLockedPointerV1Id::from(7), &fixture.state)
+            .unwrap();
+        dispatch(
+            &mut fixture.state,
+            &mut fixture.client,
+            &mut fixture.dispatcher,
+            lock.object_id(),
+            request(7, 2, &[9]),
+        );
+        dispatch(
+            &mut fixture.state,
+            &mut fixture.client,
+            &mut fixture.dispatcher,
+            lock.object_id(),
+            request(7, 1, &[9 * 256, 9 * 256]),
+        );
+        dispatch(
+            &mut fixture.state,
+            &mut fixture.client,
+            &mut fixture.dispatcher,
+            fixture.surface.object_id(),
+            request(4, 6, &[]),
+        );
+        assert_eq!(lock.rref(&fixture.state).region(), Some(&rect_region(0, 0, 50, 50)));
+        assert_eq!(lock.rref(&fixture.state).committed_hint(), Some((4.5, 4.5)));
     }
 }

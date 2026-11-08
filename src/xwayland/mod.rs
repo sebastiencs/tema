@@ -128,6 +128,8 @@ pub(crate) enum XwaylandAction {
     },
     /// Send `ConfigureWindow` for managed windows whose layout rect changed.
     Reconfigure,
+    /// Rewrite Xft / Xcursor hints and upload the root cursor again.
+    RefreshHints,
     /// The seat's keyboard focus changed. The current run's WM reads it.
     KeyboardFocus,
     /// A Wayland client asked for the bytes of an X selection.
@@ -621,6 +623,9 @@ impl Model for Xwayland {
             XwaylandAction::Wm { run, event } => self.on_wm(run, event, state, dispatcher),
             XwaylandAction::Reconfigure => {
                 self.on_wm(self.run, xwm::WmEvent::Reconfigure, state, dispatcher)
+            }
+            XwaylandAction::RefreshHints => {
+                self.on_wm(self.run, xwm::WmEvent::RefreshHints, state, dispatcher)
             }
             XwaylandAction::KeyboardFocus => {
                 self.on_wm(self.run, xwm::WmEvent::KeyboardFocus, state, dispatcher)

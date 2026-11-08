@@ -240,6 +240,28 @@ pub(crate) fn delete_property(window: Window, property: Atom) -> DeleteProperty 
     DeleteProperty { window, property }
 }
 
+/// `FreeCursor`. The window keeps its own reference after `ChangeWindowAttributes`.
+pub(crate) struct FreeCursor {
+    pub(crate) cursor: super::generated::Cursor,
+}
+
+impl super::generated::Request for FreeCursor {
+    const NAME: &'static str = "FreeCursor";
+    const EXTENSION: Option<super::generated::ExtensionName> = None;
+    const OPCODE: u8 = 95;
+    type Reply = super::generated::NoReply;
+
+    fn serialize(
+        &self,
+        writer: &mut super::wire::Writer<'_>,
+        _major_opcode: u8,
+    ) -> Result<(), super::wire::WireError> {
+        writer.begin_request(Self::OPCODE, 0);
+        self.cursor.serialize(writer);
+        writer.finish_request()
+    }
+}
+
 fn u32s_to_bytes(values: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for value in values {

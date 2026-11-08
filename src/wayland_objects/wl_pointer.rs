@@ -179,7 +179,15 @@ impl Object for WlPointer {
                                 return Ok(());
                             }
                         }
-                        state.seat.set_cursor_surface(surface, hotspot_x, hotspot_y)
+                        // The hotspot arrives in the client's wire units. The
+                        // cursor surface's attach offset is already logical:
+                        // its commit divided that offset by S.
+                        let scale = dispatcher.wire_scale();
+                        state.seat.set_cursor_surface(
+                            surface,
+                            scale.pos_to_logical(hotspot_x),
+                            scale.pos_to_logical(hotspot_y),
+                        )
                     }
                 };
                 if cursor_changed {
@@ -200,5 +208,75 @@ impl Object for WlPointer {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        clients::{Arguments, Client, ClientId, RawRequest},
+        cursor::CursorSourceRef,
+        input::{
+            types::{SurfaceFocusPick, SurfaceRect},
+            SurfaceFocus,
+        },
+        protocol_generated::{WlPointerId, WlSurfaceId},
+        runner::Dispatcher,
+        test_support::{state_for_tests, test_client_and_dispatcher},
+        wayland_objects::wl_surface::WlSurface,
+        wire_scale::WireScale,
+    };
+
+    use super::WlPointer;
+
+    fn set_cursor(scale: WireScale) -> (i32, i32) {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(1);
+        client.set_wire_scale_for_tests(scale);
+        let (surface, _) = client.insert_object(
+            &mut state,
+            WlSurface::new(WlSurfaceId::from(4), ClientId::from_raw(1), 6),
+        );
+        let (pointer, _) =
+            client.insert_object(&mut state, WlPointer::new(WlPointerId::from(5), 9));
+        state.seat.pointer_focus = Some(SurfaceFocusPick {
+            target: SurfaceFocus::new(surface),
+            rect: SurfaceRect { x: 0, y: 0, width: 10, height: 10 },
+        });
+        state.seat.record_pointer_enter(client.client_id(), 7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        client_dispatcher.set_requester_object_id_for_tests(pointer.wayland_id().into());
+        state
+            .objects
+            .grab(pointer.object_id())
+            .on(
+                &mut client,
+                &mut state,
+                RawRequest {
+                    object_id: 5,
+                    request_id: 0,
+                    arguments: Arguments::from_words(std::collections::VecDeque::from(vec![
+                        7, 4, 9, 9,
+                    ])),
+                    fds: None,
+                },
+                &mut client_dispatcher,
+            )
+            .unwrap();
+        drop(client_dispatcher);
+        match state.seat.visible_cursor_source() {
+            Some(CursorSourceRef::Surface { cursor }) => (cursor.hotspot_x, cursor.hotspot_y),
+            other => panic!("cursor was not the surface: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wire_scaled_hotspot_is_stored_in_logical_units() {
+        assert_eq!(set_cursor(WireScale::new(2)), (4, 4));
+    }
+
+    #[test]
+    fn wire_scale_one_leaves_the_hotspot_unchanged() {
+        assert_eq!(set_cursor(WireScale::ONE), (9, 9));
     }
 }

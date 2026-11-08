@@ -17,9 +17,13 @@ renderer = "opengl"
 outer_gap = 10
 inner_gap = 10
 
-# Xwayland starts lazily on the first X connection. Changing this requires a restart.
+# Xwayland starts lazily on the first X connection. Changing `enabled` requires a restart.
 [xwayland]
 enabled = true
+
+# "downscaled" lets X apps render at full resolution on HiDPI outputs.
+# They must scale themselves (set GDK_SCALE=2 for GTK).
+scaling_mode = "default"
 
 # Mouse move of a tiled window.
 # threshold is logical pixels before the window is picked up; 0 picks it up immediately.

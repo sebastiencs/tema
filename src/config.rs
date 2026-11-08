@@ -83,9 +83,29 @@ impl Default for RendererSelection {
     }
 }
 
+/// How Xwayland windows are rendered on HiDPI outputs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum XwaylandScalingMode {
+    /// X apps render at logical resolution and the compositor upscales them.
+    #[default]
+    Default,
+    /// X apps render at the full output resolution and the compositor downscales them.
+    Downscaled,
+}
+
+impl fmt::Display for XwaylandScalingMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Default => "default",
+            Self::Downscaled => "downscaled",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XwaylandConfig {
     pub enabled: bool,
+    pub scaling_mode: XwaylandScalingMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -518,6 +538,7 @@ fn output_scale_setting_from_f64(scale: f64) -> anyhow::Result<OutputScaleSettin
 #[serde(default, deny_unknown_fields)]
 struct XwaylandConfigFile {
     enabled: bool,
+    scaling_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -638,7 +659,10 @@ impl RuntimeConfig {
                 inner_gap: sanitize_non_negative_i32(parsed.general.inner_gap),
                 renderer: parse_renderer(&parsed.general.renderer)?,
             },
-            xwayland: XwaylandConfig { enabled: parsed.xwayland.enabled },
+            xwayland: XwaylandConfig {
+                enabled: parsed.xwayland.enabled,
+                scaling_mode: parse_xwayland_scaling_mode(&parsed.xwayland.scaling_mode)?,
+            },
             tiling: TilingConfig {
                 drag: TilingDragConfig {
                     threshold: sanitize_non_negative_i32(parsed.tiling.drag.threshold),
@@ -842,13 +866,27 @@ impl MouseBindingTrigger {
 
 impl Default for XwaylandConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, scaling_mode: XwaylandScalingMode::default() }
     }
 }
 
 impl Default for XwaylandConfigFile {
     fn default() -> Self {
-        Self { enabled: XwaylandConfig::default().enabled }
+        let defaults = XwaylandConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            scaling_mode: defaults.scaling_mode.to_string(),
+        }
+    }
+}
+
+fn parse_xwayland_scaling_mode(raw: &str) -> anyhow::Result<XwaylandScalingMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "default" => Ok(XwaylandScalingMode::Default),
+        "downscaled" => Ok(XwaylandScalingMode::Downscaled),
+        _ => {
+            bail!("invalid xwayland.scaling_mode `{raw}`; expected \"default\" or \"downscaled\"")
+        }
     }
 }
 
@@ -1190,8 +1228,14 @@ pub fn reload_from_disk(
         );
         next.xwayland.enabled = state.config.xwayland.enabled;
     }
+    let scaling_mode_changed = next.xwayland.scaling_mode != state.config.xwayland.scaling_mode;
     let changed = state.config != next;
     state.config = next;
+    if scaling_mode_changed {
+        // Ahead of `apply_output_settings`, so `SetWireScale` is queued before
+        // the output broadcasts that function may add.
+        dispatcher.dispatch(crate::clients::ClientManagerAction::XwaylandWireScaleChanged);
+    }
     apply_general_settings(state, dispatcher);
     apply_output_settings(state, dispatcher);
     if changed {
@@ -1213,6 +1257,9 @@ pub fn apply_general_settings(state: &mut State, dispatcher: &mut Dispatcher) {
     let changed = state
         .seat
         .set_cursor_theme(general.cursor_theme.clone(), general.cursor_size);
+    if changed {
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::RefreshHints);
+    }
     if changed && state.seat.cursor_is_visible() {
         request_outputs_for_points(state, [state.seat.pointer_position()], dispatcher);
     }
@@ -2314,10 +2361,53 @@ mod tests {
     }
 
     #[test]
+    fn xwayland_scaling_mode_defaults_to_default_and_parses_known_values() {
+        let xkb = Xkb::new();
+        assert_eq!(XwaylandScalingMode::default(), XwaylandScalingMode::Default);
+        assert_eq!(RuntimeConfig::default().xwayland.scaling_mode, XwaylandScalingMode::Default,);
+        assert_eq!(
+            RuntimeConfig::parse_for_test("", &xkb)
+                .unwrap()
+                .xwayland
+                .scaling_mode,
+            XwaylandScalingMode::Default,
+        );
+        assert_eq!(
+            RuntimeConfig::parse_for_test("[xwayland]\nscaling_mode = \"default\"\n", &xkb)
+                .unwrap()
+                .xwayland
+                .scaling_mode,
+            XwaylandScalingMode::Default,
+        );
+        assert_eq!(
+            RuntimeConfig::parse_for_test("[xwayland]\nscaling_mode = \"downscaled\"\n", &xkb)
+                .unwrap()
+                .xwayland
+                .scaling_mode,
+            XwaylandScalingMode::Downscaled,
+        );
+        assert_eq!(
+            RuntimeConfig::parse_for_test("[xwayland]\nscaling_mode = \"Downscaled\"\n", &xkb)
+                .unwrap()
+                .xwayland
+                .scaling_mode,
+            XwaylandScalingMode::Downscaled,
+        );
+        assert_eq!(XwaylandScalingMode::Downscaled.to_string(), "downscaled");
+    }
+
+    #[test]
+    fn rejects_an_unknown_xwayland_scaling_mode() {
+        let error =
+            RuntimeConfig::parse_for_test("[xwayland]\nscaling_mode = \"blurry\"\n", &Xkb::new())
+                .unwrap_err();
+        assert!(error.to_string().contains("invalid xwayland.scaling_mode"), "{error:#}");
+    }
+
+    #[test]
     fn rejects_unknown_xwayland_keys() {
         let error =
-            RuntimeConfig::parse_for_test("[xwayland]\nscaling_mode = \"default\"\n", &Xkb::new())
-                .unwrap_err();
+            RuntimeConfig::parse_for_test("[xwayland]\nbogus = 1\n", &Xkb::new()).unwrap_err();
         assert!(error.to_string().contains("unknown field"), "{error:#}");
     }
 
@@ -2361,6 +2451,109 @@ mod tests {
         assert!(changed);
         assert!(state.config.xwayland.enabled);
         assert_eq!(state.config.general.outer_gap, 16);
+    }
+
+    #[test]
+    fn reload_applies_a_changed_scaling_mode_and_keeps_running_enabled() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[xwayland]\nenabled = false\nscaling_mode = \"default\"\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[xwayland]\nenabled = true\nscaling_mode = \"downscaled\"\n").unwrap();
+
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        assert_eq!(state.config.xwayland.scaling_mode, XwaylandScalingMode::Downscaled);
+        assert!(!state.config.xwayland.enabled);
+    }
+
+    #[test]
+    fn reload_to_downscaled_on_a_2x_output_queues_set_wire_scale_first() {
+        use {
+            crate::{
+                clients::{ClientId, ClientManager, ClientManagerAction, ClientOrigin},
+                runner::Model,
+                state::FractionalScale,
+                test_support::test_output_drm0_wh,
+                wire_scale::WireScale,
+            },
+            std::os::unix::net::UnixStream,
+        };
+
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[xwayland]\nscaling_mode = \"default\"\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        state.insert_output(test_output_drm0_wh(800, 600));
+
+        let socket_dir = mktemp::Temp::new_dir().unwrap();
+        let mut manager =
+            ClientManager::bind(&socket_dir.to_path_buf().join("wayland-test")).unwrap();
+        let mut dispatcher = Dispatcher::default();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AdoptClient {
+                    fd: socket.into(),
+                    origin: ClientOrigin { xwayland: true, pid: None },
+                    adopted: crate::runner::Redispatcher::None,
+                    closed: crate::runner::Redispatcher::None,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let _ = dispatcher.test_take_queued_actions::<crate::clients::ClientAction>();
+
+        fs::write(
+            &path,
+            "[output.scales]\ntest-output = 2\n\n[xwayland]\nscaling_mode = \"downscaled\"\n",
+        )
+        .unwrap();
+        reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+        assert_eq!(state.outputs.iter().next().unwrap().1.scale, FractionalScale::TWO);
+
+        let manager_actions = dispatcher.test_take_queued_actions::<ClientManagerAction>();
+        assert!(manager_actions
+            .iter()
+            .any(|action| matches!(action, ClientManagerAction::XwaylandWireScaleChanged)));
+        for action in manager_actions {
+            manager
+                .process(&mut state, action, &mut dispatcher)
+                .unwrap();
+        }
+
+        assert_eq!(state.xwayland_wire_scale, WireScale::new(2));
+        let mut marks = Vec::new();
+        dispatcher.test_matching_actions_for::<crate::clients::ClientAction, ClientId>(
+            ClientId::from_raw(0),
+            |action| {
+                marks.push(match action {
+                    crate::clients::ClientAction::SetWireScale { scale } => scale.get(),
+                    crate::clients::ClientAction::OutputStateChanged { .. } => 0,
+                    _ => 99,
+                });
+            },
+        );
+        let scale_at = marks
+            .iter()
+            .position(|mark| *mark == 2)
+            .expect("set wire scale");
+        if let Some(output_at) = marks.iter().position(|mark| *mark == 0) {
+            assert!(scale_at < output_at);
+        }
     }
 
     #[test]
@@ -3281,5 +3474,27 @@ mod tests {
         assert_eq!(keyboard_surface(&state), Some(surface));
         assert!(output_frame_requested(&dispatcher, left));
         assert!(output_frame_requested(&dispatcher, right));
+    }
+
+    #[test]
+    fn a_cursor_size_change_asks_the_xwm_to_refresh_hints() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        state.config.general.cursor_size = 32;
+        apply_general_settings(&mut state, &mut dispatcher);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::RefreshHints)
+            }),
+            1
+        );
+        let _ = dispatcher.test_take_queued_actions::<crate::xwayland::XwaylandAction>();
+        apply_general_settings(&mut state, &mut dispatcher);
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::RefreshHints)
+            }),
+            0
+        );
     }
 }

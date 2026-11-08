@@ -5,7 +5,8 @@
 //!
 //! A paired, mapped window becomes a tema window once its first property batch
 //! has arrived. The layout owns that window's root position. An
-//! override-redirect window stays unmanaged at its X geometry.
+//! override-redirect window stays unmanaged: its geometry stays in X pixels,
+//! and the surface position and damage are the logical conversion.
 
 use crate::{
     clients::Resolved,
@@ -80,7 +81,10 @@ impl Rect {
 pub(super) struct Managed {
     pub(super) window: WindowId,
     pub(super) object: ObjectId,
+    /// Last `ConfigureWindow` rectangle sent to X, in X pixels.
     pub(super) configured: Option<Rect>,
+    /// Content size in logical pixels, not X pixels. `None` until placement
+    /// clamps the size into the workspace, or an interactive resize stores one.
     pub(super) floating_size: Option<(u32, u32)>,
 }
 
@@ -95,7 +99,9 @@ enum Presence {
 pub(super) struct XWindow {
     pub(super) id: Window,
     pub(super) override_redirect: bool,
+    /// Last known geometry, in X pixels.
     pub(super) geometry: Rect,
+    /// `ConfigureRequest` stored until map, in X pixels.
     pub(super) pending: Rect,
     pub(super) mapped: bool,
     pub(super) serial: Option<u64>,
@@ -498,6 +504,8 @@ impl Wm {
         let net_wm_state =
             change_property_atoms(event.window, atoms._NET_WM_STATE, atoms.ATOM, &state);
         self.write_state(event.window, atoms.WM_STATE, NORMAL)?;
+        // `pending` is the X geometry from CreateNotify or ConfigureRequest.
+        // Placement does not rewrite it before map, so these values stay unscaled.
         if pending.has_size() {
             self.send_request(&ConfigureWindow {
                 window: event.window,
@@ -693,7 +701,7 @@ impl Wm {
         let window_id = ctx.state.allocate_window_id();
         let mut toplevel = XToplevel::new(window_id, id, ctx.run);
         if let Some(atoms) = atoms {
-            toplevel.refresh(&props, parent, &atoms);
+            toplevel.refresh(&props, parent, &atoms, ctx.wire_scale());
         }
         let (_, object) = ctx.state.insert_object(toplevel);
         ctx.state.insert_window(window_id, surface, object);
@@ -755,8 +763,11 @@ impl Wm {
             return;
         };
         let insets = crate::root_geometry::effective_decoration_insets(ctx.state, surface);
-        let content_width = i32::try_from(geometry.width).unwrap_or(i32::MAX);
-        let content_height = i32::try_from(geometry.height).unwrap_or(i32::MAX);
+        let scale = ctx.wire_scale();
+        let content_width =
+            scale.size_to_logical(i32::try_from(geometry.width).unwrap_or(i32::MAX));
+        let content_height =
+            scale.size_to_logical(i32::try_from(geometry.height).unwrap_or(i32::MAX));
         let mut frame_width = content_width
             .saturating_add(insets.left)
             .saturating_add(insets.right);
@@ -898,6 +909,7 @@ impl Wm {
         };
         let parent = self.managed_window(transient);
         let atoms = self.ready_atoms();
+        let scale = ctx.wire_scale();
         let (minimum_changed, title, app_id, parent_window) = {
             let Some(atoms) = atoms else { return };
             let Some(toplevel) = ctx
@@ -908,7 +920,7 @@ impl Wm {
             else {
                 return;
             };
-            let minimum_changed = toplevel.refresh(&props, parent, &atoms);
+            let minimum_changed = toplevel.refresh(&props, parent, &atoms, scale);
             (
                 minimum_changed,
                 toplevel.title().to_string(),
@@ -965,9 +977,16 @@ impl Wm {
     }
 
     pub(super) fn reconfigure(&mut self, ctx: &mut WmCtx<'_>) -> Result<(), WmFailure> {
+        // `state.xwayland_wire_scale` may already be the new S while Xwayland
+        // still has the previous output layout. Converting with that S can be
+        // briefly stale; this pass is what converges it.
         let ids = self.windows.keys().copied().collect::<Vec<_>>();
+        for id in &ids {
+            self.refresh_managed(*id, ctx);
+        }
         for id in ids {
             self.reconfigure_window(id, ctx)?;
+            self.reposition_unmanaged(id, ctx);
         }
         let managed = self
             .windows
@@ -978,6 +997,19 @@ impl Wm {
             crate::capture::sync_layout_shell_state(ctx.state, ctx.dispatcher, window);
         }
         Ok(())
+    }
+
+    /// Move a shown override-redirect window to the logical position of its
+    /// unchanged X geometry, and damage that rect.
+    fn reposition_unmanaged(&mut self, id: Window, ctx: &mut WmCtx<'_>) {
+        let Some(window) = self.windows.get(&id) else { return };
+        if window.managed.is_some() || !window.shown {
+            return;
+        }
+        let surface = window.surface;
+        let geometry = window.geometry;
+        place(surface, geometry, ctx);
+        damage(geometry, ctx);
     }
 
     pub(super) fn resize(
@@ -994,6 +1026,7 @@ impl Wm {
         else {
             return Ok(());
         };
+        // Logical content size. `reconfigure_window` multiplies it into the X ConfigureWindow.
         managed.floating_size = Some((at_least_one(width), at_least_one(height)));
         self.reconfigure_window(id, ctx)
     }
@@ -1040,8 +1073,9 @@ impl Wm {
         {
             return None;
         }
+        let scale = ctx.wire_scale();
         if let Some(layout) = ctx.state.tiled_window_geometry(tema_window) {
-            let content = layout.content_rect_global();
+            let content = scale.rect_to_wire(layout.content_rect_global());
             return Some(Rect {
                 x: content.x,
                 y: content.y,
@@ -1057,9 +1091,21 @@ impl Wm {
         } else if let Some((width, height)) = floating_size {
             (width.max(1), height.max(1))
         } else {
-            (geometry.width.max(1), geometry.height.max(1))
+            (
+                at_least_one(
+                    scale.size_to_logical(i32::try_from(geometry.width).unwrap_or(i32::MAX)),
+                ),
+                at_least_one(
+                    scale.size_to_logical(i32::try_from(geometry.height).unwrap_or(i32::MAX)),
+                ),
+            )
         };
-        Some(Rect { x, y, width, height })
+        Some(Rect {
+            x: scale.to_wire(x),
+            y: scale.to_wire(y),
+            width: scale.size_to_wire(width),
+            height: scale.size_to_wire(height),
+        })
     }
 
     pub(super) fn close(&mut self, id: Window) -> Result<(), WmFailure> {
@@ -1312,8 +1358,10 @@ fn reveal(surface: Option<Resolved<WlSurfaceId>>, ctx: &mut WmCtx<'_>) {
 fn place(surface: Option<Resolved<WlSurfaceId>>, geometry: Rect, ctx: &mut WmCtx<'_>) {
     reveal(surface, ctx);
     let Some(surface) = surface else { return };
+    let scale = ctx.wire_scale();
     if let Some(mut wl_surface) = surface.try_grab(ctx.state) {
-        wl_surface.set_root_position(geometry.x, geometry.y);
+        wl_surface
+            .set_root_position(scale.pos_to_logical(geometry.x), scale.pos_to_logical(geometry.y));
     }
 }
 
@@ -1358,5 +1406,6 @@ fn damage(rect: Rect, ctx: &mut WmCtx<'_>) {
     let Ok(width) = i32::try_from(rect.width) else { return };
     let Ok(height) = i32::try_from(rect.height) else { return };
     let Some(rect) = RectI::new(rect.x, rect.y, width, height) else { return };
+    let rect = ctx.wire_scale().rect_to_logical_outward(rect);
     request_outputs_for_rect(ctx.state, rect, ctx.dispatcher);
 }

@@ -78,7 +78,8 @@ impl ZwpConfinedPointerV1 {
             return Ok(None);
         };
         let region = client.resolve_or_disconnect(region, state, dispatcher)?;
-        Ok(Some(region.rref(state).snapshot()))
+        let snapshot = region.rref(state).snapshot();
+        Ok(Some(dispatcher.wire_scale().region_to_logical_outward(snapshot)))
     }
 }
 

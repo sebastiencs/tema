@@ -19,7 +19,13 @@ use super::{Wm, WmCtx, WmEvent, WmFailure, WmPhase, Xwayland, XwaylandAction};
 
 impl Wm {
     pub(super) fn begin_cursor(&mut self, ctx: &mut WmCtx<'_>) -> Result<(), WmFailure> {
-        let Some(image) = ctx.state.seat.default_cursor_image() else {
+        let pixels = ctx
+            .state
+            .config
+            .general
+            .cursor_size
+            .saturating_mul(ctx.wire_scale().get());
+        let Some(image) = ctx.state.seat.default_cursor_image_at(pixels) else {
             return Ok(());
         };
         let run = ctx.run;
@@ -126,6 +132,13 @@ impl Wm {
             value_list: ChangeWindowAttributesAux::default().cursor(cursor),
         })? {
             return Ok(());
+        }
+        let previous = match &mut self.phase {
+            WmPhase::Ready(ready) => ready.root_cursor.replace(cursor),
+            _ => None,
+        };
+        if let Some(old) = previous {
+            let _ = self.send(&crate::x11::FreeCursor { cursor: old })?;
         }
         if !self.send(&RenderFreePicture { picture })? {
             return Ok(());

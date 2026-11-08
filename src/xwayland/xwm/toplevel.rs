@@ -10,6 +10,7 @@ use crate::{
     runner::Dispatcher,
     state::{GrabbedObject, State},
     window::{InteractiveSizeConstraints, Toplevel, ToplevelDecorationMode, WindowId},
+    wire_scale::WireScale,
     x11::{Atom, Atoms, Window},
     xwayland::XwaylandAction,
 };
@@ -34,7 +35,10 @@ pub(crate) struct XToplevel {
     title: String,
     app_id: String,
     parent: Option<WindowId>,
+    /// Minimum content size in logical pixels. Raw ICCCM hints stay on
+    /// `WindowProps`; the fixed-size float rule compares those raw values.
     min_size: Option<(i32, i32)>,
+    /// Maximum content size in logical pixels.
     max_size: Option<(i32, i32)>,
     maximized: bool,
     fullscreen_requested: bool,
@@ -58,12 +62,14 @@ impl XToplevel {
         }
     }
 
-    /// Copies the fields the layout reads. Returns whether the minimum size changed.
+    /// Copies the fields the layout reads. Size hints are stored in logical
+    /// pixels. Returns whether the logical minimum size changed.
     pub(super) fn refresh(
         &mut self,
         props: &WindowProps,
         parent: Option<WindowId>,
         atoms: &Atoms,
+        scale: WireScale,
     ) -> bool {
         self.title = props.title.clone().unwrap_or_default();
         self.app_id = props.class.clone().unwrap_or_default();
@@ -72,10 +78,18 @@ impl XToplevel {
         self.fullscreen_requested = props.fullscreen;
         self.accepts_focus = accepts_focus(props, atoms);
         let previous_min = self.min_size;
-        self.min_size =
-            hinted_size(&props.normal_hints, P_MIN_SIZE, HINT_MIN_WIDTH, HINT_MIN_HEIGHT);
-        self.max_size =
-            hinted_size(&props.normal_hints, P_MAX_SIZE, HINT_MAX_WIDTH, HINT_MAX_HEIGHT);
+        let raw_min = hinted_size(&props.normal_hints, P_MIN_SIZE, HINT_MIN_WIDTH, HINT_MIN_HEIGHT);
+        let raw_max = hinted_size(&props.normal_hints, P_MAX_SIZE, HINT_MAX_WIDTH, HINT_MAX_HEIGHT);
+        self.min_size = raw_min
+            .map(|(width, height)| (scale.size_to_logical(width), scale.size_to_logical(height)));
+        self.max_size = raw_max.map(|(width, height)| {
+            let min_width = self.min_size.map(|size| size.0).unwrap_or(0);
+            let min_height = self.min_size.map(|size| size.1).unwrap_or(0);
+            (
+                scale.max_size_to_logical(width, min_width),
+                scale.max_size_to_logical(height, min_height),
+            )
+        });
         previous_min != self.min_size
     }
 }
@@ -237,8 +251,8 @@ mod tests {
         props.normal_hints = sized_hints(P_MIN_SIZE | P_MAX_SIZE, (80, 40), (800, 600));
 
         let atoms = test_atoms();
-        assert!(toplevel.refresh(&props, Some(parent), &atoms));
-        assert!(!toplevel.refresh(&props, Some(parent), &atoms));
+        assert!(toplevel.refresh(&props, Some(parent), &atoms, WireScale::ONE));
+        assert!(!toplevel.refresh(&props, Some(parent), &atoms, WireScale::ONE));
         assert!(toplevel.accepts_keyboard_focus());
         assert_eq!(toplevel.window(), WindowId::for_tests(3));
         assert_eq!(toplevel.title(), "Term");
@@ -253,6 +267,19 @@ mod tests {
     }
 
     #[test]
+    fn refresh_divides_size_hints_by_the_wire_scale() {
+        let mut toplevel = XToplevel::new(WindowId::for_tests(3), Window(9), 4);
+        let mut props = WindowProps::default();
+        props.normal_hints = sized_hints(P_MIN_SIZE | P_MAX_SIZE, (400, 300), (801, 601));
+
+        toplevel.refresh(&props, None, &test_atoms(), WireScale::new(2));
+
+        assert_eq!(toplevel.minimum_size(), Some((200, 150)));
+        assert_eq!(toplevel.size_constraints().clamp(1, 1), (200, 150));
+        assert_eq!(toplevel.size_constraints().clamp(10_000, 10_000), (400, 300));
+    }
+
+    #[test]
     fn refresh_drops_hints_without_flags_or_a_positive_pair() {
         let mut toplevel = XToplevel::new(WindowId::for_tests(1), Window(1), 1);
         let mut props = WindowProps::default();
@@ -260,7 +287,7 @@ mod tests {
         props.normal_hints = sized_hints(0, (80, 40), (800, 600));
 
         let atoms = test_atoms();
-        assert!(!toplevel.refresh(&props, None, &atoms));
+        assert!(!toplevel.refresh(&props, None, &atoms, WireScale::ONE));
         assert_eq!(toplevel.title(), "");
         assert_eq!(toplevel.app_id(), "");
         assert!(toplevel.parent_window().is_none());
@@ -271,13 +298,13 @@ mod tests {
 
         props.normal_hints = vec![P_MIN_SIZE | P_MAX_SIZE, 1, 2];
         let atoms = test_atoms();
-        assert!(!toplevel.refresh(&props, None, &atoms));
+        assert!(!toplevel.refresh(&props, None, &atoms, WireScale::ONE));
         assert_eq!(toplevel.minimum_size(), None);
         assert_eq!(toplevel.size_constraints().clamp(900, 700), (900, 700));
 
         props.normal_hints = sized_hints(P_MIN_SIZE | P_MAX_SIZE, (0, 40), (800, 0));
         let atoms = test_atoms();
-        assert!(!toplevel.refresh(&props, None, &atoms));
+        assert!(!toplevel.refresh(&props, None, &atoms, WireScale::ONE));
         assert_eq!(toplevel.minimum_size(), None);
         assert_eq!(toplevel.size_constraints().clamp(900, 700), (900, 700));
     }
@@ -288,17 +315,17 @@ mod tests {
         let mut toplevel = XToplevel::new(WindowId::for_tests(1), Window(1), 1);
         let mut props = WindowProps::default();
         props.input_hint = false;
-        toplevel.refresh(&props, None, &atoms);
+        toplevel.refresh(&props, None, &atoms, WireScale::ONE);
         assert!(!toplevel.accepts_keyboard_focus());
 
         props.protocols = vec![atoms.WM_TAKE_FOCUS];
-        toplevel.refresh(&props, None, &atoms);
+        toplevel.refresh(&props, None, &atoms, WireScale::ONE);
         assert!(toplevel.accepts_keyboard_focus());
 
         props.input_hint = true;
         props.protocols.clear();
         props.window_types = vec![atoms._NET_WM_WINDOW_TYPE_TOOLTIP];
-        toplevel.refresh(&props, None, &atoms);
+        toplevel.refresh(&props, None, &atoms, WireScale::ONE);
         assert!(!toplevel.accepts_keyboard_focus());
     }
 
@@ -340,7 +367,7 @@ mod tests {
         let mut toplevel = XToplevel::new(WindowId::for_tests(1), Window(1), 1);
         let mut props = WindowProps::default();
         props.fullscreen = true;
-        toplevel.refresh(&props, None, &test_atoms());
+        toplevel.refresh(&props, None, &test_atoms(), WireScale::ONE);
 
         toplevel.set_requested_fullscreen(false);
         assert!(toplevel.is_fullscreen_requested());

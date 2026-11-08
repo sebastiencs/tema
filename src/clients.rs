@@ -56,6 +56,7 @@ use crate::{
         },
         zxdg_output_v1::ZxdgOutputV1,
     },
+    wire_scale::WireScale,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, derive_more::Into)]
@@ -148,6 +149,8 @@ pub struct ClientManager {
     set: BTreeSet<ClientId>,
     /// Notified once, when an adopted client is closed.
     closed: BTreeMap<ClientId, Redispatcher<ClientId>>,
+    /// The Xwayland client, when one is adopted. `SetWireScale` goes only here.
+    xwayland_client: Option<ClientId>,
     accept_op_id: Option<RingId>,
     accepting: bool,
     unlinked: bool,
@@ -223,6 +226,9 @@ pub enum ClientManagerAction {
     Close {
         id: ClientId,
     },
+    /// Recompute the wire scale and update the Xwayland client when it changes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    XwaylandWireScaleChanged,
     Stop,
 }
 
@@ -249,6 +255,7 @@ impl ClientManager {
             path,
             set: BTreeSet::default(),
             closed: BTreeMap::new(),
+            xwayland_client: None,
             accept_op_id: None,
             accepting: true,
             unlinked: false,
@@ -284,6 +291,9 @@ impl ClientManager {
 
     fn close_client(&mut self, dispatcher: &mut Dispatcher, id: ClientId) {
         log::trace!("client {:?} closed", id);
+        if self.xwayland_client == Some(id) {
+            self.xwayland_client = None;
+        }
         if self.set.remove(&id) {
             dispatcher.stop_model(id);
         }
@@ -313,6 +323,18 @@ impl ClientManager {
             self.close_client(dispatcher, id);
         }
         self.unlink_socket();
+    }
+
+    /// Recompute S and queue `SetWireScale` when it changed.
+    ///
+    /// `state.xwayland_wire_scale` moves here, before Xwayland has processed the
+    /// output events that follow. For that short window the XWM may convert a
+    /// stale X geometry with the new S. The `Reconfigure` dispatched from
+    /// `SetWireScale` converges it; nothing else waits.
+    fn queue_xwayland_wire_scale(&mut self, state: &mut State, dispatcher: &mut Dispatcher) {
+        let Some(scale) = state.refresh_xwayland_wire_scale() else { return };
+        let Some(client_id) = self.xwayland_client else { return };
+        dispatcher.dispatch_to(client_id, ClientAction::SetWireScale { scale });
     }
 }
 
@@ -372,7 +394,11 @@ impl Model for ClientManager {
                 let client_id = self.next_id();
                 self.set.insert(client_id);
                 self.closed.insert(client_id, closed);
-                dispatcher.start_model(client_id, Client::new(client_id, fd, origin));
+                if origin.xwayland {
+                    self.xwayland_client = Some(client_id);
+                }
+                let client = client_for_adoption(client_id, fd, origin, state);
+                dispatcher.start_model(client_id, client);
                 dispatcher.redispatch_to(adopted, client_id);
                 log::trace!("adopted client id={:?} xwayland={}", client_id, origin.xwayland);
             }
@@ -399,6 +425,11 @@ impl Model for ClientManager {
                 // }
             }
             RegistryGlobalAdded { name, interface, version } => {
+                // A new `wl_output` is already in the layout. Recompute S before
+                // announcing the global, so `SetWireScale` is queued first.
+                if interface == WlOutput::INTERFACE_NAME {
+                    self.queue_xwayland_wire_scale(state, dispatcher);
+                }
                 for client_id in self.set.iter().copied() {
                     dispatcher.dispatch_to(
                         client_id,
@@ -416,6 +447,9 @@ impl Model for ClientManager {
                 }
             }
             OutputStateChanged { output_id } => {
+                // The output's new scale is already stored. Queue `SetWireScale`
+                // before this broadcast so the Xwayland client applies S first.
+                self.queue_xwayland_wire_scale(state, dispatcher);
                 crate::wayland_objects::ext_session_lock_v1::on_output_state_changed(
                     state, dispatcher, output_id,
                 );
@@ -425,6 +459,9 @@ impl Model for ClientManager {
                 }
             }
             OutputRemoved { output_id } => {
+                // The output has already left the layout. Recompute S before the
+                // clients are told it is gone.
+                self.queue_xwayland_wire_scale(state, dispatcher);
                 for client_id in self.set.iter().copied() {
                     dispatcher.dispatch_to(client_id, ClientAction::OutputRemoved { output_id });
                 }
@@ -458,11 +495,30 @@ impl Model for ClientManager {
                     dispatcher.dispatch_to(client_id, ClientAction::RefreshLayerSurfaces);
                 }
             }
+            XwaylandWireScaleChanged => {
+                self.queue_xwayland_wire_scale(state, dispatcher);
+            }
             Close { id } => self.close_client(dispatcher, id),
             Stop => self.stop(dispatcher),
         }
         Ok(())
     }
+}
+
+/// Build the client for an adoption. The Xwayland client starts with the
+/// running wire scale, before its model begins reading output state, so its
+/// first `wl_output` bind already sees S. Every other client keeps `ONE`.
+fn client_for_adoption(
+    client_id: ClientId,
+    fd: OwnedFd,
+    origin: ClientOrigin,
+    state: &State,
+) -> Client {
+    let mut client = Client::new(client_id, fd, origin);
+    if origin.xwayland {
+        client.wire_scale = state.xwayland_wire_scale;
+    }
+    client
 }
 
 #[derive(Debug)]
@@ -502,6 +558,8 @@ pub struct Client {
     next_server_id: u32,
     /// Highest `xwayland_surface_v1.set_serial` accepted for this client. `0` means none.
     last_xwayland_serial: u64,
+    /// Integer scale of the Xwayland wire. `ONE` for every normal client.
+    wire_scale: WireScale,
 }
 
 impl ModelInstanceId for ClientId {
@@ -514,6 +572,10 @@ impl ModelInstanceId for ClientId {
 
 pub enum ClientAction {
     Start,
+    /// Update this client's Xwayland wire scale. Phase 9 resends output state.
+    SetWireScale {
+        scale: WireScale,
+    },
     MsgReceived {
         request: RawRequest<'static>,
     },
@@ -676,6 +738,7 @@ impl Client {
             pending_fds: VecDeque::new(),
             next_server_id: MIN_SERVER_ID,
             last_xwayland_serial: 0,
+            wire_scale: WireScale::ONE,
         }
     }
 
@@ -693,6 +756,78 @@ impl Client {
 
     pub fn is_xwayland(&self) -> bool {
         self.xwayland
+    }
+
+    /// The scale of the Xwayland wire for this client. `ONE` for normal clients.
+    pub fn wire_scale(&self) -> WireScale {
+        self.wire_scale
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wire_scale_for_tests(&mut self, scale: WireScale) {
+        self.wire_scale = scale;
+    }
+
+    /// Store a new wire scale on the client and on the dispatcher that sends its
+    /// events in this `process` call.
+    fn apply_wire_scale(&mut self, dispatcher: &mut ClientDispatcher<'_>, scale: WireScale) {
+        self.wire_scale = scale;
+        dispatcher.wire_scale = scale;
+    }
+
+    /// Apply a wire scale that really changed: store it, resend every bound
+    /// output, recompute on-screen surfaces from their raw wire inputs, and ask
+    /// the X window manager to reconfigure and refresh DPI and cursor hints.
+    fn apply_changed_wire_scale(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher<'_>,
+        scale: WireScale,
+    ) {
+        if self.wire_scale == scale {
+            return;
+        }
+        self.apply_wire_scale(dispatcher, scale);
+        let output_ids = state
+            .outputs
+            .iter()
+            .map(|(output_id, _)| output_id)
+            .collect::<Vec<_>>();
+        for output_id in output_ids {
+            self.handle_output_state_changed(state, dispatcher, output_id);
+        }
+        self.refresh_surface_outputs(state, dispatcher);
+        self.recompute_wire_scaled_surfaces(state, dispatcher);
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::Reconfigure);
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::RefreshHints);
+    }
+
+    /// Recompute each of this client's on-screen surfaces for the scale just
+    /// stored, then mark root geometry dirty and ask the covered outputs to draw.
+    fn recompute_wire_scaled_surfaces(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher<'_>,
+    ) {
+        let scale = dispatcher.wire_scale();
+        let surfaces = self
+            .iter_resolved_of::<WlSurfaceId>(state)
+            .collect::<Vec<_>>();
+        for surface_id in surfaces {
+            let changed = surface_id
+                .try_grab(state)
+                .is_some_and(|mut surface| surface.recompute_for_wire_scale(state, scale));
+            if !changed {
+                continue;
+            }
+            let root = state
+                .root_surface_for_surface(surface_id)
+                .unwrap_or(surface_id);
+            state.mark_root_geometry_dirty(root);
+            if let Some(bounds) = state.surface_scene_bounds(surface_id) {
+                crate::drm::request_outputs_for_rect(state, bounds, dispatcher);
+            }
+        }
     }
 
     pub fn client_id(&self) -> ClientId {
@@ -1067,6 +1202,57 @@ impl Client {
         }
     }
 
+    /// Scale 1 keeps the `f32` bits. Any other scale multiplies exactly.
+    fn wire_coord(scale: WireScale, value: f32) -> f32 {
+        if scale.is_one() {
+            value
+        } else {
+            scale.to_wire_f64(f64::from(value)) as f32
+        }
+    }
+
+    fn wire_point(scale: WireScale, x: f32, y: f32) -> (f32, f32) {
+        (Self::wire_coord(scale, x), Self::wire_coord(scale, y))
+    }
+
+    /// Continuous axis distance is multiplied. Wheel steps (`axis_discrete` and
+    /// `axis_value120`) stay in hardware units.
+    fn wire_scroll_frame(
+        scale: WireScale,
+        mut frame: crate::seat::PointerScrollFrame,
+    ) -> crate::seat::PointerScrollFrame {
+        if scale.is_one() {
+            return frame;
+        }
+        frame.vertical = frame
+            .vertical
+            .map(|change| Self::wire_axis_change(scale, change));
+        frame.horizontal = frame
+            .horizontal
+            .map(|change| Self::wire_axis_change(scale, change));
+        frame
+    }
+
+    fn wire_axis_change(
+        scale: WireScale,
+        change: crate::seat::PointerAxisChange,
+    ) -> crate::seat::PointerAxisChange {
+        match change {
+            crate::seat::PointerAxisChange::Scroll {
+                value,
+                discrete,
+                value120,
+                relative_direction,
+            } => crate::seat::PointerAxisChange::Scroll {
+                value: Self::wire_coord(scale, value),
+                discrete,
+                value120,
+                relative_direction,
+            },
+            stop @ crate::seat::PointerAxisChange::Stop => stop,
+        }
+    }
+
     fn handle_seat_event(
         &mut self,
         state: &mut State,
@@ -1076,8 +1262,14 @@ impl Client {
         if crate::logger::ENABLE_NOISY_LOG {
             log::debug!("client {:?} seat event {:?}", self.id, event);
         }
+        // Surface-local pointer values are logical. A wire-scaled client
+        // receives them multiplied by S. wl_touch is not advertised. Tablet,
+        // gestures and wp_pointer_warp do not exist, so there is nothing else
+        // to scale on the way out.
+        let scale = dispatcher.wire_scale();
         match event {
             SeatClientEvent::PointerEnter { serial, surface, x, y } => {
+                let (x, y) = Self::wire_point(scale, x, y);
                 for pointer in state.seat.pointer_resources(self.id) {
                     if !pointer.exists(state) {
                         continue;
@@ -1100,6 +1292,7 @@ impl Client {
                 }
             }
             SeatClientEvent::PointerMotion { time, x, y } => {
+                let (x, y) = Self::wire_point(scale, x, y);
                 for pointer in state.seat.pointer_resources(self.id) {
                     if !pointer.exists(state) {
                         continue;
@@ -1108,6 +1301,7 @@ impl Client {
                 }
             }
             SeatClientEvent::PointerWarp { time, x, y } => {
+                let (x, y) = Self::wire_point(scale, x, y);
                 for pointer in state.seat.pointer_resources(self.id) {
                     if !pointer.exists(state) {
                         continue;
@@ -1171,6 +1365,8 @@ impl Client {
                 dx_unaccel,
                 dy_unaccel,
             } => {
+                let (dx, dy) = Self::wire_point(scale, dx, dy);
+                let (dx_unaccel, dy_unaccel) = Self::wire_point(scale, dx_unaccel, dy_unaccel);
                 for relative in state.seat.relative_pointers_for_client(self.id) {
                     if !relative.exists(state) {
                         continue;
@@ -1181,6 +1377,7 @@ impl Client {
                 }
             }
             SeatClientEvent::PointerScroll(frame) => {
+                let frame = Self::wire_scroll_frame(scale, frame);
                 for pointer in state.seat.pointer_resources(self.id) {
                     if !pointer.exists(state) {
                         continue;
@@ -2579,6 +2776,8 @@ pub struct ClientDispatcher<'a> {
     client_id: ClientId,
     requester_object_id: Option<WaylandId>,
     command: Option<Rc<ProcessInfo>>,
+    /// The client's wire scale, copied here so every send/request handler can read it.
+    wire_scale: WireScale,
     /// Deferred work to run after the current `Object::on` handler returns and its grabbed object
     /// is released (see `MsgReceived` in `Client::process`).
     post_actions: VecDeque<Box<dyn PostAction>>,
@@ -2594,8 +2793,14 @@ impl<'a> ClientDispatcher<'a> {
             client_id: client.id,
             requester_object_id: None,
             command,
+            wire_scale: client.wire_scale(),
             post_actions: VecDeque::new(),
         }
+    }
+
+    /// The wire scale of the client this dispatcher sends events to.
+    pub fn wire_scale(&self) -> WireScale {
+        self.wire_scale
     }
 
     #[cfg(test)]
@@ -2687,6 +2892,9 @@ impl Model for Client {
         let mut dispatcher = ClientDispatcher::make(self, dispatcher);
 
         match action {
+            SetWireScale { scale } => {
+                self.apply_changed_wire_scale(state, &mut dispatcher, scale);
+            }
             Start => {
                 self.read_process_info();
                 state.set_client_process_info(self.id, self.info.clone());
@@ -4129,6 +4337,488 @@ mod socket_shutdown_tests {
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+}
+
+#[cfg(test)]
+mod wire_scale_tests {
+    use std::{
+        os::{fd::IntoRawFd, unix::net::UnixStream},
+        path::PathBuf,
+    };
+
+    use {super::*, crate::test_support::state_for_tests};
+
+    fn temp_socket() -> (mktemp::Temp, PathBuf) {
+        let dir = mktemp::Temp::new_dir().unwrap();
+        let path = dir.to_path_buf().join("wayland-test");
+        (dir, path)
+    }
+
+    fn no_notify() -> Redispatcher<ClientId> {
+        Redispatcher::None
+    }
+
+    /// Adopt the Xwayland client (id 0) and accept a normal client (id 1).
+    fn adopt_xwayland_and_normal(
+        manager: &mut ClientManager,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+    ) {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        manager
+            .process(
+                state,
+                ClientManagerAction::AdoptClient {
+                    fd: socket.into(),
+                    origin: ClientOrigin { xwayland: true, pid: None },
+                    adopted: no_notify(),
+                    closed: no_notify(),
+                },
+                dispatcher,
+            )
+            .unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        manager
+            .process(
+                state,
+                ClientManagerAction::NewClient { new_client: socket.into_raw_fd() },
+                dispatcher,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn normal_clients_always_have_wire_scale_one() {
+        assert_eq!(Client::new_for_tests(ClientId::from_raw(1)).wire_scale(), WireScale::ONE);
+        assert_eq!(
+            Client::new_xwayland_for_tests(ClientId::from_raw(2)).wire_scale(),
+            WireScale::ONE,
+        );
+        let mut state = state_for_tests();
+        state.xwayland_wire_scale = WireScale::new(2);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let normal = client_for_adoption(
+            ClientId::from_raw(3),
+            socket.into(),
+            ClientOrigin { xwayland: false, pid: None },
+            &state,
+        );
+        assert_eq!(normal.wire_scale(), WireScale::ONE);
+    }
+
+    #[test]
+    fn adopted_xwayland_client_gets_the_states_wire_scale() {
+        let mut state = state_for_tests();
+        // S = 1 leaves the wire untouched.
+        let (socket_one, _peer_one) = UnixStream::pair().unwrap();
+        let at_one = client_for_adoption(
+            ClientId::from_raw(0),
+            socket_one.into(),
+            ClientOrigin { xwayland: true, pid: None },
+            &state,
+        );
+        assert_eq!(at_one.wire_scale(), WireScale::ONE);
+
+        state.xwayland_wire_scale = WireScale::new(2);
+        let (socket_two, _peer_two) = UnixStream::pair().unwrap();
+        let at_two = client_for_adoption(
+            ClientId::from_raw(1),
+            socket_two.into(),
+            ClientOrigin { xwayland: true, pid: None },
+            &state,
+        );
+        assert_eq!(at_two.wire_scale(), WireScale::new(2));
+    }
+
+    #[test]
+    fn a_client_dispatcher_carries_the_clients_wire_scale() {
+        let mut client = Client::new_for_tests(ClientId::from_raw(3));
+        let mut dispatcher = Dispatcher::default();
+        assert_eq!(client.test_dispatcher(&mut dispatcher).wire_scale(), WireScale::ONE);
+        client.set_wire_scale_for_tests(WireScale::new(2));
+        assert_eq!(client.test_dispatcher(&mut dispatcher).wire_scale(), WireScale::new(2));
+    }
+
+    #[test]
+    fn applying_a_wire_scale_updates_the_client_and_the_dispatcher_together() {
+        let mut client = Client::new_for_tests(ClientId::from_raw(3));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        assert_eq!(client_dispatcher.wire_scale(), WireScale::ONE);
+        client.apply_wire_scale(&mut client_dispatcher, WireScale::new(2));
+        assert_eq!(client.wire_scale(), WireScale::new(2));
+        assert_eq!(client_dispatcher.wire_scale(), WireScale::new(2));
+    }
+
+    #[test]
+    fn set_wire_scale_action_stores_the_value_on_the_client() {
+        let mut client = Client::new_for_tests(ClientId::from_raw(3));
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        client
+            .process(
+                &mut state,
+                ClientAction::SetWireScale { scale: WireScale::new(2) },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert_eq!(client.wire_scale(), WireScale::new(2));
+        assert_eq!(client.test_dispatcher(&mut dispatcher).wire_scale(), WireScale::new(2));
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::Reconfigure)
+            }),
+            1,
+        );
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::RefreshHints)
+            }),
+            1,
+        );
+        client
+            .process(
+                &mut state,
+                ClientAction::SetWireScale { scale: WireScale::new(2) },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::Reconfigure)
+            }),
+            1,
+        );
+        assert_eq!(
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::RefreshHints)
+            }),
+            1,
+        );
+    }
+
+    #[test]
+    fn adopt_tracks_and_close_clears_only_the_xwayland_client() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        adopt_xwayland_and_normal(&mut manager, &mut state, &mut dispatcher);
+        assert_eq!(manager.xwayland_client, Some(ClientId(0)));
+
+        // Closing a normal client leaves the Xwayland tracking intact.
+        manager
+            .process(&mut state, ClientManagerAction::Close { id: ClientId(1) }, &mut dispatcher)
+            .unwrap();
+        assert_eq!(manager.xwayland_client, Some(ClientId(0)));
+
+        manager
+            .process(&mut state, ClientManagerAction::Close { id: ClientId(0) }, &mut dispatcher)
+            .unwrap();
+        assert_eq!(manager.xwayland_client, None);
+    }
+
+    #[test]
+    fn xwayland_wire_scale_changed_queues_set_wire_scale_only_for_the_xwayland_client() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        adopt_xwayland_and_normal(&mut manager, &mut state, &mut dispatcher);
+
+        // The running scale was 2; `default` mode recomputes it to ONE, so a
+        // change is detected. Set the running value directly, as the phase rules
+        // require, rather than building HiDPI outputs.
+        state.xwayland_wire_scale = WireScale::new(2);
+
+        manager
+            .process(&mut state, ClientManagerAction::XwaylandWireScaleChanged, &mut dispatcher)
+            .unwrap();
+
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId(0),
+            |action| matches!(action, ClientAction::SetWireScale { scale } if scale.get() == 1),
+        ));
+        assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId(1),
+            |action| matches!(action, ClientAction::SetWireScale { .. }),
+        ));
+        assert_eq!(
+            dispatcher.test_count_queued_action::<ClientAction>(|action| {
+                matches!(action, ClientAction::SetWireScale { .. })
+            }),
+            1,
+        );
+        assert_eq!(state.xwayland_wire_scale, WireScale::ONE);
+    }
+
+    #[test]
+    fn xwayland_wire_scale_changed_is_quiet_when_the_scale_is_unchanged() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        adopt_xwayland_and_normal(&mut manager, &mut state, &mut dispatcher);
+
+        manager
+            .process(&mut state, ClientManagerAction::XwaylandWireScaleChanged, &mut dispatcher)
+            .unwrap();
+
+        assert_eq!(
+            dispatcher.test_count_queued_action::<ClientAction>(|action| {
+                matches!(action, ClientAction::SetWireScale { .. })
+            }),
+            0,
+        );
+        assert_eq!(state.xwayland_wire_scale, WireScale::ONE);
+    }
+
+    fn xwayland_client_marks(dispatcher: &Dispatcher) -> Vec<u32> {
+        let mut marks = Vec::new();
+        dispatcher.test_matching_actions_for::<ClientAction, ClientId>(ClientId(0), |action| {
+            marks.push(match action {
+                ClientAction::SetWireScale { scale } => scale.get(),
+                ClientAction::OutputStateChanged { .. } => 0,
+                ClientAction::RegistryGlobalAdded { .. } => 100,
+                _ => 99,
+            });
+        });
+        marks
+    }
+
+    #[test]
+    fn an_output_scale_change_queues_set_wire_scale_before_output_state() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        state.config.xwayland.scaling_mode = crate::config::XwaylandScalingMode::Downscaled;
+        let mut dispatcher = Dispatcher::default();
+        adopt_xwayland_and_normal(&mut manager, &mut state, &mut dispatcher);
+        let output_id = state.insert_output(crate::test_support::test_output_drm0_wh(800, 600));
+        state.outputs.try_get_mut(output_id).unwrap().scale = crate::state::FractionalScale::TWO;
+        let _ = dispatcher.test_take_queued_actions::<ClientAction>();
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::OutputStateChanged { output_id },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        let marks = xwayland_client_marks(&dispatcher);
+        let scale_at = marks
+            .iter()
+            .position(|mark| *mark == 2)
+            .expect("set wire scale");
+        let output_at = marks
+            .iter()
+            .position(|mark| *mark == 0)
+            .expect("output state");
+        assert!(scale_at < output_at);
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId(1),
+            |action| matches!(action, ClientAction::OutputStateChanged { .. }),
+        ));
+        assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId(1),
+            |action| matches!(action, ClientAction::SetWireScale { .. }),
+        ));
+
+        let queued = dispatcher.test_count_queued_action::<ClientAction>(|action| {
+            matches!(action, ClientAction::SetWireScale { .. })
+        });
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::OutputStateChanged { output_id },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.test_count_queued_action::<ClientAction>(|action| {
+                matches!(action, ClientAction::SetWireScale { .. })
+            }),
+            queued,
+        );
+    }
+
+    #[test]
+    fn adding_a_wl_output_queues_set_wire_scale_before_the_global() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        state.config.xwayland.scaling_mode = crate::config::XwaylandScalingMode::Downscaled;
+        let mut dispatcher = Dispatcher::default();
+        adopt_xwayland_and_normal(&mut manager, &mut state, &mut dispatcher);
+        let output_id = state.insert_output(crate::test_support::test_output_drm0_wh(800, 600));
+        state.outputs.try_get_mut(output_id).unwrap().scale = crate::state::FractionalScale::TWO;
+        let _ = dispatcher.test_take_queued_actions::<ClientAction>();
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::RegistryGlobalAdded {
+                    name: 7,
+                    interface: "wl_output".to_string(),
+                    version: 4,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        let marks = xwayland_client_marks(&dispatcher);
+        let scale_at = marks
+            .iter()
+            .position(|mark| *mark == 2)
+            .expect("set wire scale");
+        let global_at = marks.iter().position(|mark| *mark == 100).expect("global");
+        assert!(scale_at < global_at);
+    }
+}
+
+#[cfg(test)]
+mod pointer_wire_scale_tests {
+    use crate::{
+        clients::{Client, ClientAction, Resolved},
+        io_uring::model::IoUringAction,
+        protocol_generated::{WlPointerId, WlSurfaceId, ZwpRelativePointerV1Id},
+        runner::{Dispatcher, Model},
+        seat::{PointerAxisChange, PointerScrollFrame, PointerScrollSource, SeatClientEvent},
+        state::ObjectId,
+        test_support::test_client_and_dispatcher,
+        wayland_objects::{wl_pointer::WlPointer, zwp_relative_pointer_v1::ZwpRelativePointerV1},
+        wire_scale::WireScale,
+    };
+
+    fn fixed_bits(value: f32) -> u32 {
+        ((value * 256.0).round() as i32) as u32
+    }
+
+    fn args(dispatcher: &Dispatcher, object: u32, opcode: u32) -> Vec<Vec<u32>> {
+        let mut found = Vec::new();
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            if let IoUringAction::Sendmsg { buffer, .. } = action {
+                let words: Vec<u32> = buffer
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                if words.len() >= 2 && words[0] == object && (words[1] & 0xffff) == opcode {
+                    found.push(words[2..].to_vec());
+                }
+            }
+        });
+        found
+    }
+
+    fn deliver(scale: WireScale) -> Dispatcher {
+        let mut state = crate::test_support::state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(3);
+        client.set_wire_scale_for_tests(scale);
+        let (warp, _) = client.insert_object(&mut state, WlPointer::new(WlPointerId::from(11), 11));
+        let (discrete, _) =
+            client.insert_object(&mut state, WlPointer::new(WlPointerId::from(7), 7));
+        let (value120, _) =
+            client.insert_object(&mut state, WlPointer::new(WlPointerId::from(8), 8));
+        state.seat.register_pointer(warp);
+        state.seat.register_pointer(discrete);
+        state.seat.register_pointer(value120);
+        let (relative, _) = client.insert_object(
+            &mut state,
+            ZwpRelativePointerV1::new(ZwpRelativePointerV1Id::from(12), warp),
+        );
+        state.seat.register_relative_pointer(warp, relative);
+        let surface =
+            Resolved::new(client.client_id(), WlSurfaceId::from(8), ObjectId::from(1usize));
+
+        let send =
+            |client: &mut Client, state: &mut crate::State, dispatcher: &mut Dispatcher, event| {
+                client
+                    .process(state, ClientAction::SeatEvent { event }, dispatcher)
+                    .unwrap();
+            };
+        send(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            SeatClientEvent::PointerEnter { serial: 4, surface, x: 10.5, y: 20.0 },
+        );
+        send(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            SeatClientEvent::PointerMotion { time: 9, x: 10.5, y: 20.0 },
+        );
+        send(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            SeatClientEvent::PointerWarp { time: 9, x: 10.5, y: 20.0 },
+        );
+        send(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            SeatClientEvent::PointerScroll(PointerScrollFrame {
+                time: 40,
+                source: PointerScrollSource::Wheel,
+                vertical: Some(PointerAxisChange::Scroll {
+                    value: 1.5,
+                    discrete: Some(3),
+                    value120: Some(360),
+                    relative_direction: None,
+                }),
+                horizontal: None,
+            }),
+        );
+        send(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            SeatClientEvent::RelativePointerMotion {
+                utime_hi: 1,
+                utime_lo: 2,
+                dx: 1.5,
+                dy: -2.25,
+                dx_unaccel: 0.5,
+                dy_unaccel: -0.25,
+            },
+        );
+        dispatcher
+    }
+
+    fn expect_motion(scale: WireScale, x: f32, y: f32, axis: f32, relative: [f32; 4]) {
+        let dispatcher = deliver(scale);
+        let xy = [fixed_bits(x), fixed_bits(y)];
+        assert_eq!(args(&dispatcher, 11, 0), vec![vec![4, 8, xy[0], xy[1]]], "enter");
+        assert_eq!(args(&dispatcher, 11, 2), vec![vec![9, xy[0], xy[1]]], "motion");
+        assert_eq!(args(&dispatcher, 11, 11), vec![vec![xy[0], xy[1]]], "warp");
+        assert_eq!(args(&dispatcher, 7, 8), vec![vec![0, 3]], "axis_discrete stays in wheel steps");
+        assert_eq!(args(&dispatcher, 7, 4), vec![vec![40, 0, fixed_bits(axis)]], "continuous axis");
+        assert_eq!(args(&dispatcher, 8, 9), vec![vec![0, 360]], "axis_value120");
+        assert_eq!(args(&dispatcher, 8, 4), vec![vec![40, 0, fixed_bits(axis)]]);
+        assert_eq!(
+            args(&dispatcher, 12, 0),
+            vec![vec![
+                1,
+                2,
+                fixed_bits(relative[0]),
+                fixed_bits(relative[1]),
+                fixed_bits(relative[2]),
+                fixed_bits(relative[3]),
+            ]]
+        );
+    }
+
+    #[test]
+    fn wire_scale_two_multiplies_pointer_motion_and_keeps_wheel_steps() {
+        expect_motion(WireScale::new(2), 21.0, 40.0, 3.0, [3.0, -4.5, 1.0, -0.5]);
+    }
+
+    #[test]
+    fn wire_scale_one_leaves_pointer_motion_unchanged() {
+        expect_motion(WireScale::ONE, 10.5, 20.0, 1.5, [1.5, -2.25, 0.5, -0.25]);
     }
 }
 

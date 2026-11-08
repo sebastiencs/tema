@@ -44,7 +44,8 @@ pub(crate) use io::XIo;
 #[allow(unused_imports)]
 pub(crate) use property::{
     change_property_atoms, change_property_u32s, change_property_u8s, change_property_utf8,
-    delete_property, get_property, get_property_deleting, Property, PropertyChange, PropertyError,
+    delete_property, get_property, get_property_deleting, FreeCursor, Property, PropertyChange,
+    PropertyError,
 };
 #[allow(unused_imports)]
 pub(crate) use startup::{

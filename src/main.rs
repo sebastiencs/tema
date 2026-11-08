@@ -204,6 +204,7 @@ mod utils;
 mod visual_animation;
 mod wayland_objects;
 mod window;
+mod wire_scale;
 mod x11;
 mod xkb;
 mod xwayland;

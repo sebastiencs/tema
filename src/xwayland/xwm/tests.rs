@@ -25,8 +25,8 @@ use crate::{
         ClientIdValue, ClientMessage, ClientMessageData, Colormap, CompositeRedirectSubwindows,
         ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux,
         CreateGc, CreateGcAux, CreateNotify, CreatePixmap, CreateWindow, CreateWindowAux, Cursor,
-        DestroyNotify, Directformat, Drawable, Event, EventMask, FreeGc, FreePixmap, Gcontext,
-        GetProperty, ImageFormat, MapNotify, MapRequest, MapWindow, PictType, Pictformat,
+        DestroyNotify, Directformat, Drawable, Event, EventMask, FreeCursor, FreeGc, FreePixmap,
+        Gcontext, GetProperty, ImageFormat, MapNotify, MapRequest, MapWindow, PictType, Pictformat,
         Pictforminfo, Picture, Pixmap, PropertyNotify, PropertyState, PutImage, Redirect,
         RenderCreateCursor, RenderCreatePicture, RenderCreatePictureAux, RenderFreePicture,
         RenderQueryPictFormats, ResQueryClientIds, ResQueryClientIdsReply, SelectionEventMask,
@@ -191,6 +191,255 @@ fn a_pict_formats_error_skips_the_cursor() {
     );
     pump_events(&mut wm, &mut state, &mut dispatcher, &surfaces);
     assert!(drain_io(&mut dispatcher).writes.is_empty());
+    assert!(matches!(wm.phase, WmPhase::Ready(_)));
+}
+
+#[test]
+fn default_mode_queues_no_resource_manager_read() {
+    let (_wm, _state, mut dispatcher, _surfaces) = drive_to_ready(None);
+    let io = drain_io(&mut dispatcher);
+    let sent = testing::split_requests(&io.writes[0].0);
+    assert!(sent
+        .iter()
+        .all(|request| request.first().copied() != Some(20)));
+}
+
+#[test]
+fn downscaled_hints_merge_dpi_and_cursor_size() {
+    let (mut wm, mut state, mut dispatcher, surfaces) = drive_prepared(None, |state| {
+        state.config.xwayland.scaling_mode = crate::config::XwaylandScalingMode::Downscaled;
+        state.xwayland_wire_scale = crate::wire_scale::WireScale::new(2);
+        state.config.general.cursor_size = 24;
+    });
+    let io = drain_io(&mut dispatcher);
+    let sent = testing::split_requests(&io.writes[0].0);
+    let index = sent
+        .iter()
+        .position(|request| request.first().copied() == Some(20))
+        .expect("GetProperty");
+    let sequence = u16::try_from(8 + NAMES.len() + index + 1).unwrap();
+    ack_write(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.writes.into_iter().next().unwrap().1,
+    );
+    feed_read(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.reads.into_iter().next().unwrap(),
+        testing::property_reply(sequence, 8, Atom::STRING, 0, b"Xft.antialias:\t1\nXft.dpi:\t96\n"),
+    );
+    pump_events(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    let io = drain_io(&mut dispatcher);
+    let merged = String::from_utf8_lossy(&io.writes[0].0);
+    assert!(merged.contains("Xft.antialias:\t1"), "{merged}");
+    assert!(merged.contains("Xft.dpi:\t192"), "{merged}");
+    assert!(merged.contains("Xcursor.size:\t48"), "{merged}");
+    let antialias = merged.find("Xft.antialias").unwrap();
+    let dpi = merged.find("Xft.dpi:\t192").unwrap();
+    let size = merged.find("Xcursor.size").unwrap();
+    assert!(antialias < dpi && dpi < size, "{merged}");
+    {
+        let WmPhase::Ready(ready) = &wm.phase else { panic!("ready") };
+        assert!(ready.hints_written);
+    }
+    let read = io.reads.into_iter().next().expect("x11 read");
+    ack_write(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.writes.into_iter().next().unwrap().1,
+    );
+
+    state.config.xwayland.scaling_mode = crate::config::XwaylandScalingMode::Default;
+    state.xwayland_wire_scale = crate::wire_scale::WireScale::ONE;
+    let sequence = wm.conn.test_next_sequence();
+    let mut ctx = WmCtx {
+        run: 1,
+        state: &mut state,
+        dispatcher: &mut dispatcher,
+        surfaces: &surfaces,
+        client: None,
+    };
+    wm.handle(WmEvent::RefreshHints, &mut ctx).unwrap();
+    let io = drain_io(&mut dispatcher);
+    let sent = testing::split_requests(&io.writes[0].0);
+    assert_eq!(sent[0].first().copied(), Some(20));
+    ack_write(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.writes.into_iter().next().unwrap().1,
+    );
+    feed_read(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        read,
+        testing::property_reply(
+            u16::try_from(sequence).unwrap(),
+            8,
+            Atom::STRING,
+            0,
+            b"Xft.antialias:\t1\nXft.dpi:\t192\nXcursor.size:\t48\n",
+        ),
+    );
+    pump_events(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    let io = drain_io(&mut dispatcher);
+    let restored = String::from_utf8_lossy(&io.writes[0].0);
+    assert!(restored.contains("Xft.antialias:\t1"), "{restored}");
+    assert!(restored.contains("Xft.dpi:\t96"), "{restored}");
+    assert!(restored.contains("Xcursor.size:\t24"), "{restored}");
+    assert!(!restored.contains("Xft.dpi:\t192"), "{restored}");
+    {
+        let WmPhase::Ready(ready) = &wm.phase else { panic!("ready") };
+        assert!(!ready.hints_written);
+    }
+    ack_write(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.writes.into_iter().next().unwrap().1,
+    );
+
+    let before = wm.conn.test_next_sequence();
+    let mut ctx = WmCtx {
+        run: 1,
+        state: &mut state,
+        dispatcher: &mut dispatcher,
+        surfaces: &surfaces,
+        client: None,
+    };
+    wm.handle(WmEvent::RefreshHints, &mut ctx).unwrap();
+    assert_eq!(wm.conn.test_next_sequence(), before);
+    assert!(drain_io(&mut dispatcher).writes.is_empty());
+}
+
+#[test]
+fn a_downscaled_root_cursor_uses_cursor_size_times_scale() {
+    let image = CursorImage::new("default".to_string(), 48, 48, 2, 5, 1, vec![0x11; 48 * 48 * 4]);
+    let (mut wm, mut state, mut dispatcher, surfaces) =
+        drive_prepared(Some(image.clone()), |state| {
+            state.config.xwayland.scaling_mode = crate::config::XwaylandScalingMode::Downscaled;
+            state.xwayland_wire_scale = crate::wire_scale::WireScale::new(2);
+            state.config.general.cursor_size = 24;
+        });
+    let io = drain_io(&mut dispatcher);
+    let (buffer, dispatch_to) = io.writes.into_iter().next().unwrap();
+    let sent = testing::split_requests(&buffer);
+    let query = testing::encode(&RenderQueryPictFormats, RENDER_MAJOR_OPCODE);
+    assert_eq!(sent.last().unwrap(), &query);
+    ack_write(&mut wm, &mut state, &mut dispatcher, &surfaces, dispatch_to);
+    let sequence = u16::try_from(8 + NAMES.len() + sent.len()).unwrap();
+    let read = io.reads.into_iter().next().unwrap();
+    feed_read(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        read,
+        testing::pict_formats_reply(sequence, vec![argb_format()]),
+    );
+    {
+        let WmPhase::Ready(ready) = &wm.phase else { panic!("ready") };
+        assert_eq!(
+            ready
+                .cursor
+                .as_ref()
+                .map(|cursor| (cursor.width, cursor.height)),
+            Some((image.width, image.height))
+        );
+    }
+    pump_events(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    let io = drain_io(&mut dispatcher);
+    let uploaded = testing::split_requests(&io.writes[0].0);
+    let pixmap = testing::encode(
+        &CreatePixmap {
+            depth: 32,
+            pid: Pixmap(0x23),
+            drawable: Drawable(0x100),
+            width: 48,
+            height: 48,
+        },
+        0,
+    );
+    assert_eq!(uploaded.first(), Some(&pixmap));
+    assert!(matches!(wm.phase, WmPhase::Ready(_)));
+}
+
+#[test]
+fn a_second_root_cursor_frees_the_previous() {
+    let image =
+        CursorImage::new("default".to_string(), 1, 1, 2, 5, 1, vec![0x11, 0x22, 0x33, 0x44]);
+    let (mut wm, mut state, mut dispatcher, surfaces) = drive_to_ready(Some(image));
+    let io = drain_io(&mut dispatcher);
+    let (buffer, dispatch_to) = io.writes.into_iter().next().unwrap();
+    let sent = testing::split_requests(&buffer);
+    ack_write(&mut wm, &mut state, &mut dispatcher, &surfaces, dispatch_to);
+    let sequence = u16::try_from(8 + NAMES.len() + sent.len()).unwrap();
+    feed_read(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.reads.into_iter().next().unwrap(),
+        testing::pict_formats_reply(sequence, vec![argb_format()]),
+    );
+    pump_events(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    let io = drain_io(&mut dispatcher);
+    let read = io.reads.into_iter().next().expect("x11 read");
+    ack_write(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.writes.into_iter().next().unwrap().1,
+    );
+
+    let before = wm.conn.test_next_sequence();
+    let mut ctx = WmCtx {
+        run: 1,
+        state: &mut state,
+        dispatcher: &mut dispatcher,
+        surfaces: &surfaces,
+        client: None,
+    };
+    wm.handle(WmEvent::RefreshHints, &mut ctx).unwrap();
+    let io = drain_io(&mut dispatcher);
+    let sent = testing::split_requests(&io.writes[0].0);
+    let query_at = sent
+        .iter()
+        .position(|request| request.first().copied() == Some(RENDER_MAJOR_OPCODE))
+        .expect("picture formats");
+    let sequence = u16::try_from(before + query_at as u64).unwrap();
+    ack_write(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        io.writes.into_iter().next().unwrap().1,
+    );
+    feed_read(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        read,
+        testing::pict_formats_reply(sequence, vec![argb_format()]),
+    );
+    pump_events(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    let io = drain_io(&mut dispatcher);
+    let uploaded = testing::split_requests(&io.writes[0].0);
+    let freed = testing::encode(&FreeCursor { cursor: Cursor(0x26) }, 0);
+    assert!(uploaded.iter().any(|request| request == &freed));
     assert!(matches!(wm.phase, WmPhase::Ready(_)));
 }
 

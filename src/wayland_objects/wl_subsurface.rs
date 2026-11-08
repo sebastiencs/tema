@@ -116,7 +116,11 @@ impl Object for WlSubsurface {
                 let Some(mut surface) = self.surface.try_grab(state) else {
                     return Ok(());
                 };
-                surface.set_subsurface_position(x, y);
+                // A wire-scaled client sends X pixels. Converted once here and
+                // not recomputed when S changes (Xwayland does not use
+                // subsurfaces).
+                let scale = dispatcher.wire_scale();
+                surface.set_subsurface_position(scale.pos_to_logical(x), scale.pos_to_logical(y));
                 drop(surface);
                 state.mark_root_geometry_dirty_for_surface(self.parent);
             }
@@ -189,9 +193,10 @@ mod tests {
             object::{Object, RequestResult},
             protocol_generated::{WlSubsurfaceId, WlSurfaceId},
             runner::Dispatcher,
-            state::{GrabbedObject, State},
+            state::{GrabbedObject, ObjectId, State},
             test_support::{state_for_tests, test_client_and_dispatcher},
             wayland_objects::wl_surface::{StackEntry, WlSurface},
+            wire_scale::WireScale,
         },
     };
 
@@ -202,6 +207,123 @@ mod tests {
         let mut event = RawEvent::new(object_id.into(), 2, 1);
         event.id(sibling);
         (&*event.into_bytes()).try_into().unwrap()
+    }
+
+    fn set_position_request(
+        object_id: WlSubsurfaceId,
+        x: i32,
+        y: i32,
+    ) -> crate::clients::RawRequest<'static> {
+        let mut event = RawEvent::new(object_id.into(), 1, 2);
+        event.uint(x as u32);
+        event.uint(y as u32);
+        (&*event.into_bytes()).try_into().unwrap()
+    }
+
+    /// A parent with one subsurface child, both registered as roots. Returns
+    /// the object ids of the parent, the child and the subsurface object.
+    fn parent_child_and_subsurface(
+        client: &mut Client,
+        state: &mut State,
+    ) -> (ObjectId, ObjectId, ObjectId) {
+        let (parent_resolved, parent_object_id) = {
+            let (resolved, _) = client
+                .insert_object(state, WlSurface::new(WlSurfaceId::from(10), client.client_id(), 6));
+            (resolved, resolved.object_id())
+        };
+        state.register_root_surface(parent_resolved);
+        let (child_resolved, child_object_id) = {
+            let (resolved, _) = client
+                .insert_object(state, WlSurface::new(WlSurfaceId::from(11), client.client_id(), 6));
+            (resolved, resolved.object_id())
+        };
+        state.register_root_surface(child_resolved);
+        let (subsurface_resolved, subsurface_object_id) = {
+            let (resolved, _) = client.insert_object(
+                state,
+                WlSubsurface::new(WlSubsurfaceId::from(30), child_resolved, parent_resolved),
+            );
+            (resolved, resolved.object_id())
+        };
+        {
+            let parent = state
+                .objects
+                .get_mut(parent_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            parent.add_pending_child(child_resolved);
+        }
+        {
+            let child = state
+                .objects
+                .get_mut(child_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            child.assign_subsurface(subsurface_resolved, parent_resolved);
+        }
+        (parent_object_id, child_object_id, subsurface_object_id)
+    }
+
+    fn send_set_position(
+        client: &mut Client,
+        state: &mut State,
+        subsurface_object_id: ObjectId,
+        x: i32,
+        y: i32,
+    ) {
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let subsurface = state
+            .objects
+            .grab_object::<WlSubsurface>(subsurface_object_id);
+        subsurface.on(
+            client,
+            state,
+            set_position_request(WlSubsurfaceId::from(30), x, y),
+            &mut client_dispatcher,
+        );
+    }
+
+    #[test]
+    fn set_position_converts_wire_units_for_a_scaled_client() {
+        let mut state = state_for_tests();
+        let (mut client, _) = test_client_and_dispatcher(5);
+        client.set_wire_scale_for_tests(WireScale::new(2));
+        let (parent_object_id, child_object_id, subsurface_object_id) =
+            parent_child_and_subsurface(&mut client, &mut state);
+
+        send_set_position(&mut client, &mut state, subsurface_object_id, -3, 5);
+        {
+            let mut parent = state.objects.grab_object::<WlSurface>(parent_object_id);
+            assert!(parent.apply_pending_tree_state(&mut state));
+        }
+        let child = state
+            .objects
+            .get_mut(child_object_id)
+            .downcast_mut::<WlSurface>()
+            .unwrap();
+        // floor(-3/2) = -2 and floor(5/2) = 2, in logical units.
+        assert_eq!(child.current_subsurface_position(), (-2, 2));
+    }
+
+    #[test]
+    fn set_position_is_the_identity_at_scale_one() {
+        let mut state = state_for_tests();
+        let (mut client, _) = test_client_and_dispatcher(5);
+        let (parent_object_id, child_object_id, subsurface_object_id) =
+            parent_child_and_subsurface(&mut client, &mut state);
+
+        send_set_position(&mut client, &mut state, subsurface_object_id, 20, 30);
+        {
+            let mut parent = state.objects.grab_object::<WlSurface>(parent_object_id);
+            assert!(parent.apply_pending_tree_state(&mut state));
+        }
+        let child = state
+            .objects
+            .get_mut(child_object_id)
+            .downcast_mut::<WlSurface>()
+            .unwrap();
+        assert_eq!(child.current_subsurface_position(), (20, 30));
     }
 
     #[test]

@@ -1236,6 +1236,15 @@ impl SeatState {
         self.cursor.default_image()
     }
 
+    /// The theme's default cursor at `size` pixels. The seat's own cursor stays
+    /// at the configured theme size.
+    pub(crate) fn default_cursor_image_at(
+        &mut self,
+        size: u32,
+    ) -> Option<crate::cursor::CursorImage> {
+        self.cursor.image_at(size)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_block_cursor_icons(&mut self, names: &[&str]) {
         self.cursor.test_block_icons(names);

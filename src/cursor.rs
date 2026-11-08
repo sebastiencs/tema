@@ -161,6 +161,58 @@ impl CursorState {
         })
     }
 
+    /// The default cursor rendered nearest to `size`.
+    ///
+    /// A lookup at the theme size uses the shared cache. Any other size reads a
+    /// cached frame of that pixel size, or the theme file, and leaves the cache
+    /// that the compositor cursor uses in place.
+    pub(crate) fn image_at(&mut self, size: u32) -> Option<CursorImage> {
+        let size = size.max(1);
+        DEFAULT_ICON_NAMES
+            .iter()
+            .find_map(|name| self.frame_at(name, size))
+    }
+
+    fn frame_at(&mut self, name: &str, size: u32) -> Option<CursorImage> {
+        if size == self.theme_size {
+            return self
+                .load_icon(name)
+                .and_then(|animation| animation.frames.into_iter().next());
+        }
+        if let Some(cached) = self.cache.get(name) {
+            match cached {
+                None => return None,
+                Some(animation) => {
+                    let pixels = i32::try_from(size).unwrap_or(i32::MAX);
+                    if let Some(frame) = animation
+                        .frames
+                        .iter()
+                        .find(|frame| frame.width == pixels && frame.height == pixels)
+                    {
+                        return Some(frame.clone());
+                    }
+                }
+            }
+        }
+        self.load_theme_frame(name, size)
+    }
+
+    fn load_theme_frame(&self, icon_name: &str, size: u32) -> Option<CursorImage> {
+        let images = self
+            .theme
+            .load_icon(icon_name)
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| parser::parse_xcursor(&bytes))?;
+        let target = images.iter().min_by_key(|image| {
+            (image.size.abs_diff(size), image.width.saturating_mul(image.height))
+        })?;
+        let (width, height) = (target.width, target.height);
+        images
+            .into_iter()
+            .find(|image| image.width == width && image.height == height)
+            .and_then(|image| convert_cursor_image(icon_name, image))
+    }
+
     pub fn ensure_default_named_cursor(&mut self) -> bool {
         if matches!(
             self.source.as_ref(),
@@ -726,6 +778,20 @@ mod tests {
                 .as_ref()
                 .map(|image| &image.pixels_rgba),
             Some(&first.pixels_rgba)
+        );
+    }
+
+    #[test]
+    fn image_at_uses_a_cached_frame_of_the_asked_size() {
+        let mut cursor = CursorState::new("tema-missing-cursor-theme".to_string(), 24);
+        cursor.test_block_icons(DEFAULT_ICON_NAMES);
+        let large = CursorImage::new("default".to_string(), 48, 48, 4, 5, 1, vec![9; 48 * 48 * 4]);
+        cursor.test_cache_frames("default", vec![large.clone()]);
+        assert_eq!(cursor.image_at(48).as_ref().map(|image| image.width), Some(48));
+        assert_eq!(cursor.theme_size, 24);
+        assert_eq!(
+            cursor.image_at(48).as_ref().map(|image| &image.pixels_rgba),
+            Some(&large.pixels_rgba)
         );
     }
 }

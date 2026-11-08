@@ -563,6 +563,8 @@ If coming back after a long time, this order should restore the mental model qui
     How a managed X window is announced to taskbars and copied by toplevel image capture.
 17. `src/xwayland/xwm/selection.rs`, `src/xwayland/xwm/transfer.rs`, and section 24
     How `CLIPBOARD` and `PRIMARY` move between X clients and Wayland clients.
+18. `src/wire_scale.rs` and section 25
+    How downscaled Xwayland gets one integer scale, and where that scale is applied.
 
 ## 14. Vocabulary
 
@@ -742,7 +744,7 @@ Xwayland is enabled by default. At startup the compositor claims one X display a
 enabled = true
 ```
 
-`enabled = false` logs `Xwayland disabled` and skips the display. A reload that flips `enabled` logs the requested value and the running value, then keeps the running one. Changing it takes a restart.
+`enabled = false` logs `Xwayland disabled` and skips the display. A reload that flips `enabled` logs the requested value and the running value, then keeps the running one. Changing it takes a restart. `scaling_mode` is `default` or `downscaled`. A reload applies it live. Section 25 is that mode.
 
 ```text
 Start
@@ -990,7 +992,7 @@ The claim is ten void requests, in this order:
 
 ### The root cursor
 
-After the claim, the seat's default cursor image is the first frame of `default`, or of `left_ptr` when `default` has none. With an image, the WM sends `RenderQueryPictFormats` and keeps the image until the reply. The format is the direct pictformat of depth 32 whose channels are alpha at 24, red at 16, green at 8, and blue at 0, each with mask `0xff`. The upload is `CreatePixmap`, `CreateGc`, `PutImage` of the premultiplied pixels as native-endian ARGB, `RenderCreatePicture`, `RenderCreateCursor` at the image hotspot, and `ChangeWindowAttributes` of the root cursor. The picture, gc, and pixmap are then freed.
+After the claim, the seat's default cursor image is the first frame of `default`, or of `left_ptr` when `default` has none. With an image, the WM sends `RenderQueryPictFormats` and keeps the image until the reply. The format is the direct pictformat of depth 32 whose channels are alpha at 24, red at 16, green at 8, and blue at 0, each with mask `0xff`. The upload is `CreatePixmap`, `CreateGc`, `PutImage` of the premultiplied pixels as native-endian ARGB, `RenderCreatePicture`, `RenderCreateCursor` at the image hotspot, and `ChangeWindowAttributes` of the root cursor. The picture, gc, and pixmap are then freed. The previous root cursor is freed after `ChangeWindowAttributes` replaces it. Section 25 is the pixel size of that image.
 
 A missing image, an image with no pixels, a missing format, a request that does not fit, or a reply error is logged at debug and skipped. The WM stays up.
 
@@ -1076,7 +1078,7 @@ On a `wl_surface` commit, a mapped change of an X root that already has a window
 - Tiled or fullscreen uses `content_rect_global`. Width and height are at least 1.
 - Floating uses the root position. The size is the floating restore's configure size, then `floating_size`, then the X geometry. Width and height are at least 1.
 
-A hidden workspace has no protocol visibility, so nothing is sent. When the target differs from the stored `configured` rect, one `ConfigureWindow` carries x, y, width, height, and `border_width` 0. There is no sibling, no stack mode, and no synthetic `ConfigureNotify`. `ConfigureRequest` is ignored once the window is shown or managed.
+A hidden workspace has no protocol visibility, so nothing is sent. When the target differs from the stored `configured` rect, one `ConfigureWindow` carries x, y, width, height, and `border_width` 0. Those values are X pixels. Section 25 is the conversion from the logical layout. There is no sibling, no stack mode, and no synthetic `ConfigureNotify`. `ConfigureRequest` is ignored once the window is shown or managed.
 
 ### Placement
 
@@ -1304,3 +1306,73 @@ Run a normal session from a terminal. The display number is in section 20.
 4. `head -c 5M /dev/urandom | wl-copy`, then `xclip -o -selection clipboard | wc -c` prints 5242880. The reverse goes through `xclip -i` and `wl-paste | wc -c`.
 5. With focus on a Wayland window, `xclip -o` from a background X client returns nothing.
 6. `wl-copy --clear` makes `xclip -o -selection clipboard` fail.
+
+## 25. Xwayland scaling
+
+`[xwayland] scaling_mode` is `default` or `downscaled`. `default` keeps X coordinates equal to tema's logical coordinates, and X apps are upscaled by the compositor on a HiDPI output. `downscaled` gives the Xwayland client one integer wire scale S. Everything tema sends to that client is multiplied by S, and everything it receives is divided by S. X apps render at S times their logical size, and tema reads their buffers as buffer scale S. On an output whose scale is lower than S, those buffers are downscaled. The helpers live in `src/wire_scale.rs`. A normal Wayland client stays at scale 1.
+
+Rootless Xwayland builds its RandR CRTCs and the root window from `zxdg_output_v1.logical_position` and `logical_size`, read as X pixels. It ignores `wl_output.mode` once xdg_output is bound, and it ignores `wl_output.scale`. Multiplying the xdg_output position and size by S is what makes the X screen S times the logical layout, with the same gaps and the same output order. `wl_output` geometry x and y are multiplied the same way. Its `scale` event is 1 while S is greater than 1, and the legacy scale otherwise. Its `mode` stays the physical mode. `preferred_buffer_scale` is 1 and `wp_fractional_scale_v1.preferred_scale` is 120, which is scale 1 in that protocol's units of 1/120.
+
+### Choosing S
+
+S is the largest `ceil(scale)` among enabled outputs, and at least 1. Scales 1.25 and 1.5 both give 2. A disabled output is left out. `default`, downscaled with no enabled outputs, and downscaled on all-1x outputs all give 1. With S equal to 1 every conversion is the identity. `State::refresh_xwayland_wire_scale` stores the value and logs `Xwayland wire scale is now N` when it changes. The Xwayland client receives that value at adopt, before its first `wl_output` bind.
+
+### Rounding
+
+Logical values become wire values by exact multiplication. `i32` multiplication saturates. The way back is in `src/wire_scale.rs`:
+
+| Conversion | Rule | Used for |
+|---|---|---|
+| wire position to logical | floor division (`div_euclid`) | override-redirect position, attach offset, subsurface position, hotspot |
+| wire size to logical | ceiling division | surface size, viewport destination, X window width and height, min size hint |
+| wire max size hint to logical | floor division, then at least the logical min already converted | `WM_NORMAL_HINTS` max, one axis at a time |
+| wire rect outward | floor x1/y1, ceil x2/y2 | surface damage, input region, X damage |
+| wire rect inward | ceil x1/y1, floor x2/y2, drop when empty | opaque region |
+| wire `f64` to logical | exact division | viewport source, locked-pointer hint |
+
+An X damage rect `(100, 51, 300, 200)` at S = 2 is logical `(50, 25, 150, 101)`, because the far edge of the odd y coordinate rounds outward.
+
+### Commit normalization
+
+The pending commit is normalized once, in `wl_surface.rs`, when the committing client's wire scale is greater than 1. The rest of the compositor then sees logical units. The effective buffer scale is the client's buffer scale times S, so a 200×100 X buffer becomes a 100×50 logical surface. Viewport source fields are divided exactly and the destination uses ceiling division. Surface damage and the input region convert outward. The opaque region converts inward. The attach offset and `wl_subsurface.set_position` use floor division. Buffer damage is left alone, because it already converts through the effective buffer scale.
+
+The raw client values and the scale used are stored as `WireInputs` on the on-screen state. A commit at scale 1 stores none. A later scale change rebuilds the logical size, regions, and viewport from those raw values, or from the on-screen state when the commit happened at scale 1.
+
+### Input
+
+Pointer enter, motion, and warp, the continuous axis value, and both relative-motion pairs are multiplied by S on the way to the client. `axis_discrete` and `axis_value120` stay in protocol steps. A cursor hotspot, a locked-pointer hint, and a lock or confine region are divided on the way back. `wl_touch` is not advertised.
+
+### The X window manager boundary
+
+`XWindow.geometry` and `XWindow.pending` stay in X pixels. Conversion happens where a value meets the compositor or where a compositor value is sent back. `place` uses floor division. X damage uses the outward rect. A floating window's centered size and `floating_size` are logical. Size hints are stored both raw and logical. The raw min and max decide "fixed size, so float". The logical min is the ceiling division, and the logical max is the floor division clamped up to that min.
+
+`ConfigureWindow` sends X pixels. Tiled and fullscreen content uses `rect_to_wire`. A floating window multiplies the logical root position and the logical size. `configured` is the last rect sent, in X pixels, so a new S changes the target and the window is configured again. The 1×1 and `pending` configures on map request send `pending` unchanged. `ConfigureRequest` after map stays ignored.
+
+### A live change of S
+
+S is recomputed when an output scale changes, when an output is removed, when a `wl_output` global is added, and when a reload changes `scaling_mode`. The Xwayland client's `SetWireScale` is queued before that client's output events. The handler stores the scale, resends every bound `wl_output` and `xdg_output`, resends preferred buffer and fractional scale, recomputes each on-screen surface, and dispatches `Reconfigure` and `RefreshHints`.
+
+`state.xwayland_wire_scale` moves before Xwayland has processed the new output events. For that short window the XWM may convert a stale X geometry with the new S. `Wm::reconfigure` is what converges it: it refreshes logical size hints, sends `ConfigureWindow` for managed windows, and places every shown override-redirect window again from its unchanged X geometry. Xwayland is left running.
+
+### `RESOURCE_MANAGER` and the root cursor
+
+In `downscaled` mode the WM reads the root `RESOURCE_MANAGER` property (`STRING`, format 8) and merges `Xft.dpi: 96*S` and `Xcursor.size: cursor_size*S`. Other lines, comments, and continuation lines stay. Missing keys are appended. `default` mode leaves the property alone until a previous downscaled write has to be put back, and then merges `Xft.dpi: 96` and `Xcursor.size: cursor_size` once. The code is `src/xwayland/xwm/hints.rs`.
+
+The root cursor is the theme's `default` image, or `left_ptr`, at `cursor_size * S` pixels. The seat's own cursor stays at `cursor_size`. A change of S, of `cursor_size`, or of `cursor_theme` runs the upload again. `RefreshHints` is that path, from `SetWireScale` and from `apply_general_settings`.
+
+### Known limits
+
+An X window on an output whose scale is lower than S is downscaled, which costs a scale and is slightly soft. A fractional output renders at the next integer. GTK needs `GDK_SCALE`. Qt needs `QT_SCALE_FACTOR`, or it can follow `Xft.dpi`. `wl_output.mode` stays the physical mode for the Xwayland client too. Drag-and-drop coordinates are M10's job.
+
+### Manual check
+
+Run tema on a 2× output, or set `[output.scales]` for that output's name to 2. The display number is in section 20. `cursor_size` 24 is the example below.
+
+1. `scaling_mode = "default"`. `xterm` and `xeyes` look as they do today, upscaled. `xdpyinfo | grep dimensions` shows the logical size.
+2. `scaling_mode = "downscaled"`. `xdpyinfo` shows twice the logical size. `xrandr` lists outputs at doubled positions. `xterm` text is sharp and small. `xrdb -query` shows `Xft.dpi: 192` and `Xcursor.size: 48`. `GDK_SCALE=2 GDK_BACKEND=x11 gtk3-demo` looks native size and sharp.
+3. `xev` reports coordinates that match the pointer. Clicks hit buttons in a tiled window and in a floating window. Menus open next to the click.
+4. Tiling, floating, fullscreen, and an interactive resize give X sizes of twice the logical size (`xwininfo`).
+5. With a 1× output and a 2× output, X windows on the 1× output are downscaled. The X root spans both. Moving a window between outputs keeps it correct.
+6. Change that output's scale from 2 to 1 and reload. X windows reconfigure to 1× without restarting Xwayland. `xrdb -query` shows `Xft.dpi: 96` and `Xcursor.size: 24`.
+7. Switch `scaling_mode` on reload both ways while `xterm` is open. It reconfigures, and Xwayland stays running.
+8. `scaling_mode = "downscaled"` on all-1× outputs behaves as `default` does.

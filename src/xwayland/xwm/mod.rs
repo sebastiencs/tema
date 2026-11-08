@@ -9,6 +9,7 @@ mod cursor;
 mod focus;
 #[cfg(test)]
 mod focus_tests;
+mod hints;
 #[cfg(test)]
 mod manage_tests;
 mod mime;
@@ -87,6 +88,12 @@ struct Ready {
     root: Window,
     check_window: Window,
     cursor: Option<crate::cursor::CursorImage>,
+    /// The X cursor currently set on the root. Freed after the next upload replaces it.
+    root_cursor: Option<crate::x11::Cursor>,
+    /// Tema has published `Xft.dpi` / `Xcursor.size` and still owes the unscaled values.
+    hints_written: bool,
+    /// Latest `RESOURCE_MANAGER` read. An older reply is ignored.
+    hints_fetch: u64,
     selections: selection::Selections,
     atom_cache: AtomCache,
 }
@@ -116,6 +123,13 @@ pub(crate) enum WmEvent {
     },
     Startup(StartupEvent),
     PictFormats(Result<RenderQueryPictFormatsReply, XReplyError>),
+    /// `GetProperty` of the root `RESOURCE_MANAGER`.
+    Resources {
+        generation: u64,
+        result: Result<Property, PropertyError>,
+    },
+    /// Rewrite DPI and cursor hints, and upload the root cursor again.
+    RefreshHints,
     Property {
         window: Window,
         atom: crate::x11::Atom,
@@ -197,6 +211,13 @@ pub(super) struct WmCtx<'a> {
     pub(super) client: Option<crate::clients::ClientId>,
 }
 
+impl WmCtx<'_> {
+    /// Integer wire scale for this Xwayland client. One is the identity.
+    pub(super) fn wire_scale(&self) -> crate::wire_scale::WireScale {
+        self.state.xwayland_wire_scale
+    }
+}
+
 impl Wm {
     /// Queues the setup request and arms the connection.
     /// `queue_bytes` before `start` only stores the setup request. `start` arms the read and writes it.
@@ -263,6 +284,10 @@ impl Wm {
                 }
                 WmEvent::Startup(event) => self.on_startup(event, ctx),
                 WmEvent::PictFormats(result) => self.on_pict_formats(result),
+                WmEvent::Resources { generation, result } => {
+                    self.on_resources(generation, result, ctx)
+                }
+                WmEvent::RefreshHints => self.refresh_hints(ctx),
                 WmEvent::Property { window, atom, result } => {
                     self.on_property_reply(window, atom, result, ctx)
                 }
@@ -393,6 +418,9 @@ impl Wm {
             root,
             check_window: Window(0),
             cursor: None,
+            root_cursor: None,
+            hints_written: false,
+            hints_fetch: 0,
             selections: selection::Selections::pending(&bringup.atoms),
             atom_cache,
         };
@@ -404,6 +432,6 @@ impl Wm {
         self.phase = WmPhase::Ready(ready);
         self.on_selection_changed(selection::SelectionKind::Clipboard, ctx)?;
         self.on_selection_changed(selection::SelectionKind::Primary, ctx)?;
-        self.begin_cursor(ctx)
+        self.refresh_hints(ctx)
     }
 }

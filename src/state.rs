@@ -36,6 +36,7 @@ use crate::{
         zwlr_layer_surface_v1::{output_usable_bounds_with_snapshot, LayerLayoutObjectSnapshot},
     },
     window::{WindowEntry, WindowId},
+    wire_scale::{xwayland_wire_scale, WireScale},
     xkb::{KeyboardState, Xkb},
 };
 
@@ -953,6 +954,8 @@ pub struct State {
     pub globals: Globals,
     pub activation_tokens: ActivationTokenStore,
     pub config: RuntimeConfig,
+    /// One integer scale for the Xwayland wire. `ONE` in `default` mode.
+    pub(crate) xwayland_wire_scale: WireScale,
     pub seat: SeatState,
     pub keyboard: KeyboardState,
     pub xkb: Xkb,
@@ -1042,6 +1045,7 @@ impl State {
             globals,
             activation_tokens: Default::default(),
             config,
+            xwayland_wire_scale: WireScale::ONE,
             seat: SeatState::default(),
             keyboard,
             xkb,
@@ -4002,6 +4006,24 @@ impl State {
         changed
     }
 
+    /// Recomputes the Xwayland wire scale from the running mode and output scales.
+    /// Returns the new scale only when it changed; Phase 3 and Phase 9 act on that.
+    pub(crate) fn refresh_xwayland_wire_scale(&mut self) -> Option<WireScale> {
+        let new = xwayland_wire_scale(
+            self.config.xwayland.scaling_mode,
+            self.outputs
+                .iter()
+                .filter(|(_, output)| output.enabled)
+                .map(|(_, output)| output.scale),
+        );
+        if new == self.xwayland_wire_scale {
+            return None;
+        }
+        self.xwayland_wire_scale = new;
+        log::info!("Xwayland wire scale is now {scale}", scale = new.get());
+        Some(new)
+    }
+
     pub fn refresh_outputs_for_backend(&mut self, backend: BackendOutputRef) {
         let Some(drm) = self.drm.try_get(backend.drm_id) else {
             return;
@@ -4034,11 +4056,12 @@ mod tests {
         super::*,
         crate::{
             clients::{Client, ClientDispatcher, RawRequest},
-            config::RgbaColor,
+            config::{RgbaColor, XwaylandScalingMode},
             protocol_generated::{WaylandId, WlSurfaceId},
             test_support::{
                 resolved_wl_surface as root, state_for_tests, test_output_with_crtc_name,
             },
+            wire_scale::WireScale,
         },
         std::time::Duration,
     };
@@ -4995,6 +5018,94 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.output_id_for_surface_object(surface_resolved, surface), Some(output_id));
+    }
+
+    fn state_with_output_scales(mode: XwaylandScalingMode, scales: &[f64]) -> State {
+        let mut state = state_for_tests();
+        state.config.xwayland.scaling_mode = mode;
+        for (index, scale) in scales.iter().enumerate() {
+            let mut output = test_output_with_crtc_name(
+                BackendOutputRef::new(DrmId::from(1usize)),
+                index as u32 + 1,
+                0,
+                0,
+                1280,
+                720,
+            );
+            output.scale = FractionalScale::try_from_f64(*scale).unwrap();
+            state.outputs.insert(output);
+        }
+        state
+    }
+
+    #[test]
+    fn refresh_xwayland_wire_scale_follows_the_mode_and_output_scales() {
+        let downscaled = XwaylandScalingMode::Downscaled;
+        let default = XwaylandScalingMode::Default;
+        let cases: &[(XwaylandScalingMode, &[f64], Option<WireScale>)] = &[
+            (default, &[2.0], None),
+            (downscaled, &[], None),
+            (downscaled, &[1.0], None),
+            (downscaled, &[1.25], Some(WireScale::new(2))),
+            (downscaled, &[1.0, 2.0], Some(WireScale::new(2))),
+            (downscaled, &[1.5, 3.0], Some(WireScale::new(3))),
+        ];
+        for (mode, scales, expected) in cases {
+            let mut state = state_with_output_scales(*mode, scales);
+            assert_eq!(state.xwayland_wire_scale, WireScale::ONE);
+            assert_eq!(state.refresh_xwayland_wire_scale(), *expected);
+            assert_eq!(state.xwayland_wire_scale, expected.unwrap_or(WireScale::ONE));
+        }
+    }
+
+    #[test]
+    fn refresh_xwayland_wire_scale_returns_none_when_unchanged() {
+        let mut state = state_with_output_scales(XwaylandScalingMode::Downscaled, &[2.0]);
+        assert_eq!(state.refresh_xwayland_wire_scale(), Some(WireScale::new(2)));
+        assert_eq!(state.refresh_xwayland_wire_scale(), None);
+
+        state.config.xwayland.scaling_mode = XwaylandScalingMode::Default;
+        assert_eq!(state.refresh_xwayland_wire_scale(), Some(WireScale::ONE));
+        assert_eq!(state.refresh_xwayland_wire_scale(), None);
+
+        state.config.xwayland.scaling_mode = XwaylandScalingMode::Downscaled;
+        assert_eq!(state.refresh_xwayland_wire_scale(), Some(WireScale::new(2)));
+
+        let mut highest = test_output_with_crtc_name(
+            BackendOutputRef::new(DrmId::from(1usize)),
+            2,
+            1280,
+            0,
+            1280,
+            720,
+        );
+        highest.scale = FractionalScale::try_from_f64(3.0).unwrap();
+        state.outputs.insert(highest);
+        assert_eq!(state.refresh_xwayland_wire_scale(), Some(WireScale::new(3)));
+        assert_eq!(state.xwayland_wire_scale, WireScale::new(3));
+    }
+
+    #[test]
+    fn refresh_xwayland_wire_scale_counts_only_enabled_outputs() {
+        let mut state = state_with_output_scales(XwaylandScalingMode::Downscaled, &[1.0]);
+        let mut disabled = test_output_with_crtc_name(
+            BackendOutputRef::new(DrmId::from(1usize)),
+            2,
+            1280,
+            0,
+            1280,
+            720,
+        );
+        disabled.scale = FractionalScale::try_from_f64(3.0).unwrap();
+        disabled.enabled = false;
+        state.outputs.insert(disabled);
+        assert_eq!(state.refresh_xwayland_wire_scale(), None);
+        assert_eq!(state.xwayland_wire_scale, WireScale::ONE);
+
+        let output_id = state.outputs.iter().nth(1).map(|(id, _)| id).unwrap();
+        state.outputs.try_get_mut(output_id).unwrap().enabled = true;
+        assert_eq!(state.refresh_xwayland_wire_scale(), Some(WireScale::new(3)));
+        assert_eq!(state.xwayland_wire_scale, WireScale::new(3));
     }
 
     #[test]

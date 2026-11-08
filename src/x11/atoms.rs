@@ -135,6 +135,7 @@ atoms! {
         WM_CLASS = Atom::WM_CLASS,
         WM_TRANSIENT_FOR = Atom::WM_TRANSIENT_FOR,
         STRING = Atom::STRING,
+        RESOURCE_MANAGER = Atom::RESOURCE_MANAGER,
         INTEGER = Atom::INTEGER,
         CARDINAL = Atom::CARDINAL,
         ATOM = Atom::ATOM,
@@ -484,11 +485,19 @@ mod tests {
                 "{name} is neither interned nor predefined"
             );
         }
-        for name in ["WM_NAME", "WM_CLASS", "WM_TRANSIENT_FOR", "STRING", "CARDINAL", "ATOM"] {
+        for name in [
+            "WM_NAME",
+            "WM_CLASS",
+            "WM_TRANSIENT_FOR",
+            "STRING",
+            "CARDINAL",
+            "ATOM",
+            "RESOURCE_MANAGER",
+        ] {
             assert!(PREDEFINED.contains(&name), "{name}");
             assert!(!NAMES.contains(&name), "{name} would be interned");
         }
-        assert_eq!(NAMES.len() + PREDEFINED.len(), 68 + 12);
+        assert_eq!(NAMES.len() + PREDEFINED.len(), 68 + 13);
         assert!(NAMES.contains(&"MULTIPLE"));
         assert!(PREDEFINED.contains(&"INTEGER"));
         assert!(NAMES.contains(&"XdndSelection"));

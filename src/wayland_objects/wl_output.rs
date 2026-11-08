@@ -125,9 +125,10 @@ impl WlOutput {
             return;
         };
 
+        let wire_scale = dispatcher.wire_scale();
         let geometry = wl_output::Event::Geometry {
-            x: output.x,
-            y: output.y,
+            x: wire_scale.to_wire(output.x),
+            y: wire_scale.to_wire(output.y),
             physical_width: output.physical_width,
             physical_height: output.physical_height,
             subpixel: wl_output::Subpixel::Unknown as i32,
@@ -142,6 +143,9 @@ impl WlOutput {
         let Some(output) = self.output(state) else {
             return;
         };
+        // Keep the physical mode unchanged: rootless Xwayland derives its RandR
+        // layout from zxdg_output logical_position/logical_size and ignores
+        // wl_output.mode once it has bound xdg_output.
         self.send_event(mode_event(output), dispatcher);
     }
 
@@ -149,13 +153,16 @@ impl WlOutput {
         if self.version < wl_output::SCALE_SINCE {
             return;
         }
-        let scale = wl_output::Event::Scale {
-            factor: self
-                .output(state)
+        // A wire-scaled client sees its geometry in X pixels and renders its
+        // buffers at scale 1, so report 1 instead of the output's legacy scale.
+        let factor = if dispatcher.wire_scale().is_one() {
+            self.output(state)
                 .map(|output| output.legacy_scale())
-                .unwrap_or(1),
+                .unwrap_or(1)
+        } else {
+            1
         };
-        self.send_event(scale, dispatcher);
+        self.send_event(wl_output::Event::Scale { factor }, dispatcher);
     }
 
     pub fn send_name(&self, state: &State, dispatcher: &mut ClientDispatcher) {
@@ -212,10 +219,79 @@ mod tests {
     use {
         super::*,
         crate::{
-            state::{BackendOutputRef, DrmId},
-            test_support::{state_for_tests, test_output},
+            io_uring::model::IoUringAction,
+            runner::Dispatcher,
+            state::{BackendOutputRef, DrmId, FractionalScale, OutputId},
+            test_support::{state_for_tests, test_client_and_dispatcher, test_output},
+            wire_scale::WireScale,
         },
     };
+
+    /// A 2x output: mode 2560x1440 gives a logical size of 1280x720.
+    fn output_state() -> (State, OutputId) {
+        let mut state = state_for_tests();
+        let output_id = state.insert_output(test_output(
+            BackendOutputRef::new(DrmId::from(1usize)),
+            1,
+            1280,
+            0,
+            2560,
+            1440,
+            "test-output",
+        ));
+        state.outputs.try_get_mut(output_id).unwrap().scale = FractionalScale::TWO;
+        (state, output_id)
+    }
+
+    const WL_OUTPUT_ID: u32 = 12;
+
+    fn queued_state(scale: WireScale) -> Dispatcher {
+        let (state, output_id) = output_state();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        client.set_wire_scale_for_tests(scale);
+        let wl_output = WlOutput::new(WlOutputId::from(WL_OUTPUT_ID), output_id, 4);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            wl_output.send_state(&state, &mut client_dispatcher);
+        }
+        dispatcher
+    }
+
+    /// Argument words of the first queued event with the given object/opcode.
+    fn event_args(dispatcher: &Dispatcher, object: u32, opcode: u32) -> Vec<u32> {
+        let mut args = Vec::new();
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            if let IoUringAction::Sendmsg { buffer, .. } = action {
+                let words: Vec<u32> = buffer
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                if words.len() >= 2 && words[0] == object && (words[1] & 0xffff) == opcode {
+                    args = words[2..].to_vec();
+                }
+            }
+        });
+        args
+    }
+
+    #[test]
+    fn wire_scaled_client_gets_doubled_geometry_and_scale_one() {
+        let dispatcher = queued_state(WireScale::new(2));
+        let geometry = event_args(&dispatcher, WL_OUTPUT_ID, 0);
+        assert_eq!(&geometry[0..2], &[2560, 0]);
+        assert_eq!(event_args(&dispatcher, WL_OUTPUT_ID, 3)[0], 1);
+        // The physical mode stays unchanged.
+        assert_eq!(&event_args(&dispatcher, WL_OUTPUT_ID, 1)[1..3], &[2560, 1440]);
+    }
+
+    #[test]
+    fn normal_client_output_state_matches_today() {
+        let dispatcher = queued_state(WireScale::ONE);
+        let geometry = event_args(&dispatcher, WL_OUTPUT_ID, 0);
+        assert_eq!(&geometry[0..2], &[1280, 0]);
+        assert_eq!(event_args(&dispatcher, WL_OUTPUT_ID, 3)[0], 2);
+        assert_eq!(&event_args(&dispatcher, WL_OUTPUT_ID, 1)[1..3], &[2560, 1440]);
+    }
 
     #[test]
     fn mode_event_uses_output_nominal_refresh() {

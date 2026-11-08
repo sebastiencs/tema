@@ -5,7 +5,10 @@ use crate::{
     region::RectI,
     runner::Dispatcher,
     scene::SceneRole,
-    window::ToplevelDecorationMode,
+    scheduler::{output_scheduler_id, OutputSchedulerAction, RequestFrameReason},
+    test_support::{test_output_drm1, test_output_drm1_crtc},
+    window::{Toplevel, ToplevelDecorationMode},
+    wire_scale::WireScale,
     x11::{
         change_property_atoms, change_property_u32s, event_bytes, testing, Atom, Atoms,
         ClientMessage, ClientMessageData, ConfigWindow, ConfigureNotify, ConfigureWindow,
@@ -602,6 +605,42 @@ fn an_override_redirect_window_stays_at_its_x_geometry() {
 }
 
 #[test]
+fn a_downscaled_override_redirect_window_is_placed_and_damaged_in_logical_pixels() {
+    let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
+    state.xwayland_wire_scale = WireScale::new(2);
+    let origin = state.insert_output(test_output_drm1(0, 0, 80, 40));
+    let tail = state.insert_output(test_output_drm1_crtc(2, 50, 125, 100, 1));
+    let far = state.insert_output(test_output_drm1_crtc(3, 300, 0, 200, 200));
+    let window = Window(0x50);
+    let surface = hold_override_redirect(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &mut surfaces,
+        window,
+        80,
+        1,
+        100,
+        51,
+        300,
+        200,
+    );
+    let _ = dispatcher.test_take_queued_actions::<OutputSchedulerAction>();
+
+    deliver(&mut wm, &mut state, &mut dispatcher, &surfaces, map_notify(window, 1));
+
+    let tracked = wm.windows.get(&window).expect("tracked");
+    assert_eq!(tracked.geometry.x, 100);
+    assert_eq!(tracked.geometry.y, 51);
+    assert_eq!(tracked.geometry.width, 300);
+    assert_eq!(tracked.geometry.height, 200);
+    assert_eq!(super::tests::root_position(&state, surface), (50, 25));
+    assert!(damage_requested(&dispatcher, origin));
+    assert!(damage_requested(&dispatcher, tail));
+    assert!(!damage_requested(&dispatcher, far));
+}
+
+#[test]
 fn a_tiled_window_is_configured_to_its_content_rect() {
     let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
     add_output(&mut state);
@@ -626,6 +665,174 @@ fn a_tiled_window_is_configured_to_its_content_rect() {
 
     let again = reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces);
     assert!(again.is_empty());
+}
+
+#[test]
+fn a_downscaled_tiled_window_is_configured_in_x_pixels() {
+    let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
+    state.config.decorations.border.size = 0;
+    state.xwayland_wire_scale = WireScale::new(2);
+    state.insert_output(test_output_drm1(10, 20, 640, 480));
+    let managed = manage(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &mut surfaces,
+        Window(0x50),
+        80,
+        1,
+        "Term",
+        "XTerm",
+    );
+    let content = state
+        .tiled_window_geometry(managed.window)
+        .expect("tile")
+        .content_rect_global();
+    assert_eq!(content, RectI { x: 10, y: 20, width: 640, height: 480 });
+
+    let sent = reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    expect_requests(
+        sent,
+        vec![encoded_configure(Window(0x50), RectI { x: 20, y: 40, width: 1280, height: 960 })],
+    );
+    assert_eq!(
+        wm.windows
+            .get(&Window(0x50))
+            .unwrap()
+            .managed
+            .unwrap()
+            .configured,
+        Some(super::window::Rect { x: 20, y: 40, width: 1280, height: 960 })
+    );
+
+    let again = reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    assert!(again.is_empty());
+}
+
+#[test]
+fn a_wire_scale_change_reconfigures_managed_windows_and_repositions_override_redirect() {
+    let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
+    state.config.decorations.border.size = 0;
+    state.insert_output(test_output_drm1(10, 20, 640, 480));
+    let managed = manage(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &mut surfaces,
+        Window(0x50),
+        80,
+        1,
+        "Term",
+        "XTerm",
+    );
+    let content = state
+        .tiled_window_geometry(managed.window)
+        .expect("tile")
+        .content_rect_global();
+    assert_eq!(content, RectI { x: 10, y: 20, width: 640, height: 480 });
+    expect_requests(
+        reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces),
+        vec![encoded_configure(Window(0x50), content)],
+    );
+
+    let menu = Window(0x51);
+    let surface = hold_override_redirect(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &mut surfaces,
+        menu,
+        81,
+        2,
+        100,
+        51,
+        300,
+        200,
+    );
+    deliver(&mut wm, &mut state, &mut dispatcher, &surfaces, map_notify(menu, 1));
+    assert_eq!(super::tests::root_position(&state, surface), (100, 51));
+
+    state.xwayland_wire_scale = WireScale::new(2);
+    expect_requests(
+        reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces),
+        vec![encoded_configure(Window(0x50), RectI { x: 20, y: 40, width: 1280, height: 960 })],
+    );
+    assert_eq!(super::tests::root_position(&state, surface), (50, 25));
+    assert_eq!(wm.windows.get(&menu).unwrap().geometry.x, 100);
+    assert_eq!(wm.windows.get(&menu).unwrap().geometry.y, 51);
+    assert!(reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces).is_empty());
+}
+
+#[test]
+fn a_downscaled_floating_window_is_configured_in_x_pixels() {
+    let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
+    state.xwayland_wire_scale = WireScale::new(2);
+    add_output(&mut state);
+    let dialog = floating_dialog(&mut wm, &mut state, &mut dispatcher, &mut surfaces);
+    dialog
+        .surface
+        .try_grab(&mut state)
+        .expect("surface")
+        .set_root_position(100, 100);
+    wm.windows
+        .get_mut(&Window(0x50))
+        .unwrap()
+        .managed
+        .as_mut()
+        .unwrap()
+        .floating_size = Some((401, 300));
+
+    let sent = reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    expect_requests(
+        sent,
+        vec![encoded_configure(Window(0x50), RectI { x: 200, y: 200, width: 802, height: 600 })],
+    );
+    assert_eq!(
+        wm.windows
+            .get(&Window(0x50))
+            .unwrap()
+            .managed
+            .unwrap()
+            .floating_size,
+        Some((401, 300))
+    );
+
+    let again = reconfigure(&mut wm, &mut state, &mut dispatcher, &surfaces);
+    assert!(again.is_empty());
+}
+
+#[test]
+fn a_downscaled_interactive_resize_is_configured_in_x_pixels() {
+    let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
+    state.xwayland_wire_scale = WireScale::new(2);
+    add_output(&mut state);
+    let dialog = floating_dialog(&mut wm, &mut state, &mut dispatcher, &mut surfaces);
+    dialog
+        .surface
+        .try_grab(&mut state)
+        .expect("surface")
+        .set_root_position(100, 100);
+
+    let sent = handle_event(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        WmEvent::Resize { window: Window(0x50), width: 500, height: 400 },
+    );
+    expect_requests(
+        sent,
+        vec![encoded_configure(Window(0x50), RectI { x: 200, y: 200, width: 1000, height: 800 })],
+    );
+    assert_eq!(
+        wm.windows
+            .get(&Window(0x50))
+            .unwrap()
+            .managed
+            .unwrap()
+            .floating_size,
+        Some((500, 400))
+    );
 }
 
 #[test]
@@ -972,6 +1179,81 @@ fn a_window_larger_than_the_output_is_shrunk_and_clamped() {
             .floating_size,
         Some((u32::try_from(placed.width).unwrap(), u32::try_from(placed.height).unwrap()))
     );
+}
+
+#[test]
+fn a_downscaled_floating_window_is_centered_from_its_logical_size() {
+    let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
+    state.xwayland_wire_scale = WireScale::new(2);
+    let output = add_output(&mut state);
+    let managed = manage_with(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &mut surfaces,
+        Window(0x50),
+        80,
+        1,
+        801,
+        600,
+        "Ask",
+        "App",
+        |ready, property| {
+            (property == ready._NET_WM_WINDOW_TYPE)
+                .then(|| cardinals(&[ready._NET_WM_WINDOW_TYPE_DIALOG.0]))
+        },
+    );
+
+    let bounds = state.output_bounds(output).expect("output");
+    let insets = state.frame_insets();
+    let placed = placed_content(bounds, bounds, insets, 401, 300);
+    assert_eq!(super::tests::root_position(&state, managed.surface), (placed.x, placed.y));
+    let tracked = wm.windows.get(&Window(0x50)).expect("tracked");
+    assert_eq!(tracked.geometry.width, 801);
+    assert_eq!(tracked.geometry.height, 600);
+    assert_eq!(tracked.managed.unwrap().floating_size, None);
+}
+
+#[test]
+fn a_downscaled_window_reports_logical_size_hints() {
+    let (mut wm, mut state, mut dispatcher, mut surfaces) = open_wm();
+    state.xwayland_wire_scale = WireScale::new(2);
+    add_output(&mut state);
+    let managed = manage_with(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &mut surfaces,
+        Window(0x50),
+        80,
+        1,
+        10,
+        12,
+        "Term",
+        "XTerm",
+        |ready, property| {
+            if property != ready.WM_NORMAL_HINTS {
+                return None;
+            }
+            let mut hints = vec![0; 9];
+            hints[0] = (1 << 4) | (1 << 5);
+            hints[5] = 400;
+            hints[6] = 300;
+            hints[7] = 801;
+            hints[8] = 601;
+            Some(cardinals(&hints))
+        },
+    );
+
+    let toplevel = state
+        .objects
+        .try_get(managed.object)
+        .and_then(|object| object.downcast_ref::<super::toplevel::XToplevel>())
+        .expect("toplevel");
+    assert_eq!(toplevel.minimum_size(), Some((200, 150)));
+    assert_eq!(toplevel.size_constraints().clamp(1, 1), (200, 150));
+    assert_eq!(toplevel.size_constraints().clamp(10_000, 10_000), (400, 300));
+    assert!(!state.window_is_floating(managed.window));
 }
 
 #[test]
@@ -1867,6 +2149,18 @@ fn scene_surfaces(state: &crate::State) -> Vec<Resolved<WlSurfaceId>> {
         .into_iter()
         .map(|entry| entry.root_surface)
         .collect()
+}
+
+fn damage_requested(dispatcher: &Dispatcher, output: crate::state::OutputId) -> bool {
+    dispatcher.test_has_queued_action_for::<OutputSchedulerAction, _>(
+        output_scheduler_id(output),
+        |action| {
+            matches!(
+                action,
+                OutputSchedulerAction::RequestFrame { reason: RequestFrameReason::Damage }
+            )
+        },
+    )
 }
 
 fn scene_role(state: &crate::State, surface: Resolved<WlSurfaceId>) -> Option<SceneRole> {

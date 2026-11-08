@@ -479,6 +479,36 @@ impl RegionValue {
             }
         }
     }
+
+    /// Map every rectangle of the region and drop the ops whose rectangle maps
+    /// to `None`. Op order is kept, so subtracts keep their meaning; a region
+    /// whose adds all map away is empty. Empty and infinite regions stay as
+    /// they are. This is the Xwayland wire-scale conversion point for regions
+    /// (M11): input regions map outward, opaque regions inward.
+    pub fn map_rects(&self, map: impl Fn(RectI) -> Option<RectI>) -> Self {
+        match self {
+            Self::Empty => Self::Empty,
+            Self::Infinite => Self::Infinite,
+            Self::Spec(spec) => {
+                let mut mapped = RegionSpec::default();
+                for op in spec.ops() {
+                    match op {
+                        RegionOp::Add(rect) => {
+                            if let Some(rect) = map(*rect) {
+                                mapped.add_rect(rect);
+                            }
+                        }
+                        RegionOp::Subtract(rect) => {
+                            if let Some(rect) = map(*rect) {
+                                mapped.subtract_rect(rect);
+                            }
+                        }
+                    }
+                }
+                Self::from_spec(mapped)
+            }
+        }
+    }
 }
 
 fn closest_point_in_rect(rect: RectI, point: (f64, f64)) -> (f64, f64) {
@@ -608,7 +638,7 @@ impl Default for RegionValue {
 #[cfg(test)]
 mod tests {
     use {
-        super::{DamageRegion, RectI, RegionSpec, RegionValue},
+        super::{DamageRegion, RectI, RegionOp, RegionSpec, RegionValue},
         crate::transform::RectF,
     };
 
@@ -649,6 +679,39 @@ mod tests {
         let mut spec = RegionSpec::default();
         spec.subtract_rect(RectI::new(0, 0, 5, 5).unwrap());
         assert!(RegionValue::from_spec(spec).is_empty());
+    }
+
+    #[test]
+    fn map_rects_maps_each_op_and_drops_away_mappings() {
+        let mut spec = RegionSpec::default();
+        spec.add_rect(RectI::new(2, 2, 8, 8).unwrap());
+        spec.subtract_rect(RectI::new(4, 4, 2, 2).unwrap());
+        let region = RegionValue::from_spec(spec);
+
+        // Halve every rect, keeping op order: the subtract still cuts the add.
+        let halved = region.map_rects(|rect| {
+            Some(RectI::new(rect.x / 2, rect.y / 2, rect.width / 2, rect.height / 2).unwrap())
+        });
+        let RegionValue::Spec(mapped) = &halved else {
+            panic!("expected a spec");
+        };
+        assert_eq!(
+            mapped.ops(),
+            &[
+                RegionOp::Add(RectI::new(1, 1, 4, 4).unwrap()),
+                RegionOp::Subtract(RectI::new(2, 2, 1, 1).unwrap()),
+            ],
+        );
+        assert!(halved.contains(1, 1));
+        assert!(!halved.contains(2, 2));
+        assert!(!halved.contains(6, 6));
+
+        // Mapping everything to None empties the region.
+        assert!(region.map_rects(|_| None).is_empty());
+
+        // Empty and infinite stay as they are.
+        assert!(RegionValue::empty().map_rects(|_| None).is_empty());
+        assert_eq!(RegionValue::infinite().map_rects(|_| None), RegionValue::infinite());
     }
 
     #[test]

@@ -86,7 +86,18 @@ impl ZwpLockedPointerV1 {
             return Ok(None);
         };
         let region = client.resolve_or_disconnect::<WlRegionId>(region, state, dispatcher)?;
-        Ok(Some(region.rref(state).snapshot()))
+        let snapshot = region.rref(state).snapshot();
+        Ok(Some(dispatcher.wire_scale().region_to_logical_outward(snapshot)))
+    }
+}
+
+/// A wire-scaled client's hint is in X pixels. Divide it into logical units.
+/// Scale 1 keeps the bits the client sent.
+fn logical_fixed(scale: crate::wire_scale::WireScale, value: f32) -> f32 {
+    if scale.is_one() {
+        value
+    } else {
+        scale.to_logical_f64(f64::from(value)) as f32
     }
 }
 
@@ -132,8 +143,10 @@ impl Object for ZwpLockedPointerV1 {
                 {
                     return Ok(());
                 }
+                let scale = dispatcher.wire_scale();
+                let hint = (logical_fixed(scale, surface_x), logical_fixed(scale, surface_y));
                 if let Some(mut surface) = self.core.surface.try_ref_mut(state) {
-                    surface.set_pending_pointer_constraint_hint((surface_x, surface_y));
+                    surface.set_pending_pointer_constraint_hint(hint);
                 }
             }
             SetRegion { region } => {
