@@ -1266,7 +1266,7 @@ Every Wayland clipboard or primary change takes the matching X selection with `S
 
 An X owner is published once its `TARGETS` reply has become a non-empty MIME list, the keyboard-focus root has the Xwayland role, and the run's Xwayland client has connected. The root of the focused surface is what is checked, so an override-redirect menu counts. `install_x_selection` offers the result to the focused data device and to data-control devices. The source is an `XSelectionSourceObject` kept outside any client map.
 
-A `SelectionRequest` while the focus root is a Wayland surface is refused.
+A `SelectionRequest` while the focus root is a Wayland surface is refused. A `SelectionRequest` for any other selection, including `XdndSelection`, is logged and left unanswered.
 
 ### MIME types
 

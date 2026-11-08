@@ -634,6 +634,7 @@ impl Wm {
         ctx: &mut WmCtx<'_>,
     ) -> Result<(), WmFailure> {
         let Some(kind) = self.kind_for_selection(event.selection) else {
+            log::warn!("Unknown selection request");
             return Ok(());
         };
         if !x_keyboard_focus(ctx.state) {

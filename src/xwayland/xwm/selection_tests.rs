@@ -2106,6 +2106,26 @@ fn focus_data_device(
 }
 
 #[test]
+#[test]
+fn an_unknown_selection_request_is_left_unanswered() {
+    let (mut wm, mut state, mut dispatcher, surfaces) = focused_x_window();
+    let ready = atoms(&wm);
+    let sent = deliver(
+        &mut wm,
+        &mut state,
+        &mut dispatcher,
+        &surfaces,
+        Event::SelectionRequest(selection_request(
+            Window(0x90),
+            ready.XdndSelection,
+            ready.UTF8_STRING,
+            Atom(70),
+            4,
+        )),
+    );
+    assert!(sent.is_empty());
+}
+
 fn stopping_clears_the_x_selection_and_drops_a_pending_receive() {
     let (mut wm, mut state, mut dispatcher, surfaces) = focused_x_window();
     let object = publish_utf8_clipboard(&mut wm, &mut state, &mut dispatcher, &surfaces);
