@@ -197,6 +197,8 @@ pub struct DrmOutput {
     cursor_animation_delay_msec: Option<u32>,
     allow_in_fence_fd: bool,
     allow_fb_damage_clips: bool,
+    /// Mode this compositor intends to program. Independent of the kernel MODE_ID blob.
+    configured_mode: OutputMode,
     /// Plane state the next composited commit still has to apply. Startup records
     /// geometry here after a TEST_ONLY check; the first rendered frame commits it.
     pending_modeset: Option<PendingModeset>,
@@ -705,12 +707,9 @@ fn mode_blob_replaced(previous: Option<u64>, next: u64) -> Option<u64> {
 }
 
 /// Installed mode blob that the successful commit supersedes.
-fn retired_mode_blob(previous: u32, applied: u64) -> Option<u64> {
-    if previous != 0 && u64::from(previous) != applied {
-        Some(u64::from(previous))
-    } else {
-        None
-    }
+/// Only blobs created by this compositor are tracked.
+fn retired_mode_blob(previous: Option<u64>, applied: u64) -> Option<u64> {
+    previous.filter(|blob| *blob != applied)
 }
 
 #[derive(Clone, Copy)]
@@ -1287,7 +1286,8 @@ struct Crtc {
     possible_planes: HashSet<plane::Handle>,
     active: bool,
     active_prop: Option<control::property::Handle>,
-    mode_id: u32,
+    /// MODE_ID blob created by this compositor. The blob inherited at startup is not ours.
+    owned_mode_blob_id: Option<u64>,
     mode_id_prop: Option<control::property::Handle>,
     color: CrtcColorProperties,
     vrr_enabled_prop: Option<control::property::Handle>,
@@ -1414,25 +1414,8 @@ impl Drm {
     }
 
     pub fn current_output_mode(&self, drm_crtc_id: u32) -> Option<OutputMode> {
-        let mode_blob = self.outputs.get(&drm_crtc_id)?.in_use.crtc.mode_id;
-        if mode_blob == 0 {
-            return None;
-        }
-        let blob = self.fd.get_property_blob(mode_blob as u64).ok()?;
-        if blob.len() < std::mem::size_of::<drm_ffi::drm_sys::drm_mode_modeinfo>() {
-            return None;
-        }
-        let raw: drm_ffi::drm_sys::drm_mode_modeinfo = unsafe {
-            std::ptr::read_unaligned(blob.as_ptr() as *const drm_ffi::drm_sys::drm_mode_modeinfo)
-        };
-        let clock_milli_hertz = raw.clock as u64 * 1_000_000;
-        let refresh_millihz = (((clock_milli_hertz / raw.htotal as u64) + (raw.vtotal as u64 / 2))
-            / raw.vtotal as u64) as i32;
-        Some(OutputMode {
-            width: raw.hdisplay as i32,
-            height: raw.vdisplay as i32,
-            refresh_millihz,
-        })
+        self.output(drm_crtc_id)
+            .map(|output| output.configured_mode.clone())
     }
 
     pub fn output_gamma_size(&self, drm_crtc_id: u32) -> u32 {
@@ -1863,6 +1846,8 @@ impl Drm {
             .output(drm_crtc_id)
             .and_then(|output| output.in_use.connector.preferred_mode)
             .ok_or_else(|| OutputRestoreError::Refresh("connector has no retained mode".into()))?;
+        let configured_mode = OutputMode::from_drm_mode(&mode)
+            .ok_or_else(|| OutputRestoreError::Refresh("retained mode is not usable".into()))?;
         let raw_mode = Self::modeinfo_from_mode(mode);
         let mode_blob = self
             .fd
@@ -1900,6 +1885,7 @@ impl Drm {
                 .pending_modeset
                 .and_then(|pending| pending.crtc)
                 .map(|crtc| crtc.mode_blob_id);
+            output.configured_mode = configured_mode;
             output.pending_modeset = Some(PendingModeset {
                 geometry: primary_plane_geometry(u64::from(width), u64::from(height)),
                 crtc: Some(PendingCrtc { mode_blob_id }),
@@ -2582,10 +2568,11 @@ impl Drm {
                     if let Some(pending) = pending_modeset {
                         let retired = pending.crtc.and_then(|crtc_state| {
                             let output = self.output_mut(drm_crtc_id).unwrap();
-                            let previous = std::mem::replace(
-                                &mut output.in_use.crtc.mode_id,
-                                crtc_state.mode_blob_id as u32,
-                            );
+                            let previous = output
+                                .in_use
+                                .crtc
+                                .owned_mode_blob_id
+                                .replace(crtc_state.mode_blob_id);
                             output.in_use.crtc.active = true;
                             retired_mode_blob(previous, crtc_state.mode_blob_id)
                         });
@@ -3203,6 +3190,12 @@ impl Drm {
         let Some(mode) = in_use.connector.preferred_mode.as_ref() else {
             return Err("connector has no mode".into());
         };
+        let Some(configured_mode) = OutputMode::from_drm_mode(mode) else {
+            return Err(format!(
+                "connector {} mode is not usable",
+                in_use.connector.interface_name
+            ));
+        };
         let (hdisplay, vdisplay) = mode.size();
         let (primary_plane, plane_modifiers) = in_use.primary_plane();
         let explicit_sync = renderer.capabilities().explicit_sync;
@@ -3283,6 +3276,7 @@ impl Drm {
             cursor_animation_delay_msec: None,
             allow_in_fence_fd: true,
             allow_fb_damage_clips: true,
+            configured_mode,
             pending_modeset: Some(PendingModeset { geometry, crtc: None }),
         })
     }
@@ -3488,7 +3482,7 @@ impl Drm {
             possible_planes,
             active: props.get("ACTIVE").map(|(v, _)| *v != 0).unwrap_or(false),
             active_prop: props.get("ACTIVE").map(|(_, info)| info.handle()),
-            mode_id: props.get("MODE_ID").map(|(v, _)| *v as u32).unwrap(),
+            owned_mode_blob_id: None,
             mode_id_prop: props.get("MODE_ID").map(|(_, info)| info.handle()),
             color: CrtcColorProperties {
                 gamma_lut: props.get("GAMMA_LUT").map(|(_, info)| info.handle()),
@@ -4248,8 +4242,8 @@ pub enum VisualAnimationPumpAction {
 
 pub struct VisualAnimationPump;
 
-pub fn sync_output_nodes_for_backend(state: &mut State, drm_id: DrmId) {
-    state.refresh_outputs_for_backend(BackendOutputRef::new(drm_id));
+pub fn sync_output_nodes_for_backend(state: &mut State, drm_id: DrmId) -> Vec<OutputId> {
+    state.refresh_outputs_for_backend(BackendOutputRef::new(drm_id))
 }
 
 pub fn request_output_frame(
@@ -10267,9 +10261,9 @@ mod presentation_timing_tests {
         assert_eq!(mode_blob_replaced(Some(11), 22), Some(11));
         assert_eq!(mode_blob_replaced(Some(22), 22), None);
         assert_eq!(mode_blob_replaced(None, 22), None);
-        assert_eq!(retired_mode_blob(11, 22), Some(11));
-        assert_eq!(retired_mode_blob(22, 22), None);
-        assert_eq!(retired_mode_blob(0, 22), None);
+        assert_eq!(retired_mode_blob(Some(11), 22), Some(11));
+        assert_eq!(retired_mode_blob(Some(22), 22), None);
+        assert_eq!(retired_mode_blob(None, 22), None);
     }
 
     #[test]

@@ -162,6 +162,30 @@ pub struct OutputMode {
     pub refresh_millihz: i32,
 }
 
+impl OutputMode {
+    pub(crate) fn has_area(&self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+
+    /// The mode the compositor intends to program. A zero display size or blank
+    /// sync totals is not a mode.
+    pub(crate) fn from_drm_mode(mode: &drm::control::Mode) -> Option<Self> {
+        let (width, height) = mode.size();
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let (_, _, htotal) = mode.hsync();
+        let (_, _, vtotal) = mode.vsync();
+        if htotal == 0 || vtotal == 0 {
+            return None;
+        }
+        let clock_milli_hertz = mode.clock() as u64 * 1_000_000;
+        let refresh_millihz =
+            (((clock_milli_hertz / htotal as u64) + (vtotal as u64 / 2)) / vtotal as u64) as i32;
+        Some(Self { width: width as i32, height: height as i32, refresh_millihz })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct FractionalScale(u32);
 
@@ -253,6 +277,31 @@ pub struct Output {
     pub preferred_mode: Option<OutputMode>,
 }
 
+/// Fields advertised to clients or used to place the output. Identity and
+/// protocol object ids stay out of the comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublishedOutputState {
+    enabled: bool,
+    x: i32,
+    y: i32,
+    physical_width: i32,
+    physical_height: i32,
+    scale: FractionalScale,
+    transform: i32,
+    make: String,
+    model: String,
+    name: String,
+    description: String,
+    current_mode: OutputMode,
+    preferred_mode: Option<OutputMode>,
+    gamma_lut_size: u32,
+    ctm_supported: bool,
+    vrr_capable: bool,
+    vrr_policy_enabled: bool,
+    vrr_enabled: bool,
+    vrr_range: Option<VrrRange>,
+}
+
 impl Output {
     pub fn new(backend: BackendOutputRef, drm_crtc_id: u32, drm: &Drm) -> Self {
         let mut output = Self {
@@ -308,10 +357,18 @@ impl Output {
         let preferred_mode = connector
             .preferred_mode
             .as_ref()
-            .map(Self::mode_from_connector);
+            .and_then(OutputMode::from_drm_mode);
+        // `current_output_mode` is the mode this compositor has chosen to program.
+        // It is absent only when the DRM output itself is gone.
         let current_mode = drm
             .current_output_mode(self.drm_crtc_id)
+            .filter(OutputMode::has_area)
             .or_else(|| preferred_mode.clone())
+            .or_else(|| {
+                self.current_mode
+                    .has_area()
+                    .then(|| self.current_mode.clone())
+            })
             .unwrap_or(OutputMode { width: 0, height: 0, refresh_millihz: 0 });
 
         let make = connector.manufacturer_id.clone();
@@ -394,17 +451,34 @@ impl Output {
         RectI::new(self.x, self.y, width, height)
     }
 
-    fn mode_from_connector(mode: &drm::control::Mode) -> OutputMode {
-        let (width, height) = mode.size();
-        let refresh_millihz = {
-            let clock_milli_hertz = mode.clock() as u64 * 1_000_000;
-            let (_, _, htotal) = mode.hsync();
-            let (_, _, vtotal) = mode.vsync();
-            (((clock_milli_hertz / htotal as u64) + (vtotal as u64 / 2)) / vtotal as u64) as i32
-        };
-
-        OutputMode { width: width as i32, height: height as i32, refresh_millihz }
+    fn published_state(&self) -> PublishedOutputState {
+        PublishedOutputState {
+            enabled: self.enabled,
+            x: self.x,
+            y: self.y,
+            physical_width: self.physical_width,
+            physical_height: self.physical_height,
+            scale: self.scale,
+            transform: self.transform,
+            make: self.make.clone(),
+            model: self.model.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            current_mode: self.current_mode.clone(),
+            preferred_mode: self.preferred_mode.clone(),
+            gamma_lut_size: self.gamma_lut_size,
+            ctm_supported: self.ctm_supported,
+            vrr_capable: self.vrr_capable,
+            vrr_policy_enabled: self.vrr_policy_enabled,
+            vrr_enabled: self.vrr_enabled,
+            vrr_range: self.vrr_range,
+        }
     }
+}
+
+fn clamp_to_span(value: i32, start: i32, end: i32) -> Option<i32> {
+    let max = end.saturating_sub(1);
+    (max >= start).then_some(value.clamp(start, max))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -534,11 +608,11 @@ impl OutputLayout {
                 if !output.enabled {
                     return None;
                 }
-                Some(OutputLayoutEntry {
-                    output_id,
-                    backend: output.backend(),
-                    bounds: output.logical_bounds()?,
-                })
+                let bounds = output.logical_bounds()?;
+                if bounds.is_empty() {
+                    return None;
+                }
+                Some(OutputLayoutEntry { output_id, backend: output.backend(), bounds })
             })
             .collect::<Vec<_>>();
         let extents = entries
@@ -589,8 +663,13 @@ impl OutputLayout {
         let mut best = None;
         let mut best_distance = i64::MAX;
         for entry in &self.entries {
-            let clamped_x = x.clamp(entry.bounds.x, entry.bounds.x2().saturating_sub(1));
-            let clamped_y = y.clamp(entry.bounds.y, entry.bounds.y2().saturating_sub(1));
+            // A 0×0 mode makes `x2() - 1` less than `x`, and `clamp` panics.
+            let (Some(clamped_x), Some(clamped_y)) = (
+                clamp_to_span(x, entry.bounds.x, entry.bounds.x2()),
+                clamp_to_span(y, entry.bounds.y, entry.bounds.y2()),
+            ) else {
+                continue;
+            };
             let dx = i64::from(x.saturating_sub(clamped_x));
             let dy = i64::from(y.saturating_sub(clamped_y));
             let distance = dx * dx + dy * dy;
@@ -4024,9 +4103,9 @@ impl State {
         Some(new)
     }
 
-    pub fn refresh_outputs_for_backend(&mut self, backend: BackendOutputRef) {
+    pub fn refresh_outputs_for_backend(&mut self, backend: BackendOutputRef) -> Vec<OutputId> {
         let Some(drm) = self.drm.try_get(backend.drm_id) else {
-            return;
+            return Vec::new();
         };
         let output_ids = self
             .outputs
@@ -4034,12 +4113,19 @@ impl State {
             .filter_map(|(output_id, output)| (output.backend == backend).then_some(output_id))
             .collect::<Vec<_>>();
 
+        let mut changed = Vec::new();
         for output_id in output_ids {
-            if let Some(output) = self.outputs.try_get_mut(output_id) {
-                output.refresh_from_backend(drm);
-                output.scale = output.configured_scale(&self.config);
+            let Some(output) = self.outputs.try_get_mut(output_id) else {
+                continue;
+            };
+            let before = output.published_state();
+            output.refresh_from_backend(drm);
+            output.scale = output.configured_scale(&self.config);
+            if output.published_state() != before {
+                changed.push(output_id);
             }
         }
+        changed
     }
 
     pub fn output_ids_for_backend(&self, backend: BackendOutputRef) -> Vec<OutputId> {
@@ -4963,6 +5049,105 @@ mod tests {
         let layout = OutputLayout::from_outputs(&outputs);
         assert_eq!(layout.nearest_point(150, 10), Some((right_id, (200, 10))));
         assert_eq!(layout.nearest_point(250, 50), Some((right_id, (250, 50))));
+    }
+
+    #[test]
+    fn zero_size_output_is_left_out_of_pointer_clamping() {
+        let mut state = state_for_tests();
+        let output_id = state.insert_output(test_output_with_crtc_name(
+            BackendOutputRef::new(DrmId::from(1usize)),
+            1,
+            0,
+            0,
+            0,
+            0,
+        ));
+
+        assert!(state.output_layout().is_empty());
+        assert_eq!(state.clamp_point_to_outputs(10, 10), None);
+        assert_eq!(state.primary_output_for_rect(RectI::new(0, 0, 80, 40).unwrap(), None), None);
+        // The enabled output remains the stored fallback, without clamping into it.
+        assert_eq!(state.active_output_id(), Some(output_id));
+
+        let mut outputs = IndexMap::<OutputId, Output>::default();
+        outputs.insert(Output {
+            backend: BackendOutputRef::new(DrmId::from(1usize)),
+            drm_crtc_id: 1,
+            global_name: None,
+            gamma_lut_size: 0,
+            ctm_supported: false,
+            vrr_capable: false,
+            vrr_policy_enabled: false,
+            vrr_enabled: false,
+            vrr_range: None,
+            gamma_control_object_id: None,
+            x: 0,
+            y: 0,
+            physical_width: 0,
+            physical_height: 0,
+            scale: FractionalScale::ONE,
+            transform: 0,
+            make: String::new(),
+            model: String::new(),
+            name: "blank".to_string(),
+            description: String::new(),
+            enabled: true,
+            current_mode: OutputMode { width: 0, height: 0, refresh_millihz: 0 },
+            preferred_mode: None,
+        });
+        let real_id = outputs.insert(Output {
+            backend: BackendOutputRef::new(DrmId::from(1usize)),
+            drm_crtc_id: 2,
+            global_name: None,
+            gamma_lut_size: 0,
+            ctm_supported: false,
+            vrr_capable: false,
+            vrr_policy_enabled: false,
+            vrr_enabled: false,
+            vrr_range: None,
+            gamma_control_object_id: None,
+            x: 0,
+            y: 0,
+            physical_width: 0,
+            physical_height: 0,
+            scale: FractionalScale::ONE,
+            transform: 0,
+            make: String::new(),
+            model: String::new(),
+            name: "real".to_string(),
+            description: String::new(),
+            enabled: true,
+            current_mode: OutputMode { width: 100, height: 80, refresh_millihz: 60_000 },
+            preferred_mode: None,
+        });
+        let layout = OutputLayout::from_outputs(&outputs);
+        assert_eq!(layout.entries().len(), 1);
+        assert_eq!(layout.nearest_point(-4, 200), Some((real_id, (0, 79))));
+    }
+
+    #[test]
+    fn published_output_state_changes_with_the_mode() {
+        let mut output = test_output_with_crtc_name(
+            BackendOutputRef::new(DrmId::from(1usize)),
+            1,
+            0,
+            0,
+            100,
+            80,
+        );
+        let before = output.published_state();
+        output.global_name = Some(crate::globals::GlobalName::from_raw(4));
+        assert_eq!(output.published_state(), before);
+        output.current_mode.width += 1;
+        assert_ne!(output.published_state(), before);
+    }
+
+    #[test]
+    fn refresh_without_a_drm_backend_reports_no_changes() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(7usize));
+        state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 100, 80));
+        assert!(state.refresh_outputs_for_backend(backend).is_empty());
     }
 
     #[test]

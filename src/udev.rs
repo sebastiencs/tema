@@ -388,12 +388,30 @@ impl Udev {
         let Some(devnum) = device.devnum() else {
             return;
         };
+        self.handle_drm_change_for_devnum(devnum, state, dispatcher);
+    }
+
+    /// A DRM change while the session is paused, or before the resume modeset,
+    /// must not republish output state. An accepted change notifies clients only
+    /// for outputs whose published state actually moved.
+    fn handle_drm_change_for_devnum(
+        &mut self,
+        devnum: libc::dev_t,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+    ) {
+        if !state.session_active
+            || self.awaiting_drm_resume.contains(&devnum)
+            || self.parked.contains_key(&devnum)
+        {
+            return;
+        }
         let Some(drm_id) = Self::find_drm_id_for_devnum(state, devnum) else {
-            log::trace!("Ignored change event for unmanaged DRM device {:?}", device.devnode());
+            log::trace!("Ignored change event for unmanaged DRM device {devnum}");
             return;
         };
-        sync_output_nodes_for_backend(state, drm_id);
-        for output_id in state.output_ids_for_backend(BackendOutputRef::new(drm_id)) {
+        let changed_outputs = sync_output_nodes_for_backend(state, drm_id);
+        for output_id in changed_outputs {
             dispatcher.dispatch_to(
                 crate::scheduler::output_scheduler_id(output_id),
                 crate::scheduler::OutputSchedulerAction::ModeUpdated,
@@ -1453,6 +1471,53 @@ mod tests {
         assert!(!dispatcher.test_has_queued_action(|action: &LibinputAction| {
             matches!(action, LibinputAction::OpenInput { .. })
         }));
+    }
+
+    fn output_change_was_broadcast(dispatcher: &crate::runner::Dispatcher) -> bool {
+        use crate::{clients::ClientManagerAction, scheduler::OutputSchedulerAction};
+
+        dispatcher.test_has_queued_action(|action: &ClientManagerAction| {
+            matches!(action, ClientManagerAction::OutputStateChanged { .. })
+        }) || dispatcher.test_has_queued_action(|action: &OutputSchedulerAction| {
+            matches!(action, OutputSchedulerAction::ModeUpdated)
+        })
+    }
+
+    #[test]
+    fn a_drm_change_is_ignored_until_the_session_can_restore() {
+        use super::{ParkedKind, ParkedSessionDevice};
+
+        let mut udev = Udev::new().expect("udev monitor");
+        let mut state = crate::test_support::state_for_tests();
+        let devnum = 42;
+
+        state.session_active = false;
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        udev.handle_drm_change_for_devnum(devnum, &mut state, &mut dispatcher);
+        assert!(!output_change_was_broadcast(&dispatcher));
+
+        state.session_active = true;
+        udev.awaiting_drm_resume.insert(devnum);
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        udev.handle_drm_change_for_devnum(devnum, &mut state, &mut dispatcher);
+        assert!(!output_change_was_broadcast(&dispatcher));
+
+        udev.awaiting_drm_resume.remove(&devnum);
+        udev.parked
+            .insert(devnum, ParkedSessionDevice { kind: ParkedKind::Input, fd: None });
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        udev.handle_drm_change_for_devnum(devnum, &mut state, &mut dispatcher);
+        assert!(!output_change_was_broadcast(&dispatcher));
+    }
+
+    #[test]
+    fn a_drm_change_without_a_backend_publishes_nothing() {
+        let mut udev = Udev::new().expect("udev monitor");
+        let mut state = crate::test_support::state_for_tests();
+        state.session_active = true;
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        udev.handle_drm_change_for_devnum(42, &mut state, &mut dispatcher);
+        assert!(!output_change_was_broadcast(&dispatcher));
     }
 
     fn first_device(subsystem: &str) -> udev::Device {
