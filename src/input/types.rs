@@ -9,6 +9,8 @@ use crate::{
     window::WindowId,
 };
 
+use super::grab::TiledDragSession;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, derive_more::Deref)]
 pub struct SurfaceFocus {
     pub surface: Resolved<WlSurfaceId>,
@@ -139,21 +141,7 @@ pub(crate) enum ActiveGrab {
     /// Compositor move of a tiled window. The window stays tiled until the pointer
     /// travels past `threshold`, then it becomes a temporary floating preview.
     /// The preview follows the pointer and may extend past the source output.
-    MoveTiled {
-        window: WindowId,
-        root_surface: Resolved<WlSurfaceId>,
-        size_constraints: InteractiveSizeConstraints,
-        decoration_mode: ToplevelDecorationMode,
-        origin_pointer: (f64, f64),
-        threshold: i32,
-        picked_up: bool,
-        grab_pointer: (f64, f64),
-        grab_geometry: WindowTargetGeometry,
-        /// Width and height of the preview frame, including server-side decoration.
-        preview_size: (i32, i32),
-        /// Preview-frame origin minus the window root. Zero when they coincide.
-        frame_from_root: (i32, i32),
-    },
+    MoveTiled(TiledDragSession),
 }
 
 pub(crate) type ActiveGrabState = ActiveGrab;

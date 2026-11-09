@@ -11,7 +11,9 @@ use crate::{
     seat::{dispatch_client_action, dispatch_client_event, refresh_pointer_focus, SeatClientEvent},
     state::State,
     tiling::ExtractedTiledLeaf,
-    wayland_objects::xdg_surface::xdg_toplevel::InteractiveSizeConstraints,
+    wayland_objects::xdg_surface::xdg_toplevel::{
+        InteractiveSizeConstraints, ToplevelDecorationMode,
+    },
     window::WindowId,
 };
 
@@ -29,6 +31,31 @@ const POINTER_RESIZE_N_CURSOR_ICON_NAMES: &[&str] = &["n-resize", "size_ver"];
 const POINTER_RESIZE_S_CURSOR_ICON_NAMES: &[&str] = &["s-resize", "size_ver"];
 const POINTER_RESIZE_W_CURSOR_ICON_NAMES: &[&str] = &["w-resize", "size_hor"];
 const POINTER_RESIZE_E_CURSOR_ICON_NAMES: &[&str] = &["e-resize", "size_hor"];
+
+/// A tiled window following the pointer as a scaled preview.
+///
+/// The interactive grab stores one of these. A toplevel drag stores its own and never
+/// starts a compositor pointer grab.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TiledDragSession {
+    pub window: WindowId,
+    pub root_surface: Resolved<WlSurfaceId>,
+    pub size_constraints: InteractiveSizeConstraints,
+    pub decoration_mode: ToplevelDecorationMode,
+    pub origin_pointer: (f64, f64),
+    pub threshold: i32,
+    pub picked_up: bool,
+    pub grab_pointer: (f64, f64),
+    pub grab_geometry: WindowTargetGeometry,
+    pub preview_size: (i32, i32),
+    pub frame_from_root: (i32, i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TiledDragEnd {
+    Drop,
+    Cancel,
+}
 
 pub(crate) fn apply_interaction_intent(
     state: &mut State,
@@ -86,8 +113,8 @@ pub(crate) fn apply_pointer_interactive_grab(
     let window = match grab {
         ActiveGrabState::Move { window, .. }
         | ActiveGrabState::Resize { window, .. }
-        | ActiveGrabState::ResizeTiled { window, .. }
-        | ActiveGrabState::MoveTiled { window, .. } => window,
+        | ActiveGrabState::ResizeTiled { window, .. } => window,
+        ActiveGrabState::MoveTiled(session) => session.window,
     };
     if state.window_root_surface(window).is_none() {
         abort_pointer_interactive_grab(state, dispatcher, 0);
@@ -103,41 +130,18 @@ pub(crate) fn apply_pointer_interactive_grab(
                 initial_geometry.root_pos,
             );
         }
-        ActiveGrabState::MoveTiled {
-            window,
-            root_surface,
-            size_constraints,
-            decoration_mode,
-            origin_pointer,
-            threshold,
-            picked_up: false,
-            ..
-        } => {
-            if !tiled_drag_threshold_reached(origin_pointer, state.seat.pointer_pos, threshold) {
-                return true;
-            }
-            pickup_tiled_drag(
-                state,
-                dispatcher,
-                window,
-                root_surface,
-                size_constraints,
-                decoration_mode,
-            );
-        }
-        ActiveGrabState::MoveTiled {
-            root_surface,
-            picked_up: true,
-            preview_size,
-            frame_from_root,
-            ..
-        } => {
-            // The pickup animation plays only while the pointer stays put. Motion samples the
-            // pointer-centered preview and warps to it, matching Hyprland's warpPositionSize.
-            let root_pos =
-                preview_root_for_pointer(state.seat.pointer_pos, preview_size, frame_from_root);
-            if !place_grabbed_root(state, dispatcher, root_surface, root_pos) {
-                abort_pointer_interactive_grab(state, dispatcher, 0);
+        ActiveGrabState::MoveTiled(mut session) => {
+            let mut origin = state.seat.tiled_drag_origin.take();
+            match tiled_drag_motion(state, dispatcher, &mut session, &mut origin) {
+                Ok(()) => {
+                    state.seat.tiled_drag_origin = origin;
+                    state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled(session));
+                }
+                Err(()) => {
+                    state.seat.tiled_drag_origin = origin;
+                    state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled(session));
+                    abort_pointer_interactive_grab(state, dispatcher, 0);
+                }
             }
         }
         ActiveGrabState::Resize {
@@ -277,8 +281,9 @@ fn settle_pointer_interactive_grab(
     let was_tiled_resize = matches!(grab, ActiveGrabState::ResizeTiled { .. });
     state.seat.clear_pointer_interactive_grab();
     crate::session::note_window_changed(state, dispatcher);
-    if let ActiveGrabState::MoveTiled { root_surface, picked_up, .. } = grab {
-        settle_tiled_drag(state, dispatcher, root_surface, picked_up, origin, cancel);
+    if let ActiveGrabState::MoveTiled(session) = grab {
+        let end = if cancel { TiledDragEnd::Cancel } else { TiledDragEnd::Drop };
+        tiled_drag_settle(state, dispatcher, session, origin, end);
     }
     if was_tiled_resize {
         dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
@@ -287,20 +292,22 @@ fn settle_pointer_interactive_grab(
     true
 }
 
-fn settle_tiled_drag(
+/// Insert the preview or put the window back. Does not touch the compositor pointer grab.
+pub(crate) fn tiled_drag_settle(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    root_surface: Resolved<WlSurfaceId>,
-    picked_up: bool,
+    session: TiledDragSession,
     origin: Option<ExtractedTiledLeaf>,
-    cancel: bool,
+    end: TiledDragEnd,
 ) {
-    if !picked_up {
+    if !session.picked_up {
         return;
     }
+    let root_surface = session.root_surface;
     let mapped = root_surface
         .try_ref(state)
         .is_some_and(|surface| surface.has_committed_buffer());
+    let cancel = matches!(end, TiledDragEnd::Cancel);
     if mapped && !cancel {
         let placed = place_dragged_window(state, root_surface);
         if !placed {
@@ -366,7 +373,7 @@ fn restore_tiled_drag_origin(
 pub(crate) fn tiled_drag_tracks_surface(state: &State, surface: Resolved<WlSurfaceId>) -> bool {
     matches!(
         state.seat.pointer_interactive_grab,
-        Some(ActiveGrabState::MoveTiled { root_surface, .. }) if root_surface == surface
+        Some(ActiveGrabState::MoveTiled(session)) if session.root_surface == surface
     )
 }
 
@@ -539,19 +546,17 @@ fn start_window_grab(
 
 const TILED_DRAG_PREVIEW_SCALE: f64 = 0.8489;
 
-fn start_tiled_drag(
-    state: &mut State,
-    dispatcher: &mut Dispatcher,
+pub(crate) fn tiled_drag_session_new(
+    state: &State,
     window: WindowId,
     root_surface: Resolved<WlSurfaceId>,
     size_constraints: InteractiveSizeConstraints,
-    decoration_mode: crate::wayland_objects::xdg_surface::xdg_toplevel::ToplevelDecorationMode,
-    initial_geometry: WindowTargetGeometry,
-) -> bool {
-    begin_compositor_pointer_grab(state, dispatcher, POINTER_MOVE_CURSOR_ICON_NAMES);
+    decoration_mode: ToplevelDecorationMode,
+    grab_geometry: WindowTargetGeometry,
+    threshold: i32,
+) -> TiledDragSession {
     let pointer = state.seat.pointer_pos;
-    let threshold = state.config.tiling.drag.threshold;
-    state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled {
+    TiledDragSession {
         window,
         root_surface,
         size_constraints,
@@ -560,19 +565,44 @@ fn start_tiled_drag(
         threshold,
         picked_up: false,
         grab_pointer: pointer,
-        grab_geometry: initial_geometry,
+        grab_geometry,
         preview_size: (0, 0),
         frame_from_root: (0, 0),
-    });
+    }
+}
+
+fn start_tiled_drag(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    window: WindowId,
+    root_surface: Resolved<WlSurfaceId>,
+    size_constraints: InteractiveSizeConstraints,
+    decoration_mode: ToplevelDecorationMode,
+    initial_geometry: WindowTargetGeometry,
+) -> bool {
+    begin_compositor_pointer_grab(state, dispatcher, POINTER_MOVE_CURSOR_ICON_NAMES);
+    let threshold = state.config.tiling.drag.threshold;
+    let mut session = tiled_drag_session_new(
+        state,
+        window,
+        root_surface,
+        size_constraints,
+        decoration_mode,
+        initial_geometry,
+        threshold,
+    );
+    state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled(session));
     if threshold <= 0 {
-        pickup_tiled_drag(
-            state,
-            dispatcher,
-            window,
-            root_surface,
-            size_constraints,
-            decoration_mode,
-        );
+        match tiled_drag_pickup(state, dispatcher, &mut session) {
+            Ok(origin) => {
+                state.seat.tiled_drag_origin = origin;
+                state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled(session));
+            }
+            Err(()) => {
+                state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled(session));
+                abort_pointer_interactive_grab(state, dispatcher, 0);
+            }
+        }
     }
     true
 }
@@ -584,22 +614,22 @@ fn tiled_drag_threshold_reached(origin: (f64, f64), pointer: (f64, f64), thresho
     dx * dx + dy * dy > threshold * threshold
 }
 
-fn pickup_tiled_drag(
+/// Ok(origin) after the window is a preview. `Err(())` means the caller must abort.
+///
+/// A failure after the window has left the tree puts it back here, so a toplevel drag can
+/// drop the attempt without aborting a pointer grab. The session is then not picked up.
+pub(crate) fn tiled_drag_pickup(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    window: WindowId,
-    root_surface: Resolved<WlSurfaceId>,
-    size_constraints: InteractiveSizeConstraints,
-    decoration_mode: crate::wayland_objects::xdg_surface::xdg_toplevel::ToplevelDecorationMode,
-) {
-    let Some(ActiveGrabState::MoveTiled { picked_up: false, grab_geometry, .. }) =
-        state.seat.pointer_interactive_grab
-    else {
-        return;
-    };
+    session: &mut TiledDragSession,
+) -> Result<Option<ExtractedTiledLeaf>, ()> {
+    if session.picked_up {
+        return Ok(None);
+    }
+    let root_surface = session.root_surface;
+    let window = session.window;
     let Some(geometry) = state.committed_root_geometry(root_surface) else {
-        abort_pointer_interactive_grab(state, dispatcher, 0);
-        return;
+        return Err(());
     };
     let pointer = state.seat.pointer_pos;
     let mut frame = scaled_tiled_preview_frame(geometry.layout_rect_global, pointer);
@@ -607,11 +637,10 @@ fn pickup_tiled_drag(
         .try_ref(state)
         .and_then(|surface| preview_geometry(state, root_surface, &surface, frame))
     else {
-        abort_pointer_interactive_grab(state, dispatcher, 0);
-        return;
+        return Err(());
     };
     let configure = crate::root_geometry::project_configure_geometry(built).size;
-    let clamped = size_constraints.clamp(configure.0, configure.1);
+    let clamped = session.size_constraints.clamp(configure.0, configure.1);
     if clamped != configure {
         frame.width = frame.width.saturating_add(clamped.0 - configure.0).max(1);
         frame.height = frame.height.saturating_add(clamped.1 - configure.1).max(1);
@@ -621,41 +650,32 @@ fn pickup_tiled_drag(
             .try_ref(state)
             .and_then(|surface| preview_geometry(state, root_surface, &surface, frame))
         else {
-            abort_pointer_interactive_grab(state, dispatcher, 0);
-            return;
+            return Err(());
         };
         built = rebuilt;
     }
     let frame_from_root = (frame.x - built.root_pos.0, frame.y - built.root_pos.1);
     let preview_size = (frame.width, frame.height);
     let root_pos = preview_root_for_pointer(pointer, preview_size, frame_from_root);
-    state.seat.tiled_drag_origin = state
+    let origin = state
         .root_surface_workspace(root_surface)
         .and_then(|workspace_id| state.workspaces.try_get(workspace_id))
         .and_then(|workspace| workspace.layout.capture_tiled_drag_origin(window));
     if !state.float_window_for_drag(window) {
-        abort_pointer_interactive_grab(state, dispatcher, 0);
-        return;
+        return Err(());
     }
-    let mut grab_geometry = grab_geometry;
-    grab_geometry.root_pos = root_pos;
-    state.seat.pointer_interactive_grab = Some(ActiveGrabState::MoveTiled {
-        window,
-        root_surface,
-        size_constraints,
-        decoration_mode,
-        origin_pointer: pointer,
-        threshold: state.config.tiling.drag.threshold,
-        picked_up: true,
-        grab_pointer: pointer,
-        grab_geometry,
-        preview_size,
-        frame_from_root,
-    });
+    session.grab_geometry.root_pos = root_pos;
+    session.origin_pointer = pointer;
+    session.threshold = state.config.tiling.drag.threshold;
+    session.picked_up = true;
+    session.grab_pointer = pointer;
+    session.preview_size = preview_size;
+    session.frame_from_root = frame_from_root;
     let old_bounds = interactive_damage_rect(state, root_surface);
     let Some(mut surface) = root_surface.try_grab(state) else {
-        abort_pointer_interactive_grab(state, dispatcher, 0);
-        return;
+        tiled_drag_settle(state, dispatcher, *session, origin, TiledDragEnd::Cancel);
+        session.picked_up = false;
+        return Err(());
     };
     surface.set_root_position(root_pos.0, root_pos.1);
     drop(surface);
@@ -677,6 +697,44 @@ fn pickup_tiled_drag(
         );
     } else {
         request_active_output(state, dispatcher);
+    }
+    Ok(origin)
+}
+
+/// Threshold check, pickup, or preview placement. `Err(())` means the caller must abort.
+pub(crate) fn tiled_drag_motion(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    session: &mut TiledDragSession,
+    origin: &mut Option<ExtractedTiledLeaf>,
+) -> Result<(), ()> {
+    if !session.picked_up {
+        if !tiled_drag_threshold_reached(
+            session.origin_pointer,
+            state.seat.pointer_pos,
+            session.threshold,
+        ) {
+            return Ok(());
+        }
+        return match tiled_drag_pickup(state, dispatcher, session) {
+            Ok(picked) => {
+                *origin = picked;
+                Ok(())
+            }
+            Err(()) => Err(()),
+        };
+    }
+    // The pickup animation plays only while the pointer stays put. Motion samples the
+    // pointer-centered preview and warps to it, matching Hyprland's warpPositionSize.
+    let root_pos = preview_root_for_pointer(
+        state.seat.pointer_pos,
+        session.preview_size,
+        session.frame_from_root,
+    );
+    if place_grabbed_root(state, dispatcher, session.root_surface, root_pos) {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 

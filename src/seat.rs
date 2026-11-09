@@ -1108,17 +1108,15 @@ impl SeatState {
         {
             self.popup_grab = None;
         }
-        if self
-            .pointer_interactive_grab
-            .is_some_and(|grab| match grab {
+        if self.pointer_interactive_grab.is_some_and(|grab| {
+            let root_surface = match grab {
                 PointerInteractiveGrab::Move { root_surface, .. }
-                | PointerInteractiveGrab::MoveTiled { root_surface, .. }
                 | PointerInteractiveGrab::Resize { root_surface, .. }
-                | PointerInteractiveGrab::ResizeTiled { root_surface, .. } => {
-                    root_surface.client_id() == client_id
-                }
-            })
-        {
+                | PointerInteractiveGrab::ResizeTiled { root_surface, .. } => root_surface,
+                PointerInteractiveGrab::MoveTiled(session) => session.root_surface,
+            };
+            root_surface.client_id() == client_id
+        }) {
             self.clear_pointer_interactive_grab();
             result.interactive_grab_cleared = true;
         }
@@ -4631,7 +4629,7 @@ mod xdg_seat_tests {
         );
         assert!(matches!(
             state.seat.pointer_interactive_grab,
-            Some(super::PointerInteractiveGrab::MoveTiled { picked_up: true, .. })
+            Some(super::PointerInteractiveGrab::MoveTiled(session)) if session.picked_up
         ));
         assert!(state.is_floating_root_surface(root(&state, wl_surface_object_id)));
         assert!(!state.is_tiled_root_surface(root(&state, wl_surface_object_id)));
@@ -4862,7 +4860,7 @@ mod xdg_seat_tests {
         handle_pointer_button(&mut state, &mut dispatcher, 0x110, 1, 100);
         assert!(matches!(
             state.seat.pointer_interactive_grab,
-            Some(super::PointerInteractiveGrab::MoveTiled { picked_up: false, .. })
+            Some(super::PointerInteractiveGrab::MoveTiled(session)) if !session.picked_up
         ));
         assert!(state.is_tiled_root_surface(root(&state, wl_surface_object_id)));
 
@@ -4872,7 +4870,7 @@ mod xdg_seat_tests {
         handle_pointer_motion(&mut state, &mut dispatcher, 25.0, 0.0, 25.0, 0.0, 102, 102_000);
         assert!(matches!(
             state.seat.pointer_interactive_grab,
-            Some(super::PointerInteractiveGrab::MoveTiled { picked_up: true, .. })
+            Some(super::PointerInteractiveGrab::MoveTiled(session)) if session.picked_up
         ));
         assert!(state.is_floating_root_surface(root(&state, wl_surface_object_id)));
         let pointer = state.seat.pointer_pos;
@@ -5446,7 +5444,7 @@ mod xdg_seat_tests {
 
         assert!(matches!(
             state.seat.pointer_interactive_grab,
-            Some(super::PointerInteractiveGrab::MoveTiled { picked_up: true, .. })
+            Some(super::PointerInteractiveGrab::MoveTiled(session)) if session.picked_up
         ));
         let stayed_tile = layout_rect(&state, stayed);
         move_pointer_to(
