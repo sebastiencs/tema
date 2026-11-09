@@ -489,6 +489,31 @@ impl XdgSurface {
                         .try_ref(state)
                         .and_then(|toplevel| toplevel.minimum_size());
                     let surface_decoration_insets = fallback_decoration_insets;
+                    let restore = id.try_ref_mut(state).and_then(|mut toplevel| {
+                        toplevel
+                            .take_pending_session_restore()
+                            .map(|(session_id, record)| {
+                                (
+                                    toplevel.window(),
+                                    toplevel.has_parent(),
+                                    toplevel.session(),
+                                    session_id,
+                                    record,
+                                )
+                            })
+                    });
+                    let restored =
+                        restore.and_then(|(window, has_parent, session, session_id, record)| {
+                            crate::session::apply_restore(
+                                state,
+                                window,
+                                has_parent,
+                                &session_id,
+                                &record,
+                            )
+                            .then_some(session)
+                            .flatten()
+                        });
                     let initial_tiled_geometry = crate::tiling::initial_root_geometry_for_surface(
                         state,
                         surface_id,
@@ -500,12 +525,29 @@ impl XdgSurface {
                         target_min_size,
                         configure_bounds,
                     );
+                    let floating_restore = if initial_tiled_geometry.is_none() {
+                        id.try_ref(state)
+                            .map(|toplevel| toplevel.window())
+                            .filter(|window| !state.window_is_fullscreen(*window))
+                            .and_then(|window| state.take_window_floating_restore(window))
+                    } else {
+                        None
+                    };
+                    if let Some(session) = restored {
+                        if let Some(mut session) = session.try_grab(state) {
+                            session.send_event(
+                                crate::protocol_generated::xdg_toplevel_session_v1::Event::Restored,
+                                dispatcher,
+                            );
+                        }
+                    }
                     let mut xdg_toplevel = id.grab(state);
                     xdg_toplevel.send_initial_configure(
                         client,
                         state,
                         configure_bounds,
                         initial_tiled_geometry,
+                        floating_restore,
                         self,
                         dispatcher,
                     );
@@ -1035,6 +1077,7 @@ pub mod xdg_toplevel {
             state: &State,
             configure_bounds: Option<(i32, i32)>,
             initial_tiled_geometry: Option<crate::root_geometry::CommittedRootGeometry>,
+            floating_restore: Option<crate::state::RememberedFloatingState>,
             xdg_surface: &mut XdgSurface,
             dispatcher: &mut ClientDispatcher,
         ) {
@@ -1046,6 +1089,17 @@ pub mod xdg_toplevel {
                     xdg_surface,
                     geometry,
                     configure_geometry,
+                    false,
+                    dispatcher,
+                );
+            } else if let Some(restored) = floating_restore {
+                self.send_interactive_resize_configure(
+                    client,
+                    state,
+                    configure_bounds,
+                    xdg_surface,
+                    restored.configure_size.0,
+                    restored.configure_size.1,
                     false,
                     dispatcher,
                 );
@@ -1217,6 +1271,16 @@ pub mod xdg_toplevel {
             &self,
         ) -> Option<&(String, crate::session_store::ToplevelRecord)> {
             self.pending_session_restore.as_ref()
+        }
+
+        pub(crate) fn take_pending_session_restore(
+            &mut self,
+        ) -> Option<(String, crate::session_store::ToplevelRecord)> {
+            self.pending_session_restore.take()
+        }
+
+        pub(crate) fn has_parent(&self) -> bool {
+            self.parent_window.is_some()
         }
 
         pub(crate) fn set_description(&mut self, description: Option<String>) -> bool {

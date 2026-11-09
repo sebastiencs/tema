@@ -853,6 +853,7 @@ mod tests {
             toplevel_request(SESSION, 2, TOPLEVEL_SESSION, 22, "main"),
         )
         .unwrap();
+        mark_mapped(&mut fixture.state, fixture.toplevel.window);
         dispatch(
             &mut fixture.client,
             &mut fixture.state,

@@ -274,6 +274,7 @@ fn settle_pointer_interactive_grab(
     let origin = state.seat.tiled_drag_origin.take();
     let was_tiled_resize = matches!(grab, ActiveGrabState::ResizeTiled { .. });
     state.seat.clear_pointer_interactive_grab();
+    crate::session::note_window_changed(state, dispatcher);
     if let ActiveGrabState::MoveTiled { root_surface, picked_up, .. } = grab {
         settle_tiled_drag(state, dispatcher, root_surface, picked_up, origin, cancel);
     }

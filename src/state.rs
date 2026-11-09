@@ -1509,7 +1509,7 @@ impl State {
         let Some(managed) = self.managed_window_state_mut(window) else {
             return false;
         };
-        if managed.mode != ManagedWindowMode::Tiled || managed.mapped {
+        if (managed.mode != ManagedWindowMode::Tiled && !managed.fullscreen) || managed.mapped {
             return false;
         }
         if managed.awaiting_initial_layout {
@@ -3248,7 +3248,15 @@ impl State {
         else {
             return false;
         };
-        let current_state = self.current_root_surface_remembered_floating_state(root);
+        // Entering floating does not read this. Sampling it would try_ref the xdg
+        // surface, which is grabbed for the whole initial commit.
+        let leaving_floating = !floating
+            && self
+                .managed_window_state(window)
+                .is_some_and(|managed| managed.mode == ManagedWindowMode::Floating);
+        let current_state = leaving_floating
+            .then(|| self.current_root_surface_remembered_floating_state(root))
+            .flatten();
         let Some(managed) = self.managed_window_state_mut(window) else {
             return false;
         };

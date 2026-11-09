@@ -491,6 +491,7 @@ impl Model for ClientManager {
                 // Floating and fullscreen keybindings, drags, and workspace
                 // publication all arrive here, so the IPC snapshot sees them.
                 crate::ipc::mark_dirty(state, dispatcher);
+                crate::session::note_window_changed(state, dispatcher);
                 crate::idle_inhibit::refresh(state, dispatcher, std::time::Instant::now());
                 for client_id in self.set.iter().copied() {
                     dispatcher.dispatch_to(client_id, ClientAction::WorkspaceStateChanged);

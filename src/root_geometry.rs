@@ -377,8 +377,10 @@ pub fn build_committed_root_geometry(
     layout_allocation: Option<LayoutAllocation>,
     overrides: GeometryBuildOverrides,
 ) -> Option<CommittedRootGeometry> {
+    // The initial commit holds the xdg surface out of the map.
     let xdg_surface = surface
         .xdg_surface()
+        .filter(|xdg_surface| !state.objects.is_grabbed(xdg_surface.object_id()))
         .and_then(|xdg_surface| xdg_surface.try_ref(state));
     let decoration_mode = overrides.decoration_mode.or_else(|| {
         state
