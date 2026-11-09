@@ -24,15 +24,16 @@ pub(crate) fn build(state: &State) -> IpcSnapshot {
     }
 }
 
-pub(crate) fn topic(snapshot: &IpcSnapshot, topic: proto::Topic) -> proto::Event {
+pub(crate) fn topic(snapshot: &IpcSnapshot, topic: proto::Topic) -> Option<proto::Event> {
     match topic {
         proto::Topic::FocusedWindow => {
-            proto::Event::FocusedWindow { window: snapshot.focused_window.clone() }
+            Some(proto::Event::FocusedWindow { window: snapshot.focused_window.clone() })
         }
         proto::Topic::Workspaces => {
-            proto::Event::Workspaces { workspaces: snapshot.workspaces.clone() }
+            Some(proto::Event::Workspaces { workspaces: snapshot.workspaces.clone() })
         }
-        proto::Topic::Outputs => proto::Event::Outputs { outputs: snapshot.outputs.clone() },
+        proto::Topic::Outputs => Some(proto::Event::Outputs { outputs: snapshot.outputs.clone() }),
+        proto::Topic::Bell => None,
     }
 }
 
@@ -198,16 +199,17 @@ mod tests {
         assert_eq!(snapshot, IpcSnapshot::default());
         assert_eq!(
             topic(&snapshot, proto::Topic::FocusedWindow),
-            proto::Event::FocusedWindow { window: None }
+            Some(proto::Event::FocusedWindow { window: None })
         );
         assert_eq!(
             topic(&snapshot, proto::Topic::Workspaces),
-            proto::Event::Workspaces { workspaces: Vec::new() }
+            Some(proto::Event::Workspaces { workspaces: Vec::new() })
         );
         assert_eq!(
             topic(&snapshot, proto::Topic::Outputs),
-            proto::Event::Outputs { outputs: Vec::new() }
+            Some(proto::Event::Outputs { outputs: Vec::new() })
         );
+        assert_eq!(topic(&snapshot, proto::Topic::Bell), None);
         assert!(toplevel_info(&state, WindowId::for_tests(1)).is_none());
     }
 
@@ -331,7 +333,7 @@ mod tests {
         assert!(window.fullscreen);
         assert_eq!(
             topic(&snapshot, proto::Topic::FocusedWindow),
-            proto::Event::FocusedWindow { window: Some(window) }
+            Some(proto::Event::FocusedWindow { window: Some(window) })
         );
 
         let focused: Vec<_> = snapshot

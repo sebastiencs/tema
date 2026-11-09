@@ -29,7 +29,7 @@ Commands:
                 [--no-escape] [--once]
   -h, --help
 
-TOPIC is focused_window, workspaces, or outputs. With no topic, subscribe
+TOPIC is focused_window, workspaces, outputs, or bell. With no topic, subscribe
 to all of them.
 
 -j prints the ok value as one line of compact JSON.
@@ -709,6 +709,7 @@ mod tests {
             proto::Topic::FocusedWindow => "focused_window",
             proto::Topic::Workspaces => "workspaces",
             proto::Topic::Outputs => "outputs",
+            proto::Topic::Bell => "bell",
         }
     }
 
@@ -917,8 +918,12 @@ mod tests {
 
     #[test]
     fn subscribe_accepts_every_topic_name() {
-        for topic in [proto::Topic::FocusedWindow, proto::Topic::Workspaces, proto::Topic::Outputs]
-        {
+        for topic in [
+            proto::Topic::FocusedWindow,
+            proto::Topic::Workspaces,
+            proto::Topic::Outputs,
+            proto::Topic::Bell,
+        ] {
             let name = protocol_name(topic);
             assert_eq!(serde_json::to_value(topic).unwrap(), name);
             assert!(USAGE.contains(name), "{name}");

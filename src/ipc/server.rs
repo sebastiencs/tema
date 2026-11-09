@@ -75,6 +75,7 @@ pub(crate) enum IpcServerAction {
     ConnectionClosed { id: IpcConnectionId },
     Subscribed { id: IpcConnectionId, topics: BTreeSet<proto::Topic> },
     Refresh,
+    Bell { window: Option<u64> },
     Stop,
 }
 
@@ -232,6 +233,7 @@ impl Model for IpcServer {
                 }
             }
             IpcServerAction::Refresh => self.refresh(state, dispatcher),
+            IpcServerAction::Bell { window } => self.bell(window, dispatcher),
             IpcServerAction::Stop => {
                 state.ipc_enabled = false;
                 self.stop(dispatcher);
@@ -252,11 +254,24 @@ impl IpcServer {
         let topics = changed_topics(&self.last, &next);
         self.last = next;
         for topic in topics {
-            let bytes: Rc<[u8]> = Rc::from(proto::encode_line(&snapshot::topic(&self.last, topic)));
+            let event = snapshot::topic(&self.last, topic).expect("bell is not a snapshot topic");
+            let bytes: Rc<[u8]> = Rc::from(proto::encode_line(&event));
             for (id, subscribed) in &self.subscribers {
                 if subscribed.is_empty() || subscribed.contains(&topic) {
                     dispatcher.dispatch_to(*id, IpcConnectionAction::Send(Rc::clone(&bytes)));
                 }
+            }
+        }
+    }
+
+    fn bell(&self, window: Option<u64>, dispatcher: &mut Dispatcher) {
+        if self.subscribers.is_empty() {
+            return;
+        }
+        let bytes: Rc<[u8]> = Rc::from(proto::encode_line(&proto::Event::Bell { window }));
+        for (id, topics) in &self.subscribers {
+            if topics.is_empty() || topics.contains(&proto::Topic::Bell) {
+                dispatcher.dispatch_to(*id, IpcConnectionAction::Send(Rc::clone(&bytes)));
             }
         }
     }
@@ -557,7 +572,36 @@ mod tests {
     }
 
     fn encoded_event(snapshot: &IpcSnapshot, topic: proto::Topic) -> String {
-        String::from_utf8(proto::encode_line(&snapshot::topic(snapshot, topic))).unwrap()
+        let event = snapshot::topic(snapshot, topic).expect("bell is not a snapshot topic");
+        String::from_utf8(proto::encode_line(&event)).unwrap()
+    }
+
+    #[test]
+    fn bell_reaches_bell_and_all_topics_subscribers_only() {
+        let dir = TempDir::new();
+        let mut server = IpcServer::bind(dir.path.join("sock")).unwrap();
+        let bell_id = IpcConnectionId::from(1);
+        let all_id = IpcConnectionId::from(2);
+        let focused_id = IpcConnectionId::from(3);
+        server
+            .subscribers
+            .insert(bell_id, BTreeSet::from([proto::Topic::Bell]));
+        server.subscribers.insert(all_id, BTreeSet::new());
+        server
+            .subscribers
+            .insert(focused_id, BTreeSet::from([proto::Topic::FocusedWindow]));
+        let before = server.last.clone();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        server
+            .process(&mut state, IpcServerAction::Bell { window: Some(12) }, &mut dispatcher)
+            .unwrap();
+        let line = "{\"event\":\"bell\",\"window\":12}\n";
+        assert_eq!(sent_lines(&mut dispatcher, bell_id), vec![line.to_string()]);
+        assert_eq!(sent_lines(&mut dispatcher, all_id), vec![line.to_string()]);
+        assert!(sent_lines(&mut dispatcher, focused_id).is_empty());
+        assert_eq!(server.last, before);
+        assert!(!state.ipc_dirty);
     }
 
     fn initial_bytes(state: &State) -> Vec<u8> {

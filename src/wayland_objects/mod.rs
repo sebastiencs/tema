@@ -62,6 +62,7 @@ pub mod xdg_activation_v1;
 pub mod xdg_popup;
 pub mod xdg_positioner;
 pub mod xdg_surface;
+pub mod xdg_system_bell_v1;
 pub mod xdg_wm_base;
 pub mod xwayland_shell_v1;
 pub mod xwayland_surface_v1;
@@ -162,7 +163,6 @@ fake_obj! {
     { xdg_session_manager_v1, XdgSessionManagerV1 },
     { xdg_session_v1, XdgSessionV1 },
     { xdg_toplevel_session_v1, XdgToplevelSessionV1 },
-    { xdg_system_bell_v1, XdgSystemBellV1 },
     { xdg_toplevel_icon_manager_v1, XdgToplevelIconManagerV1 },
     { xdg_toplevel_icon_v1, XdgToplevelIconV1 },
     { xdg_toplevel_tag_manager_v1, XdgToplevelTagManagerV1 },

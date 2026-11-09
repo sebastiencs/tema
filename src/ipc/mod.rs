@@ -12,7 +12,9 @@ pub(crate) mod snapshot;
 
 pub(crate) use server::{IpcServer, IpcServerAction};
 
-use crate::{runner::Dispatcher, state::State};
+use std::time::{Duration, Instant};
+
+use crate::{runner::Dispatcher, state::State, window::WindowId};
 
 /// Coalesce every IPC-visible change in this runner turn into one [`IpcServerAction::Refresh`].
 pub(crate) fn mark_dirty(state: &mut State, dispatcher: &mut Dispatcher) {
@@ -21,6 +23,25 @@ pub(crate) fn mark_dirty(state: &mut State, dispatcher: &mut Dispatcher) {
     }
     state.ipc_dirty = true;
     dispatcher.dispatch(IpcServerAction::Refresh);
+}
+
+/// One `bell` event per window per 100 ms. `None` is a ring with no surface.
+pub(crate) fn bell(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    window: Option<WindowId>,
+    now: Instant,
+) {
+    if !state.ipc_enabled {
+        return;
+    }
+    if let Some(last) = state.bell_last.get(&window) {
+        if now.saturating_duration_since(*last) < Duration::from_millis(100) {
+            return;
+        }
+    }
+    state.bell_last.insert(window, now);
+    dispatcher.dispatch(IpcServerAction::Bell { window: window.map(WindowId::as_u64) });
 }
 
 #[cfg(test)]
@@ -61,5 +82,46 @@ mod tests {
             }),
             2
         );
+    }
+
+    #[test]
+    fn bell_throttles_per_window_and_destroy_clears_the_entry() {
+        use std::time::Duration;
+
+        let mut state = crate::test_support::state_for_tests();
+        state.ipc_enabled = true;
+        let mut dispatcher = Dispatcher::default();
+        let start = std::time::Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let window_a = crate::window::WindowId::for_tests(4);
+        let window_b = crate::window::WindowId::for_tests(9);
+
+        super::bell(&mut state, &mut dispatcher, None, at(0));
+        super::bell(&mut state, &mut dispatcher, None, at(99));
+        super::bell(&mut state, &mut dispatcher, Some(window_a), at(0));
+        super::bell(&mut state, &mut dispatcher, Some(window_a), at(50));
+        super::bell(&mut state, &mut dispatcher, Some(window_b), at(50));
+        assert_eq!(
+            bell_windows(&mut dispatcher),
+            vec![None, Some(window_a.as_u64()), Some(window_b.as_u64())]
+        );
+
+        super::bell(&mut state, &mut dispatcher, Some(window_a), at(100));
+        assert_eq!(bell_windows(&mut dispatcher), vec![Some(window_a.as_u64())]);
+
+        state.destroy_window(window_a);
+        super::bell(&mut state, &mut dispatcher, Some(window_a), at(150));
+        assert_eq!(bell_windows(&mut dispatcher), vec![Some(window_a.as_u64())]);
+    }
+
+    fn bell_windows(dispatcher: &mut Dispatcher) -> Vec<Option<u64>> {
+        dispatcher
+            .test_take_queued_actions::<IpcServerAction>()
+            .into_iter()
+            .map(|action| match action {
+                IpcServerAction::Bell { window } => window,
+                other => panic!("unexpected ipc action {other:?}"),
+            })
+            .collect()
     }
 }

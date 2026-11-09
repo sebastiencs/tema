@@ -1124,6 +1124,8 @@ pub struct State {
     /// False when the IPC socket failed to bind. Hooks then skip `Refresh`: the runner
     /// logs and drops an action whose model was never registered.
     pub(crate) ipc_enabled: bool,
+    /// Last IPC `bell` for this window. `None` is a ring with no surface.
+    pub(crate) bell_last: BTreeMap<Option<WindowId>, Instant>,
 }
 
 const INITIAL_WORKSPACES_PER_OUTPUT: usize = 4;
@@ -1230,6 +1232,7 @@ impl State {
             xkb,
             ipc_dirty: false,
             ipc_enabled: false,
+            bell_last: BTreeMap::new(),
         }
     }
 

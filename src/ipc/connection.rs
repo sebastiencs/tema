@@ -209,7 +209,10 @@ impl IpcConnection {
         let snapshot = snapshot::build(state);
         let mut bytes = proto::encode_line(&Reply::Ok(Response::Subscribed));
         for topic in initial_topics(events) {
-            bytes.extend(proto::encode_line(&snapshot::topic(&snapshot, topic)));
+            let Some(event) = snapshot::topic(&snapshot, topic) else {
+                continue;
+            };
+            bytes.extend(proto::encode_line(&event));
         }
         if !self.enqueue_or_close(&bytes) {
             return false;
@@ -613,5 +616,14 @@ mod tests {
             text(&connection.take_queued()),
             "{\"ok\":\"subscribed\"}\n{\"event\":\"outputs\",\"outputs\":[]}\n",
         );
+
+        let mut connection = open_connection();
+        let mut dispatcher = Dispatcher::default();
+        assert!(connection.ingest(
+            &state,
+            b"{\"request\":\"subscribe\",\"events\":[\"bell\"]}\n",
+            &mut dispatcher,
+        ));
+        assert_eq!(text(&connection.take_queued()), "{\"ok\":\"subscribed\"}\n");
     }
 }

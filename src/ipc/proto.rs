@@ -37,6 +37,7 @@ pub enum Topic {
     FocusedWindow,
     Workspaces,
     Outputs,
+    Bell,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +65,7 @@ pub enum Event {
     FocusedWindow { window: Option<Window> },
     Workspaces { workspaces: Vec<Workspace> },
     Outputs { outputs: Vec<Output> },
+    Bell { window: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -327,6 +329,9 @@ mod tests {
             r#"{"event":"workspaces","workspaces":[]}"#,
         );
         assert_json(&Event::Outputs { outputs: vec![] }, r#"{"event":"outputs","outputs":[]}"#);
+        assert_json(&Event::Bell { window: Some(12) }, r#"{"event":"bell","window":12}"#);
+        assert_json(&Event::Bell { window: None }, r#"{"event":"bell","window":null}"#);
+        assert_eq!(serde_json::from_str::<Topic>(r#""bell""#).unwrap(), Topic::Bell);
 
         let mut nulls = window();
         nulls.workspace = None;

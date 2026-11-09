@@ -142,6 +142,7 @@ impl State {
 
     /// Drops the window from both maps. An id that is already gone leaves the maps unchanged.
     pub(crate) fn destroy_window(&mut self, id: WindowId) {
+        self.bell_last.remove(&Some(id));
         let Some(entry) = self.windows.remove(&id) else {
             return;
         };
