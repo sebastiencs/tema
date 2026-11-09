@@ -181,6 +181,7 @@ mod io_uring;
 mod libinput;
 mod logger;
 mod object;
+mod output_scale;
 mod process;
 mod protocol;
 mod protocol_generated;

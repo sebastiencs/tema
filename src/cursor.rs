@@ -85,6 +85,8 @@ pub struct CursorState {
     theme: CursorTheme,
     theme_size: u32,
     cache: BTreeMap<String, Option<NamedCursorAnimation>>,
+    /// Animations loaded at a pixel size other than [`Self::theme_size`].
+    sized_cache: BTreeMap<(String, u32), Option<NamedCursorAnimation>>,
 }
 
 impl Default for CursorState {
@@ -107,7 +109,12 @@ impl CursorState {
             theme: CursorTheme::load(&theme_name),
             theme_size,
             cache: BTreeMap::new(),
+            sized_cache: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn theme_size(&self) -> u32 {
+        self.theme_size
     }
 
     pub fn source_at(&self, now_msec: u32) -> Option<CursorSourceRef<'_>> {
@@ -238,6 +245,7 @@ impl CursorState {
         self.theme = CursorTheme::load(&theme_name);
         self.theme_size = theme_size;
         self.cache.clear();
+        self.sized_cache.clear();
 
         if let Some((owner, name)) = restore_name {
             if let Some(animation) = self.load_icon(&name) {
@@ -329,6 +337,40 @@ impl CursorState {
             .find_map(|name| self.load_icon(name).map(|animation| (*name, animation)))
     }
 
+    /// The current named cursor at `size` pixels, using the same frame timing as the theme-size cursor.
+    pub(crate) fn frame_at_size(
+        &mut self,
+        size: u32,
+        now_msec: u32,
+    ) -> Option<(CursorImage, Option<u32>)> {
+        let (name, started_at_msec) = match self.source.as_ref()? {
+            CursorSource::Named(cursor) => (cursor.name.clone(), cursor.started_at_msec),
+            CursorSource::Surface { .. } => return None,
+        };
+        let animation = self.animation_at(&name, size.max(1))?;
+        let (image, next_frame_in_msec) =
+            select_animation_frame(&animation, started_at_msec, now_msec)?;
+        Some((image.clone(), next_frame_in_msec))
+    }
+
+    fn animation_at(&mut self, icon_name: &str, size: u32) -> Option<NamedCursorAnimation> {
+        if size == self.theme_size {
+            return self.load_icon(icon_name);
+        }
+        let key = (icon_name.to_string(), size);
+        if let Some(cached) = self.sized_cache.get(&key) {
+            return cached.clone();
+        }
+        let animation = self
+            .theme
+            .load_icon(icon_name)
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| parser::parse_xcursor(&bytes))
+            .and_then(|images| self.pick_best_animation(icon_name, images, size));
+        self.sized_cache.insert(key, animation.clone());
+        animation
+    }
+
     fn load_icon(&mut self, icon_name: &str) -> Option<NamedCursorAnimation> {
         if let Some(animation) = self.cache.get(icon_name) {
             return animation.clone();
@@ -339,7 +381,7 @@ impl CursorState {
             .load_icon(icon_name)
             .and_then(|path| fs::read(path).ok())
             .and_then(|bytes| parser::parse_xcursor(&bytes))
-            .and_then(|images| self.pick_best_animation(icon_name, images));
+            .and_then(|images| self.pick_best_animation(icon_name, images, self.theme_size));
         self.cache.insert(icon_name.to_string(), animation.clone());
         animation
     }
@@ -348,9 +390,10 @@ impl CursorState {
         &self,
         icon_name: &str,
         images: Vec<parser::Image>,
+        size: u32,
     ) -> Option<NamedCursorAnimation> {
         let target = images.iter().min_by_key(|image| {
-            (image.size.abs_diff(self.theme_size), image.width.saturating_mul(image.height))
+            (image.size.abs_diff(size), image.width.saturating_mul(image.height))
         })?;
         let (target_width, target_height) = (target.width, target.height);
         let mut frames = Vec::new();
@@ -681,6 +724,7 @@ mod tests {
                         pixels_argb: vec![2; 48 * 48 * 4],
                     },
                 ],
+                24,
             )
             .unwrap();
 

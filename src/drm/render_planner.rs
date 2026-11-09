@@ -5,9 +5,11 @@ use crate::{
 };
 
 // Output capture and any debug view of a physical output must consume this same
-// frame plan, including both participants of a live workspace transition. A session
-// lock replaces that view with the opaque blank and the lock surface. Retained closing
-// capture is window-local and is not an output or screencopy path.
+// frame plan, including both participants of a live workspace transition. Items are
+// global logical pixels until `scale_scene_items`; `build_frame_plan` and the
+// renderers are physical framebuffer pixels. There is no second overlay renderer.
+// A session lock replaces that view with the opaque blank and the lock surface.
+// Retained closing capture is window-local and is not an output or screencopy path.
 pub(super) fn collect_output_render_plan(
     state: &mut State,
     drm_id: DrmId,
@@ -19,14 +21,13 @@ pub(super) fn collect_output_render_plan(
     let drm_crtc_id = state
         .output_crtc_id(logical_output_id)
         .expect("missing DRM CRTC for logical output");
-    let global_bounds = state.output_bounds(logical_output_id).unwrap_or_else(|| {
-        state
-            .drm
-            .get(drm_id)
-            .output(drm_crtc_id)
-            .unwrap()
-            .output_bounds()
-    });
+    let global_bounds = logical_render_bounds(state, logical_output_id)
+        .expect("logical output has no layout bounds");
+    let output_scale = state
+        .outputs
+        .try_get(logical_output_id)
+        .map(|output| output.scale)
+        .unwrap_or(crate::state::FractionalScale::ONE);
     if state.session_lock.consume_full_damage(logical_output_id) {
         let drm = state.drm.get_mut(drm_id);
         if let Some(output) = drm.output_mut(drm_crtc_id) {
@@ -40,6 +41,7 @@ pub(super) fn collect_output_render_plan(
             drm_crtc_id,
             logical_output_id,
             global_bounds,
+            output_scale,
         );
     }
     let view = state.compose_output_view(scene, logical_output_id, None);
@@ -66,6 +68,9 @@ pub(super) fn collect_output_render_plan(
         -global_bounds.x,
         -global_bounds.y,
     );
+    super::scale_scene_items(&mut items, output_scale);
+    super::scale_scene_items(&mut software_cursor_items, output_scale);
+    super::scale_recorded_frame_elements(&mut frame_elements, output_scale);
     let mut frame = {
         let drm = state.drm.get_mut(drm_id);
         build_frame_plan(
@@ -84,10 +89,10 @@ pub(super) fn collect_output_render_plan(
             damage_live_workspace_transition(&mut frame.damage, true, bounds);
         }
     }
-    let output_id = Some(logical_output_id)
-        .or_else(|| select_presentation_output_for_scene(state, drm_id, &frame.scene));
+    // The frame scene is already physical, so it must not be matched against the
+    // logical layout. This plan is always for `logical_output_id`.
     super::OutputRenderPlan {
-        output_id,
+        output_id: Some(logical_output_id),
         global_bounds,
         local_origin: (global_bounds.x, global_bounds.y),
         deferred_releases,
@@ -176,6 +181,8 @@ pub(super) fn build_frame_plan(
 
     let scanout_blocked =
         super::direct_scanout_blocked(output.pending_modeset.is_some(), protected);
+    // Item bounds are already framebuffer pixels. Direct scanout programs both
+    // CRTC and SRC from that size, so the client buffer has to be the mode size.
     let sole_fullscreen = !has_effects
         && items.len() == 1
         && items[0].state.bounds == output_bounds
@@ -241,6 +248,7 @@ fn collect_protected_output_render_plan(
     drm_crtc_id: u32,
     logical_output_id: OutputId,
     global_bounds: RectI,
+    output_scale: crate::state::FractionalScale,
 ) -> super::OutputRenderPlan {
     let (mut items, mut frame_elements, deferred_releases) = super::collect_protected_scene(
         state,
@@ -255,6 +263,8 @@ fn collect_protected_output_render_plan(
         -global_bounds.x,
         -global_bounds.y,
     );
+    super::scale_scene_items(&mut items, output_scale);
+    super::scale_recorded_frame_elements(&mut frame_elements, output_scale);
     let frame = {
         let drm = state.drm.get_mut(drm_id);
         build_frame_plan(
@@ -277,6 +287,20 @@ fn collect_protected_output_render_plan(
     }
 }
 
+/// Global logical rect used to translate the scene onto this output.
+///
+/// `State::output_bounds` skips a disabled output. The output's own logical size is
+/// still the right rect. `DrmOutput::output_bounds` is the physical framebuffer and
+/// is not a substitute: at scale 2 that would treat a 3840×2160 buffer as the layout.
+fn logical_render_bounds(state: &State, output_id: OutputId) -> Option<RectI> {
+    state.output_bounds(output_id).or_else(|| {
+        state
+            .outputs
+            .try_get(output_id)
+            .and_then(|output| output.logical_bounds())
+    })
+}
+
 fn output_overlap_area(scene: &[super::SceneItemState], output_rect: crate::region::RectI) -> i64 {
     scene
         .iter()
@@ -292,6 +316,8 @@ fn output_overlap_area(scene: &[super::SceneItemState], output_rect: crate::regi
         .sum()
 }
 
+/// Pick an output from global logical scene bounds. Do not pass a frame plan after
+/// `scale_scene_items`: those bounds are physical and output-local.
 pub(super) fn select_presentation_output_for_scene(
     state: &State,
     drm_id: DrmId,
@@ -811,5 +837,236 @@ mod tests {
         let mut steady = DamageRegion::from_rect(RectI::new(10, 10, 4, 4).unwrap());
         damage_live_workspace_transition(&mut steady, false, output_bounds());
         assert!(!covers_output(&steady));
+    }
+
+    #[test]
+    fn output_scale_maps_logical_scene_items_onto_physical_pixels() {
+        let bounds = RectI::new(0, 0, 1920, 1080).unwrap();
+        let damage = RectI::new(10, 10, 5, 5).unwrap();
+        let mask = super::super::SceneItemMask::RoundedClip { clip: clip(0, 0, 100, 80, 8) };
+        let mut items = [item(1, bounds, 255, mask, damage)];
+        items[0].sample_damage_padding = 1;
+        items[0].opaque_region = DamageRegion::from_rect(RectI::new(-5, -5, 4000, 3000).unwrap());
+        super::super::scale_scene_items(&mut items, crate::state::FractionalScale::TWO);
+
+        assert_eq!(items[0].state.bounds, RectI::new(0, 0, 3840, 2160).unwrap());
+        assert_eq!(items[0].damage.rects(), &[RectI::new(20, 20, 10, 10).unwrap()]);
+        assert_eq!(items[0].sample_damage_padding, 2);
+        assert_eq!(items[0].opaque_region.rects(), &[RectI::new(0, 0, 3840, 2160).unwrap()]);
+        let scaled_clip = clip(0, 0, 200, 160, 16);
+        assert_eq!(items[0].mask, super::super::SceneItemMask::RoundedClip { clip: scaled_clip });
+        assert_eq!(items[0].state.mask, items[0].mask);
+        assert_eq!(items[0].state.tex_transform, crate::transform::Mat3::identity());
+    }
+
+    #[test]
+    fn output_scale_one_leaves_scene_items_unchanged() {
+        let bounds = RectI::new(10, 20, 30, 40).unwrap();
+        let damage = RectI::new(12, 22, 4, 4).unwrap();
+        let mask = super::super::SceneItemMask::RoundedClip { clip: clip(10, 20, 30, 40, 6) };
+        let mut items = [item(1, bounds, 200, mask, damage)];
+        items[0].sample_damage_padding = 3;
+        super::super::scale_scene_items(&mut items, crate::state::FractionalScale::ONE);
+
+        assert_eq!(items[0].state.bounds, bounds);
+        assert_eq!(items[0].damage.rects(), &[damage]);
+        assert_eq!(items[0].sample_damage_padding, 3);
+        assert_eq!(items[0].state.mask, mask);
+        assert_eq!(items[0].mask, mask);
+    }
+
+    #[test]
+    fn output_scale_fractional_tiles_keep_a_shared_edge() {
+        let scale = crate::state::FractionalScale::try_from_f64(1.25).unwrap();
+        let mut items = [
+            item(
+                1,
+                RectI::new(0, 0, 3, 3).unwrap(),
+                255,
+                super::super::SceneItemMask::None,
+                RectI::new(0, 0, 3, 3).unwrap(),
+            ),
+            item(
+                2,
+                RectI::new(3, 0, 3, 3).unwrap(),
+                255,
+                super::super::SceneItemMask::None,
+                RectI::new(3, 0, 3, 3).unwrap(),
+            ),
+        ];
+        super::super::scale_scene_items(&mut items, scale);
+
+        assert_eq!(items[0].state.bounds.x2(), items[1].state.bounds.x);
+        assert!(items[0].state.bounds.width > 0 && items[1].state.bounds.width > 0);
+    }
+
+    #[test]
+    fn output_scale_grows_border_shadow_blur_and_dim() {
+        let outer = clip(8, 16, 96, 78, 10);
+        let inner = clip(14, 22, 84, 66, 8);
+        let ring = crate::render::RoundedRing { outer, inner };
+        let mut elements = [
+            super::super::RecordedFrameElement::Effect {
+                phase: crate::render::FramePhase::UnderWindow,
+                element: crate::render::EffectElement::WindowBlurBackdrop {
+                    ring,
+                    style: crate::render::BlurVisualStyle { radius: 12, passes: 2 },
+                    alpha: 180,
+                },
+            },
+            super::super::RecordedFrameElement::Effect {
+                phase: crate::render::FramePhase::OverWindow,
+                element: crate::render::EffectElement::WindowBorder {
+                    ring,
+                    gradient: crate::render::BorderGradient {
+                        start_color: crate::config::RgbaColor::new(1, 2, 3, 4),
+                        end_color: crate::config::RgbaColor::new(5, 6, 7, 8),
+                        angle_degrees: 45,
+                    },
+                    alpha: 220,
+                },
+            },
+            super::super::RecordedFrameElement::Effect {
+                phase: crate::render::FramePhase::UnderWindow,
+                element: crate::render::EffectElement::WindowShadow {
+                    clip: outer,
+                    style: crate::render::ShadowVisualStyle {
+                        radius: 16,
+                        offset_x: -4,
+                        offset_y: 6,
+                        color: crate::config::RgbaColor::new(0, 0, 0, 120),
+                        power: crate::config::ShadowPower::DEFAULT,
+                    },
+                    alpha: 120,
+                },
+            },
+            super::super::RecordedFrameElement::Effect {
+                phase: crate::render::FramePhase::Overlay,
+                element: crate::render::EffectElement::DimOverlay { clip: outer, alpha: 40 },
+            },
+        ];
+
+        super::super::scale_recorded_frame_elements(
+            &mut elements,
+            crate::state::FractionalScale::TWO,
+        );
+
+        assert!(matches!(
+            elements[0],
+            super::super::RecordedFrameElement::Effect {
+                element: crate::render::EffectElement::WindowBlurBackdrop { ring, style, alpha },
+                ..
+            } if ring.outer.outer_rect == RectI::new(16, 32, 192, 156).unwrap()
+                && ring.outer.corner_radius == 20
+                && ring.inner.outer_rect == RectI::new(28, 44, 168, 132).unwrap()
+                && ring.inner.corner_radius == 16
+                && style.radius == 24
+                && style.passes == 2
+                && alpha == 180
+        ));
+        assert!(matches!(
+            elements[1],
+            super::super::RecordedFrameElement::Effect {
+                element: crate::render::EffectElement::WindowBorder { ring, alpha, .. },
+                ..
+            } if ring.outer.outer_rect == RectI::new(16, 32, 192, 156).unwrap()
+                && ring.outer.corner_radius == 20
+                && alpha == 220
+        ));
+        assert!(matches!(
+            elements[2],
+            super::super::RecordedFrameElement::Effect {
+                element: crate::render::EffectElement::WindowShadow { clip, style, .. },
+                ..
+            } if clip.outer_rect == RectI::new(16, 32, 192, 156).unwrap()
+                && clip.corner_radius == 20
+                && style.radius == 32
+                && style.offset_x == -8
+                && style.offset_y == 12
+        ));
+        assert!(matches!(
+            elements[3],
+            super::super::RecordedFrameElement::Effect {
+                element: crate::render::EffectElement::DimOverlay { clip, alpha },
+                ..
+            } if clip.outer_rect == RectI::new(16, 32, 192, 156).unwrap() && alpha == 40
+        ));
+    }
+
+    #[test]
+    fn output_scale_scanout_accepts_a_physical_fullscreen_buffer() {
+        let output = RectI::new(1920, 0, 1920, 1080).unwrap();
+        let scale = crate::state::FractionalScale::TWO;
+        assert_eq!(
+            super::super::scaled_destination_size(output, output, scale),
+            Some((3840, 2160))
+        );
+        assert_eq!(
+            super::super::sample_damage_padding_for(
+                crate::transform::Mat3::identity(),
+                output,
+                output,
+                3840,
+                2160,
+                scale,
+            ),
+            0
+        );
+        assert_eq!(
+            super::super::sample_damage_padding_for(
+                crate::transform::Mat3::identity(),
+                output,
+                output,
+                1920,
+                1080,
+                scale,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn output_scale_destination_uses_the_output_local_rect() {
+        let output = RectI::new(1, 0, 1, 1).unwrap();
+        let scale = crate::state::FractionalScale::ONE_POINT_FIVE;
+        assert_eq!(super::super::scaled_destination_size(output, output, scale), Some((2, 2)));
+        assert_eq!(output.scaled(scale).unwrap().width, 1);
+        let window = RectI::new(10, 20, 100, 80).unwrap();
+        let screen = RectI::new(0, 0, 1920, 1080).unwrap();
+        assert_eq!(
+            super::super::scaled_destination_size(
+                window,
+                screen,
+                crate::state::FractionalScale::TWO
+            ),
+            Some((200, 160))
+        );
+        assert_eq!(
+            super::super::sample_damage_padding_for(
+                crate::transform::Mat3::translation(1.0, 0.0),
+                window,
+                screen,
+                200,
+                160,
+                crate::state::FractionalScale::TWO,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn logical_render_bounds_stay_logical_when_the_output_leaves_the_layout() {
+        let mut state = crate::test_support::state_for_tests();
+        let backend = crate::state::BackendOutputRef::new(DrmId::from(0usize));
+        let output_id = state.insert_output(crate::test_support::test_output(
+            backend, 1, 1920, 0, 3840, 2160, "wide",
+        ));
+        state.outputs[output_id].scale = crate::state::FractionalScale::TWO;
+        state.outputs[output_id].enabled = false;
+        assert!(state.output_bounds(output_id).is_none());
+        assert_eq!(
+            logical_render_bounds(&state, output_id),
+            Some(RectI::new(1920, 0, 1920, 1080).unwrap())
+        );
     }
 }

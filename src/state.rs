@@ -239,6 +239,46 @@ impl Default for FractionalScale {
     }
 }
 
+/// Nearest v120 scale for which `mode / scale` is a whole number on both axes.
+///
+/// Search `wanted`, then one v120 step up, then one down, out to 89 steps.
+/// `None` when nothing in that window divides both axes.
+pub fn snap_scale(mode_w: i32, mode_h: i32, wanted: FractionalScale) -> Option<FractionalScale> {
+    let wanted_raw = wanted.as_v120();
+    if scale_divides_mode(mode_w, mode_h, wanted_raw) {
+        return Some(wanted);
+    }
+    for step in 1..=89u32 {
+        let up = wanted_raw.saturating_add(step);
+        if up != wanted_raw && scale_divides_mode(mode_w, mode_h, up) {
+            return Some(FractionalScale::from_v120(up));
+        }
+        let down = wanted_raw.saturating_sub(step);
+        if down >= 1 && down != wanted_raw && scale_divides_mode(mode_w, mode_h, down) {
+            return Some(FractionalScale::from_v120(down));
+        }
+    }
+    None
+}
+
+fn scale_divides_mode(mode_w: i32, mode_h: i32, raw: u32) -> bool {
+    raw > 0 && axis_divides(mode_w, raw) && axis_divides(mode_h, raw)
+}
+
+fn axis_divides(mode: i32, raw: u32) -> bool {
+    if mode < 0 {
+        return false;
+    }
+    i64::from(mode).saturating_mul(i64::from(FractionalScale::DENOMINATOR)) % i64::from(raw) == 0
+}
+
+/// Nearest integer scale, half going up. Used when auto scale has no clean neighbor.
+fn round_scale_to_integer(scale: FractionalScale) -> FractionalScale {
+    let denominator = u64::from(FractionalScale::DENOMINATOR);
+    let rounded = (u64::from(scale.as_v120()) + denominator / 2) / denominator;
+    FractionalScale::from_integer(u32::try_from(rounded).unwrap_or(u32::MAX).max(1))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorTransformMatrix {
     pub values: [f32; 9],
@@ -399,11 +439,41 @@ impl Output {
     }
 
     pub fn configured_scale(&self, config: &RuntimeConfig) -> FractionalScale {
-        match config.output_scale(self.name.as_str()) {
+        let setting = config.output_scale(self.name.as_str());
+        let wanted = match setting {
             Some(OutputScaleSetting::Fixed(scale)) => scale,
             Some(OutputScaleSetting::Auto) => self.auto_scale(),
             None => FractionalScale::ONE,
+        };
+        let mode_w = self.current_mode.width;
+        let mode_h = self.current_mode.height;
+        if let Some(applied) = snap_scale(mode_w, mode_h, wanted) {
+            if applied != wanted {
+                log::warn!(
+                    "output {}: scale {:.4} does not divide {}x{}; using {:.4}",
+                    self.name,
+                    wanted.as_f64(),
+                    mode_w,
+                    mode_h,
+                    applied.as_f64(),
+                );
+            }
+            return applied;
         }
+        let fallback = if matches!(setting, Some(OutputScaleSetting::Auto)) {
+            round_scale_to_integer(wanted)
+        } else {
+            FractionalScale::ONE
+        };
+        log::error!(
+            "output {}: no clean scale near {:.4} for {}x{}; using {:.4}",
+            self.name,
+            wanted.as_f64(),
+            mode_w,
+            mode_h,
+            fallback.as_f64(),
+        );
+        fallback
     }
 
     pub fn auto_scale(&self) -> FractionalScale {
@@ -3818,6 +3888,7 @@ impl State {
         self.output_layout().extents()
     }
 
+    /// Global logical layout rect. The physical framebuffer is `DrmOutput::output_bounds`.
     pub fn output_bounds(&self, output_id: OutputId) -> Option<RectI> {
         self.output_layout().bounds(output_id)
     }
@@ -4075,14 +4146,21 @@ impl State {
         let Some(backend) = self.backend_for_output(output_id) else {
             return false;
         };
-        let Some(drm) = self.drm.try_get(backend.drm_id) else {
-            return false;
+        let scale_changed = {
+            let Some(drm) = self.drm.try_get(backend.drm_id) else {
+                return false;
+            };
+            let Some(output) = self.outputs.try_get_mut(output_id) else {
+                return false;
+            };
+            let previous_scale = output.scale;
+            output.refresh_from_backend(drm);
+            output.scale = output.configured_scale(&self.config);
+            output.scale != previous_scale
         };
-        let Some(output) = self.outputs.try_get_mut(output_id) else {
-            return false;
-        };
-        output.refresh_from_backend(drm);
-        output.scale = output.configured_scale(&self.config);
+        if scale_changed {
+            self.force_output_redraw(output_id);
+        }
         true
     }
 
@@ -4102,6 +4180,9 @@ impl State {
                 output.scale = desired_scale;
                 changed.push(output_id);
             }
+        }
+        for output_id in &changed {
+            self.force_output_redraw(*output_id);
         }
         changed
     }
@@ -4125,28 +4206,49 @@ impl State {
     }
 
     pub fn refresh_outputs_for_backend(&mut self, backend: BackendOutputRef) -> Vec<OutputId> {
-        let Some(drm) = self.drm.try_get(backend.drm_id) else {
-            return Vec::new();
-        };
-        let output_ids = self
-            .outputs
-            .iter()
-            .filter_map(|(output_id, output)| (output.backend == backend).then_some(output_id))
-            .collect::<Vec<_>>();
-
         let mut changed = Vec::new();
-        for output_id in output_ids {
-            let Some(output) = self.outputs.try_get_mut(output_id) else {
-                continue;
+        let mut scale_changed = Vec::new();
+        {
+            let Some(drm) = self.drm.try_get(backend.drm_id) else {
+                return Vec::new();
             };
-            let before = output.published_state();
-            output.refresh_from_backend(drm);
-            output.scale = output.configured_scale(&self.config);
-            if output.published_state() != before {
-                changed.push(output_id);
+            let output_ids = self
+                .outputs
+                .iter()
+                .filter_map(|(output_id, output)| (output.backend == backend).then_some(output_id))
+                .collect::<Vec<_>>();
+
+            for output_id in output_ids {
+                let Some(output) = self.outputs.try_get_mut(output_id) else {
+                    continue;
+                };
+                let before = output.published_state();
+                let previous_scale = output.scale;
+                output.refresh_from_backend(drm);
+                output.scale = output.configured_scale(&self.config);
+                if output.scale != previous_scale {
+                    scale_changed.push(output_id);
+                }
+                if output.published_state() != before {
+                    changed.push(output_id);
+                }
             }
         }
+        for output_id in scale_changed {
+            self.force_output_redraw(output_id);
+        }
         changed
+    }
+
+    fn force_output_redraw(&mut self, output_id: OutputId) {
+        let Some(output) = self.outputs.try_get(output_id) else {
+            return;
+        };
+        let drm_id = output.backend.drm_id;
+        let crtc_id = output.drm_crtc_id;
+        if let Some(drm) = self.drm.try_get_mut(drm_id) {
+            drm.force_full_redraw(crtc_id);
+        }
     }
 
     pub fn output_ids_for_backend(&self, backend: BackendOutputRef) -> Vec<OutputId> {
@@ -4166,9 +4268,11 @@ mod tests {
             config::{RgbaColor, XwaylandScalingMode},
             protocol_generated::{WaylandId, WlSurfaceId},
             test_support::{
-                resolved_wl_surface as root, state_for_tests, test_output_with_crtc_name,
+                resolved_wl_surface as root, state_for_tests, state_for_tests_with_config,
+                test_output, test_output_with_crtc_name,
             },
             wire_scale::WireScale,
+            xkb::Xkb,
         },
         std::time::Duration,
     };
@@ -4183,6 +4287,95 @@ mod tests {
         assert!(clip.contains_point(30.0, 35.0));
         assert!(!clip.contains_point(10.0, 20.0));
         assert!(!clip.contains_point(49.0, 20.0));
+    }
+
+    #[test]
+    fn snap_scale_keeps_a_divisor_and_moves_off_a_fractional_edge() {
+        let one_point_five = FractionalScale::ONE_POINT_FIVE;
+        let two = FractionalScale::TWO;
+        let one_point_three_three = FractionalScale::from_v120(160);
+        assert_eq!(snap_scale(3840, 2160, one_point_five), Some(one_point_five));
+        assert_eq!(snap_scale(3840, 2160, two), Some(two));
+        assert_eq!(snap_scale(2560, 1440, one_point_three_three), Some(one_point_three_three));
+        assert_eq!(
+            snap_scale(2560, 1440, one_point_three_three)
+                .unwrap()
+                .logical_length(2560),
+            1920
+        );
+        assert_eq!(
+            snap_scale(2560, 1440, one_point_three_three)
+                .unwrap()
+                .logical_length(1440),
+            1080
+        );
+        // 1.25 is 30 v120 steps above scale 1, and scale 1 is the nearest clean value.
+        assert_eq!(
+            snap_scale(1366, 768, FractionalScale::from_v120(150)),
+            Some(FractionalScale::ONE)
+        );
+        // An odd mode is not an integer at scale 2. The nearest clean value is 1.5.
+        assert_eq!(snap_scale(1365, 768, two), Some(one_point_five));
+        assert_eq!(snap_scale(1920, 1081, two), None);
+        assert_eq!(round_scale_to_integer(one_point_five), two);
+        assert_eq!(round_scale_to_integer(FractionalScale::from_v120(168)), FractionalScale::ONE);
+    }
+
+    #[test]
+    fn configured_scale_snaps_and_a_second_apply_is_quiet() {
+        let config = crate::config::RuntimeConfig::parse_for_test(
+            "[output.scales]\n\"test-output\" = 2\n",
+            &Xkb::new(),
+        )
+        .unwrap();
+        let mut state = state_for_tests_with_config(config);
+        let output_id = state.insert_output(crate::test_support::test_output_drm0_wh(3840, 2160));
+        assert_eq!(state.outputs[output_id].scale, FractionalScale::TWO);
+        assert!(state.apply_output_scales_from_config().is_empty());
+        state.config.xwayland.scaling_mode = XwaylandScalingMode::Downscaled;
+        assert_eq!(state.refresh_xwayland_wire_scale(), Some(WireScale::new(2)));
+        assert_eq!(state.refresh_xwayland_wire_scale(), None);
+        assert!(state.apply_output_scales_from_config().is_empty());
+
+        let odd = test_output(
+            crate::state::BackendOutputRef::new(crate::state::DrmId::from(0usize)),
+            2,
+            0,
+            0,
+            1920,
+            1081,
+            "odd-output",
+        );
+        let odd_config = crate::config::RuntimeConfig::parse_for_test(
+            "[output.scales]\n\"odd-output\" = 2\n",
+            &Xkb::new(),
+        )
+        .unwrap();
+        let mut state = state_for_tests_with_config(odd_config);
+        let output_id = state.insert_output(odd);
+        assert_eq!(state.outputs[output_id].scale, FractionalScale::ONE);
+
+        let mut auto_output = test_output(
+            crate::state::BackendOutputRef::new(crate::state::DrmId::from(0usize)),
+            3,
+            0,
+            0,
+            1365,
+            768,
+            "hidpi",
+        );
+        auto_output.physical_width = 100;
+        auto_output.physical_height = 100;
+        let auto_config = crate::config::RuntimeConfig::parse_for_test(
+            "[output.scales]\nhidpi = \"auto\"\n",
+            &Xkb::new(),
+        )
+        .unwrap();
+        let mut state = state_for_tests_with_config(auto_config);
+        let output_id = state.insert_output(auto_output);
+        assert_eq!(state.outputs[output_id].scale, FractionalScale::ONE_POINT_FIVE);
+        let (width, height) = state.outputs[output_id].logical_size();
+        assert_eq!((width, height), (910, 512));
     }
 
     #[test]

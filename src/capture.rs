@@ -803,7 +803,7 @@ fn ext_failure_reason(state: &State, job_id: CaptureJobId) -> u32 {
     if !target_is_live(state, job.target) {
         return FailureReason::Stopped as u32;
     }
-    if let Some((width, height)) = image_copy_buffer_size(state, job.target, false) {
+    if let Some((width, height)) = source_pixel_size(state, job.target) {
         if job.width != width || job.height != height {
             return FailureReason::BufferConstraints as u32;
         }
@@ -811,15 +811,9 @@ fn ext_failure_reason(state: &State, job_id: CaptureJobId) -> u32 {
     FailureReason::Unknown as u32
 }
 
-pub(crate) fn image_copy_buffer_size(
-    state: &State,
-    target: CaptureTarget,
-    cursor: bool,
-) -> Option<(i32, i32)> {
-    if cursor {
-        let placement = cursor_placement(state, target)?;
-        return Some((placement.image.width, placement.image.height));
-    }
+/// Pixel size of an output or toplevel source. A toplevel is the window-local rect at the
+/// primary output's scale, which is what `ext_image_copy_capture` advertises as buffer pixels.
+pub(crate) fn source_pixel_size(state: &State, target: CaptureTarget) -> Option<(i32, i32)> {
     match target {
         CaptureTarget::Output(output_id) => {
             let output = state.outputs.try_get(output_id)?;
@@ -834,16 +828,45 @@ pub(crate) fn image_copy_buffer_size(
         }
         CaptureTarget::Toplevel(key) => {
             let bounds = toplevel_rendered_bounds(state, key)?;
-            Some((bounds.width, bounds.height))
+            bounds.capture_pixel_size(toplevel_capture_scale(state, bounds))
         }
     }
+}
+
+pub(crate) fn image_copy_buffer_size(
+    state: &mut State,
+    target: CaptureTarget,
+    cursor: bool,
+) -> Option<(i32, i32)> {
+    if cursor {
+        let placement = cursor_placement(state, target)?;
+        return Some((placement.image.width, placement.image.height));
+    }
+    source_pixel_size(state, target)
+}
+
+/// Scale of the output that owns a toplevel capture. A window on no output stays at scale 1.
+pub(crate) fn toplevel_capture_scale(
+    state: &State,
+    bounds: RectI,
+) -> crate::state::FractionalScale {
+    state
+        .primary_output_for_rect(bounds, None)
+        .and_then(|output_id| state.outputs.try_get(output_id))
+        .map(|output| output.scale)
+        .unwrap_or(crate::state::FractionalScale::ONE)
 }
 
 /// Cursor image in output-local or toplevel-local coordinates. `argb` is little-endian BGRA.
 #[derive(Clone, Debug)]
 pub(crate) struct CursorSnapshot {
+    /// Cursor image buffer, in pixels.
     pub width: i32,
     pub height: i32,
+    /// Size of that image in logical pixels. Equal to `width`/`height` at scale 1.
+    pub logical_width: i32,
+    pub logical_height: i32,
+    /// Hotspot in the cursor image buffer.
     pub hotspot_x: i32,
     pub hotspot_y: i32,
     pub stride: usize,
@@ -860,20 +883,31 @@ pub(crate) struct CursorPlacement {
     pub position: (i32, i32),
 }
 
-pub(crate) fn cursor_placement(state: &State, target: CaptureTarget) -> Option<CursorPlacement> {
+pub(crate) fn cursor_placement(
+    state: &mut State,
+    target: CaptureTarget,
+) -> Option<CursorPlacement> {
     if state.session_lock.input_gated() {
         return None;
     }
-    let image = cursor_snapshot(state)?;
+    let scale = match target {
+        CaptureTarget::Output(_) => crate::state::FractionalScale::ONE,
+        CaptureTarget::Toplevel(key) => {
+            let bounds = toplevel_rendered_bounds(state, key)?;
+            toplevel_capture_scale(state, bounds)
+        }
+    };
+    let image = cursor_snapshot(state, scale)?;
     let position = cursor_hotspot_position(state, target, &image)?;
-    let cursor_rect = RectI::new(image.origin_x, image.origin_y, image.width, image.height)?;
+    let cursor_rect =
+        RectI::new(image.origin_x, image.origin_y, image.logical_width, image.logical_height)?;
     let inside = source_bounds(state, target).is_some_and(|bounds| cursor_rect.intersects(bounds));
     Some(CursorPlacement { image, inside, position })
 }
 
 /// Blend a painted cursor into a toplevel capture. The desktop frame is not modified.
 pub(crate) fn paint_toplevel_cursor(
-    state: &State,
+    state: &mut State,
     key: ToplevelKey,
     bytes: &mut [u8],
     stride: usize,
@@ -884,51 +918,75 @@ pub(crate) fn paint_toplevel_cursor(
     let Some(bounds) = toplevel_rendered_bounds(state, key) else {
         return;
     };
-    let Some(image) = cursor_snapshot(state) else {
+    let scale = toplevel_capture_scale(state, bounds);
+    let Some((pixel_width, pixel_height)) = bounds.capture_pixel_size(scale) else {
+        return;
+    };
+    let Some(image) = cursor_snapshot(state, scale) else {
         return;
     };
     let cursor = CaptureCursorImage {
         local_x: image.origin_x.saturating_sub(bounds.x),
         local_y: image.origin_y.saturating_sub(bounds.y),
-        width: image.width,
-        height: image.height,
+        width: image.logical_width,
+        height: image.logical_height,
+        pixel_width: image.width,
+        pixel_height: image.height,
         stride: image.stride,
         argb: image.argb,
-        mode_width: bounds.width,
-        mode_height: bounds.height,
-        scale: crate::state::FractionalScale::ONE,
+        mode_width: pixel_width,
+        mode_height: pixel_height,
+        scale,
         transform: 0,
     };
     blend_cursor_into_copy(
         bytes,
         stride,
-        CapturePixelRect { x: 0, y: 0, width: bounds.width, height: bounds.height },
+        CapturePixelRect { x: 0, y: 0, width: pixel_width, height: pixel_height },
         &cursor,
     );
 }
 
-fn cursor_snapshot(state: &State) -> Option<CursorSnapshot> {
+fn cursor_snapshot(
+    state: &mut State,
+    scale: crate::state::FractionalScale,
+) -> Option<CursorSnapshot> {
     let (pointer_x, pointer_y) = state.seat.pointer_position();
     let pointer_x = pointer_x.round() as i32;
     let pointer_y = pointer_y.round() as i32;
-    match state.seat.visible_cursor_source()? {
-        crate::cursor::CursorSourceRef::Named { image, .. } => {
-            let width = image.width;
-            let height = image.height;
-            if width <= 0 || height <= 0 {
-                return None;
-            }
-            Some(CursorSnapshot {
-                width,
-                height,
-                hotspot_x: image.hotspot_x,
-                hotspot_y: image.hotspot_y,
-                stride: (width as usize).saturating_mul(4),
-                argb: rgba_to_argb(&image.pixels_rgba, width as usize, height as usize),
-                origin_x: pointer_x.saturating_sub(image.hotspot_x),
-                origin_y: pointer_y.saturating_sub(image.hotspot_y),
-            })
+    let named = matches!(
+        state.seat.visible_cursor_source(),
+        Some(crate::cursor::CursorSourceRef::Named { .. })
+    );
+    if named {
+        let pixels = if scale.is_one() {
+            state.seat.theme_cursor_size()
+        } else {
+            crate::drm::cursor_theme_pixels(state.seat.theme_cursor_size(), scale)
+        };
+        let (image, _) = state
+            .seat
+            .named_cursor_frame_at(pixels, monotonic_millis())?;
+        if image.width <= 0 || image.height <= 0 {
+            return None;
         }
+        let logical_hotspot_x = crate::drm::logical_from_pixels(scale, image.hotspot_x);
+        let logical_hotspot_y = crate::drm::logical_from_pixels(scale, image.hotspot_y);
+        return Some(CursorSnapshot {
+            width: image.width,
+            height: image.height,
+            logical_width: crate::drm::logical_from_pixels(scale, image.width),
+            logical_height: crate::drm::logical_from_pixels(scale, image.height),
+            hotspot_x: image.hotspot_x,
+            hotspot_y: image.hotspot_y,
+            stride: (image.width as usize).saturating_mul(4),
+            argb: rgba_to_argb(&image.pixels_rgba, image.width as usize, image.height as usize),
+            origin_x: pointer_x.saturating_sub(logical_hotspot_x),
+            origin_y: pointer_y.saturating_sub(logical_hotspot_y),
+        });
+    }
+    match state.seat.visible_cursor_source()? {
+        crate::cursor::CursorSourceRef::Named { .. } => None,
         crate::cursor::CursorSourceRef::Surface { cursor } => {
             let surface = cursor.surface.try_ref(state)?;
             let render = surface.render_state_at(0, 0)?;
@@ -944,6 +1002,8 @@ fn cursor_snapshot(state: &State) -> Option<CursorSnapshot> {
             Some(CursorSnapshot {
                 width: render.width,
                 height: render.height,
+                logical_width: render.width,
+                logical_height: render.height,
                 hotspot_x: cursor.hotspot_x,
                 hotspot_y: cursor.hotspot_y,
                 stride: shm.stride(),
@@ -965,7 +1025,12 @@ fn cursor_hotspot_position(
     match target {
         CaptureTarget::Toplevel(key) => {
             let bounds = toplevel_rendered_bounds(state, key)?;
-            Some((hotspot_x.saturating_sub(bounds.x), hotspot_y.saturating_sub(bounds.y)))
+            let scale = toplevel_capture_scale(state, bounds);
+            let (pointer_x, pointer_y) = state.seat.pointer_position();
+            Some((
+                scale.scale_edge(pointer_x.round() as i32 - bounds.x),
+                scale.scale_edge(pointer_y.round() as i32 - bounds.y),
+            ))
         }
         CaptureTarget::Output(output_id) => {
             let output = state.outputs.try_get(output_id)?;
@@ -986,10 +1051,7 @@ fn cursor_hotspot_position(
                 logical_width,
                 logical_height,
             )?;
-            Some((
-                scale_logical_to_buffer(x, output.scale),
-                scale_logical_to_buffer(y, output.scale),
-            ))
+            Some((output.scale.scale_edge(x), output.scale.scale_edge(y)))
         }
     }
 }
@@ -1084,27 +1146,34 @@ struct OrientedCursor {
 }
 
 fn orient_cursor(cursor: &CaptureCursorImage) -> Option<OrientedCursor> {
-    if cursor.width <= 0 || cursor.height <= 0 {
+    if cursor.pixel_width <= 0 || cursor.pixel_height <= 0 {
         return None;
     }
-    let width = cursor.width as usize;
-    let height = cursor.height as usize;
+    let width = cursor.pixel_width as usize;
+    let height = cursor.pixel_height as usize;
     let needed = cursor.stride.saturating_mul(height);
     if cursor.argb.len() < needed || cursor.stride < width.saturating_mul(4) {
         return None;
     }
     let inverted = invert_output_transform(cursor.transform);
     let (dest_width, dest_height) = if inverted % 2 == 0 {
-        (cursor.width, cursor.height)
+        (cursor.pixel_width, cursor.pixel_height)
     } else {
-        (cursor.height, cursor.width)
+        (cursor.pixel_height, cursor.pixel_width)
     };
     let dest_stride = (dest_width as usize).saturating_mul(4);
     let mut argb = vec![0u8; dest_stride.saturating_mul(dest_height as usize)];
-    for sy in 0..cursor.height {
-        for sx in 0..cursor.width {
-            let (dx, dy, _, _) =
-                transform_output_box(sx, sy, 1, 1, inverted, cursor.width, cursor.height)?;
+    for sy in 0..cursor.pixel_height {
+        for sx in 0..cursor.pixel_width {
+            let (dx, dy, _, _) = transform_output_box(
+                sx,
+                sy,
+                1,
+                1,
+                inverted,
+                cursor.pixel_width,
+                cursor.pixel_height,
+            )?;
             if dx < 0 || dy < 0 || dx >= dest_width || dy >= dest_height {
                 continue;
             }
@@ -1143,10 +1212,10 @@ fn cursor_buffer_rect(cursor: &CaptureCursorImage) -> Option<CapturePixelRect> {
         logical_width,
         logical_height,
     )?;
-    let x1 = scale_logical_to_buffer(x, cursor.scale);
-    let y1 = scale_logical_to_buffer(y, cursor.scale);
-    let x2 = scale_logical_to_buffer(x.saturating_add(width), cursor.scale);
-    let y2 = scale_logical_to_buffer(y.saturating_add(height), cursor.scale);
+    let x1 = cursor.scale.scale_edge(x);
+    let y1 = cursor.scale.scale_edge(y);
+    let x2 = cursor.scale.scale_edge(x.saturating_add(width));
+    let y2 = cursor.scale.scale_edge(y.saturating_add(height));
     if x2 <= x1 || y2 <= y1 {
         return None;
     }
@@ -1178,7 +1247,8 @@ pub(crate) struct OutputCopySpec {
     pub cursor: CaptureCursor,
 }
 
-/// Cursor image in output-local logical coordinates. `argb` is little-endian BGRA, matching
+/// Cursor image in output-local logical coordinates. `width`/`height` are the logical size.
+/// `pixel_width`/`pixel_height` are the `argb` buffer. `argb` is little-endian BGRA, matching
 /// the SHM capture buffer.
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureCursorImage {
@@ -1186,6 +1256,8 @@ pub(crate) struct CaptureCursorImage {
     pub local_y: i32,
     pub width: i32,
     pub height: i32,
+    pub pixel_width: i32,
+    pub pixel_height: i32,
     pub stride: usize,
     pub argb: Vec<u8>,
     pub mode_width: i32,
@@ -1332,6 +1404,17 @@ pub(crate) fn apply_rendered_output(
     }
 }
 
+fn monotonic_millis() -> u32 {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    let millis = (time.tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add((time.tv_nsec as u64) / 1_000_000);
+    millis.min(u64::from(u32::MAX)) as u32
+}
+
 pub(crate) fn capture_timestamp_now() -> CaptureTimestamp {
     let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
@@ -1434,10 +1517,10 @@ pub(crate) fn output_capture_rect(
         logical_width,
         logical_height,
     )?;
-    let x1 = scale_logical_to_buffer(transformed.0, scale);
-    let y1 = scale_logical_to_buffer(transformed.1, scale);
-    let x2 = scale_logical_to_buffer(transformed.0.saturating_add(transformed.2), scale);
-    let y2 = scale_logical_to_buffer(transformed.1.saturating_add(transformed.3), scale);
+    let x1 = scale.scale_edge(transformed.0);
+    let y1 = scale.scale_edge(transformed.1);
+    let x2 = scale.scale_edge(transformed.0.saturating_add(transformed.2));
+    let y2 = scale.scale_edge(transformed.1.saturating_add(transformed.3));
     let mode = crate::region::RectI::new(0, 0, mode_width, mode_height)?;
     let scaled = crate::region::RectI::new(x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1))?;
     let hit = scaled.intersection(mode)?;
@@ -1445,13 +1528,6 @@ pub(crate) fn output_capture_rect(
         return None;
     }
     Some(CapturePixelRect { x: hit.x, y: hit.y, width: hit.width, height: hit.height })
-}
-
-fn scale_logical_to_buffer(logical: i32, scale: crate::state::FractionalScale) -> i32 {
-    let logical = i64::from(logical);
-    let numerator = i64::from(scale.as_v120());
-    let denominator = i64::from(crate::state::FractionalScale::DENOMINATOR);
-    ((logical * numerator) + (denominator / 2)).div_euclid(denominator) as i32
 }
 
 fn invert_output_transform(transform: i32) -> i32 {
@@ -1548,20 +1624,23 @@ pub(crate) fn submit_toplevel_capture(
     let Some(bounds) = toplevel_rendered_bounds(state, key) else {
         return Err(CaptureQueueError::SourceGone);
     };
+    let Some((width, height)) = bounds.capture_pixel_size(toplevel_capture_scale(state, bounds))
+    else {
+        return Err(CaptureQueueError::SourceGone);
+    };
     let id = submit_capture(
         state,
         dispatcher,
         CaptureJobRequest {
             target: CaptureTarget::Toplevel(key),
             buffer,
-            width: bounds.width,
-            height: bounds.height,
+            width,
+            height,
             cursor,
         },
     )?;
     if let Some(job) = state.capture.jobs.get_mut(&id) {
-        job.pixel_rect =
-            Some(CapturePixelRect { x: 0, y: 0, width: bounds.width, height: bounds.height });
+        job.pixel_rect = Some(CapturePixelRect { x: 0, y: 0, width, height });
         job.with_damage = with_damage;
     }
     Ok(id)
@@ -3614,6 +3693,8 @@ mod tests {
             local_y: 0,
             width: 1,
             height: 1,
+            pixel_width: 1,
+            pixel_height: 1,
             stride: 4,
             argb: vec![10, 20, 30, 255],
             mode_width: 4,

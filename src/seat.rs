@@ -1245,6 +1245,19 @@ impl SeatState {
         self.cursor.image_at(size)
     }
 
+    pub(crate) fn theme_cursor_size(&self) -> u32 {
+        self.cursor.theme_size()
+    }
+
+    /// The visible named cursor nearest to `size` pixels. A surface cursor returns nothing.
+    pub(crate) fn named_cursor_frame_at(
+        &mut self,
+        size: u32,
+        now_msec: u32,
+    ) -> Option<(crate::cursor::CursorImage, Option<u32>)> {
+        self.cursor.frame_at_size(size, now_msec)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_block_cursor_icons(&mut self, names: &[&str]) {
         self.cursor.test_block_icons(names);

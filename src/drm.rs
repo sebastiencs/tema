@@ -336,22 +336,31 @@ struct CursorSurfaceContentKey {
     content_revision: u64,
     width: i32,
     height: i32,
+    scale_v120: u32,
 }
 
 #[derive(Clone, Debug)]
 enum CursorPlaneUploadSource {
-    Named { image: *const CursorImage },
+    Named { image: CursorImage },
     SurfaceShm { buffer: CursorShmBuffer },
 }
 
 #[derive(Clone, Debug)]
 struct CursorPlaneRequest {
+    /// Image top-left and size in global logical pixels.
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     hotspot_x: i32,
     hotspot_y: i32,
+    /// Plane position in output-local physical pixels, and the image size drawn into the plane.
+    plane_x: i32,
+    plane_y: i32,
+    pixel_width: i32,
+    pixel_height: i32,
+    pixel_hotspot_x: i32,
+    pixel_hotspot_y: i32,
     content_key: CursorPlaneContentKey,
     upload: CursorPlaneUploadSource,
     next_frame_in_msec: Option<u32>,
@@ -930,6 +939,7 @@ impl DrmOutput {
         &self.in_use.connector.interface_name
     }
 
+    /// Physical framebuffer, at the origin. Layout rects are `State::output_bounds`.
     fn output_bounds(&self) -> RectI {
         let buffer = self.render_buffer();
         RectI::new(0, 0, buffer.width, buffer.height)
@@ -1412,6 +1422,12 @@ impl Drm {
 
     fn output_mut(&mut self, drm_crtc_id: u32) -> Option<&mut DrmOutput> {
         self.outputs.get_mut(&drm_crtc_id)
+    }
+
+    pub(crate) fn force_full_redraw(&mut self, drm_crtc_id: u32) {
+        if let Some(output) = self.output_mut(drm_crtc_id) {
+            output.pipeline.set_force_full_redraw(true);
+        }
     }
 
     pub fn output_connector_in_use(&self, drm_crtc_id: u32) -> Option<&ConnectorInUse> {
@@ -2202,19 +2218,19 @@ impl Drm {
         &mut self,
         drm_crtc_id: u32,
         request: &CursorPlaneRequest,
-        output_bounds: RectI,
     ) -> Option<CursorPlaneCandidate> {
-        if request.width <= 0
-            || request.height <= 0
-            || request.width as u64 > self.resources.cursor_width
-            || request.height as u64 > self.resources.cursor_height
+        if request.pixel_width <= 0
+            || request.pixel_height <= 0
+            || request.pixel_width as u64 > self.resources.cursor_width
+            || request.pixel_height as u64 > self.resources.cursor_height
         {
             return None;
         }
-        let x = request.x;
-        let y = request.y;
-        let bounds = RectI::new(x, y, request.width, request.height)?;
-        if classify_cursor_output_visibility(bounds, output_bounds)
+        let x = request.plane_x;
+        let y = request.plane_y;
+        let framebuffer = self.output(drm_crtc_id)?.output_bounds();
+        let bounds = RectI::new(x, y, request.pixel_width, request.pixel_height)?;
+        if classify_cursor_output_visibility(bounds, framebuffer)
             != CursorOutputVisibility::FullyVisible
         {
             return None;
@@ -2229,8 +2245,8 @@ impl Drm {
                 log::debug!(
                 "Reusing cached DRM cursor plane buffer: slot={} visible_size={}x{} fb_size={}x{} pos=({}, {}) hotspot=({}, {}) fb={:?}",
                 slot,
-                request.width,
-                request.height,
+                request.pixel_width,
+                request.pixel_height,
                 fb_width,
                 fb_height,
                 x,
@@ -2249,8 +2265,8 @@ impl Drm {
                 log::debug!(
                 "Prepared DRM cursor plane candidate: slot={} visible_size={}x{} fb_size={}x{} pos=({}, {}) hotspot=({}, {}) fb={:?}",
                 slot,
-                request.width,
-                request.height,
+                request.pixel_width,
+                request.pixel_height,
                 fb_width,
                 fb_height,
                 x,
@@ -2946,7 +2962,7 @@ impl Drm {
                 return None;
             }
         };
-        let recipe = cursor_plane_recipe(texture, request.width, request.height);
+        let recipe = cursor_plane_recipe(texture, request.pixel_width, request.pixel_height);
         let content_key = request.content_key;
         let rendered = {
             let Drm { renderer, outputs, .. } = self;
@@ -3003,14 +3019,10 @@ impl Drm {
         request: &CursorPlaneRequest,
     ) -> Result<Rc<dyn Texture>, String> {
         match &request.upload {
-            CursorPlaneUploadSource::Named { image } => {
-                let Some(image) = (unsafe { image.as_ref() }) else {
-                    return Err("named cursor image is gone".to_string());
-                };
-                self.renderer
-                    .upload_rgba(&image.pixels_rgba, image.width, image.height)
-                    .map_err(|error| error.to_string())
-            }
+            CursorPlaneUploadSource::Named { image } => self
+                .renderer
+                .upload_rgba(&image.pixels_rgba, image.width, image.height)
+                .map_err(|error| error.to_string()),
             CursorPlaneUploadSource::SurfaceShm { buffer } => {
                 let bytes = buffer.argb_bytes();
                 if bytes.is_empty() {
@@ -4631,8 +4643,12 @@ fn queue_animation_damage(state: &mut State, rects: &[RectI]) {
         let Some(output) = state.outputs.try_get(output_id) else {
             continue;
         };
+        let scale = output.scale;
         let drm_id = output.backend.drm_id;
         let crtc_id = output.drm_crtc_id;
+        let Some(local) = local.scaled_out(scale) else {
+            continue;
+        };
         let Some(drm) = state.drm.try_get_mut(drm_id) else {
             continue;
         };
@@ -4744,6 +4760,7 @@ struct PreparedToplevelCapture {
     width: i32,
     height: i32,
     bounds: Option<RectI>,
+    scale: crate::state::FractionalScale,
     snapshots: Vec<crate::wayland_objects::wl_surface::SurfaceRenderState>,
     visual: Option<RootSurfaceVisualState>,
 }
@@ -4778,6 +4795,9 @@ fn sample_pending_toplevel_captures(
             continue;
         };
         let bounds = crate::capture::toplevel_rendered_bounds(state, key);
+        let scale = bounds
+            .map(|bounds| crate::capture::toplevel_capture_scale(state, bounds))
+            .unwrap_or(crate::state::FractionalScale::ONE);
         let snapshots = crate::capture::peek_toplevel_snapshots(state, key);
         let visual = crate::capture::toplevel_root_surface(state, key)
             .and_then(|root| state.root_surface_visual_state(root));
@@ -4787,6 +4807,7 @@ fn sample_pending_toplevel_captures(
             width,
             height,
             bounds,
+            scale,
             snapshots,
             visual,
         });
@@ -4847,12 +4868,15 @@ fn render_prepared_toplevels(
             let Some(bounds) = item.bounds else {
                 return failed(0, 0);
             };
-            if bounds.width != item.width
-                || bounds.height != item.height
-                || bounds.width > 16_384
-                || bounds.height > 16_384
-            {
+            let Some((pixel_width, pixel_height)) = bounds.capture_pixel_size(item.scale) else {
                 return failed(bounds.width, bounds.height);
+            };
+            if pixel_width != item.width
+                || pixel_height != item.height
+                || pixel_width > 16_384
+                || pixel_height > 16_384
+            {
+                return failed(pixel_width, pixel_height);
             }
             let mut items = Vec::new();
             let mut elements = Vec::new();
@@ -4888,10 +4912,13 @@ fn render_prepared_toplevels(
                 item.visual.and_then(|visual| visual.clip),
                 alpha,
                 None,
+                item.scale,
             );
             push_scene_item_frame_elements(&mut elements, item_start..items.len());
             translate_scene_items(&mut items, -bounds.x, -bounds.y);
             translate_recorded_frame_elements(&mut elements, -bounds.x, -bounds.y);
+            scale_scene_items(&mut items, item.scale);
+            scale_recorded_frame_elements(&mut elements, item.scale);
             let recipe = build_output_frame_recipe(&items, &elements);
             wait_scene_acquires(drm, &items);
             let (reference_width, reference_height) = drm
@@ -4900,16 +4927,16 @@ fn render_prepared_toplevels(
                     let buffer = output.render_buffer();
                     (buffer.width, buffer.height)
                 })
-                .unwrap_or((bounds.width, bounds.height));
+                .unwrap_or((pixel_width, pixel_height));
             let mut target = match drm
                 .renderer
-                .create_offscreen_target(bounds.width, bounds.height)
+                .create_offscreen_target(pixel_width, pixel_height)
             {
                 Ok(target) => target,
-                Err(_) => return failed(bounds.width, bounds.height),
+                Err(_) => return failed(pixel_width, pixel_height),
             };
-            let Some(capture_rect) = RectI::new(0, 0, bounds.width, bounds.height) else {
-                return failed(bounds.width, bounds.height);
+            let Some(capture_rect) = RectI::new(0, 0, pixel_width, pixel_height) else {
+                return failed(pixel_width, pixel_height);
             };
             let damage = DamageRegion::from_rect(capture_rect);
             if drm
@@ -4928,10 +4955,10 @@ fn render_prepared_toplevels(
                 )
                 .is_err()
             {
-                return failed(bounds.width, bounds.height);
+                return failed(pixel_width, pixel_height);
             }
-            let stride = (bounds.width as usize).saturating_mul(4);
-            let mut bytes = vec![0u8; stride.saturating_mul(bounds.height.max(0) as usize)];
+            let stride = (pixel_width as usize).saturating_mul(4);
+            let mut bytes = vec![0u8; stride.saturating_mul(pixel_height.max(0) as usize)];
             let read_ok = drm
                 .renderer
                 .readback(&*target, capture_rect, stride, &mut bytes)
@@ -4940,17 +4967,22 @@ fn render_prepared_toplevels(
                 .snapshots
                 .iter()
                 .flat_map(|snapshot| snapshot.damage.rects().iter().copied())
-                .map(|rect| crate::capture::CapturePixelRect {
-                    x: rect.x.saturating_sub(bounds.x),
-                    y: rect.y.saturating_sub(bounds.y),
-                    width: rect.width,
-                    height: rect.height,
+                .filter_map(|rect| {
+                    let physical = rect
+                        .translate(-bounds.x, -bounds.y)
+                        .scaled_out(item.scale)?;
+                    Some(crate::capture::CapturePixelRect {
+                        x: physical.x,
+                        y: physical.y,
+                        width: physical.width,
+                        height: physical.height,
+                    })
                 })
                 .collect();
             RenderedToplevelCapture {
                 key: item.key,
-                bounds_width: bounds.width,
-                bounds_height: bounds.height,
+                bounds_width: pixel_width,
+                bounds_height: pixel_height,
                 damage,
                 copy: crate::capture::RenderedOutputCopy {
                     job_id: item.job_id,
@@ -5824,6 +5856,7 @@ fn collect_protected_scene(
         log::error!("session lock blank texture is unavailable; desktop content stays hidden");
     }
     let surface_start = items.len();
+    let output_scale = output_fractional_scale(state, output_id);
     {
         let (objects, drm_map) = (&mut state.objects, &mut state.drm);
         let drm = drm_map.get_mut(drm_id);
@@ -5840,6 +5873,7 @@ fn collect_protected_scene(
             None,
             u8::MAX,
             None,
+            output_scale,
         );
     }
     push_scene_item_frame_elements(&mut frame_elements, surface_start..items.len());
@@ -6101,14 +6135,23 @@ fn collect_named_cursor_render_item(
     state: &mut crate::state::State,
     drm_id: DrmId,
     output_bounds: RectI,
+    output_scale: crate::state::FractionalScale,
     now_msec: u32,
 ) -> Option<(SceneItem, Option<u32>)> {
     let (pointer_x, pointer_y) = state.seat.pointer_position();
-    match state.seat.visible_cursor_source_at(now_msec)? {
-        CursorSourceRef::Named { image, next_frame_in_msec, .. } => {
-            let x = pointer_x.round() as i32 - image.hotspot_x;
-            let y = pointer_y.round() as i32 - image.hotspot_y;
-            let bounds = RectI::new(x, y, image.width, image.height)?;
+    let pixels = cursor_theme_pixels(state.seat.theme_cursor_size(), output_scale);
+    match state.seat.named_cursor_frame_at(pixels, now_msec) {
+        Some((image, next_frame_in_msec)) => {
+            let hotspot_x = logical_from_pixels(output_scale, image.hotspot_x);
+            let hotspot_y = logical_from_pixels(output_scale, image.hotspot_y);
+            let x = pointer_x.round() as i32 - hotspot_x;
+            let y = pointer_y.round() as i32 - hotspot_y;
+            let bounds = RectI::new(
+                x,
+                y,
+                logical_from_pixels(output_scale, image.width),
+                logical_from_pixels(output_scale, image.height),
+            )?;
             if classify_cursor_output_visibility(bounds, output_bounds)
                 == CursorOutputVisibility::Hidden
             {
@@ -6148,7 +6191,7 @@ fn collect_named_cursor_render_item(
                 next_frame_in_msec,
             ))
         }
-        CursorSourceRef::Surface { .. } => None,
+        None => None,
     }
 }
 
@@ -6189,14 +6232,13 @@ fn collect_submission_metadata(
 }
 
 fn capture_cursor_overlay(
-    state: &crate::state::State,
+    state: &mut crate::state::State,
     output_id: OutputId,
 ) -> Option<crate::capture::CaptureCursorImage> {
+    let request = build_cursor_plane_request(state, output_id, monotonic_time_msec())?;
     let output = state.outputs.try_get(output_id)?;
-    let request = build_cursor_plane_request(state, monotonic_time_msec())?;
-    let (argb, stride) = match &request.upload {
+    let (argb, stride, pixel_width, pixel_height) = match &request.upload {
         CursorPlaneUploadSource::Named { image } => {
-            let image = unsafe { image.as_ref() }?;
             let width = image.width.max(0) as usize;
             let height = image.height.max(0) as usize;
             if width == 0 || height == 0 {
@@ -6204,14 +6246,14 @@ fn capture_cursor_overlay(
             }
             let stride = width.saturating_mul(4);
             let argb = rgba_to_drm_argb8888(&image.pixels_rgba, width, height, stride, height);
-            (argb, stride)
+            (argb, stride, image.width, image.height)
         }
         CursorPlaneUploadSource::SurfaceShm { buffer } => {
             let argb = buffer.argb_bytes();
             if argb.is_empty() {
                 return None;
             }
-            (argb, buffer.stride())
+            (argb, buffer.stride(), buffer.width(), buffer.height())
         }
     };
     Some(crate::capture::CaptureCursorImage {
@@ -6219,6 +6261,8 @@ fn capture_cursor_overlay(
         local_y: request.y.saturating_sub(output.y),
         width: request.width,
         height: request.height,
+        pixel_width,
+        pixel_height,
         stride,
         argb,
         mode_width: output.current_mode.width,
@@ -6289,6 +6333,45 @@ fn wait_scene_acquires(drm: &mut Drm, items: &[SceneItem]) {
     }
 }
 
+fn output_fractional_scale(state: &State, output_id: OutputId) -> crate::state::FractionalScale {
+    state
+        .outputs
+        .try_get(output_id)
+        .map(|output| output.scale)
+        .unwrap_or(crate::state::FractionalScale::ONE)
+}
+
+/// Physical size of `bounds` after the output-local translation and [`scale_scene_items`].
+///
+/// Scaling the global rect would change the width at a fractional scale when the output
+/// is not at the origin. Direct scanout and sample padding both need this destination.
+fn scaled_destination_size(
+    bounds: RectI,
+    output_bounds: RectI,
+    scale: crate::state::FractionalScale,
+) -> Option<(i32, i32)> {
+    let local = bounds.translate(-output_bounds.x, -output_bounds.y);
+    let physical = local.scaled(scale)?;
+    Some((physical.width, physical.height))
+}
+
+fn sample_damage_padding_for(
+    tex_transform: transform::Mat3,
+    bounds: RectI,
+    output_bounds: RectI,
+    buffer_width: i32,
+    buffer_height: i32,
+    scale: crate::state::FractionalScale,
+) -> i32 {
+    let matches_destination = scaled_destination_size(bounds, output_bounds, scale)
+        == Some((buffer_width, buffer_height));
+    if tex_transform != transform::Mat3::identity() || !matches_destination {
+        1
+    } else {
+        0
+    }
+}
+
 fn push_scene_items_from_snapshots(
     items: &mut Vec<SceneItem>,
     objects: &mut Box<crate::state::IndexMap<ObjectId, Box<dyn Object>>>,
@@ -6301,6 +6384,7 @@ fn push_scene_items_from_snapshots(
     root_clip: Option<WindowClip>,
     alpha: u8,
     geometry_scale: Option<(RectI, RectI)>,
+    output_scale: crate::state::FractionalScale,
 ) {
     for surface_state in snapshots {
         let buffer_oid = surface_state.buffer.object_id();
@@ -6344,14 +6428,17 @@ fn push_scene_items_from_snapshots(
         };
         let tex_transform = buffer.base_tex_transform().mul(surface_state.tex_transform);
         let (buffer_width, buffer_height) = buffer.dimensions();
-        let sample_damage_padding = if surface_state.tex_transform != transform::Mat3::identity()
-            || buffer_width != bounds.width
-            || buffer_height != bounds.height
-        {
-            1
-        } else {
-            0
-        };
+        let destination_matches_buffer =
+            scaled_destination_size(bounds, output_bounds, output_scale)
+                == Some((buffer_width, buffer_height));
+        let sample_damage_padding = sample_damage_padding_for(
+            surface_state.tex_transform,
+            bounds,
+            output_bounds,
+            buffer_width,
+            buffer_height,
+            output_scale,
+        );
         let scanout_sync_ok =
             matches!(
                 surface_state.sync.acquire,
@@ -6365,8 +6452,7 @@ fn push_scene_items_from_snapshots(
             && buffer.dmabuf().is_some()
             && !buffer.y_inverted()
             && bounds == output_bounds
-            && buffer_width == bounds.width
-            && buffer_height == bounds.height
+            && destination_matches_buffer
             && tex_transform == transform::Mat3::identity()
             && scanout_sync_ok;
         let direct_scanout = if scanout_candidate && !buffer.format().has_alpha {
@@ -6543,11 +6629,16 @@ fn collect_software_cursor_items(
     drm_crtc_id: u32,
     output_bounds: RectI,
     frame_time_msec: u32,
+    output_scale: crate::state::FractionalScale,
     retired_candidates: &mut Vec<RetiredBufferCandidate>,
 ) -> (Vec<SceneItem>, Option<u32>) {
-    if let Some((item, next_frame_in_msec)) =
-        collect_named_cursor_render_item(state, drm_id, output_bounds, frame_time_msec)
-    {
+    if let Some((item, next_frame_in_msec)) = collect_named_cursor_render_item(
+        state,
+        drm_id,
+        output_bounds,
+        output_scale,
+        frame_time_msec,
+    ) {
         return (vec![item], next_frame_in_msec);
     }
     if !matches!(state.seat.visible_cursor_source(), Some(CursorSourceRef::Surface { .. })) {
@@ -6570,24 +6661,43 @@ fn collect_software_cursor_items(
         None,
         u8::MAX,
         None,
+        output_scale,
     );
     (items, None)
 }
 
 fn build_named_cursor_plane_request(
     pointer_position: (f64, f64),
-    image: &CursorImage,
+    output_origin: (i32, i32),
+    scale: crate::state::FractionalScale,
+    image: CursorImage,
     next_frame_in_msec: Option<u32>,
 ) -> CursorPlaneRequest {
+    let logical_hotspot_x = logical_from_pixels(scale, image.hotspot_x);
+    let logical_hotspot_y = logical_from_pixels(scale, image.hotspot_y);
+    let logical_width = logical_from_pixels(scale, image.width);
+    let logical_height = logical_from_pixels(scale, image.height);
+    let x = pointer_position.0.round() as i32 - logical_hotspot_x;
+    let y = pointer_position.1.round() as i32 - logical_hotspot_y;
+    let pixel_hotspot_x = image.hotspot_x;
+    let pixel_hotspot_y = image.hotspot_y;
     CursorPlaneRequest {
-        x: pointer_position.0.round() as i32 - image.hotspot_x,
-        y: pointer_position.1.round() as i32 - image.hotspot_y,
-        width: image.width,
-        height: image.height,
-        hotspot_x: image.hotspot_x,
-        hotspot_y: image.hotspot_y,
+        x,
+        y,
+        width: logical_width,
+        height: logical_height,
+        hotspot_x: logical_hotspot_x,
+        hotspot_y: logical_hotspot_y,
+        plane_x: scale.scale_coord(pointer_position.0 - f64::from(output_origin.0))
+            - pixel_hotspot_x,
+        plane_y: scale.scale_coord(pointer_position.1 - f64::from(output_origin.1))
+            - pixel_hotspot_y,
+        pixel_width: image.width,
+        pixel_height: image.height,
+        pixel_hotspot_x,
+        pixel_hotspot_y,
         content_key: CursorPlaneContentKey::Named(image.content_key()),
-        upload: CursorPlaneUploadSource::Named { image: image as *const CursorImage },
+        upload: CursorPlaneUploadSource::Named { image },
         next_frame_in_msec,
     }
 }
@@ -6595,6 +6705,9 @@ fn build_named_cursor_plane_request(
 fn build_surface_cursor_plane_request(
     state: &crate::state::State,
     cursor: &crate::cursor::CursorSurface,
+    output_origin: (i32, i32),
+    output_bounds: RectI,
+    scale: crate::state::FractionalScale,
 ) -> Option<CursorPlaneRequest> {
     let (pointer_x, pointer_y) = state.seat.pointer_position();
     let surface = state
@@ -6612,12 +6725,16 @@ fn build_surface_cursor_plane_request(
     }
     let content_revision = surface.content_revision();
     let buffer_ref = render_state.buffer.try_ref(state)?;
-    if buffer_ref.dimensions() != (render_state.width, render_state.height) {
-        return None;
-    }
     let Some(buffer) = buffer_ref.shm_cursor_argb8888() else {
         return None;
     };
+    let bounds =
+        RectI::new(render_state.x, render_state.y, render_state.width, render_state.height)?;
+    let (pixel_width, pixel_height) = scaled_destination_size(bounds, output_bounds, scale)?;
+    let pixel_hotspot_x = scale.scale_length(cursor.hotspot_x);
+    let pixel_hotspot_y = scale.scale_length(cursor.hotspot_y);
+    let extra_x = render_state.x - (pointer_x.round() as i32 - cursor.hotspot_x);
+    let extra_y = render_state.y - (pointer_y.round() as i32 - cursor.hotspot_y);
     Some(CursorPlaneRequest {
         x: render_state.x,
         y: render_state.y,
@@ -6625,12 +6742,21 @@ fn build_surface_cursor_plane_request(
         height: render_state.height,
         hotspot_x: cursor.hotspot_x,
         hotspot_y: cursor.hotspot_y,
+        plane_x: scale.scale_coord(pointer_x - f64::from(output_origin.0)) - pixel_hotspot_x
+            + scale.scale_edge(extra_x),
+        plane_y: scale.scale_coord(pointer_y - f64::from(output_origin.1)) - pixel_hotspot_y
+            + scale.scale_edge(extra_y),
+        pixel_width,
+        pixel_height,
+        pixel_hotspot_x,
+        pixel_hotspot_y,
         content_key: CursorPlaneContentKey::Surface(CursorSurfaceContentKey {
             surface: cursor.surface,
             buffer: render_state.buffer,
             content_revision,
-            width: render_state.width,
-            height: render_state.height,
+            width: pixel_width,
+            height: pixel_height,
+            scale_v120: scale.as_v120(),
         }),
         upload: CursorPlaneUploadSource::SurfaceShm { buffer },
         next_frame_in_msec: None,
@@ -6638,17 +6764,54 @@ fn build_surface_cursor_plane_request(
 }
 
 fn build_cursor_plane_request(
-    state: &crate::state::State,
+    state: &mut crate::state::State,
+    output_id: OutputId,
     frame_time_msec: u32,
 ) -> Option<CursorPlaneRequest> {
-    let pointer_position = state.seat.pointer_position();
-    match state.seat.visible_cursor_source_at(frame_time_msec)? {
-        CursorSourceRef::Named { image, next_frame_in_msec, .. } => {
-            Some(build_named_cursor_plane_request(pointer_position, image, next_frame_in_msec))
-        }
-        CursorSourceRef::Surface { cursor, .. } => {
-            build_surface_cursor_plane_request(state, cursor)
-        }
+    let output = state.outputs.try_get(output_id)?;
+    let scale = output.scale;
+    let output_origin = (output.x, output.y);
+    let output_bounds = output.logical_bounds()?;
+    let named = matches!(
+        state.seat.visible_cursor_source_at(frame_time_msec),
+        Some(CursorSourceRef::Named { .. })
+    );
+    if named {
+        let pixels = cursor_theme_pixels(state.seat.theme_cursor_size(), scale);
+        let (image, next_frame_in_msec) =
+            state.seat.named_cursor_frame_at(pixels, frame_time_msec)?;
+        return Some(build_named_cursor_plane_request(
+            state.seat.pointer_position(),
+            output_origin,
+            scale,
+            image,
+            next_frame_in_msec,
+        ));
+    }
+    let cursor = match state.seat.visible_cursor_source_at(frame_time_msec)? {
+        CursorSourceRef::Surface { cursor } => cursor.clone(),
+        CursorSourceRef::Named { .. } => return None,
+    };
+    build_surface_cursor_plane_request(state, &cursor, output_origin, output_bounds, scale)
+}
+
+/// Pixel size of the theme cursor on an output: `ceil(theme_size · scale)`, at least 1.
+pub(crate) fn cursor_theme_pixels(theme_size: u32, scale: crate::state::FractionalScale) -> u32 {
+    let logical = i64::from(theme_size.min(i32::MAX as u32));
+    let denominator = i64::from(crate::state::FractionalScale::DENOMINATOR);
+    let scaled = logical.saturating_mul(i64::from(scale.as_v120()));
+    let pixels = scaled.saturating_add(denominator - 1) / denominator;
+    u32::try_from(pixels.max(1)).unwrap_or(u32::MAX)
+}
+
+/// Logical length of a cursor pixel count. A positive count stays at least one logical pixel.
+pub(crate) fn logical_from_pixels(scale: crate::state::FractionalScale, pixels: i32) -> i32 {
+    let magnitude = i32::try_from(pixels.unsigned_abs()).unwrap_or(i32::MAX);
+    let logical = scale.logical_length(magnitude);
+    if pixels < 0 {
+        -logical
+    } else {
+        logical
     }
 }
 
@@ -7114,6 +7277,12 @@ fn realize_closing_texture(
     state: &mut State,
     plan: &ClosingCapturePlan,
 ) -> Option<Rc<dyn Texture>> {
+    let scale = state
+        .outputs
+        .try_get(plan.output_id)
+        .map(|output| output.scale)
+        .unwrap_or(crate::state::FractionalScale::ONE);
+    let (width, height) = plan.bounds.capture_pixel_size(scale)?;
     let (objects, drm_map) = (&mut state.objects, &mut state.drm);
     let drm = drm_map.try_get_mut(plan.drm_id)?;
     drm.bind_context();
@@ -7126,7 +7295,7 @@ fn realize_closing_texture(
         let tex_transform = buffer.base_tex_transform().mul(surface.tex_transform);
         uploaded.push((texture, tex_transform));
     }
-    let elements = closing_capture_elements(plan, &uploaded);
+    let elements = closing_capture_elements(plan, &uploaded, scale);
     let (reference_width, reference_height) = {
         let buffer = drm.output(plan.crtc_id)?.render_buffer();
         (buffer.width, buffer.height)
@@ -7134,8 +7303,8 @@ fn realize_closing_texture(
     drm.renderer
         .capture_transparent(
             &elements,
-            plan.bounds.width,
-            plan.bounds.height,
+            width,
+            height,
             (reference_width, reference_height),
             plan.presentation_transform,
         )
@@ -7145,20 +7314,29 @@ fn realize_closing_texture(
 fn closing_capture_elements(
     plan: &ClosingCapturePlan,
     uploaded: &[(Rc<dyn Texture>, transform::Mat3)],
+    scale: crate::state::FractionalScale,
 ) -> Vec<FrameElement> {
     let mut elements = Vec::new();
+    let push_effect = |elements: &mut Vec<FrameElement>, effect: &PlannedClosingEffect| {
+        let mut element = effect.element;
+        scale_effect_element(&mut element, scale);
+        elements.push(FrameElement::Effect { phase: effect.phase, element });
+    };
     for effect in &plan.effects {
         if effect.phase == FramePhase::UnderWindow {
-            elements.push(FrameElement::Effect { phase: effect.phase, element: effect.element });
+            push_effect(&mut elements, effect);
         }
     }
     for (surface, (texture, tex_transform)) in plan.surfaces.iter().zip(uploaded.iter()) {
-        let Some(bounds) = RectI::new(surface.x, surface.y, surface.width, surface.height) else {
+        let Some(logical) = RectI::new(surface.x, surface.y, surface.width, surface.height) else {
+            continue;
+        };
+        let Some(bounds) = logical.scaled(scale) else {
             continue;
         };
         let mask = if surface.inherit_root_clip {
             plan.root_clip
-                .map(|window_clip| {
+                .and_then(|window_clip| {
                     let clip = RootSurfaceClip::new(
                         window_clip.clip().outer_rect.translate(
                             plan.bounds.x.saturating_neg(),
@@ -7166,15 +7344,16 @@ fn closing_capture_elements(
                         ),
                         window_clip.clip().corner_radius,
                         window_clip.clip().rounding_power,
-                    );
-                    match window_clip {
+                    )
+                    .scaled(scale)?;
+                    Some(match window_clip {
                         WindowClip::Frame(_) => {
                             TextureMask::RoundedClip { clip: localize_clip(clip, bounds) }
                         }
                         WindowClip::Corners(_) => {
                             TextureMask::CornerRoundedClip { clip: localize_clip(clip, bounds) }
                         }
-                    }
+                    })
                 })
                 .unwrap_or(TextureMask::None)
         } else {
@@ -7185,10 +7364,10 @@ fn closing_capture_elements(
             element: TextureElement {
                 source: TextureSource::Texture,
                 texture: Rc::clone(texture),
-                x: surface.x,
-                y: surface.y,
-                width: surface.width,
-                height: surface.height,
+                x: bounds.x,
+                y: bounds.y,
+                width: bounds.width,
+                height: bounds.height,
                 tex_transform: *tex_transform,
                 damage: DamageRegion::from_rect(bounds),
                 blend: true,
@@ -7199,7 +7378,7 @@ fn closing_capture_elements(
     }
     for effect in &plan.effects {
         if effect.phase != FramePhase::UnderWindow {
-            elements.push(FrameElement::Effect { phase: effect.phase, element: effect.element });
+            push_effect(&mut elements, effect);
         }
     }
     elements
@@ -7321,6 +7500,7 @@ fn collect_render_items_for_output_view(
     let mut cursor_animation_delay_msec = None;
     let mut content_entries = Vec::new();
     let mut rendered_content = false;
+    let output_scale = output_fractional_scale(state, output_id);
     for entry in &view.entries {
         if entry.tier == CompositionTier::Content && !rendered_content {
             content_entries.push(entry);
@@ -7350,6 +7530,7 @@ fn collect_render_items_for_output_view(
             output_bounds,
             entry,
             WorkspaceMotion::IDENTITY,
+            output_scale,
             &mut items,
             &mut frame_elements,
             &mut retired_candidates,
@@ -7379,7 +7560,7 @@ fn collect_render_items_for_output_view(
     );
 
     let cursor_plane = {
-        let cursor_request = build_cursor_plane_request(state, frame_time_msec);
+        let cursor_request = build_cursor_plane_request(state, output_id, frame_time_msec);
         let allow_cursor_plane = {
             let drm = state.drm.get_mut(drm_id);
             cursor_request.is_some()
@@ -7389,11 +7570,10 @@ fn collect_render_items_for_output_view(
         };
         if allow_cursor_plane {
             let request = cursor_request.as_ref().unwrap();
-            let cursor_plane = state.drm.get_mut(drm_id).collect_cursor_plane_candidate(
-                drm_crtc_id,
-                request,
-                output_bounds,
-            );
+            let cursor_plane = state
+                .drm
+                .get_mut(drm_id)
+                .collect_cursor_plane_candidate(drm_crtc_id, request);
             if cursor_plane.is_some() {
                 cursor_animation_delay_msec = request.next_frame_in_msec;
             }
@@ -7409,6 +7589,7 @@ fn collect_render_items_for_output_view(
             drm_crtc_id,
             output_bounds,
             frame_time_msec,
+            output_scale,
             &mut retired_candidates,
         );
     if cursor_animation_delay_msec.is_none() {
@@ -7476,6 +7657,7 @@ fn collect_dnd_render_items(
         retired_candidates,
         &mut snapshots,
     );
+    let output_scale = output_fractional_scale(state, output_id);
     let (objects, drm_map) = (&mut state.objects, &mut state.drm);
     let drm = drm_map.get_mut(drm_id);
     let drm_fd = drm.fd();
@@ -7491,6 +7673,7 @@ fn collect_dnd_render_items(
         None,
         u8::MAX,
         None,
+        output_scale,
     );
 }
 
@@ -7561,6 +7744,45 @@ fn translate_scene_item_mask(mask: &mut SceneItemMask, dx: i32, dy: i32) {
         SceneItemMask::FrameRing { ring } => {
             ring.outer.outer_rect = ring.outer.outer_rect.translate(dx, dy);
             ring.inner.outer_rect = ring.inner.outer_rect.translate(dx, dy);
+        }
+    }
+}
+
+/// Map an output-local logical frame onto the physical buffer.
+///
+/// `commit_visible_scene_state` copies `item.mask` onto `state.mask` later. Both are
+/// scaled here so a reader in between still sees one coordinate space. Damage grows
+/// outward; opaque regions stay inside the scaled bounds.
+fn scale_scene_items(items: &mut [SceneItem], scale: crate::state::FractionalScale) {
+    if scale.is_one() {
+        return;
+    }
+    for item in items {
+        let Some(bounds) = item.state.bounds.scaled(scale) else {
+            continue;
+        };
+        item.damage = item.damage.scaled_out(scale);
+        item.opaque_region = item.opaque_region.scaled(scale);
+        item.opaque_region.intersect_rect(bounds);
+        item.state.bounds = bounds;
+        scale_scene_item_mask(&mut item.mask, scale);
+        scale_scene_item_mask(&mut item.state.mask, scale);
+        item.sample_damage_padding = scale.scale_length(item.sample_damage_padding);
+    }
+}
+
+fn scale_scene_item_mask(mask: &mut SceneItemMask, scale: crate::state::FractionalScale) {
+    match mask {
+        SceneItemMask::None => {}
+        SceneItemMask::RoundedClip { clip } | SceneItemMask::CornerRoundedClip { clip } => {
+            if let Some(scaled) = clip.scaled(scale) {
+                *clip = scaled;
+            }
+        }
+        SceneItemMask::FrameRing { ring } => {
+            if let Some(scaled) = ring.scaled(scale) {
+                *ring = scaled;
+            }
         }
     }
 }
@@ -7641,6 +7863,7 @@ fn render_workspace_content(
     frame_elements: &mut Vec<RecordedFrameElement>,
     retired_candidates: &mut Vec<RetiredBufferCandidate>,
 ) {
+    let output_scale = output_fractional_scale(state, output_id);
     let workspace_order = crate::scene::visibility::output_workspace_ids(
         state,
         output_id,
@@ -7665,6 +7888,7 @@ fn render_workspace_content(
                 output_bounds,
                 entries[index],
                 motion,
+                output_scale,
                 items,
                 frame_elements,
                 retired_candidates,
@@ -7698,6 +7922,7 @@ fn render_workspace_content(
             output_bounds,
             entry,
             motion,
+            output_scale,
             items,
             frame_elements,
             retired_candidates,
@@ -7720,6 +7945,7 @@ fn render_composed_entry(
     output_bounds: RectI,
     entry: &ComposedEntry,
     motion: WorkspaceMotion,
+    output_scale: crate::state::FractionalScale,
     items: &mut Vec<SceneItem>,
     frame_elements: &mut Vec<RecordedFrameElement>,
     retired_candidates: &mut Vec<RetiredBufferCandidate>,
@@ -7796,6 +8022,7 @@ fn render_composed_entry(
             .map(|visual| visual.effects.opacity_alpha)
             .unwrap_or(u8::MAX),
         geometry_scale,
+        output_scale,
     );
     push_scene_item_frame_elements(frame_elements, item_start..items.len());
     if effects_on_output {
@@ -7841,6 +8068,48 @@ fn translate_effect_element(element: &mut EffectElement, dx: i32, dy: i32) {
         }
         EffectElement::WindowShadow { clip, .. } | EffectElement::DimOverlay { clip, .. } => {
             clip.outer_rect = clip.outer_rect.translate(dx, dy);
+        }
+    }
+}
+
+fn scale_recorded_frame_elements(
+    frame_elements: &mut [RecordedFrameElement],
+    scale: crate::state::FractionalScale,
+) {
+    if scale.is_one() {
+        return;
+    }
+    for frame_element in frame_elements {
+        let RecordedFrameElement::Effect { element, .. } = frame_element else {
+            continue;
+        };
+        scale_effect_element(element, scale);
+    }
+}
+
+fn scale_effect_element(element: &mut EffectElement, scale: crate::state::FractionalScale) {
+    match element {
+        EffectElement::WindowBorder { ring, .. } => {
+            if let Some(scaled) = ring.scaled(scale) {
+                *ring = scaled;
+            }
+        }
+        EffectElement::WindowShadow { clip, style, .. } => {
+            if let Some(scaled) = clip.scaled(scale) {
+                *clip = scaled;
+            }
+            *style = style.scaled(scale);
+        }
+        EffectElement::WindowBlurBackdrop { ring, style, .. } => {
+            if let Some(scaled) = ring.scaled(scale) {
+                *ring = scaled;
+            }
+            *style = style.scaled(scale);
+        }
+        EffectElement::DimOverlay { clip, .. } => {
+            if let Some(scaled) = clip.scaled(scale) {
+                *clip = scaled;
+            }
         }
     }
 }
@@ -9874,13 +10143,14 @@ mod render_recipe_tests {
 mod presentation_timing_tests {
     use {
         super::{
-            build_surface_cursor_plane_request, collect_submission_metadata,
-            commit_cursor_slot_results, cursor_allocation_result_accepted,
-            cursor_buffer_allocations, cursor_buffer_modifier_accepted, cursor_buffer_row,
-            cursor_dmabuf_retained, cursor_fences_for_attempts, cursor_in_fence_value,
-            cursor_plane_commit_dimensions, cursor_plane_presentation, cursor_plane_recipe,
-            cursor_plane_supports_requested_cursor, cursor_render_sync_mode, cursor_target_damage,
-            cursor_target_size_retained, cursor_upload_reuses_cached, direct_scanout_blocked,
+            build_named_cursor_plane_request, build_surface_cursor_plane_request,
+            collect_submission_metadata, commit_cursor_slot_results,
+            cursor_allocation_result_accepted, cursor_buffer_allocations,
+            cursor_buffer_modifier_accepted, cursor_buffer_row, cursor_dmabuf_retained,
+            cursor_fences_for_attempts, cursor_in_fence_value, cursor_plane_commit_dimensions,
+            cursor_plane_presentation, cursor_plane_recipe, cursor_plane_supports_requested_cursor,
+            cursor_render_sync_mode, cursor_target_damage, cursor_target_size_retained,
+            cursor_theme_pixels, cursor_upload_reuses_cached, direct_scanout_blocked,
             dropped_in_fence_wait, effect_transition_requires_full_redraw,
             find_cursor_slot_index_for_key, import_cursor_render_target, mode_blob_replaced,
             optional_plane_attempts, pending_modeset_scope, presentation_feedback_flags,
@@ -9896,7 +10166,7 @@ mod presentation_timing_tests {
         },
         crate::{
             clients::{ClientId, Resolved},
-            cursor::{CursorImageContentKey, CursorSurface},
+            cursor::{CursorImage, CursorImageContentKey, CursorSurface},
             dmabuf::{DmaBuf, DmaBufId, DmaBufPlane},
             gbm::UseFlags,
             protocol_generated::{WlBufferId, WlSurfaceId, WpPresentationFeedbackId},
@@ -9904,7 +10174,7 @@ mod presentation_timing_tests {
             render::{mock::MockRenderer, FrameElement, RenderCompletion},
             runner::Dispatcher,
             scheduler::{output_scheduler_id, OutputSchedulerAction, RequestFrameReason},
-            state::{BackendOutputRef, DrmId, ObjectId, OutputId},
+            state::{BackendOutputRef, DrmId, FractionalScale, ObjectId, OutputId},
             test_support::{state_for_tests, test_output},
             transform::{self, OutputPresentationTransform},
             wayland_objects::{
@@ -10420,6 +10690,9 @@ mod presentation_timing_tests {
                 hotspot_x: 3,
                 hotspot_y: 2,
             },
+            (0, 0),
+            RectI::new(0, 0, 1920, 1080).unwrap(),
+            FractionalScale::ONE,
         )
         .unwrap();
 
@@ -10443,8 +10716,48 @@ mod presentation_timing_tests {
                 content_revision: 1,
                 width: 16,
                 height: 12,
+                scale_v120: FractionalScale::ONE.as_v120(),
             })
         );
+        assert_eq!(request.plane_x, request.x);
+        assert_eq!(request.plane_y, request.y);
+        assert_eq!(request.pixel_width, 16);
+        assert_eq!(request.pixel_height, 12);
+    }
+
+    #[test]
+    fn named_cursor_plane_is_output_local_and_physical() {
+        let image = CursorImage::new("left_ptr".into(), 48, 48, 8, 4, 0, vec![0; 48 * 48 * 4]);
+        let scale = FractionalScale::TWO;
+        let request =
+            build_named_cursor_plane_request((2000.0, 40.0), (1920, 0), scale, image, None);
+
+        assert_eq!(request.width, 24);
+        assert_eq!(request.height, 24);
+        assert_eq!(request.hotspot_x, 4);
+        assert_eq!(request.hotspot_y, 2);
+        assert_eq!(request.pixel_width, 48);
+        assert_eq!(request.pixel_height, 48);
+        assert_eq!(request.pixel_hotspot_x, 8);
+        assert_eq!(request.pixel_hotspot_y, 4);
+        assert_eq!(request.plane_x, 152);
+        assert_eq!(request.plane_y, 76);
+        assert_eq!(request.plane_x + request.pixel_hotspot_x, scale.scale_coord(80.0));
+        assert_eq!(request.plane_y + request.pixel_hotspot_y, scale.scale_coord(40.0));
+    }
+
+    #[test]
+    fn fractional_cursor_hotspot_stays_under_the_pointer() {
+        let scale = FractionalScale::from_v120(150);
+        let image = CursorImage::new("left_ptr".into(), 30, 30, 6, 6, 0, vec![0; 30 * 30 * 4]);
+        let request = build_named_cursor_plane_request((10.4, 10.4), (0, 0), scale, image, None);
+
+        assert_eq!(cursor_theme_pixels(24, FractionalScale::ONE), 24);
+        assert_eq!(cursor_theme_pixels(24, FractionalScale::TWO), 48);
+        assert_eq!(cursor_theme_pixels(24, scale), 30);
+        assert_eq!(scale.scale_coord(10.0), scale.scale_edge(10));
+        assert_eq!(request.plane_x + request.pixel_hotspot_x, scale.scale_coord(10.4));
+        assert_eq!(request.plane_y + request.pixel_hotspot_y, scale.scale_coord(10.4));
     }
 
     #[test]
@@ -10481,6 +10794,9 @@ mod presentation_timing_tests {
                 hotspot_x: 0,
                 hotspot_y: 0,
             },
+            (0, 0),
+            RectI::new(0, 0, 100, 100).unwrap(),
+            FractionalScale::ONE,
         );
 
         assert!(request.is_none());

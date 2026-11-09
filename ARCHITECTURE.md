@@ -410,6 +410,21 @@ This is only possible when many constraints are satisfied, for example:
 - geometry is suitable
 - no overlapping composition is needed
 
+### Logical layout and the physical frame
+
+Layout, input, and protocol positions are logical pixels. `State::output_bounds` is that layout rect. `Output::scale` is a v120 fraction, snapped so the mode divides evenly on both axes. The Xwayland wire scale is a separate integer; section 25 is that path.
+
+`collect_output_render_plan` (`src/drm/render_planner.rs`) is the boundary:
+
+1. Collect items in global logical pixels.
+2. Translate by the output origin. The scene is now output-local and still logical.
+3. `scale_scene_items` and `scale_recorded_frame_elements` (`src/output_scale.rs`) turn it into physical framebuffer pixels. Geometry rounds each edge half toward +∞. Damage rounds outward.
+4. `build_frame_plan`, damage, direct scanout, and both renderers stay in those physical pixels. The projection maps the render buffer, which is the mode size. Shaders stay item-local.
+
+`DrmOutput::output_bounds` is that physical buffer, at the origin. It is not a layout rect. A missing layout rect uses the output's logical size, including when the output is disabled.
+
+A closing snapshot and a toplevel capture are window-local physical pixels at the output's scale. Live blur stays logical until the output plan scales it. Output capture and any debug view of the CRTC use this same plan. There is no separate overlay renderer. Output rotation is not applied. Scale happens first so a later transform can sit on the physical rect.
+
 ## 9. Format and Modifier
 
 These two are easy to confuse.
@@ -519,7 +534,7 @@ This is the shortest realistic "one frame" narrative for this repository:
 3. The client attaches that buffer and commits the surface.
 4. The compositor records that the surface now has a new front buffer.
 5. The buffer data is imported or uploaded into a GL-usable form.
-6. The compositor renders the scene into an output buffer allocated through GBM.
+6. The compositor scales the logical scene to the output buffer's pixel size, then renders it into a buffer allocated through GBM.
 7. That output buffer is represented as a dma-buf with a format and modifier.
 8. DRM/KMS creates a framebuffer object for that memory.
 9. An atomic commit binds that framebuffer to a plane on a CRTC attached to a connector.
@@ -549,8 +564,8 @@ If coming back after a long time, this order should restore the mental model qui
    See where client image data enters the compositor.
 9. `src/render/`
    See how a DRM device chooses OpenGL ES or Vulkan, then how that backend imports a buffer.
-10. `src/drm.rs`
-   Rebuild KMS resources, framebuffers, and display output.
+10. `src/drm.rs` and `src/output_scale.rs`
+   Rebuild KMS resources, framebuffers, and display output. The frame plan is logical until `scale_scene_items`.
 11. `src/gbm/gbm.rs`
    Understand output buffer allocation.
 12. `src/input.rs`, `src/udev.rs`, `src/dbus.rs`
@@ -592,6 +607,9 @@ If coming back after a long time, this order should restore the mental model qui
 - scissor: rectangular clip on writes
 - GL context: the current OpenGL ES stateful execution environment
 - rendering context: general term for that stateful rendering environment
+- logical pixel: layout, input, and protocol unit. `State::output_bounds` is in these
+- physical pixel: one framebuffer pixel. The frame plan is physical after `scale_scene_items`
+- output scale: the v120 fraction on an output. A logical length times that scale is the physical length when the scale divides the mode
 
 ### EGL / GL
 
