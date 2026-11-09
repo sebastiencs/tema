@@ -242,6 +242,10 @@ pub struct WlSurface {
     /// Map-time order of an override-redirect window. Later is higher.
     xwayland_shown_order: u64,
     input_popup: Option<Resolved<ZwpInputPopupSurfaceV2Id>>,
+    /// Captured when the toplevel role is destroyed while this surface still
+    /// owns the keyboard. `destroy_window` drops the managed window before
+    /// `wl_surface.destroy`, so the successor search would otherwise see no close.
+    closed_window_focus: Option<crate::input::focus::ClosedWindowFocus>,
 }
 
 #[derive(Clone, Debug)]
@@ -581,7 +585,16 @@ impl WlSurface {
             xwayland_shown: false,
             xwayland_shown_order: 0,
             input_popup: None,
+            closed_window_focus: None,
         }
+    }
+
+    /// Remember that this surface was the focused window, before its window is dropped.
+    pub(crate) fn remember_closed_window_focus(
+        &mut self,
+        close: crate::input::focus::ClosedWindowFocus,
+    ) {
+        self.closed_window_focus = Some(close);
     }
 
     pub(crate) fn add_idle_inhibitor(&mut self, inhibitor: Resolved<ZwpIdleInhibitorV1Id>) {
@@ -3395,7 +3408,22 @@ impl WlSurface {
             }
         }
         self.cleanup_extension_objects();
-        let closed_window = crate::input::focus::focused_window_close(state, object);
+        // A role destroy records the close before `destroy_window`. By the time
+        // this surface goes away the window is no longer managed, so that record
+        // is the only one that still names the focused close. It is used only
+        // while this surface still owns the keyboard.
+        let remembered = self.closed_window_focus.take();
+        let closed_window = if let Some(close) = remembered {
+            // This surface is grabbed, and `destroy_window` already dropped the
+            // managed window, so resolving its root would try_ref a grabbed id.
+            let still_focused = state
+                .seat
+                .keyboard_focus()
+                .is_some_and(|focus| focus.surface == object);
+            still_focused.then_some(close)
+        } else {
+            crate::input::focus::focused_window_close(state, object)
+        };
         // Leave goes out while this id is still live. delete_id below retires it,
         // and the post-action enters the next window without naming this surface.
         let released_keyboard =

@@ -1661,6 +1661,16 @@ pub mod xdg_toplevel {
                             Some(self.decoration_mode()),
                             dispatcher,
                         );
+                        // `destroy_window` below drops the managed window. The
+                        // surface destroy that follows can no longer see that
+                        // this was the focused window, so record it first.
+                        if let Some(close) =
+                            crate::input::focus::focused_window_close(state, surface_id)
+                        {
+                            if let Some(mut surface) = surface_id.try_grab(state) {
+                                surface.remember_closed_window_focus(close);
+                            }
+                        }
                     }
                     // Role destroy does not commit. A null-buffer unmap flushes
                     // the dirty tile tree from that commit; without this, the
@@ -2848,6 +2858,141 @@ mod tests {
         assert!(dispatcher.test_has_queued_action::<ClientManagerAction>(|action| {
             matches!(action, ClientManagerAction::WorkspaceStateChanged)
         }));
+    }
+
+    #[test]
+    fn destroying_a_focused_toplevel_focuses_the_previous_window_when_the_surface_goes() {
+        let mut state = state_for_tests();
+        state.config.animations.set_close_duration_msec(0);
+        let output_id = state.insert_output(test_output_drm0_wh(120, 80));
+        let workspace_id = state.active_workspace_for_output(output_id).unwrap();
+        let mut client = Client::new_for_tests(ClientId::from_raw(89));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+
+        let sibling_wl = WlSurfaceId::from(30u32);
+        let (sibling, _) =
+            client.insert_object(&mut state, WlSurface::new(sibling_wl, client.client_id(), 6));
+        state.register_root_surface(sibling);
+        {
+            let mut surface = state.objects.grab_object::<WlSurface>(sibling.object_id());
+            surface.test_map(ObjectId::from(900usize), 90, 40, 20, 20);
+        }
+        let sibling_window = state.allocate_window_id();
+        state.insert_window(sibling_window, sibling, ObjectId::from(1_000_001usize));
+
+        let wl_surface_id = WlSurfaceId::from(40u32);
+        let xdg_surface_id = XdgSurfaceId::from(41u32);
+        let toplevel_id = XdgToplevelId::from(42u32);
+        let (surface_resolved, _) =
+            client.insert_object(&mut state, WlSurface::new(wl_surface_id, client.client_id(), 6));
+        let surface_object_id = surface_resolved.object_id();
+        {
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            assert!(surface
+                .set_role(Role::XdgSurface, &mut client_dispatcher)
+                .is_ok());
+        }
+        state.register_root_surface(surface_resolved);
+        let (xdg_surface_resolved, _) = client.insert_object(
+            &mut state,
+            XdgSurface {
+                id: xdg_surface_id,
+                wm_base: Resolved::new(
+                    client.client_id(),
+                    XdgWmBaseId::from(1),
+                    ObjectId::from(1usize),
+                ),
+                wl_surface: Resolved::new(client.client_id(), wl_surface_id, surface_object_id),
+                wm_base_version: 7,
+                role_kind: Some(RoleKind::Toplevel),
+                role_object: RoleObject::None,
+                initial_commit_complete: true,
+                next_configure_serial: 1,
+                pending_configures: VecDeque::new(),
+                last_acked: None,
+                pending_window_geometry: None,
+                current_window_geometry: None,
+                popup_children: Vec::new(),
+            },
+        );
+        let xdg_surface_object_id = xdg_surface_resolved.object_id();
+        {
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.set_xdg_surface_impl(Resolved::new(
+                client.client_id(),
+                xdg_surface_id,
+                xdg_surface_object_id,
+            ));
+            surface.test_map(ObjectId::from(951usize), 0, 0, 80, 40);
+        }
+        let window = state.allocate_window_id();
+        let (toplevel_resolved, _) = client.insert_object(
+            &mut state,
+            XdgToplevel::new(
+                toplevel_id,
+                Resolved::new(client.client_id(), xdg_surface_id, xdg_surface_object_id),
+                7,
+                window,
+            ),
+        );
+        state.insert_window(window, surface_resolved, toplevel_resolved.object_id());
+        state
+            .objects
+            .get_mut(xdg_surface_object_id)
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .role_object = RoleObject::Toplevel(toplevel_resolved);
+        state.relayout_dirty_workspaces();
+        state.managed_window_mut(sibling).unwrap().mapped = true;
+        state.managed_window_mut(surface_resolved).unwrap().mapped = true;
+        state
+            .workspaces
+            .try_get_mut(workspace_id)
+            .unwrap()
+            .layout
+            .floating
+            .stack = vec![sibling_window];
+
+        crate::input::focus::set_keyboard_focus(
+            &mut state,
+            &mut client_dispatcher,
+            Some(crate::input::SurfaceFocus::new(sibling)),
+        );
+        crate::input::focus::set_keyboard_focus(
+            &mut state,
+            &mut client_dispatcher,
+            Some(crate::input::SurfaceFocus::new(surface_resolved)),
+        );
+        // The pointer sits in the corner the closed window used to occupy, so the
+        // successor comes from focus history rather than a hit-test.
+        state.seat.pointer_pos = (119.0, 79.0);
+
+        let destroy_request: RawRequest<'static> = (&*RawEvent::new(toplevel_id.into(), 0, 0)
+            .into_bytes())
+            .try_into()
+            .unwrap();
+        {
+            let mut toplevel = client.grab_object(toplevel_id, &mut state);
+            toplevel
+                .on(&mut client, &mut state, destroy_request, &mut client_dispatcher)
+                .unwrap();
+        }
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(surface_resolved));
+
+        let destroy_surface: RawRequest<'static> = (&*RawEvent::new(wl_surface_id.into(), 0, 0)
+            .into_bytes())
+            .try_into()
+            .unwrap();
+        {
+            let mut surface = client.grab_object(wl_surface_id, &mut state);
+            surface
+                .on(&mut client, &mut state, destroy_surface, &mut client_dispatcher)
+                .unwrap();
+        }
+        client_dispatcher.drain_post_actions(&mut client, &mut state);
+
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(sibling));
     }
 
     #[test]
