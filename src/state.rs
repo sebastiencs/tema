@@ -1130,6 +1130,8 @@ pub struct State {
     pub(crate) session_store: Option<crate::session_store::SessionStore>,
     /// Advertised `xdg_session_manager_v1`, when the config and the store both allow it.
     pub(crate) session_manager_global: Option<GlobalName>,
+    /// Sessions a client currently holds. The key is the session id.
+    pub(crate) live_sessions: BTreeMap<String, crate::session::LiveSession>,
 }
 
 const INITIAL_WORKSPACES_PER_OUTPUT: usize = 4;
@@ -1239,6 +1241,7 @@ impl State {
             bell_last: BTreeMap::new(),
             session_store: None,
             session_manager_global: None,
+            live_sessions: BTreeMap::new(),
         }
     }
 

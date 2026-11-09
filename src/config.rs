@@ -1284,6 +1284,7 @@ pub fn reload_from_disk(
     let enabled_changed = next.xwayland.enabled != state.config.xwayland.enabled;
     let scaling_mode_changed = next.xwayland.scaling_mode != state.config.xwayland.scaling_mode;
     let import_changed = next.general.import_environment != state.config.general.import_environment;
+    let session_management_changed = next.session_management != state.config.session_management;
     let changed = state.config != next;
     state.config = next;
     if import_changed {
@@ -1303,6 +1304,9 @@ pub fn reload_from_disk(
         dispatcher.dispatch(crate::clients::ClientManagerAction::XwaylandWireScaleChanged);
     }
     apply_general_settings(state, dispatcher);
+    if session_management_changed {
+        crate::session::sync_session_manager_global(state, dispatcher);
+    }
     apply_output_settings(state, dispatcher);
     if changed {
         state.mark_all_workspaces_dirty();
@@ -2710,6 +2714,53 @@ mod tests {
         let error =
             RuntimeConfig::parse_for_test("[session_management]\nbogus = 1\n", &xkb).unwrap_err();
         assert!(error.to_string().contains("unknown field"), "{error:#}");
+    }
+
+    #[test]
+    fn reload_toggles_the_session_manager_global() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[session_management]\nenabled = true\n").unwrap();
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        state.session_store = Some(crate::session_store::SessionStore::load(
+            temp_dir.to_path_buf().join("sessions.json"),
+        ));
+        let mut dispatcher = Dispatcher::default();
+        crate::session::sync_session_manager_global(&mut state, &mut dispatcher);
+        let name = state.session_manager_global.unwrap();
+
+        fs::write(&path, "[session_management]\nenabled = false\n").unwrap();
+        reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+        assert!(state.session_manager_global.is_none());
+        assert!(dispatcher.test_has_queued_action(
+            |action: &crate::clients::ClientManagerAction| {
+                matches!(
+                    action,
+                    crate::clients::ClientManagerAction::RegistryGlobalRemoved { name: removed }
+                        if *removed == name.as_u32()
+                )
+            }
+        ));
+
+        fs::write(&path, "[session_management]\nenabled = true\n").unwrap();
+        reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+        let added = state.session_manager_global.unwrap();
+        assert!(dispatcher.test_has_queued_action(
+            |action: &crate::clients::ClientManagerAction| {
+                matches!(
+                    action,
+                    crate::clients::ClientManagerAction::RegistryGlobalAdded {
+                        name: queued,
+                        interface,
+                        version: 1,
+                    } if *queued == added.as_u32()
+                        && interface == "xdg_session_manager_v1"
+                )
+            }
+        ));
     }
 
     #[test]

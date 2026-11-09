@@ -755,7 +755,8 @@ pub mod xdg_toplevel {
         object::{Object, Parser, PostAction, RequestResult},
         protocol_generated::{
             xdg_toplevel as proto_xdg_toplevel, zxdg_toplevel_decoration_v1, Array, WaylandId,
-            WlOutputId, WlSeatId, WlSurfaceId, XdgToplevelId, ZxdgToplevelDecorationV1Id,
+            WlOutputId, WlSeatId, WlSurfaceId, XdgToplevelId, XdgToplevelSessionV1Id,
+            ZxdgToplevelDecorationV1Id,
         },
         region::RectI,
         runner::Dispatcher,
@@ -787,6 +788,8 @@ pub mod xdg_toplevel {
         description: Option<String>,
         icon: Option<Rc<crate::toplevel_icon::ToplevelIcon>>,
         pending_icon: Option<Option<Rc<crate::toplevel_icon::ToplevelIcon>>>,
+        session: Option<Resolved<XdgToplevelSessionV1Id>>,
+        pending_session_restore: Option<(String, crate::session_store::ToplevelRecord)>,
         parent: Option<Resolved<XdgToplevelId>>,
         parent_window: Option<WindowId>,
         min_size: Option<(i32, i32)>,
@@ -851,6 +854,8 @@ pub mod xdg_toplevel {
                 description: None,
                 icon: None,
                 pending_icon: None,
+                session: None,
+                pending_session_restore: None,
                 parent: None,
                 parent_window: None,
                 min_size: None,
@@ -1191,6 +1196,27 @@ pub mod xdg_toplevel {
             }
             self.tag = tag;
             true
+        }
+
+        pub(crate) fn session(&self) -> Option<Resolved<XdgToplevelSessionV1Id>> {
+            self.session
+        }
+
+        pub(crate) fn set_session(&mut self, session: Option<Resolved<XdgToplevelSessionV1Id>>) {
+            self.session = session;
+        }
+
+        pub(crate) fn set_pending_session_restore(
+            &mut self,
+            pending: Option<(String, crate::session_store::ToplevelRecord)>,
+        ) {
+            self.pending_session_restore = pending;
+        }
+
+        pub(crate) fn pending_session_restore(
+            &self,
+        ) -> Option<&(String, crate::session_store::ToplevelRecord)> {
+            self.pending_session_restore.as_ref()
         }
 
         pub(crate) fn set_description(&mut self, description: Option<String>) -> bool {
@@ -1756,6 +1782,9 @@ pub mod xdg_toplevel {
                     // the dirty tile tree from that commit; without this, the
                     // sibling keeps its old size until the client socket closes.
                     let affected_outputs = workspace_outputs_if_in_layout(state, self.window);
+                    if let Some(session) = self.session.take() {
+                        crate::session::toplevel_gone(state, client, session, self.window);
+                    }
                     crate::capture::unmap_window(state, dispatcher, self.window);
                     state.destroy_window(self.window);
                     if let Some(affected_outputs) = affected_outputs {
@@ -1998,6 +2027,9 @@ pub mod xdg_toplevel {
             state: &mut State,
             dispatcher: &mut ClientDispatcher,
         ) {
+            if let Some(session) = self.session.take() {
+                crate::session::toplevel_gone(state, client, session, self.window);
+            }
             crate::capture::unmap_window(state, dispatcher, self.window);
             state.destroy_window(self.window);
         }

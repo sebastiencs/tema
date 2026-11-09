@@ -355,6 +355,7 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     state.ipc_enabled = ipc_server.is_some();
     state.session_store =
         session_store::SessionStore::default_path().map(session_store::SessionStore::load);
+    session::sync_session_manager_global(&mut state, &mut startup_dispatcher);
     let start_session_store = state.session_store.is_some();
     let mut runner = Runner::with_state(state);
     runner.add_model(uring);

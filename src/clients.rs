@@ -724,6 +724,10 @@ pub enum ClientAction {
     SendDmabufFeedback {
         id: crate::protocol_generated::ZwpLinuxDmabufFeedbackV1Id,
     },
+    /// `xdg_session_v1.replaced` for a session another client took over.
+    SessionReplaced {
+        session: Resolved<crate::protocol_generated::XdgSessionV1Id>,
+    },
 }
 
 #[derive(Debug)]
@@ -3312,6 +3316,13 @@ impl Model for Client {
                         .rref(state)
                         .send_notice(notice, &mut dispatcher);
                 }
+            }
+            SessionReplaced { session } => {
+                crate::wayland_objects::xdg_session_v1::send_replaced(
+                    session,
+                    state,
+                    &mut dispatcher,
+                );
             }
             SendDmabufFeedback { id } => {
                 let Some(resolved) = self.resolve(id, state) else {
