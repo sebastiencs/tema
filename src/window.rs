@@ -89,6 +89,14 @@ pub trait Toplevel {
     fn app_id(&self) -> &str;
     /// Parent window, when this window is transient for another.
     fn parent_window(&self) -> Option<WindowId>;
+    /// Client tag. Empty until a protocol sets one.
+    fn tag(&self) -> Option<&str> {
+        None
+    }
+    /// Client description. Empty until a protocol sets one.
+    fn description(&self) -> Option<&str> {
+        None
+    }
     /// Minimum and maximum size for interactive resize.
     fn size_constraints(&self) -> InteractiveSizeConstraints;
     /// Minimum size the layout uses when tiling.

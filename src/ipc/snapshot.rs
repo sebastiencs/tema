@@ -51,6 +51,8 @@ fn focused_window(state: &State) -> Option<proto::Window> {
         output: workspace_id.and_then(|id| first_output_name(state, id)),
         floating: managed.is_some_and(|managed| managed.mode == ManagedWindowMode::Floating),
         fullscreen: info.fullscreen,
+        tag: info.tag.map(str::to_owned),
+        description: info.description.map(str::to_owned),
     })
 }
 

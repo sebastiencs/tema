@@ -111,11 +111,20 @@ struct CaptureJob {
     with_damage: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IconSummary {
+    pub name: Option<String>,
+    pub sizes: Vec<(u32, u32)>,
+}
+
 #[derive(Clone, Debug)]
 struct ToplevelRecord {
     closed: bool,
     title: String,
     app_id: String,
+    tag: Option<String>,
+    description: Option<String>,
+    icon: Option<IconSummary>,
     /// Keyboard focus is on this toplevel or one of its popups.
     activated: bool,
     /// `Maximized` bit last sent in `xdg_toplevel.configure`, including the tiled hint.
@@ -2056,6 +2065,9 @@ pub(crate) fn announce_toplevel(
             closed: false,
             title: title.clone(),
             app_id: app_id.clone(),
+            tag: None,
+            description: None,
+            icon: None,
             activated: false,
             maximized: false,
             fullscreen: false,
@@ -2876,14 +2888,20 @@ fn send_wlr_parent(
 
 /// Publish one mapped window. A later map gets a new identifier.
 ///
-/// Title and app id come from the toplevel trait. Shell bits come from the xdg role's last
-/// configure. Another role sets them through [`sync_layout_shell_state`].
+/// Title, app id, tag, and description come from the toplevel trait. Shell bits come from the
+/// xdg role's last configure. Another role sets them through [`sync_layout_shell_state`].
 pub(crate) fn map_window(state: &mut State, dispatcher: &mut Dispatcher, window: WindowId) {
     if state.capture.by_window.contains_key(&window) {
         return;
     }
-    let Some((title, app_id, parent)) = state.toplevel(window).map(|toplevel| {
-        (toplevel.title().to_string(), toplevel.app_id().to_string(), toplevel.parent_window())
+    let Some((title, app_id, parent, tag, description)) = state.toplevel(window).map(|toplevel| {
+        (
+            toplevel.title().to_string(),
+            toplevel.app_id().to_string(),
+            toplevel.parent_window(),
+            toplevel.tag().map(str::to_owned),
+            toplevel.description().map(str::to_owned),
+        )
     }) else {
         return;
     };
@@ -2896,6 +2914,10 @@ pub(crate) fn map_window(state: &mut State, dispatcher: &mut Dispatcher, window:
     });
     let key = announce_toplevel(state, dispatcher, title, app_id);
     state.capture.by_window.insert(window, key);
+    if let Some(record) = state.capture.toplevels.get_mut(&key) {
+        record.tag = tag;
+        record.description = description;
+    }
     if let Some((maximized, fullscreen)) = shell {
         note_shell_state(state, dispatcher, key, maximized, fullscreen);
     }
@@ -3100,6 +3122,9 @@ pub(crate) struct ToplevelInfo<'a> {
     pub title: &'a str,
     pub app_id: &'a str,
     pub fullscreen: bool,
+    pub tag: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub icon: Option<&'a IconSummary>,
 }
 
 pub(crate) fn toplevel_info(state: &State, window: WindowId) -> Option<ToplevelInfo<'_>> {
@@ -3112,7 +3137,35 @@ pub(crate) fn toplevel_info(state: &State, window: WindowId) -> Option<ToplevelI
         title: &record.title,
         app_id: &record.app_id,
         fullscreen: record.fullscreen,
+        tag: record.tag.as_deref(),
+        description: record.description.as_deref(),
+        icon: record.icon.as_ref(),
     })
+}
+
+pub(crate) fn note_window_metadata(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    window: WindowId,
+    tag: Option<String>,
+    description: Option<String>,
+    icon: Option<IconSummary>,
+) {
+    let Some(&key) = state.capture.by_window.get(&window) else {
+        return;
+    };
+    let Some(record) = state.capture.toplevels.get_mut(&key) else {
+        return;
+    };
+    if record.closed
+        || (record.tag == tag && record.description == description && record.icon == icon)
+    {
+        return;
+    }
+    record.tag = tag;
+    record.description = description;
+    record.icon = icon;
+    crate::ipc::mark_dirty(state, dispatcher);
 }
 
 /// One open foreign-toplevel record, for tests.

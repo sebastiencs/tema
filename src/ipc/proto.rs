@@ -84,6 +84,12 @@ pub struct Window {
     pub output: Option<String>,
     pub floating: bool,
     pub fullscreen: bool,
+    /// Absent on older clients. An empty protocol string is stored as `None`.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Absent on older clients. An empty protocol string is stored as `None`.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -231,6 +237,8 @@ mod tests {
             output: Some("DP-1".to_string()),
             floating: false,
             fullscreen: false,
+            tag: None,
+            description: None,
         }
     }
 
@@ -299,7 +307,7 @@ mod tests {
         );
         assert_json(
             &Reply::Ok(Response::FocusedWindow(Some(window()))),
-            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false}}}"#,
+            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null}}}"#,
         );
         assert_json(&Reply::Ok(Response::FocusedWindow(None)), r#"{"ok":{"focused_window":null}}"#);
         assert_json(&Reply::Ok(Response::Subscribed), r#"{"ok":"subscribed"}"#);
@@ -310,7 +318,7 @@ mod tests {
 
         assert_json(
             &Event::FocusedWindow { window: Some(window()) },
-            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false}}"#,
+            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null}}"#,
         );
         assert_json(
             &Event::FocusedWindow { window: None },
@@ -338,7 +346,7 @@ mod tests {
         nulls.output = None;
         assert_json(
             &nulls,
-            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false}"#,
+            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false,"tag":null,"description":null}"#,
         );
         let mut disabled = output();
         disabled.active_workspace = None;
@@ -374,6 +382,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(window.id, 1);
+        assert_eq!(window.tag, None);
+        assert_eq!(window.description, None);
 
         let error = serde_json::from_str::<Request>(r#"{"request":"foo"}"#).unwrap_err();
         let message = error.to_string();

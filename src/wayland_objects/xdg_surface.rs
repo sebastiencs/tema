@@ -764,6 +764,8 @@ pub mod xdg_toplevel {
         wm_base_version: u32,
         title: String,
         app_id: String,
+        tag: Option<String>,
+        description: Option<String>,
         parent: Option<Resolved<XdgToplevelId>>,
         parent_window: Option<WindowId>,
         min_size: Option<(i32, i32)>,
@@ -824,6 +826,8 @@ pub mod xdg_toplevel {
                 wm_base_version,
                 title: String::new(),
                 app_id: String::new(),
+                tag: None,
+                description: None,
                 parent: None,
                 parent_window: None,
                 min_size: None,
@@ -1156,6 +1160,28 @@ pub mod xdg_toplevel {
 
         pub fn app_id(&self) -> &str {
             &self.app_id
+        }
+
+        pub(crate) fn set_tag(&mut self, tag: Option<String>) -> bool {
+            if self.tag == tag {
+                return false;
+            }
+            self.tag = tag;
+            true
+        }
+
+        pub(crate) fn set_description(&mut self, description: Option<String>) -> bool {
+            if self.description == description {
+                return false;
+            }
+            self.description = description;
+            true
+        }
+
+        pub(crate) fn metadata(
+            &self,
+        ) -> (Option<String>, Option<String>, Option<crate::capture::IconSummary>) {
+            (self.tag.clone(), self.description.clone(), None)
         }
 
         #[cfg(test)]
@@ -1553,6 +1579,14 @@ pub mod xdg_toplevel {
 
         fn parent_window(&self) -> Option<WindowId> {
             self.parent_window
+        }
+
+        fn tag(&self) -> Option<&str> {
+            self.tag.as_deref()
+        }
+
+        fn description(&self) -> Option<&str> {
+            self.description.as_deref()
         }
 
         fn size_constraints(&self) -> InteractiveSizeConstraints {

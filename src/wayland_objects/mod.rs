@@ -63,6 +63,7 @@ pub mod xdg_popup;
 pub mod xdg_positioner;
 pub mod xdg_surface;
 pub mod xdg_system_bell_v1;
+pub mod xdg_toplevel_tag_manager_v1;
 pub mod xdg_wm_base;
 pub mod xwayland_shell_v1;
 pub mod xwayland_surface_v1;
@@ -165,7 +166,6 @@ fake_obj! {
     { xdg_toplevel_session_v1, XdgToplevelSessionV1 },
     { xdg_toplevel_icon_manager_v1, XdgToplevelIconManagerV1 },
     { xdg_toplevel_icon_v1, XdgToplevelIconV1 },
-    { xdg_toplevel_tag_manager_v1, XdgToplevelTagManagerV1 },
     { xdg_toplevel_drag_manager_v1, XdgToplevelDragManagerV1 },
     { xdg_toplevel_drag_v1, XdgToplevelDragV1 },
     { zwp_linux_buffer_release_v1, ZwpLinuxBufferReleaseV1 },

@@ -287,7 +287,7 @@ fn format_focused_window(window: Option<&proto::Window>) -> String {
     let Some(window) = window else {
         return "No focused window\n".to_string();
     };
-    format!(
+    let mut text = format!(
         "Window {}: {}\n  App id: {}\n  Workspace: {}\n  Output: {}\n  Floating: {}\n  Fullscreen: {}\n",
         window.id,
         window.title,
@@ -296,7 +296,14 @@ fn format_focused_window(window: Option<&proto::Window>) -> String {
         window.output.as_deref().unwrap_or("none"),
         yes_no(window.floating),
         yes_no(window.fullscreen)
-    )
+    );
+    if let Some(tag) = &window.tag {
+        text.push_str(&format!("  Tag: {tag}\n"));
+    }
+    if let Some(description) = &window.description {
+        text.push_str(&format!("  Description: {description}\n"));
+    }
+    text
 }
 
 fn json_line(response: &proto::Response) -> String {
@@ -722,6 +729,8 @@ mod tests {
             output: Some("DP-1".to_string()),
             floating: false,
             fullscreen: false,
+            tag: None,
+            description: None,
         }
     }
 
@@ -1008,6 +1017,22 @@ Window 12: nvim — ~/src
   Output: DP-1
   Floating: no
   Fullscreen: no
+"
+        );
+        let mut tagged = window();
+        tagged.tag = Some("main".to_string());
+        tagged.description = Some("the main window".to_string());
+        assert_eq!(
+            format_focused_window(Some(&tagged)),
+            "\
+Window 12: nvim — ~/src
+  App id: Alacritty
+  Workspace: ws-1-2
+  Output: DP-1
+  Floating: no
+  Fullscreen: no
+  Tag: main
+  Description: the main window
 "
         );
         let mut bare = window();
