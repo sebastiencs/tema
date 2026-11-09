@@ -1126,6 +1126,8 @@ pub struct State {
     pub(crate) ipc_enabled: bool,
     /// Last IPC `bell` for this window. `None` is a ring with no surface.
     pub(crate) bell_last: BTreeMap<Option<WindowId>, Instant>,
+    /// Loaded xdg session store. `None` when no state directory is available.
+    pub(crate) session_store: Option<crate::session_store::SessionStore>,
 }
 
 const INITIAL_WORKSPACES_PER_OUTPUT: usize = 4;
@@ -1233,6 +1235,7 @@ impl State {
             ipc_dirty: false,
             ipc_enabled: false,
             bell_last: BTreeMap::new(),
+            session_store: None,
         }
     }
 

@@ -195,6 +195,7 @@ mod scene;
 mod scheduler;
 mod seat;
 mod session_lock;
+mod session_store;
 mod signals;
 mod state;
 mod sync;
@@ -351,12 +352,20 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
 
     let import_environment = state.config.general.import_environment;
     state.ipc_enabled = ipc_server.is_some();
+    state.session_store =
+        session_store::SessionStore::default_path().map(session_store::SessionStore::load);
+    let start_session_store = state.session_store.is_some();
     let mut runner = Runner::with_state(state);
     runner.add_model(uring);
     runner.add_model(dbus);
     runner.add_model(udev);
     runner.add_model(libinput);
     runner.add_model(Box::new(scheduler::IdleScheduler::new()));
+    if start_session_store {
+        runner.add_model(Box::new(
+            session_store::model::SessionStoreModel::new().map_err(StartupError::SessionStore)?,
+        ));
+    }
     runner.add_model(client_manager);
     let start_ipc = ipc_server.is_some();
     if let Some(ipc_server) = ipc_server {
@@ -439,6 +448,7 @@ enum StartupError {
     Socket(clients::SocketBindError),
     Config(std::io::Error),
     Signals(signals::SignalInstallError),
+    SessionStore(std::io::Error),
 }
 
 impl std::fmt::Display for StartupError {
@@ -452,6 +462,7 @@ impl std::fmt::Display for StartupError {
             Self::Socket(error) => write!(formatter, "wayland socket: {error}"),
             Self::Config(error) => write!(formatter, "config watcher: {error}"),
             Self::Signals(error) => write!(formatter, "signals: {error}"),
+            Self::SessionStore(error) => write!(formatter, "session store: {error}"),
         }
     }
 }

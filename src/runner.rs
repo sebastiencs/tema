@@ -662,6 +662,9 @@ impl Runner {
                     // Stop listeners before disconnecting clients. Output and
                     // device teardown comes after the clients are gone.
                     ingress_stopped = true;
+                    self.stop_loaded_singleton::<crate::session_store::model::SessionStoreModel>(
+                        &mut dispatcher,
+                    );
                     self.stop_loaded_singleton::<crate::xwayland::Xwayland>(&mut dispatcher);
                     self.stop_loaded_singleton::<crate::clients::ClientManager>(&mut dispatcher);
                     self.stop_loaded_singleton::<crate::process::ProcessManager>(&mut dispatcher);
