@@ -344,6 +344,9 @@ mod tests {
         assert_no_windows(&state, opened.root);
         state.destroy_window(opened.window);
         assert_no_windows(&state, opened.root);
+        assert!(!client_dispatcher.test_has_queued_action::<crate::clients::ClientManagerAction>(
+            |action| matches!(action, crate::clients::ClientManagerAction::WorkspaceStateChanged)
+        ));
     }
 
     #[test]

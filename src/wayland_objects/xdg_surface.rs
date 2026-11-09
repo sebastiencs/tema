@@ -1607,6 +1607,24 @@ pub mod xdg_toplevel {
         }
     }
 
+    /// Outputs of the workspace whose layout currently contains `window`.
+    ///
+    /// `None` when the toplevel was never placed. Destroying it must not
+    /// reconfigure the windows that are on screen.
+    fn workspace_outputs_if_in_layout(
+        state: &State,
+        window: WindowId,
+    ) -> Option<Vec<crate::state::OutputId>> {
+        let root = state.window_root_surface(window)?;
+        let workspace_id = state.root_surface_workspace(root)?;
+        let in_layout = state
+            .workspaces
+            .try_get(workspace_id)?
+            .layout
+            .contains_window(window);
+        in_layout.then(|| state.workspace_output_ids(workspace_id))
+    }
+
     impl Object for XdgToplevel {
         fn id(&self) -> WaylandId {
             self.id.into()
@@ -1644,8 +1662,18 @@ pub mod xdg_toplevel {
                             dispatcher,
                         );
                     }
+                    // Role destroy does not commit. A null-buffer unmap flushes
+                    // the dirty tile tree from that commit; without this, the
+                    // sibling keeps its old size until the client socket closes.
+                    let affected_outputs = workspace_outputs_if_in_layout(state, self.window);
                     crate::capture::unmap_window(state, dispatcher, self.window);
                     state.destroy_window(self.window);
+                    if let Some(affected_outputs) = affected_outputs {
+                        if !affected_outputs.is_empty() {
+                            request_outputs(state, affected_outputs, dispatcher);
+                        }
+                        dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
+                    }
                     if let Some(decoration) = self.decoration_object() {
                         let decoration_id =
                             decoration.try_ref(state).map(|decoration| decoration.id());
@@ -2721,6 +2749,105 @@ mod tests {
             ClientManagerAction::PublishWorkspaceStateChanged { affected_outputs }
                 if affected_outputs == &vec![output_id]
         )));
+    }
+
+    #[test]
+    fn destroying_a_placed_toplevel_flushes_the_workspace_layout() {
+        let mut state = state_for_tests();
+        state.config.animations.set_close_duration_msec(0);
+        let output_id = state.insert_output(test_output_drm0_wh(120, 80));
+        let workspace_id = state.active_workspace_for_output(output_id).unwrap();
+        let mut client = Client::new_for_tests(ClientId::from_raw(89));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+
+        let wl_surface_id = WlSurfaceId::from(40u32);
+        let xdg_surface_id = XdgSurfaceId::from(41u32);
+        let toplevel_id = XdgToplevelId::from(42u32);
+
+        let (surface_resolved, _) =
+            client.insert_object(&mut state, WlSurface::new(wl_surface_id, client.client_id(), 6));
+        let surface_object_id = surface_resolved.object_id();
+        {
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            assert!(surface
+                .set_role(Role::XdgSurface, &mut client_dispatcher)
+                .is_ok());
+        }
+        state.register_root_surface(surface_resolved);
+
+        let (xdg_surface_resolved, _) = client.insert_object(
+            &mut state,
+            XdgSurface {
+                id: xdg_surface_id,
+                wm_base: Resolved::new(
+                    client.client_id(),
+                    XdgWmBaseId::from(1),
+                    ObjectId::from(1usize),
+                ),
+                wl_surface: Resolved::new(client.client_id(), wl_surface_id, surface_object_id),
+                wm_base_version: 7,
+                role_kind: Some(RoleKind::Toplevel),
+                role_object: RoleObject::None,
+                initial_commit_complete: true,
+                next_configure_serial: 1,
+                pending_configures: VecDeque::new(),
+                last_acked: None,
+                pending_window_geometry: None,
+                current_window_geometry: None,
+                popup_children: Vec::new(),
+            },
+        );
+        let xdg_surface_object_id = xdg_surface_resolved.object_id();
+        {
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.set_xdg_surface_impl(Resolved::new(
+                client.client_id(),
+                xdg_surface_id,
+                xdg_surface_object_id,
+            ));
+            surface.test_map(ObjectId::from(951usize), 0, 0, 80, 60);
+        }
+        let window = state.allocate_window_id();
+        let (toplevel_resolved, _) = client.insert_object(
+            &mut state,
+            XdgToplevel::new(
+                toplevel_id,
+                Resolved::new(client.client_id(), xdg_surface_id, xdg_surface_object_id),
+                7,
+                window,
+            ),
+        );
+        state.insert_window(window, surface_resolved, toplevel_resolved.object_id());
+        state
+            .objects
+            .get_mut(xdg_surface_object_id)
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .role_object = RoleObject::Toplevel(toplevel_resolved);
+
+        assert_eq!(
+            state.root_surface_workspace(root(&state, surface_object_id)),
+            Some(workspace_id)
+        );
+        state.relayout_dirty_workspaces();
+        assert!(state.is_tiled_root_surface(root(&state, surface_object_id)));
+
+        let destroy_request: RawRequest<'static> = (&*RawEvent::new(toplevel_id.into(), 0, 0)
+            .into_bytes())
+            .try_into()
+            .unwrap();
+        {
+            let mut toplevel = client.grab_object(toplevel_id, &mut state);
+            toplevel
+                .on(&mut client, &mut state, destroy_request, &mut client_dispatcher)
+                .unwrap();
+        }
+
+        assert!(state.window_for_root(surface_resolved).is_none());
+        assert!(dispatcher.test_has_queued_action::<ClientManagerAction>(|action| {
+            matches!(action, ClientManagerAction::WorkspaceStateChanged)
+        }));
     }
 
     #[test]
