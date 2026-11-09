@@ -31,12 +31,18 @@ pub(crate) use sys::{
     socketpair_stream, waitid_pidfd, ChildExit, MAX_ATTACHED_FDS,
 };
 
-/// `WAYLAND_DISPLAY` and `XDG_CURRENT_DESKTOP`, shared by the forker environment
-/// and the activation environment.
+/// `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, and `TEMA_SOCK`, shared by the
+/// forker environment and the activation environment.
 fn session_variables() -> Vec<(String, String)> {
     vec![
         ("WAYLAND_DISPLAY".into(), crate::clients::WAYLAND_DISPLAY_NAME.into()),
         ("XDG_CURRENT_DESKTOP".into(), "tema".into()),
+        (
+            crate::ipc::proto::SOCKET_ENV.into(),
+            crate::ipc::proto::default_socket_path()
+                .display()
+                .to_string(),
+        ),
     ]
 }
 
@@ -59,29 +65,49 @@ pub(crate) fn activation_environment() -> Vec<(String, String)> {
 mod tests {
     #[test]
     fn default_environment_is_wayland_and_leaves_display_unset() {
+        let _lock = crate::ipc::proto::lock_socket_env();
         let env = super::default_environment();
         assert_eq!(
             env.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
-            vec!["WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "_JAVA_AWT_WM_NONREPARENTING"]
+            vec![
+                "WAYLAND_DISPLAY",
+                "XDG_CURRENT_DESKTOP",
+                "TEMA_SOCK",
+                "_JAVA_AWT_WM_NONREPARENTING",
+            ]
         );
         assert_eq!(env[0].1, crate::clients::WAYLAND_DISPLAY_NAME);
         assert_eq!(env[1].1, "tema");
-        assert_eq!(env[2].1, "1");
+        assert_eq!(
+            env[2].1,
+            crate::ipc::proto::default_socket_path()
+                .display()
+                .to_string()
+        );
+        assert_eq!(env[3].1, "1");
         assert!(env.iter().all(|(key, _)| key != "DISPLAY"));
     }
 
     #[test]
     fn activation_environment_matches_the_session_variables() {
+        let _lock = crate::ipc::proto::lock_socket_env();
         let env = super::activation_environment();
         let defaults = super::default_environment();
         assert_eq!(
             env.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
-            vec!["WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE"]
+            vec!["WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "TEMA_SOCK", "XDG_SESSION_TYPE"]
         );
         assert_eq!(env[0], defaults[0]);
         assert_eq!(env[1], defaults[1]);
+        assert_eq!(env[2], defaults[2]);
         assert_eq!(env[0].1, crate::clients::WAYLAND_DISPLAY_NAME);
         assert_eq!(env[1].1, "tema");
-        assert_eq!(env[2].1, "wayland");
+        assert_eq!(
+            env[2].1,
+            crate::ipc::proto::default_socket_path()
+                .display()
+                .to_string()
+        );
+        assert_eq!(env[3].1, "wayland");
     }
 }

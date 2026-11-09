@@ -203,7 +203,7 @@ impl EGL {
     }
 
     pub(super) fn assert_attribs_with_none(list: &[egl::Attrib]) {
-        assert_eq!(*list.last().unwrap(), egl::NONE as _);
+        assert_eq!(*list.last().unwrap(), egl::NONE as egl::Attrib);
     }
     pub(super) fn assert_ends_with_none(list: &[egl::Int]) {
         assert_eq!(*list.last().unwrap(), egl::NONE);
@@ -324,7 +324,7 @@ impl EGL {
                 &mut num_modifiers,
             )
         };
-        assert_eq!(modifiers.len(), num_modifiers as _);
+        assert_eq!(modifiers.len(), num_modifiers as usize);
         Self::ok_on(result, egl::TRUE as _)?;
 
         Ok((modifiers, external_only))

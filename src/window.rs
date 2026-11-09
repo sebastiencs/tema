@@ -17,6 +17,11 @@ use crate::{
 pub struct WindowId(u64);
 
 impl WindowId {
+    /// The value stored in this id. It is allocated from a counter, not from an index map.
+    pub(crate) const fn as_u64(self) -> u64 {
+        self.0
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests(raw: u64) -> Self {
         Self(raw)

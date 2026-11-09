@@ -639,6 +639,8 @@ If coming back after a long time, this order should restore the mental model qui
     How `CLIPBOARD` and `PRIMARY` move between X clients and Wayland clients.
 18. `src/wire_scale.rs` and section 25
     How downscaled Xwayland gets one integer scale, and where that scale is applied.
+19. `src/ipc/` and section 26
+    The IPC socket, the snapshot diff, and `temactl`.
 
 ## 14. Vocabulary
 
@@ -786,6 +788,7 @@ The forker removes `DISPLAY` and `WAYLAND_DISPLAY` from itself and sets `XDG_SES
 
 - `WAYLAND_DISPLAY=tema-0`
 - `XDG_CURRENT_DESKTOP=tema`
+- `TEMA_SOCK` set to the IPC socket path from section 26
 - `_JAVA_AWT_WM_NONREPARENTING=1`
 
 `DISPLAY` is not sent again, so a compositor nested under X does not pass that outer display to new programs.
@@ -810,6 +813,7 @@ At startup, after the Wayland socket exists and after the forker `SetEnv`s, tema
 
 - `WAYLAND_DISPLAY=tema-0`
 - `XDG_CURRENT_DESKTOP=tema`
+- `TEMA_SOCK` set to the IPC socket path from section 26
 - `XDG_SESSION_TYPE=wayland`
 
 `_JAVA_AWT_WM_NONREPARENTING=1` stays on the forker. Section 17 adds `DISPLAY=:N` when a display is allocated, and removes it on give-up or disable. A restart on the same display exports nothing new. `Xwayland`'s `Stop` leaves `DISPLAY` in place. The shutdown unset below removes it with the rest, when it was exported.
@@ -982,16 +986,16 @@ Run a normal session from a terminal. Note the `:N` in `Allocated display :N`.
 4. `kill -9 $(pgrep -x Xwayland)`. The log shows `Xwayland exited with signal 9`. A new `xterm` starts Xwayland again on the same `:N`, and both files are still there. A signal within ten seconds of becoming ready counts as an early failure, so one kill relaunches, and a third early failure gives up.
 5. Start a session whose `PATH` can see `sh` and the keybinding's terminal, and cannot see `Xwayland`. `mkdir -p /tmp/no-xwayland`, symlink those two programs into it, and run tema with `PATH=/tmp/no-xwayland`. From a normal shell, run `xterm` with `DISPLAY=:N`. The connection stays queued, so each failed launch tries again at once. The third logs `Xwayland gave up: repeated early failures`. Both files are gone. A terminal spawned after that has an empty `DISPLAY`.
 6. Activation environment, the live `import_environment` switch, and the live `enabled` switch. Items 1–7 and 9–11 are a session that is not nested under X. Item 8 is a nested one.
-   1. Start tema. `systemctl --user show-environment | grep -E 'DISPLAY|WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE'` shows `WAYLAND_DISPLAY=tema-0`, `DISPLAY=:N`, `XDG_CURRENT_DESKTOP=tema`, and `XDG_SESSION_TYPE=wayland`. Restart a D-Bus-activated service with `systemctl --user restart xdg-desktop-portal` and read `tr '\0' '\n' < /proc/$(pgrep -xf '.*xdg-desktop-portal')/environ`.
+   1. Start tema. `systemctl --user show-environment | grep -E 'DISPLAY|WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE|TEMA_SOCK'` shows `WAYLAND_DISPLAY=tema-0`, `DISPLAY=:N`, `XDG_CURRENT_DESKTOP=tema`, `XDG_SESSION_TYPE=wayland`, and `TEMA_SOCK` set to the socket from section 26. Restart a D-Bus-activated service with `systemctl --user restart xdg-desktop-portal` and read `tr '\0' '\n' < /proc/$(pgrep -xf '.*xdg-desktop-portal')/environ`.
    2. Open `xterm`. Set `enabled = false` and save. The log shows `waiting for X clients to exit`. `ls /tmp/.X11-unix/XN` is gone and `/tmp/.XN-lock` remains. A new terminal has no `DISPLAY`. `systemctl --user show-environment` has no `DISPLAY`. The open `xterm` still works. `xterm -display :N` fails.
    3. Close `xterm`. Xwayland exits, the lock file is gone, and nothing relaunches.
    4. Set `enabled = true`. `DISPLAY=:N` is back in a new terminal and in systemd. `xterm` starts Xwayland on the first connection.
    5. With `xterm` open, set `enabled` false and then true before it exits. After closing `xterm`, a fresh display is allocated and `DISPLAY` is exported again.
    6. Start with `enabled = false`, then set it true and save. This matches item 4. The startup log says `Xwayland disabled`, and neither file exists until the reload.
-   7. Quit tema. `systemctl --user show-environment` no longer has `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, or `XDG_SESSION_TYPE`, unless another instance exported a different value.
+   7. Quit tema. `systemctl --user show-environment` no longer has `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, or `TEMA_SOCK`, unless another instance exported a different value.
    8. Run tema nested under X11. `systemctl --user show-environment` is unchanged. `import_environment = true` leaves it unchanged too.
-   9. Start with `import_environment = false`. `systemctl --user show-environment` has none of `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, or `XDG_SESSION_TYPE`. `xterm` still works. Quitting changes nothing.
-   10. Set `import_environment = true` and save. The four variables appear, and `DISPLAY` is the current `:N`.
+   9. Start with `import_environment = false`. `systemctl --user show-environment` has none of `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, or `TEMA_SOCK`. `xterm` still works. Quitting changes nothing.
+   10. Set `import_environment = true` and save. The five variables appear, and `DISPLAY` is the current `:N`.
    11. Set it back to `false` and save. Those variables are removed. A second tema instance's different values stay.
 7. Quit tema during a normal session. No `Xwayland` process remains, and both files are gone.
 8. `wayland-info` from a normal client does not list `xwayland_shell_v1`.
@@ -1523,3 +1527,26 @@ Run tema on a 2× output, or set `[output.scales]` for that output's name to 2. 
 6. Change that output's scale from 2 to 1 and reload. X windows reconfigure to 1× without restarting Xwayland. `xrdb -query` shows `Xft.dpi: 96` and `Xcursor.size: 24`.
 7. Switch `scaling_mode` on reload both ways while `xterm` is open. It reconfigures, and Xwayland stays running.
 8. `scaling_mode = "downscaled"` on all-1× outputs behaves as `default` does.
+
+## 26. IPC
+
+Clients that need compositor state Wayland does not expose use a Unix socket. The code is `src/ipc/`. `proto.rs` is the newline-delimited JSON protocol, version 1. `temactl` compiles that file by path and does not link the compositor. `snapshot.rs` copies `&State` into the protocol objects. It does no I/O and does not use the dispatcher.
+
+`IpcServer` is one runner model. It binds `$XDG_RUNTIME_DIR/tema-0.ipc.sock`, or `/tmp/tema-0.ipc.sock` when `XDG_RUNTIME_DIR` is unset, removes a stale file at that path, and sets the mode to `0600`. It ignores `TEMA_SOCK`. That variable is how a client finds the socket. `session_variables` in `src/process/mod.rs` puts the bound path into the forker environment and into the activation environment from section 16. A bind failure is logged and startup continues with `state.ipc_enabled` false. `Stop` unlinks the socket.
+
+Each accepted connection is an `IpcConnection` model of its own. `version`, `outputs`, `workspaces`, and `focused_window` are answered from a fresh `snapshot::build`. `subscribe` stores the requested topics. An empty list means all of them. The connection writes `{"ok":"subscribed"}` and then one event per topic from that snapshot. A later request on the same connection gets `{"error":"connection is subscribed"}`. The connection also sends `IpcServerAction::Subscribed`, and the server keeps the topic set. An empty stored set means every topic.
+
+`ipc::mark_dirty` sets `state.ipc_dirty` and queues one `IpcServerAction::Refresh`. Another call in the same turn does nothing until `Refresh` clears the flag. When `ipc_enabled` is false the call returns without dispatching. The runner would otherwise log that the action has no model. `Refresh` builds a new snapshot and compares it with the one stored on the server. The comparison order is the focused window, then workspaces, then outputs. Each topic that differs is encoded once and sent to every subscriber of that topic. With no subscribers the snapshot is stored and nothing is encoded. Pointer motion is not a hook. `State::active_output_id` follows the pointer and is not part of the snapshot.
+
+The calls are in `ClientManager`, on `WorkspaceStateChanged`, `OutputStateChanged`, and `OutputRemoved`, and in `src/capture.rs`: `announce_toplevel`, `close_toplevel`, `note_window_state`, `apply_activated` when the activated set changes, and `update_window_detail` after the title or the app id changes. Floating and fullscreen keybindings, drags, and workspace publication arrive as `WorkspaceStateChanged`.
+
+A new topic needs a field on `IpcSnapshot`, filled in by `build`, a `Topic` variant, and an `Event` variant. Call `mark_dirty` where that state changes. A query also needs a `Request` variant and a `Response` variant. `temactl subscribe` accepts any `Topic` name. `temactl waybar window` follows only the focused window.
+
+### Manual check
+
+Programs tema starts have `TEMA_SOCK` set. `socat` is the wire. `temactl` is `target/release/temactl`.
+
+1. `temactl version` prints the client version, `compositor 0.1.0`, and `protocol 1`.
+2. `printf '%s\n' '{"request":"workspaces"}' | socat - UNIX-CONNECT:"$TEMA_SOCK"` prints one `{"ok":{"workspaces":[…]}}` line.
+3. `temactl subscribe focused_window` prints the current window, then another line when focus or the title changes, and nothing while the pointer only moves.
+4. Waybar `custom/window` as in the README shows the focused title. Stopping tema clears it. Starting tema again fills it back in without restarting Waybar.

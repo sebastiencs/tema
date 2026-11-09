@@ -449,6 +449,7 @@ impl Model for ClientManager {
                 }
             }
             OutputStateChanged { output_id } => {
+                crate::ipc::mark_dirty(state, dispatcher);
                 // The output's new scale is already stored. Queue `SetWireScale`
                 // before this broadcast so the Xwayland client applies S first.
                 self.queue_xwayland_wire_scale(state, dispatcher);
@@ -461,6 +462,7 @@ impl Model for ClientManager {
                 }
             }
             OutputRemoved { output_id } => {
+                crate::ipc::mark_dirty(state, dispatcher);
                 // The output has already left the layout. Recompute S before the
                 // clients are told it is gone.
                 self.queue_xwayland_wire_scale(state, dispatcher);
@@ -486,6 +488,9 @@ impl Model for ClientManager {
                 publish_workspace_state_changed(state, dispatcher, affected_outputs);
             }
             WorkspaceStateChanged => {
+                // Floating and fullscreen keybindings, drags, and workspace
+                // publication all arrive here, so the IPC snapshot sees them.
+                crate::ipc::mark_dirty(state, dispatcher);
                 crate::idle_inhibit::refresh(state, dispatcher, std::time::Instant::now());
                 for client_id in self.set.iter().copied() {
                     dispatcher.dispatch_to(client_id, ClientAction::WorkspaceStateChanged);

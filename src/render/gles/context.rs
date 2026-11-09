@@ -287,7 +287,13 @@ impl EglContext {
             .copied()
             .zip(external_only)
             .map(|(modifier, external_only)| {
-                (modifier, EglModifier { modifier, external_only: external_only == egl::TRUE as _ })
+                (
+                    modifier,
+                    EglModifier {
+                        modifier,
+                        external_only: external_only == egl::TRUE as egl::Boolean,
+                    },
+                )
             })
             .collect::<BTreeMap<_, _>>();
 

@@ -12,8 +12,9 @@ cursor_size = 24
 # Changing this requires a restart; a running compositor keeps its current renderer.
 renderer = "opengl"
 
-# Publish WAYLAND_DISPLAY, DISPLAY, XDG_CURRENT_DESKTOP and XDG_SESSION_TYPE to
-# D-Bus activation and systemd --user, so portals and user services find the session.
+# Publish WAYLAND_DISPLAY, DISPLAY, XDG_CURRENT_DESKTOP, XDG_SESSION_TYPE and
+# TEMA_SOCK to D-Bus activation and systemd --user, so portals and user
+# services find the session. There is no IPC section: the socket path is fixed.
 # Turn off when a session manager does this already. Ignored when nested. Applies on reload.
 import_environment = false
 

@@ -2076,6 +2076,7 @@ pub(crate) fn announce_toplevel(
         clients.insert(subscriber.client_id());
     }
     dispatch_deliver(dispatcher, clients);
+    crate::ipc::mark_dirty(state, dispatcher);
     key
 }
 
@@ -2163,6 +2164,7 @@ pub(crate) fn close_toplevel(state: &mut State, dispatcher: &mut Dispatcher, key
         .ext_frames
         .retain(|slot| slot.target != target);
     clients.extend(clear_parent_references(state, dispatcher, key));
+    crate::ipc::mark_dirty(state, dispatcher);
     dispatch_deliver(dispatcher, clients);
 }
 
@@ -2308,6 +2310,8 @@ pub(crate) fn note_window_state(
         return;
     };
     note_shell_state(state, dispatcher, key, maximized, fullscreen);
+    // Unchanged bits still mark dirty. The snapshot diff sends nothing.
+    crate::ipc::mark_dirty(state, dispatcher);
 }
 
 /// Copy the layout's fullscreen bit onto a window whose role publishes no configure.
@@ -2372,6 +2376,9 @@ fn apply_activated(state: &mut State, dispatcher: &mut Dispatcher, active: Optio
             (record.activated != activated).then_some((*key, activated))
         })
         .collect();
+    if !changes.is_empty() {
+        crate::ipc::mark_dirty(state, dispatcher);
+    }
     for (key, activated) in changes {
         let item = {
             let Some(record) = record_mut(state, key) else {
@@ -2950,6 +2957,7 @@ fn update_window_detail(
         }
         record.app_id = value.clone();
     }
+    crate::ipc::mark_dirty(state, dispatcher);
     let mut clients: BTreeSet<_> = state
         .capture
         .handles_for(key)
@@ -3083,6 +3091,28 @@ fn dispatch_deliver(dispatcher: &mut Dispatcher, clients: BTreeSet<ClientId>) {
     for client_id in clients {
         dispatcher.dispatch_to(client_id, ClientAction::DeliverCaptureEvents);
     }
+}
+
+/// Title, app id, and fullscreen of one open toplevel.
+///
+/// `None` when `window` has no capture record, or that record is already closed.
+pub(crate) struct ToplevelInfo<'a> {
+    pub title: &'a str,
+    pub app_id: &'a str,
+    pub fullscreen: bool,
+}
+
+pub(crate) fn toplevel_info(state: &State, window: WindowId) -> Option<ToplevelInfo<'_>> {
+    let key = state.capture.by_window.get(&window).copied()?;
+    let record = state.capture.toplevels.get(&key)?;
+    if record.closed {
+        return None;
+    }
+    Some(ToplevelInfo {
+        title: &record.title,
+        app_id: &record.app_id,
+        fullscreen: record.fullscreen,
+    })
 }
 
 /// One open foreign-toplevel record, for tests.

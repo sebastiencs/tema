@@ -41,7 +41,7 @@ impl EglRenderBuffer {
                 self.renderbuffer_object,
             );
             let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER as _);
-            assert_eq!(status, gl::FRAMEBUFFER_COMPLETE as _);
+            assert_eq!(status, gl::FRAMEBUFFER_COMPLETE as gl::Enum);
             gl::BindFramebuffer(gl::FRAMEBUFFER as _, 0);
         }
 

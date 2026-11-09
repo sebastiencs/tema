@@ -149,7 +149,7 @@ impl GlTexture {
             gl::TexParameteri(target, gl::TEXTURE_MIN_FILTER as _, gl::LINEAR as _);
             gl::TexParameteri(target, gl::TEXTURE_MAG_FILTER as _, gl::LINEAR as _);
             gl::EGLImageTargetTexture2DOES(target, image.image.ptr);
-            assert_eq!(gl::GetError(), gl::NO_ERROR as _);
+            assert_eq!(gl::GetError(), gl::NO_ERROR as gl::Enum);
             gl::BindTexture(target, 0);
             texture
         };

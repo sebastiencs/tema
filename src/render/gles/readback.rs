@@ -36,7 +36,7 @@ pub(crate) fn read_flip_y_framebuffer(
         gl::BindFramebuffer(gl::FRAMEBUFFER as _, framebuffer);
         gl::PixelStorei(gl::PACK_ALIGNMENT as _, 1);
         gl::Finish();
-        while gl::GetError() != gl::NO_ERROR as _ {}
+        while gl::GetError() != gl::NO_ERROR as gl::Enum {}
         let mut ok = true;
         for row in 0..height {
             let dst_start = (row as usize).saturating_mul(dst_stride);
@@ -49,7 +49,7 @@ pub(crate) fn read_flip_y_framebuffer(
                 gl::UNSIGNED_BYTE as _,
                 dst[dst_start..].as_mut_ptr().cast(),
             );
-            if gl::GetError() != gl::NO_ERROR as _ {
+            if gl::GetError() != gl::NO_ERROR as gl::Enum {
                 ok = false;
                 break;
             }

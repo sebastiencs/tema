@@ -178,6 +178,7 @@ mod idle_inhibit;
 mod indexmap;
 mod input;
 mod io_uring;
+mod ipc;
 mod libinput;
 mod logger;
 mod object;
@@ -337,10 +338,18 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
 
     let uring = Box::new(IoUringState::try_new().map_err(StartupError::Ring)?);
     let client_manager = ClientManager::new().map_err(StartupError::Socket)?;
+    let ipc_server = match ipc::IpcServer::new() {
+        Ok(server) => Some(server),
+        Err(error) => {
+            log::error!("ipc socket bind failed: {error}");
+            None
+        }
+    };
     let config_watcher =
         Box::new(config::ConfigWatcher::try_new(&state.config).map_err(StartupError::Config)?);
 
     let import_environment = state.config.general.import_environment;
+    state.ipc_enabled = ipc_server.is_some();
     let mut runner = Runner::with_state(state);
     runner.add_model(uring);
     runner.add_model(dbus);
@@ -348,6 +357,10 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     runner.add_model(libinput);
     runner.add_model(Box::new(scheduler::IdleScheduler::new()));
     runner.add_model(client_manager);
+    let start_ipc = ipc_server.is_some();
+    if let Some(ipc_server) = ipc_server {
+        runner.add_model(ipc_server);
+    }
     runner.add_model(config_watcher);
     runner.add_model(Box::new(drm::VisualAnimationPump::new()));
     let signals = Box::new(signals::SignalHandler::install().map_err(StartupError::Signals)?);
@@ -357,6 +370,9 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
 
     let mut dispatcher = Dispatcher::default();
     dispatcher.start::<ClientManager>();
+    if start_ipc {
+        dispatcher.start::<ipc::IpcServer>();
+    }
     dispatcher.start::<process::ProcessManager>();
     for (key, value) in process::default_environment() {
         dispatcher.dispatch(process::ProcessManagerAction::SetEnv { key, value: Some(value) });
