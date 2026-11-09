@@ -438,12 +438,13 @@ impl Output {
         self.preferred_mode = preferred_mode;
     }
 
+    /// Scale from config. A missing entry is `"auto"`.
     pub fn configured_scale(&self, config: &RuntimeConfig) -> FractionalScale {
         let setting = config.output_scale(self.name.as_str());
+        let automatic = setting.is_none_or(|setting| setting == OutputScaleSetting::Auto);
         let wanted = match setting {
             Some(OutputScaleSetting::Fixed(scale)) => scale,
-            Some(OutputScaleSetting::Auto) => self.auto_scale(),
-            None => FractionalScale::ONE,
+            Some(OutputScaleSetting::Auto) | None => self.auto_scale(),
         };
         let mode_w = self.current_mode.width;
         let mode_h = self.current_mode.height;
@@ -460,11 +461,8 @@ impl Output {
             }
             return applied;
         }
-        let fallback = if matches!(setting, Some(OutputScaleSetting::Auto)) {
-            round_scale_to_integer(wanted)
-        } else {
-            FractionalScale::ONE
-        };
+        let fallback =
+            if automatic { round_scale_to_integer(wanted) } else { FractionalScale::ONE };
         log::error!(
             "output {}: no clean scale near {:.4} for {}x{}; using {:.4}",
             self.name,
@@ -4376,6 +4374,23 @@ mod tests {
         assert_eq!(state.outputs[output_id].scale, FractionalScale::ONE_POINT_FIVE);
         let (width, height) = state.outputs[output_id].logical_size();
         assert_eq!((width, height), (910, 512));
+
+        let mut omitted = test_output(
+            crate::state::BackendOutputRef::new(crate::state::DrmId::from(0usize)),
+            4,
+            0,
+            0,
+            1365,
+            768,
+            "unlisted",
+        );
+        omitted.physical_width = 100;
+        omitted.physical_height = 100;
+        let mut state = state_for_tests_with_config(
+            crate::config::RuntimeConfig::parse_for_test("", &Xkb::new()).unwrap(),
+        );
+        let output_id = state.insert_output(omitted);
+        assert_eq!(state.outputs[output_id].scale, FractionalScale::ONE_POINT_FIVE);
     }
 
     #[test]
