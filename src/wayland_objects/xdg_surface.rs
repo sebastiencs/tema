@@ -176,6 +176,21 @@ impl XdgSurface {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_assign_toplevel_role(&mut self, toplevel: Resolved<XdgToplevelId>) {
+        self.role_object = RoleObject::Toplevel(toplevel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_latest_toplevel_configure_size(&self) -> Option<(i32, i32)> {
+        self.pending_configures
+            .back()
+            .and_then(|pending| match &pending.state {
+                ConfigureState::Toplevel(configure) => Some((configure.width, configure.height)),
+                ConfigureState::Popup(_) => None,
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_set_pending_window_geometry(&mut self, geometry: Option<RectI>) {
         self.pending_window_geometry = geometry;
     }

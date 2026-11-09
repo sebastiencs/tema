@@ -136,7 +136,9 @@ pub(crate) fn apply_pointer_interactive_grab(
             // pointer-centered preview and warps to it, matching Hyprland's warpPositionSize.
             let root_pos =
                 preview_root_for_pointer(state.seat.pointer_pos, preview_size, frame_from_root);
-            place_grabbed_root(state, dispatcher, root_surface, root_pos);
+            if !place_grabbed_root(state, dispatcher, root_surface, root_pos) {
+                abort_pointer_interactive_grab(state, dispatcher, 0);
+            }
         }
         ActiveGrabState::Resize {
             window,
@@ -736,24 +738,29 @@ fn move_grabbed_root(
 ) {
     let dx = (state.seat.pointer_pos.0 - initial_pointer_pos.0).round() as i32;
     let dy = (state.seat.pointer_pos.1 - initial_pointer_pos.1).round() as i32;
-    place_grabbed_root(
+    if !place_grabbed_root(
         state,
         dispatcher,
         root_surface,
         (initial_root_pos.0 + dx, initial_root_pos.1 + dy),
-    );
+    ) {
+        abort_pointer_interactive_grab(state, dispatcher, 0);
+    }
 }
 
-fn place_grabbed_root(
+/// Move `root_surface` to `root_pos`.
+///
+/// Returns false when the root is already grabbed. Callers that own an interactive grab abort
+/// it. A toplevel drag does not: the drag-and-drop keeps running.
+pub(crate) fn place_grabbed_root(
     state: &mut State,
     dispatcher: &mut Dispatcher,
     root_surface: Resolved<WlSurfaceId>,
     root_pos: (i32, i32),
-) {
+) -> bool {
     let old_bounds = interactive_damage_rect(state, root_surface);
     let Some(mut surface) = root_surface.try_grab(state) else {
-        abort_pointer_interactive_grab(state, dispatcher, 0);
-        return;
+        return false;
     };
     surface.set_root_position(root_pos.0, root_pos.1);
     drop(surface);
@@ -775,6 +782,7 @@ fn place_grabbed_root(
     } else {
         request_active_output(state, dispatcher);
     }
+    true
 }
 
 fn note_root_position(state: &State, dispatcher: &mut Dispatcher, root: Resolved<WlSurfaceId>) {

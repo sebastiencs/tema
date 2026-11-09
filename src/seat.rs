@@ -1530,6 +1530,9 @@ pub fn handle_pointer_motion(
         state.seat.pointer_pos.1,
         time
     );
+    if !state.session_lock.input_gated() {
+        crate::input::toplevel_drag::motion(state, dispatcher);
+    }
     if !state.session_lock.input_gated() && refresh_drag_focus(state, dispatcher, time, true) {
         refresh_visible_cursor_surface_outputs(state, dispatcher);
         refresh_visible_dnd_icon_surface_outputs(state, dispatcher);
@@ -1703,6 +1706,9 @@ pub fn handle_pointer_motion_absolute(
     //     state.seat.pointer_pos.1,
     //     time
     // );
+    if !state.session_lock.input_gated() {
+        crate::input::toplevel_drag::motion(state, dispatcher);
+    }
     if !state.session_lock.input_gated() && refresh_drag_focus(state, dispatcher, time, true) {
         refresh_visible_cursor_surface_outputs(state, dispatcher);
         refresh_visible_dnd_icon_surface_outputs(state, dispatcher);

@@ -232,6 +232,7 @@ mod tests {
             WaylandId, WlDataDeviceId, WlDataSourceId, WlSeatId, WlSurfaceId, XdgSurfaceId,
             XdgToplevelDragManagerV1Id, XdgToplevelDragV1Id, XdgToplevelId, XdgWmBaseId,
         },
+        region::RectI,
         runner::Dispatcher,
         seat::SurfaceFocus,
         state::{
@@ -240,6 +241,7 @@ mod tests {
         },
         test_support::{
             insert_window, raw_request_from_event, state_for_tests, test_client_and_dispatcher,
+            test_output_drm0_wh,
         },
         wayland_objects::{
             wl_data_device::WlDataDevice,
@@ -354,6 +356,82 @@ mod tests {
 
         fn start(&mut self, source: u32, serial: u32) -> RequestResult {
             self.dispatch(self.device, 14, start_request(14, source, 12, serial))
+        }
+
+        fn xdg(&self) -> Resolved<XdgSurfaceId> {
+            self.toplevel.try_ref(&self.state).unwrap().xdg_surface()
+        }
+
+        fn root_pos(&self) -> (i32, i32) {
+            self.surface.try_ref(&self.state).unwrap().root_position()
+        }
+
+        /// An output, then the window again, owned by the real toplevel.
+        fn bind_managed_window(&mut self) {
+            self.state.insert_output(test_output_drm0_wh(800, 600));
+            self.state.destroy_window(self.window);
+            self.state
+                .insert_window(self.window, self.surface, self.toplevel.object_id());
+        }
+
+        fn set_floating(&mut self) {
+            self.state
+                .managed_window_state_mut(self.window)
+                .unwrap()
+                .mode = ManagedWindowMode::Floating;
+        }
+
+        fn link_xdg(&mut self) {
+            let xdg = self.xdg();
+            let toplevel = self.toplevel;
+            self.surface
+                .try_ref_mut(&mut self.state)
+                .unwrap()
+                .set_xdg_surface_impl(xdg);
+            xdg.try_ref_mut(&mut self.state)
+                .unwrap()
+                .test_assign_toplevel_role(toplevel);
+        }
+
+        fn map(&mut self, width: i32, height: i32) {
+            self.surface.try_ref_mut(&mut self.state).unwrap().test_map(
+                ObjectId::from(1usize),
+                0,
+                0,
+                width,
+                height,
+            );
+        }
+
+        fn initial_configure_size(&mut self) -> Option<(i32, i32)> {
+            let xdg = self.xdg();
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            let role_changes = {
+                let mut xdg = xdg.grab(&mut self.state);
+                xdg.on_commit(
+                    &mut self.client,
+                    &mut self.state,
+                    &mut client_dispatcher,
+                    None,
+                    false,
+                    false,
+                    None,
+                )
+            };
+            let size = xdg
+                .try_ref(&self.state)
+                .unwrap()
+                .test_latest_toplevel_configure_size();
+            if let Some(role_changes) = role_changes {
+                let mut xdg = xdg.grab(&mut self.state);
+                xdg.apply_commit_role_changes(
+                    &mut self.client,
+                    &mut self.state,
+                    &mut client_dispatcher,
+                    role_changes,
+                );
+            }
+            size
         }
     }
 
@@ -901,6 +979,249 @@ mod tests {
         assert!(fix.state.seat.toplevel_drag.unwrap().attached.is_none());
         assert_eq!(fix.phase(20), DragObjPhase::Active);
         assert!(!closed(&fix.dispatcher));
+    }
+
+    #[test]
+    fn a_floating_window_follows_the_pointer_by_its_offset() {
+        let mut fix = Fixture::new();
+        fix.bind_managed_window();
+        fix.set_floating();
+        fix.map(80, 60);
+        fix.surface
+            .try_ref_mut(&mut fix.state)
+            .unwrap()
+            .set_root_position(30, 40);
+        fix.state.seat.pointer_pos = (100.0, 200.0);
+        fix.get_drag(20).unwrap();
+        fix.dispatch(fix.drag(20).object_id(), 20, attach_request(20, 13, 4, 8))
+            .unwrap();
+        let serial = fix.arm();
+        fix.start(11, serial).unwrap();
+
+        assert_eq!(fix.root_pos(), (96, 192));
+        crate::seat::handle_pointer_motion(
+            &mut fix.state,
+            &mut fix.dispatcher,
+            10.0,
+            -5.0,
+            10.0,
+            -5.0,
+            1,
+            0,
+        );
+        assert_eq!(fix.root_pos(), (106, 187));
+    }
+
+    #[test]
+    fn window_geometry_shifts_the_root_and_the_border_does_not() {
+        for border in [0, 3] {
+            let mut fix = Fixture::new();
+            fix.bind_managed_window();
+            fix.set_floating();
+            fix.link_xdg();
+            fix.map(80, 60);
+            fix.xdg()
+                .try_ref_mut(&mut fix.state)
+                .unwrap()
+                .test_set_current_window_geometry(Some(RectI {
+                    x: 10,
+                    y: 20,
+                    width: 40,
+                    height: 30,
+                }));
+            fix.state.config.decorations.border.size = border;
+            fix.state.mark_root_geometry_dirty(fix.surface);
+            fix.state.seat.pointer_pos = (100.0, 200.0);
+            fix.get_drag(20).unwrap();
+            fix.dispatch(fix.drag(20).object_id(), 20, attach_request(20, 13, 4, 8))
+                .unwrap();
+            let serial = fix.arm();
+            fix.start(11, serial).unwrap();
+
+            assert_eq!(fix.root_pos(), (86, 172), "border {border}");
+            let geometry = fix.state.committed_root_geometry(fix.surface).unwrap();
+            assert_eq!(geometry.decoration_insets.left, border, "border {border}");
+            assert_eq!(geometry.logical_window_local.unwrap().x, 10);
+        }
+    }
+
+    #[test]
+    fn a_new_window_maps_under_the_pointer_and_starts_floating() {
+        let mut fix = Fixture::new();
+        fix.bind_managed_window();
+        fix.link_xdg();
+        fix.state.seat.pointer_pos = (100.0, 200.0);
+        fix.get_drag(20).unwrap();
+        fix.dispatch(fix.drag(20).object_id(), 20, attach_request(20, 13, 4, 8))
+            .unwrap();
+        let serial = fix.arm();
+        fix.start(11, serial).unwrap();
+
+        assert_eq!(
+            fix.state.managed_window_state(fix.window).unwrap().mode,
+            ManagedWindowMode::Floating
+        );
+        assert_eq!(fix.initial_configure_size(), Some((0, 0)));
+        let xdg = fix.xdg();
+        let mut ack = RawEvent::new(WaylandId::from(80), 4, 1);
+        ack.uint(1);
+        fix.dispatch(xdg.object_id(), 80, raw_request_from_event(ack))
+            .unwrap();
+
+        let (other, _) = fix.client.insert_object(
+            &mut fix.state,
+            WlSurface::new(WlSurfaceId::from(40), fix.client.client_id(), 6),
+        );
+        fix.state.register_root_surface(other);
+        let other_window = fix.state.allocate_window_id();
+        fix.state
+            .insert_window(other_window, other, ObjectId::from(1_000_001usize));
+        let workspace = fix
+            .state
+            .managed_window_state(fix.window)
+            .unwrap()
+            .workspace_id;
+        fix.state
+            .workspaces
+            .try_get_mut(workspace)
+            .unwrap()
+            .layout
+            .floating
+            .stack = vec![fix.window, other_window];
+
+        crate::wayland_objects::wl_surface::test_commit_new_buffer(
+            &mut fix.client,
+            &mut fix.state,
+            &mut fix.dispatcher,
+            fix.surface,
+            80,
+            60,
+        );
+
+        assert_eq!(fix.root_pos(), (96, 192));
+        let stack = fix
+            .state
+            .workspaces
+            .try_get(workspace)
+            .unwrap()
+            .layout
+            .floating_windows();
+        assert_eq!(stack.last().copied(), Some(fix.window));
+    }
+
+    #[test]
+    fn the_dragged_window_is_not_the_drop_target() {
+        let mut fix = Fixture::new();
+        fix.bind_managed_window();
+        fix.set_floating();
+        fix.map(200, 200);
+        fix.state.managed_window_mut(fix.surface).unwrap().mapped = true;
+
+        let (lower, _) = fix.client.insert_object(
+            &mut fix.state,
+            WlSurface::new(WlSurfaceId::from(40), fix.client.client_id(), 6),
+        );
+        fix.state.register_root_surface(lower);
+        let lower_window = fix.state.allocate_window_id();
+        fix.state
+            .insert_window(lower_window, lower, ObjectId::from(1_000_001usize));
+        fix.state
+            .managed_window_state_mut(lower_window)
+            .unwrap()
+            .mode = ManagedWindowMode::Floating;
+        lower
+            .try_ref_mut(&mut fix.state)
+            .unwrap()
+            .test_map(ObjectId::from(2usize), 0, 0, 200, 200);
+        fix.state.managed_window_mut(lower).unwrap().mapped = true;
+        let workspace = fix
+            .state
+            .managed_window_state(fix.window)
+            .unwrap()
+            .workspace_id;
+        fix.state
+            .workspaces
+            .try_get_mut(workspace)
+            .unwrap()
+            .layout
+            .floating
+            .stack = vec![lower_window, fix.window];
+
+        fix.state.seat.pointer_pos = (50.0, 50.0);
+        assert_eq!(
+            crate::input::scene_pick_at(&fix.state, (50.0, 50.0))
+                .surface_focus
+                .map(|focus| focus.target.surface),
+            Some(fix.surface)
+        );
+
+        fix.get_drag(20).unwrap();
+        fix.dispatch(fix.drag(20).object_id(), 20, attach_request(20, 13, 50, 50))
+            .unwrap();
+        let serial = fix.arm();
+        fix.start(11, serial).unwrap();
+
+        assert_eq!(
+            fix.state
+                .seat
+                .active_drag()
+                .unwrap()
+                .target
+                .map(|target| target.surface),
+            Some(lower)
+        );
+    }
+
+    #[test]
+    fn cancel_restores_a_floating_window_and_drop_keeps_it() {
+        let mut fix = Fixture::new();
+        fix.bind_managed_window();
+        fix.set_floating();
+        fix.map(80, 60);
+        fix.surface
+            .try_ref_mut(&mut fix.state)
+            .unwrap()
+            .set_root_position(30, 40);
+        fix.state.seat.pointer_pos = (100.0, 200.0);
+        fix.get_drag(20).unwrap();
+        fix.dispatch(fix.drag(20).object_id(), 20, attach_request(20, 13, 4, 8))
+            .unwrap();
+        let serial = fix.arm();
+        fix.start(11, serial).unwrap();
+        assert_eq!(fix.root_pos(), (96, 192));
+        crate::seat::cancel_active_drag(&mut fix.state, &mut fix.dispatcher, None);
+        assert_eq!(fix.root_pos(), (30, 40));
+
+        let mut fix = Fixture::new();
+        fix.bind_managed_window();
+        fix.set_floating();
+        fix.map(80, 60);
+        fix.surface
+            .try_ref_mut(&mut fix.state)
+            .unwrap()
+            .set_root_position(30, 40);
+        fix.state.seat.pointer_pos = (100.0, 200.0);
+        fix.get_drag(20).unwrap();
+        fix.dispatch(fix.drag(20).object_id(), 20, attach_request(20, 13, 4, 8))
+            .unwrap();
+        let serial = fix.arm();
+        fix.start(11, serial).unwrap();
+        crate::seat::handle_pointer_motion(
+            &mut fix.state,
+            &mut fix.dispatcher,
+            10.0,
+            -5.0,
+            10.0,
+            -5.0,
+            1,
+            0,
+        );
+        fix.state
+            .seat
+            .set_active_drag(droppable(fix.surface, fix.source));
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+        assert_eq!(fix.root_pos(), (106, 187));
+        assert_eq!(fix.phase(20), DragObjPhase::Ended);
     }
 }
 

@@ -16,6 +16,14 @@ use super::{
 };
 
 pub(crate) fn scene_pick_at(state: &State, pointer_pos: (f64, f64)) -> ScenePick {
+    scene_pick_at_excluding(state, pointer_pos, None)
+}
+
+pub(crate) fn scene_pick_at_excluding(
+    state: &State,
+    pointer_pos: (f64, f64),
+    excluded: Option<Resolved<WlSurfaceId>>,
+) -> ScenePick {
     if state.session_lock.input_gated() {
         return pick_mapped_lock_surface(state, pointer_pos);
     }
@@ -25,7 +33,14 @@ pub(crate) fn scene_pick_at(state: &State, pointer_pos: (f64, f64)) -> ScenePick
     // come only from that output's interactive participants.
     if state.outputs.iter().next().is_none() {
         let ordered_roots = compose_global_root_order(state, &scene, None);
-        return pick_roots(state, pointer_pos, ordered_roots.into_iter().rev());
+        return pick_roots(
+            state,
+            pointer_pos,
+            ordered_roots
+                .into_iter()
+                .rev()
+                .filter(move |root| Some(*root) != excluded),
+        );
     }
     let Some(output_id) = pointer_output(state, pointer_pos) else {
         return ScenePick { surface_focus: None, window_target: None };
@@ -42,7 +57,8 @@ pub(crate) fn scene_pick_at(state: &State, pointer_pos: (f64, f64)) -> ScenePick
                     || (entry.participates_in_render
                         && state.root_surface_is_mapped(entry.root_surface))
             })
-            .map(|entry| entry.root_surface),
+            .map(|entry| entry.root_surface)
+            .filter(move |root| Some(*root) != excluded),
     )
 }
 
@@ -137,7 +153,15 @@ pub(crate) fn surface_focus_pick_at(
     state: &State,
     pointer_pos: (f64, f64),
 ) -> Option<SurfaceFocusPick> {
-    let mut focus = scene_pick_at(state, pointer_pos).surface_focus;
+    surface_focus_pick_at_excluding(state, pointer_pos, None)
+}
+
+pub(crate) fn surface_focus_pick_at_excluding(
+    state: &State,
+    pointer_pos: (f64, f64),
+    excluded: Option<Resolved<WlSurfaceId>>,
+) -> Option<SurfaceFocusPick> {
+    let mut focus = scene_pick_at_excluding(state, pointer_pos, excluded).surface_focus;
     if let Some(grab_client_id) = state.seat.popup_grab_client() {
         if focus.is_some_and(|pick| pick.target.client_id() != grab_client_id) {
             focus = None;
@@ -468,7 +492,8 @@ mod tests {
     };
 
     use super::{
-        build_protocol_move_target, build_protocol_resize_target, scene_pick_at, WindowRoleSnapshot,
+        build_protocol_move_target, build_protocol_resize_target, scene_pick_at,
+        scene_pick_at_excluding, WindowRoleSnapshot,
     };
 
     fn insert_pick_root(state: &mut crate::state::State, raw: u32) -> Resolved<WlSurfaceId> {
@@ -754,6 +779,8 @@ mod tests {
 
         let pick = scene_pick_at(&state, (10.0, 10.0));
         assert_eq!(pick.surface_focus.map(|focus| focus.target.surface), Some(upper));
+        let excluded = scene_pick_at_excluding(&state, (10.0, 10.0), Some(upper));
+        assert_eq!(excluded.surface_focus.map(|focus| focus.target.surface), Some(lower));
     }
 
     #[test]

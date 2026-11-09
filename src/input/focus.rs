@@ -16,7 +16,7 @@ use {
     std::collections::BTreeSet,
 };
 
-use super::{scene_pick_for_pointer, surface_focus_pick_at, SurfaceFocus, SurfaceRect};
+use super::{scene_pick_for_pointer, surface_focus_pick_at_excluding, SurfaceFocus, SurfaceRect};
 
 pub(crate) fn set_keyboard_focus(
     state: &mut State,
@@ -666,7 +666,11 @@ pub(crate) fn refresh_drag_focus(
         return true;
     }
 
-    let hit = surface_focus_pick_at(state, state.seat.pointer_position());
+    let hit = surface_focus_pick_at_excluding(
+        state,
+        state.seat.pointer_position(),
+        crate::input::toplevel_drag::dragged_root(state),
+    );
     let mut new_target = hit.map(|focus| DragTargetState { surface: focus.target.surface });
     if active_drag.source.object_id().is_none()
         && new_target

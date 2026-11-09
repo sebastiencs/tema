@@ -91,6 +91,9 @@ enum PostWlSurface {
     DetachToplevelDrag {
         root: Resolved<WlSurfaceId>,
     },
+    ToplevelDragMapped {
+        root: Resolved<WlSurfaceId>,
+    },
 }
 
 impl PostAction for PostWlSurface {
@@ -126,6 +129,9 @@ impl PostAction for PostWlSurface {
             }
             PostWlSurface::DetachToplevelDrag { root } => {
                 crate::input::toplevel_drag::detach(state, root);
+            }
+            PostWlSurface::ToplevelDragMapped { root } => {
+                crate::input::toplevel_drag::on_mapped(state, dispatcher, root);
             }
         }
     }
@@ -2653,6 +2659,11 @@ impl WlSurface {
                         dispatcher.dispatch_post_action(PostWlSurface::FocusNewToplevel {
                             root_surface: resolved_surface,
                         });
+                        if crate::input::toplevel_drag::tracks_root(state, resolved_surface) {
+                            dispatcher.dispatch_post_action(PostWlSurface::ToplevelDragMapped {
+                                root: resolved_surface,
+                            });
+                        }
                     }
                     if let Some(window) = state.window_for_root(resolved_surface) {
                         if is_mapped {
