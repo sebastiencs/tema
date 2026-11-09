@@ -148,6 +148,13 @@ wayland_id! {
   WpTearingControlV1Id,
   XdgActivationV1Id,
   XdgActivationTokenV1Id,
+  XdgSessionManagerV1Id,
+  XdgSessionV1Id,
+  XdgToplevelSessionV1Id,
+  XdgSystemBellV1Id,
+  XdgToplevelIconManagerV1Id,
+  XdgToplevelIconV1Id,
+  XdgToplevelTagManagerV1Id,
   XwaylandShellV1Id,
   XwaylandSurfaceV1Id,
   WpCursorShapeManagerV1Id,
@@ -175,6 +182,8 @@ wayland_id! {
   ZxdgToplevelDecorationV1Id,
   ZxdgOutputManagerV1Id,
   ZxdgOutputV1Id,
+  XdgToplevelDragManagerV1Id,
+  XdgToplevelDragV1Id,
   ExtWorkspaceManagerV1Id,
   ExtWorkspaceGroupHandleV1Id,
   ExtWorkspaceHandleV1Id,
@@ -13110,6 +13119,761 @@ pub mod xdg_activation_token_v1 {
     }
 }
 
+/// Manage sessions for applications
+///
+/// The xdg_session_manager_v1 interface defines base requests for creating and
+/// managing a session for an application. Sessions persist across application
+/// and compositor restarts unless explicitly destroyed. A session is created
+/// for the purpose of maintaining an application's xdg_toplevel surfaces
+/// across compositor or application restarts. The compositor should remember
+/// as many states as possible for surfaces in a given session, but there is
+/// no requirement for which states must be remembered.
+///
+/// Policies such as cache eviction are declared an implementation detail of
+/// the compositor. Clients should account for no longer existing sessions.
+pub mod xdg_session_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_session_manager_v1::XdgSessionManagerV1 {
+        const INTERFACE_NAME: &'static str = "xdg_session_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgSessionManagerV1Id {
+        type Object = crate::wayland_objects::xdg_session_manager_v1::XdgSessionManagerV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::xdg_session_manager_v1::XdgSessionManagerV1
+    {
+        type Id = XdgSessionManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy this object
+        ///
+        /// Destroy the manager object. The existing session objects will be
+        /// unaffected.
+        Destroy,
+        /// Create or restore a session
+        ///
+        /// Create a session object corresponding to either an existing session
+        /// identified by the given session identifier string or a new session.
+        /// While the session object exists, the session is considered to be "in
+        /// use".
+        ///
+        /// If an identifier string represents a session that is currently actively
+        /// in use by the the same client, an 'in_use' error is raised. If some
+        /// other client is currently using the same session, the new session will
+        /// replace managing the associated state.
+        ///
+        /// If the reason is not a valid enum entry, the 'invalid_reason' protocol
+        /// error is raised.
+        ///
+        /// NULL is passed to initiate a new session. If a session_id is passed
+        /// which does not represent a valid session, the compositor treats it as if
+        /// NULL had been passed.
+        ///
+        /// The session id string must be UTF-8 encoded. It is also limited by the
+        /// maximum length of wayland messages (around 4KB). The 'invalid_session_id'
+        /// protocol error will be raised if an invalid string is provided.
+        ///
+        /// A client is allowed to have any number of in use sessions at the same
+        /// time.
+        GetSession {
+            id: XdgSessionV1Id,
+            /// Reason for session,
+            reason: u32,
+            /// The session to restore,
+            session_id: String,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_session_manager_v1::XdgSessionManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetSession {
+                    id: req.id()?,
+                    reason: req.uint()?,
+                    session_id: req.string()?,
+                },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// A requested session is already in use,
+        InUse = 1,
+        /// Invalid session identifier,
+        InvalidSessionId = 2,
+        /// Invalid reason,
+        InvalidReason = 3,
+    }
+    /// Reason for getting a session
+    ///
+    /// The reason may determine in what way a session restores the window
+    /// management state of associated toplevels.
+    ///
+    /// For example newly launched applications might be launched on the active
+    /// workspace with restored size and position, while a recovered
+    /// application might restore additional state such as active workspace and
+    /// stacking order.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Reason {
+        /// An app is newly launched
+        ///
+        /// A new app instance is launched, for example from an app launcher.
+        Launch = 1,
+        /// An app recovered
+        ///
+        /// An app instance is recovering from for example a compositor or app crash.
+        Recover = 2,
+        /// An app restored
+        ///
+        /// An app instance is restored, for example part of a restored session, or
+        /// restored from having been temporarily terminated due to resource
+        /// constraints.
+        SessionRestore = 3,
+    }
+}
+
+/// A session for an application
+///
+/// A xdg_session_v1 object represents a session for an application. While the
+/// object exists, all surfaces which have been added to the session will
+/// have states stored by the compositor which can be reapplied at a later
+/// time. Two sessions cannot exist for the same identifier string.
+///
+/// States for surfaces added to a session are automatically updated by the
+/// compositor when they are changed.
+pub mod xdg_session_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_session_v1::XdgSessionV1 {
+        const INTERFACE_NAME: &'static str = "xdg_session_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgSessionV1Id {
+        type Object = crate::wayland_objects::xdg_session_v1::XdgSessionV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::xdg_session_v1::XdgSessionV1 {
+        type Id = XdgSessionV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the session
+        ///
+        /// Destroy a session object, preserving the current state but not continuing
+        /// to make further updates if state changes occur. This makes the associated
+        /// xdg_toplevel_session_v1 objects inert.
+        Destroy,
+        /// Remove the session
+        ///
+        /// Remove the session, making it no longer available for restoration. A
+        /// compositor should in response to this request remove the data related to
+        /// this session from its storage.
+        Remove,
+        /// Add a new surface to the session
+        ///
+        /// Attempt to add a given surface to the session. The passed name is used
+        /// to identify what window is being restored, and may be used to store
+        /// window specific state within the session.
+        ///
+        /// The name given to the toplevel must not correspond to any previously
+        /// existing toplevel names in the session. If the name matches an already
+        /// known toplevel name in the session, a 'name_in_use' protocol error will
+        /// be raised.
+        ///
+        /// The toplevel object must not be added more than once to any session
+        /// created by the client, otherwise the 'already_added' protocol error
+        /// will be raised.
+        ///
+        /// This request will return a xdg_toplevel_session_v1 for later
+        /// manipulation. As this resource is created from an empty initial state,
+        /// compositors must not emit a xdg_toplevel_session_v1.restored event for
+        /// resources created through this request.
+        ///
+        /// The name string must be UTF-8 encoded. It is also limited by the maximum
+        /// length of wayland messages (around 4KB). The 'invalid_name' protocol
+        /// error will be raised if an invalid string is provided.
+        AddToplevel {
+            id: XdgToplevelSessionV1Id,
+            toplevel: XdgToplevelId,
+            /// Name identifying the toplevel,
+            name: String,
+        },
+        /// Restore a surface state
+        ///
+        /// Inform the compositor that the toplevel associated with the passed name
+        /// should have its window management state restored.
+        ///
+        /// If the toplevel name was previously granted to another xdg_toplevel,
+        /// the 'name_in_use' protocol error will be raised.
+        ///
+        /// The toplevel object must not be added more than once to any session
+        /// created by the client, otherwise the 'already_added' protocol error
+        /// will be raised.
+        ///
+        /// This request must be called prior to the first commit on the associated
+        /// wl_surface after creating the toplevel, otherwise an 'already_mapped'
+        /// error is raised.
+        ///
+        /// As part of the initial configure sequence, if the toplevel was
+        /// successfully restored, a xdg_toplevel_session_v1.restored event is
+        /// emitted. If the toplevel name was not known in the session, this request
+        /// will be equivalent to the xdg_toplevel_session_v1.add_toplevel request,
+        /// and no such event will be emitted. See the xdg_toplevel_session_v1.restored
+        /// event for further details.
+        ///
+        /// The name string must be UTF-8 encoded. It is also limited by the maximum
+        /// length of wayland messages (around 4KB). The 'invalid_name' protocol
+        /// error will be raised if an invalid string is provided.
+        RestoreToplevel {
+            id: XdgToplevelSessionV1Id,
+            toplevel: XdgToplevelId,
+            /// Name identifying the toplevel,
+            name: String,
+        },
+        /// Remove a surface from the session
+        ///
+        /// Remove a specified surface from the session and render any related
+        /// xdg_toplevel_session_v1 object inert. The compositor should remove any
+        /// data related to the toplevel in the corresponding session from its internal
+        /// storage.
+        ///
+        /// The window is specified by its name in the session. The name string
+        /// must be encoded in UTF-8, and it is limited in size by the maximum
+        /// length of wayland messages (around 4KB).
+        RemoveToplevel {
+            /// Name identifying the toplevel,
+            name: String,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_session_v1::XdgSessionV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => Remove,
+                2 => AddToplevel { id: req.id()?, toplevel: req.id()?, name: req.string()? },
+                3 => RestoreToplevel { id: req.id()?, toplevel: req.id()?, name: req.string()? },
+                4 => RemoveToplevel { name: req.string()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Newly-created session id
+        ///
+        /// Emitted at most once some time after getting a new session object. It
+        /// means that no previous state was restored, and a new session was created.
+        /// The passed id can be persistently stored and used to restore previous
+        /// sessions.
+        Created { session_id: String },
+        /// The session has been restored
+        ///
+        /// Emitted at most once some time after getting a new session object. It
+        /// means that previous state was at least partially restored. The same id
+        /// can again be used to restore previous sessions.
+        Restored,
+        /// The session has been replaced
+        ///
+        /// Emitted at most once, if the session was taken over by some other
+        /// client. When this happens, the session and all its toplevel session
+        /// objects become inert, and should be destroyed.
+        Replaced,
+    }
+    impl EventWriter for crate::wayland_objects::xdg_session_v1::XdgSessionV1 {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Created { session_id } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 1);
+                    raw.string(session_id);
+                    raw
+                }
+                Restored {} => {
+                    let mut raw = RawEvent::new(self.id(), 1, 0);
+                    raw
+                }
+                Replaced {} => {
+                    let mut raw = RawEvent::new(self.id(), 2, 0);
+                    raw
+                }
+            }
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Toplevel name is already in use,
+        NameInUse = 1,
+        /// Toplevel was already mapped when restored,
+        AlreadyMapped = 2,
+        /// Provided toplevel name is invalid,
+        InvalidName = 3,
+        /// Toplevel already added,
+        AlreadyAdded = 4,
+    }
+}
+
+/// A session for an application
+///
+/// A xdg_toplevel_session_v1 resource acts as a handle for the given
+/// toplevel in the session. It allows for receiving events after a
+/// toplevel state was restored, and has the requests to manage them.
+pub mod xdg_toplevel_session_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_toplevel_session_v1::XdgToplevelSessionV1 {
+        const INTERFACE_NAME: &'static str = "xdg_toplevel_session_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgToplevelSessionV1Id {
+        type Object = crate::wayland_objects::xdg_toplevel_session_v1::XdgToplevelSessionV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::xdg_toplevel_session_v1::XdgToplevelSessionV1
+    {
+        type Id = XdgToplevelSessionV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the object
+        ///
+        /// Destroy the object. This has no effect over window management of the
+        /// associated toplevel.
+        Destroy,
+        /// Change the name of toplevel session
+        ///
+        /// Renames the toplevel session. The new name can be used in subsequent requests
+        /// to identify this session object. The state associated with this toplevel
+        /// session will be preserved.
+        ///
+        /// If the xdg_session_v1 already contains a toplevel with the specified name,
+        /// the 'name_in_use' protocol error will be raised.
+        Rename {
+            /// New name to identify the toplevel,
+            name: String,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_toplevel_session_v1::XdgToplevelSessionV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => Rename { name: req.string()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// A toplevel's session has been restored
+        ///
+        /// The "restored" event is emitted prior to the first
+        /// xdg_toplevel.configure for the toplevel. It will only be emitted after
+        /// xdg_session_v1.restore_toplevel, and the initial empty surface state has
+        /// been applied, and it indicates that the surface's session is being
+        /// restored with this configure event.
+        Restored,
+    }
+    impl EventWriter for crate::wayland_objects::xdg_toplevel_session_v1::XdgToplevelSessionV1 {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Restored {} => {
+                    let mut raw = RawEvent::new(self.id(), 0, 0);
+                    raw
+                }
+            }
+        }
+    }
+}
+
+/// System bell
+///
+/// This global interface enables clients to ring the system bell.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod xdg_system_bell_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_system_bell_v1::XdgSystemBellV1 {
+        const INTERFACE_NAME: &'static str = "xdg_system_bell_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgSystemBellV1Id {
+        type Object = crate::wayland_objects::xdg_system_bell_v1::XdgSystemBellV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::xdg_system_bell_v1::XdgSystemBellV1 {
+        type Id = XdgSystemBellV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the system bell object
+        ///
+        /// Notify that the object will no longer be used.
+        Destroy,
+        /// Ring the system bell
+        ///
+        /// This requests rings the system bell on behalf of a client. How ringing
+        /// the bell is implemented is up to the compositor. It may be an audible
+        /// sound, a visual feedback of some kind, or any other thing including
+        /// nothing.
+        ///
+        /// The passed surface should correspond to a toplevel like surface role,
+        /// or be null, meaning the client doesn't have a particular toplevel it
+        /// wants to associate the bell ringing with. See the xdg-shell protocol
+        /// extension for a toplevel like surface role.
+        Ring {
+            /// Associated surface,
+            surface: WlSurfaceId,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_system_bell_v1::XdgSystemBellV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => Ring { surface: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+}
+
+/// Interface to manage toplevel icons
+///
+/// This interface allows clients to create toplevel window icons and set
+/// them on toplevel windows to be displayed to the user.
+pub mod xdg_toplevel_icon_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1 {
+        const INTERFACE_NAME: &'static str = "xdg_toplevel_icon_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgToplevelIconManagerV1Id {
+        type Object =
+            crate::wayland_objects::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1
+    {
+        type Id = XdgToplevelIconManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the toplevel icon manager
+        ///
+        /// Destroy the toplevel icon manager.
+        /// This does not destroy objects created with the manager.
+        Destroy,
+        /// Create a new icon instance
+        ///
+        /// Creates a new icon object. This icon can then be attached to a
+        /// xdg_toplevel via the 'set_icon' request.
+        CreateIcon { id: XdgToplevelIconV1Id },
+        /// Set an icon on a toplevel window
+        ///
+        /// This request assigns the icon 'icon' to 'toplevel', or clears the
+        /// toplevel icon if 'icon' was null.
+        /// This state is double-buffered and is applied on the next
+        /// wl_surface.commit of the toplevel.
+        ///
+        /// After making this call, the xdg_toplevel_icon_v1 provided as 'icon'
+        /// can be destroyed by the client without 'toplevel' losing its icon.
+        /// The xdg_toplevel_icon_v1 is immutable from this point, and any
+        /// future attempts to change it must raise the
+        /// 'xdg_toplevel_icon_v1.immutable' protocol error.
+        ///
+        /// The compositor must set the toplevel icon from either the pixel data
+        /// the icon provides, or by loading a stock icon using the icon name.
+        /// See the description of 'xdg_toplevel_icon_v1' for details.
+        ///
+        /// If 'icon' is set to null, the icon of the respective toplevel is reset
+        /// to its default icon (usually the icon of the application, derived from
+        /// its desktop-entry file, or a placeholder icon).
+        /// If this request is passed an icon with no pixel buffers or icon name
+        /// assigned, the icon must be reset just like if 'icon' was null.
+        SetIcon {
+            /// The toplevel to act on,
+            toplevel: XdgToplevelId,
+            icon: XdgToplevelIconV1Id,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => CreateIcon { id: req.id()? },
+                2 => SetIcon { toplevel: req.id()?, icon: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Describes a supported &amp; preferred icon size
+        ///
+        /// This event indicates an icon size the compositor prefers to be
+        /// available if the client has scalable icons and can render to any size.
+        ///
+        /// When the 'xdg_toplevel_icon_manager_v1' object is created, the
+        /// compositor may send one or more 'icon_size' events to describe the list
+        /// of preferred icon sizes. If the compositor has no size preference, it
+        /// may not send any 'icon_size' event, and it is up to the client to
+        /// decide a suitable icon size.
+        ///
+        /// A sequence of 'icon_size' events must be finished with a 'done' event.
+        /// If the compositor has no size preferences, it must still send the
+        /// 'done' event, without any preceding 'icon_size' events.
+        IconSize {
+            /// The edge size of the square icon in surface-local coordinates, e.g. 64,
+            size: i32,
+        },
+        /// All information has been sent
+        ///
+        /// This event is sent after all 'icon_size' events have been sent.
+        Done,
+    }
+    impl EventWriter
+        for crate::wayland_objects::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1
+    {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                IconSize { size } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 1);
+                    raw.int(size);
+                    raw
+                }
+                Done {} => {
+                    let mut raw = RawEvent::new(self.id(), 1, 0);
+                    raw
+                }
+            }
+        }
+    }
+}
+
+/// A toplevel window icon
+///
+/// This interface defines a toplevel icon.
+/// An icon can have a name, and multiple buffers.
+/// In order to be applied, the icon must have either a name, or at least
+/// one buffer assigned. Applying an empty icon (with no buffer or name) to
+/// a toplevel should reset its icon to the default icon.
+///
+/// It is up to compositor policy whether to prefer using a buffer or loading
+/// an icon via its name. See 'set_name' and 'add_buffer' for details.
+pub mod xdg_toplevel_icon_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_toplevel_icon_v1::XdgToplevelIconV1 {
+        const INTERFACE_NAME: &'static str = "xdg_toplevel_icon_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgToplevelIconV1Id {
+        type Object = crate::wayland_objects::xdg_toplevel_icon_v1::XdgToplevelIconV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::xdg_toplevel_icon_v1::XdgToplevelIconV1
+    {
+        type Id = XdgToplevelIconV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the icon object
+        ///
+        /// Destroys the 'xdg_toplevel_icon_v1' object.
+        /// The icon must still remain set on every toplevel it was assigned to,
+        /// until the toplevel icon is reset explicitly.
+        Destroy,
+        /// Set an icon name
+        ///
+        /// This request assigns an icon name to this icon.
+        /// Any previously set name is overridden.
+        ///
+        /// The compositor must resolve 'icon_name' according to the lookup rules
+        /// described in the XDG icon theme specification[1] using the
+        /// environment's current icon theme.
+        ///
+        /// If the compositor does not support icon names or cannot resolve
+        /// 'icon_name' according to the XDG icon theme specification it must
+        /// fall back to using pixel buffer data instead.
+        ///
+        /// If this request is made after the icon has been assigned to a toplevel
+        /// via 'set_icon', an 'immutable' error must be raised.
+        ///
+        /// [1]: https://specifications.freedesktop.org/icon-theme-spec/icon-theme-spec-latest.html
+        SetName { icon_name: String },
+        /// Add icon data from a pixel buffer
+        ///
+        /// This request adds pixel data supplied as wl_buffer to the icon.
+        ///
+        /// The client should add pixel data for all icon sizes and scales that
+        /// it can provide, or which are explicitly requested by the compositor
+        /// via 'icon_size' events on xdg_toplevel_icon_manager_v1.
+        ///
+        /// The wl_buffer supplying pixel data as 'buffer' must be backed by wl_shm
+        /// and must be a square (width and height being equal).
+        /// If any of these buffer requirements are not fulfilled, a 'invalid_buffer'
+        /// error must be raised.
+        ///
+        /// If this icon instance already has a buffer of the same size and scale
+        /// from a previous 'add_buffer' request, data from the last request
+        /// overrides the preexisting pixel data.
+        ///
+        /// The wl_buffer must be kept alive for as long as the xdg_toplevel_icon
+        /// it is associated with is not destroyed, otherwise a 'no_buffer' error
+        /// is raised. The buffer contents must not be modified after it was
+        /// assigned to the icon. As a result, the region of the wl_shm_pool's
+        /// backing storage used for the wl_buffer must not be modified after this
+        /// request is sent. The wl_buffer.release event is unused.
+        ///
+        /// If this request is made after the icon has been assigned to a toplevel
+        /// via 'set_icon', an 'immutable' error must be raised.
+        AddBuffer {
+            buffer: WlBufferId,
+            /// The scaling factor of the icon, e.g. 1,
+            scale: i32,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_toplevel_icon_v1::XdgToplevelIconV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => SetName { icon_name: req.string()? },
+                2 => AddBuffer { buffer: req.id()?, scale: req.int()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// The provided buffer does not satisfy requirements,
+        InvalidBuffer = 1,
+        /// The icon has already been assigned to a toplevel and must not be changed,
+        Immutable = 2,
+        /// The provided buffer has been destroyed before the toplevel icon,
+        NoBuffer = 3,
+    }
+}
+
+/// Protocol for setting toplevel tags
+///
+/// In order to make some window properties like position, size,
+/// "always on top" or user defined rules for window behavior persistent, the
+/// compositor needs some way to identify windows even after the application
+/// has been restarted.
+/// This protocol allows clients to make this possible by setting a tag for
+/// toplevels.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod xdg_toplevel_tag_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1 {
+        const INTERFACE_NAME: &'static str = "xdg_toplevel_tag_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgToplevelTagManagerV1Id {
+        type Object = crate::wayland_objects::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1
+    {
+        type Id = XdgToplevelTagManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy toplevel tag object
+        ///
+        /// Destroy this toplevel tag manager object. This request has no other
+        /// effects.
+        Destroy,
+        /// Set tag
+        ///
+        /// Set a tag for a toplevel. The tag may be shown to the user in UI, so
+        /// it's preferable for it to be human readable, but it must be suitable
+        /// for configuration files and should not be translated.
+        /// Suitable tags would for example be "main window", "settings",
+        /// "e-mail composer" or similar.
+        ///
+        /// The tag does not need to be unique across applications, and the client
+        /// may set the same tag for multiple windows, for example if the user has
+        /// opened the same UI twice. How the potentially resulting conflicts are
+        /// handled is compositor policy.
+        ///
+        /// The client should set the tag as part of the initial commit on the
+        /// associated toplevel, but it may set it at any time afterwards as well,
+        /// for example if the purpose of the toplevel changes.
+        SetToplevelTag {
+            toplevel: XdgToplevelId,
+            /// Untranslated tag,
+            tag: String,
+        },
+        /// Set description
+        ///
+        /// Set a description for a toplevel. This description may be shown to the
+        /// user in UI or read by a screen reader for accessibility purposes, and
+        /// should be translated.
+        /// It is recommended to make the description the translation of the tag.
+        ///
+        /// The client should set the description as part of the initial commit on
+        /// the associated toplevel, but it may set it at any time afterwards as
+        /// well, for example if the purpose of the toplevel changes.
+        SetToplevelDescription {
+            toplevel: XdgToplevelId,
+            /// Translated description,
+            description: String,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => SetToplevelTag { toplevel: req.id()?, tag: req.string()? },
+                2 => SetToplevelDescription { toplevel: req.id()?, description: req.string()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+}
+
 /// Context object for Xwayland shell
 ///
 /// xwayland_shell_v1 is a singleton global object that
@@ -16259,6 +17023,173 @@ pub mod zxdg_output_v1 {
                 }
             }
         }
+    }
+}
+
+/// Move a window during a drag
+///
+/// This protocol enhances normal drag and drop with the ability to move a
+/// window at the same time. This allows having detachable parts of a window
+/// that when dragged out of it become a new window and can be dragged over
+/// an existing window to be reattached.
+///
+/// A typical workflow would be when the user starts dragging on top of a
+/// detachable part of a window, the client would create a wl_data_source and
+/// a xdg_toplevel_drag_v1 object and start the drag as normal via
+/// wl_data_device.start_drag. Once the client determines that the detachable
+/// window contents should be detached from the originating window, it creates
+/// a new xdg_toplevel with these contents and issues a
+/// xdg_toplevel_drag_v1.attach request before mapping it. From now on the new
+/// window is moved by the compositor during the drag as if the client called
+/// xdg_toplevel.move.
+///
+/// Dragging an existing window is similar. The client creates a
+/// xdg_toplevel_drag_v1 object and attaches the existing toplevel before
+/// starting the drag.
+///
+/// Clients use the existing drag and drop mechanism to detect when a window
+/// can be docked or undocked. If the client wants to snap a window into a
+/// parent window it should delete or unmap the dragged top-level. If the
+/// contents should be detached again it attaches a new toplevel as described
+/// above. If a drag operation is cancelled without being dropped, clients
+/// should revert to the previous state, deleting any newly created windows
+/// as appropriate. When a drag operation ends as indicated by
+/// wl_data_source.dnd_drop_performed the dragged toplevel window's final
+/// position is determined as if a xdg_toplevel_move operation ended.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod xdg_toplevel_drag_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1 {
+        const INTERFACE_NAME: &'static str = "xdg_toplevel_drag_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgToplevelDragManagerV1Id {
+        type Object =
+            crate::wayland_objects::xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1
+    {
+        type Id = XdgToplevelDragManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the xdg_toplevel_drag_manager_v1 object
+        ///
+        /// Destroy this xdg_toplevel_drag_manager_v1 object. Other objects,
+        /// including xdg_toplevel_drag_v1 objects created by this factory, are not
+        /// affected by this request.
+        Destroy,
+        /// Get an xdg_toplevel_drag for a wl_data_source
+        ///
+        /// Create an xdg_toplevel_drag for a drag and drop operation that is going
+        /// to be started with data_source.
+        ///
+        /// This request can only be made on sources used in drag-and-drop, so it
+        /// must be performed before wl_data_device.start_drag. Attempting to use
+        /// the source other than for drag-and-drop such as in
+        /// wl_data_device.set_selection will raise an invalid_source error.
+        ///
+        /// Destroying data_source while a toplevel is attached to the
+        /// xdg_toplevel_drag is undefined.
+        GetXdgToplevelDrag { id: XdgToplevelDragV1Id, data_source: WlDataSourceId },
+    }
+    impl Parser for crate::wayland_objects::xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetXdgToplevelDrag { id: req.id()?, data_source: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Data_source already used for toplevel drag,
+        InvalidSource = 0,
+    }
+}
+
+/// Object representing a toplevel move during a drag
+///
+///
+pub mod xdg_toplevel_drag_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_toplevel_drag_v1::XdgToplevelDragV1 {
+        const INTERFACE_NAME: &'static str = "xdg_toplevel_drag_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgToplevelDragV1Id {
+        type Object = crate::wayland_objects::xdg_toplevel_drag_v1::XdgToplevelDragV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::xdg_toplevel_drag_v1::XdgToplevelDragV1
+    {
+        type Id = XdgToplevelDragV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy an xdg_toplevel_drag_v1 object
+        ///
+        /// Destroy this xdg_toplevel_drag_v1 object. This request must only be
+        /// called after the underlying wl_data_source drag has ended, as indicated
+        /// by the dnd_drop_performed or cancelled events. In any other case an
+        /// ongoing_drag error is raised.
+        Destroy,
+        /// Move a toplevel with the drag operation
+        ///
+        /// Request that the window will be moved with the cursor during the drag
+        /// operation. The offset is a hint to the compositor how the toplevel
+        /// should be positioned relative to the cursor hotspot in surface local
+        /// coordinates and relative to the geometry of the toplevel being attached.
+        /// See xdg_surface.set_window_geometry. For example it might only
+        /// be used when an unmapped window is attached. The attached window
+        /// does not participate in the selection of the drag target.
+        ///
+        /// If the toplevel is unmapped while it is attached, it is automatically
+        /// detached from the drag. In this case this request has to be called again
+        /// if the window should be attached after it is remapped.
+        ///
+        /// This request can be called multiple times but issuing it while a
+        /// toplevel with an active role is attached raises a toplevel_attached
+        /// error.
+        Attach {
+            toplevel: XdgToplevelId,
+            /// Dragged surface x offset,
+            x_offset: i32,
+            /// Dragged surface y offset,
+            y_offset: i32,
+        },
+    }
+    impl Parser for crate::wayland_objects::xdg_toplevel_drag_v1::XdgToplevelDragV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => Attach {
+                    toplevel: req.id()?,
+                    x_offset: req.int()?,
+                    y_offset: req.int()?,
+                },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Valid toplevel already attached,
+        ToplevelAttached = 0,
+        /// Drag has not ended,
+        OngoingDrag = 1,
     }
 }
 

@@ -3849,17 +3849,18 @@ impl Arguments {
 
     pub fn string(&mut self) -> Result<String, ParserError> {
         let len = self.uint()? as usize;
-        // let nwords = len / 4;
-        let nwords = len.next_multiple_of(4) / 4;
-
-        let mut bytes = Vec::with_capacity(len);
-        for _ in 0..nwords {
-            let word = self.pop()?;
-            bytes.extend(u32::to_ne_bytes(word));
+        if len == 0 {
+            return Ok(String::new()); // null string; handlers treat "" as null
         }
-        assert!(bytes.len() >= len);
+        let nwords = len.next_multiple_of(4) / 4;
+        let mut bytes = Vec::with_capacity(nwords * 4);
+        for _ in 0..nwords {
+            bytes.extend(u32::to_ne_bytes(self.pop()?));
+        }
+        if bytes[len - 1] != 0 || bytes[..len - 1].contains(&0) {
+            return Err(ParserError::InvalidString);
+        }
         bytes.truncate(len - 1);
-
         String::from_utf8(bytes).map_err(|_| ParserError::InvalidString)
     }
 
@@ -3978,12 +3979,45 @@ mod clients_wire_tests {
         let _ = Array(vec![1, 2]).to_u32s();
     }
 
+    #[test]
     fn arguments_string_rejects_invalid_utf8() {
         let mut args = VecDeque::new();
         args.push_back(2);
         args.push_back(u32::from_ne_bytes([0xFFu8, 0xFF, 0, 0]));
         let mut a = Arguments { args };
         assert_eq!(a.string(), Err(ParserError::InvalidString));
+    }
+
+    #[test]
+    fn arguments_null_string_is_empty() {
+        let mut args = Arguments { args: VecDeque::from([0]) };
+        assert_eq!(args.string().unwrap(), "");
+        assert!(args.uint().is_err());
+    }
+
+    #[test]
+    fn arguments_string_rejects_a_missing_terminator() {
+        let mut args = Arguments {
+            args: VecDeque::from([2, u32::from_ne_bytes([b'a', b'b', 0, 0])]),
+        };
+        assert_eq!(args.string(), Err(ParserError::InvalidString));
+    }
+
+    #[test]
+    fn arguments_string_rejects_an_embedded_nul() {
+        let mut args = Arguments {
+            args: VecDeque::from([4, u32::from_ne_bytes([b'a', 0, b'b', 0])]),
+        };
+        assert_eq!(args.string(), Err(ParserError::InvalidString));
+    }
+
+    #[test]
+    fn arguments_string_round_trips_with_the_writer() {
+        let mut event = RawEvent::new(WaylandId::from(1), 0, 1);
+        event.string("hello");
+        let mut args = Arguments { args: event.arguments.args };
+        assert_eq!(args.string().unwrap(), "hello");
+        assert!(args.uint().is_err());
     }
 
     #[test]
