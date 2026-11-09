@@ -127,6 +127,7 @@ fn collect_unmanaged_scene_entries(
             || surface.has_lock_surface_role()
             || surface.is_hidden_xwayland_surface()
             || surface.layer_surface().is_some()
+            || surface.has_input_popup_role()
         {
             continue;
         }

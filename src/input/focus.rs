@@ -66,6 +66,16 @@ fn set_keyboard_focus_with_snapshot(
     }
 
     if let Some(new_focus) = new_focus {
+        let keymap = state.xkb.keymap_blob();
+        let modifiers = state.keyboard.modifiers();
+        crate::seat::ensure_client_keymap(
+            state,
+            dispatcher,
+            new_focus,
+            keymap,
+            crate::seat::empty_keys(),
+            modifiers,
+        );
         let keys = state.keyboard.pressed_keys();
         dispatch_client_event(
             dispatcher,
@@ -78,6 +88,7 @@ fn set_keyboard_focus_with_snapshot(
     let old_focus = state.seat.keyboard_focus;
     state.seat.keyboard_focus = new_focus;
     dispatcher.dispatch(crate::xwayland::XwaylandAction::KeyboardFocus);
+    super::ime::keyboard_focus_changed(state, dispatcher, old_focus, new_focus);
     if let Some(new_focus) = new_focus.filter(|_| !state.session_lock.input_gated()) {
         let root_focus = state
             .root_surface_for_surface(new_focus.surface)
@@ -196,6 +207,7 @@ fn keyboard_focus_is_restorable(state: &State, focus: SurfaceFocus) -> bool {
         || surface.has_cursor_role()
         || surface.has_dnd_icon_role()
         || (surface.has_xwayland_role() && state.window_for_root(focus.surface).is_none())
+        || surface.has_input_popup_role()
     {
         return false;
     }

@@ -9,8 +9,9 @@ use crate::{
 
 use super::{
     apply_interaction_intent, build_protocol_move_target, build_protocol_resize_target,
-    rect_contains_point, resize_cursor_icon_names, resize_edges_for_pointer, scene_pick_at,
-    HitSemantics, InteractionIntent, WindowHit, WindowRoleSnapshot, WindowTarget,
+    popup_keyboard_focus, rect_contains_point, resize_cursor_icon_names, resize_edges_for_pointer,
+    scene_pick_at, set_keyboard_focus, HitSemantics, InteractionIntent, SurfaceFocus,
+    SurfaceFocusPick, WindowHit, WindowRoleSnapshot, WindowTarget,
     POINTER_INTERACTION_START_OPTIONS, PROTOCOL_INTERACTION_START_OPTIONS,
 };
 
@@ -37,6 +38,79 @@ pub(crate) fn begin_pointer_binding(
         return false;
     };
     apply_interaction_intent(state, dispatcher, intent, POINTER_INTERACTION_START_OPTIONS)
+}
+
+/// Keyboard focus for a pointer press.
+///
+/// A layer surface with `keyboard_interactivity = none`, an unmanaged X window, or a
+/// window that refuses keyboard focus produces [`InteractionIntent::None`]: the press
+/// is delivered, and the current keyboard focus stays. Other hits produce
+/// [`InteractionIntent::FocusSurface`]. A press with no target clears keyboard focus.
+pub(crate) fn apply_pointer_press_keyboard_focus(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    pointer_focus: Option<SurfaceFocusPick>,
+) {
+    if !state.session_lock.input_gated() {
+        // Focusing the popup sends `wl_keyboard.leave` to the parent. Firefox closes its menu on that leave.
+        if let Some(focus) = popup_keyboard_focus(state) {
+            apply_interaction_intent(
+                state,
+                dispatcher,
+                InteractionIntent::FocusSurface(focus),
+                POINTER_INTERACTION_START_OPTIONS,
+            );
+            return;
+        }
+    }
+
+    let Some(pointer_focus) = pointer_focus else {
+        set_keyboard_focus(state, dispatcher, None);
+        return;
+    };
+    let focus = state
+        .root_surface_for_surface(pointer_focus.target.surface)
+        .map(SurfaceFocus::new)
+        .unwrap_or(pointer_focus.target);
+    let layer_keeps_focus =
+        crate::wayland_objects::zwlr_layer_surface_v1::layer_surface_keyboard_focus(
+            state,
+            focus.surface,
+        ) == Some(crate::wayland_objects::zwlr_layer_surface_v1::LayerKeyboardFocus::None);
+    let intent = if layer_keeps_focus || press_keeps_keyboard_focus(state, focus) {
+        InteractionIntent::None
+    } else {
+        InteractionIntent::FocusSurface(focus)
+    };
+    apply_interaction_intent(state, dispatcher, intent, POINTER_INTERACTION_START_OPTIONS);
+}
+
+/// An unmanaged X root keeps the current focus when that focus already belongs to an X
+/// surface. A window that refuses keyboard focus keeps it too.
+fn press_keeps_keyboard_focus(state: &State, root: SurfaceFocus) -> bool {
+    let Some(surface) = root.surface.try_ref(state) else {
+        return false;
+    };
+    if surface.has_xwayland_role() && state.window_for_root(root.surface).is_none() {
+        return keyboard_focus_root_has_xwayland_role(state);
+    }
+    let Some(window) = state.window_for_root(root.surface) else {
+        return false;
+    };
+    state
+        .toplevel(window)
+        .is_some_and(|toplevel| !toplevel.accepts_keyboard_focus())
+}
+
+fn keyboard_focus_root_has_xwayland_role(state: &State) -> bool {
+    let Some(focus) = state.seat.keyboard_focus else {
+        return false;
+    };
+    let root = state
+        .root_surface_for_surface(focus.surface)
+        .unwrap_or(focus.surface);
+    root.try_ref(state)
+        .is_some_and(|surface| surface.has_xwayland_role())
 }
 
 pub(crate) fn begin_decoration_pointer_action(

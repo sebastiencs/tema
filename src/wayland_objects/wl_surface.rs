@@ -15,7 +15,7 @@ use crate::{
         wp_viewport, xdg_wm_base, ExtSessionLockSurfaceV1Id, WaylandId, WlBufferId, WlCallbackId,
         WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId, WpFractionalScaleV1Id,
         WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpViewportId, XdgSurfaceId,
-        XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
+        XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id, ZwpInputPopupSurfaceV2Id,
     },
     region::{DamageRegion, RectI, RegionValue},
     scene::visibility::root_participates_in_input,
@@ -141,6 +141,7 @@ pub enum Role {
     Subsurface,
     LockSurface,
     XwaylandSurface,
+    InputPopup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +231,7 @@ pub struct WlSurface {
     xwayland_shown: bool,
     /// Map-time order of an override-redirect window. Later is higher.
     xwayland_shown_order: u64,
+    input_popup: Option<Resolved<ZwpInputPopupSurfaceV2Id>>,
 }
 
 #[derive(Clone, Debug)]
@@ -561,6 +563,7 @@ impl WlSurface {
             xwayland_serial: None,
             xwayland_shown: false,
             xwayland_shown_order: 0,
+            input_popup: None,
         }
     }
 
@@ -707,6 +710,34 @@ impl WlSurface {
 
     pub(crate) fn xwayland_shown_order(&self) -> u64 {
         self.xwayland_shown_order
+    }
+
+    pub fn has_input_popup_role(&self) -> bool {
+        self.role == Role::InputPopup
+    }
+
+    /// Assign the input-popup role. Fails when the surface already has a role or a buffer.
+    pub fn set_input_popup_role(&mut self) -> Result<(), ()> {
+        if self.role != Role::None || self.has_attached_or_committed_buffer() {
+            return Err(());
+        }
+        self.role = Role::InputPopup;
+        Ok(())
+    }
+
+    pub fn assign_input_popup(&mut self, popup: Resolved<ZwpInputPopupSurfaceV2Id>) {
+        self.input_popup = Some(popup);
+    }
+
+    pub fn input_popup(&self) -> Option<Resolved<ZwpInputPopupSurfaceV2Id>> {
+        self.input_popup
+    }
+
+    pub fn clear_input_popup_role(&mut self) {
+        if self.role == Role::InputPopup {
+            self.role = Role::None;
+            self.input_popup = None;
+        }
     }
 
     pub fn lock_surface(&self) -> Option<Resolved<ExtSessionLockSurfaceV1Id>> {
@@ -2491,7 +2522,7 @@ impl WlSurface {
                 }
             }
         }
-        if !this.has_cursor_role() && !this.has_dnd_icon_role() {
+        if !this.has_cursor_role() && !this.has_dnd_icon_role() && !this.has_input_popup_role() {
             (this, _) = client.with_ungrabbed(this, state, |state| {
                 state.mark_root_geometry_dirty_for_surface(resolved_surface);
             });
@@ -2609,6 +2640,10 @@ impl WlSurface {
                 request_outputs(state, this.output_membership_ids(), dispatcher);
                 request_active_output(state, dispatcher);
             }
+        }
+
+        if this.role == Role::InputPopup {
+            dispatcher.dispatch_post_action(crate::input::ime::RepositionInputPopups);
         }
 
         if matches!(this.shell_surface, Some(ShellSurfaceObject::LayerSurface(_))) {
