@@ -797,8 +797,8 @@ pub mod xdg_toplevel {
         object::{Object, Parser, PostAction, RequestResult},
         protocol_generated::{
             xdg_toplevel as proto_xdg_toplevel, zxdg_toplevel_decoration_v1, Array, WaylandId,
-            WlOutputId, WlSeatId, WlSurfaceId, XdgToplevelId, XdgToplevelSessionV1Id,
-            ZxdgToplevelDecorationV1Id,
+            WlOutputId, WlSeatId, WlSurfaceId, XdgToplevelDragV1Id, XdgToplevelId,
+            XdgToplevelSessionV1Id, ZxdgToplevelDecorationV1Id,
         },
         region::RectI,
         runner::Dispatcher,
@@ -832,6 +832,7 @@ pub mod xdg_toplevel {
         pending_icon: Option<Option<Rc<crate::toplevel_icon::ToplevelIcon>>>,
         session: Option<Resolved<XdgToplevelSessionV1Id>>,
         pending_session_restore: Option<(String, crate::session_store::ToplevelRecord)>,
+        toplevel_drag: Option<Resolved<XdgToplevelDragV1Id>>,
         parent: Option<Resolved<XdgToplevelId>>,
         parent_window: Option<WindowId>,
         min_size: Option<(i32, i32)>,
@@ -898,6 +899,7 @@ pub mod xdg_toplevel {
                 pending_icon: None,
                 session: None,
                 pending_session_restore: None,
+                toplevel_drag: None,
                 parent: None,
                 parent_window: None,
                 min_size: None,
@@ -1189,6 +1191,14 @@ pub mod xdg_toplevel {
 
         pub fn window(&self) -> WindowId {
             self.window
+        }
+
+        pub(crate) fn toplevel_drag(&self) -> Option<Resolved<XdgToplevelDragV1Id>> {
+            self.toplevel_drag
+        }
+
+        pub(crate) fn set_toplevel_drag(&mut self, drag: Option<Resolved<XdgToplevelDragV1Id>>) {
+            self.toplevel_drag = drag;
         }
 
         pub(crate) fn bind_object_id(&mut self, object_id: ObjectId) {
@@ -1777,6 +1787,20 @@ pub mod xdg_toplevel {
         }
     }
 
+    fn release_toplevel_drag(
+        state: &mut State,
+        drag: Option<Resolved<XdgToplevelDragV1Id>>,
+        toplevel: XdgToplevelId,
+        client_id: ClientId,
+    ) {
+        if let Some(drag) = drag {
+            if let Some(mut drag) = drag.try_ref_mut(state) {
+                drag.take_pending_if(toplevel);
+            }
+        }
+        crate::input::toplevel_drag::clear_attached_toplevel(state, toplevel, client_id);
+    }
+
     /// Outputs of the workspace whose layout currently contains `window`.
     ///
     /// `None` when the toplevel was never placed. Destroying it must not
@@ -1849,6 +1873,12 @@ pub mod xdg_toplevel {
                     if let Some(session) = self.session.take() {
                         crate::session::toplevel_gone(state, client, session, self.window);
                     }
+                    release_toplevel_drag(
+                        state,
+                        self.toplevel_drag.take(),
+                        self.id,
+                        self.client_id,
+                    );
                     crate::capture::unmap_window(state, dispatcher, self.window);
                     state.destroy_window(self.window);
                     if let Some(affected_outputs) = affected_outputs {
@@ -2094,6 +2124,7 @@ pub mod xdg_toplevel {
             if let Some(session) = self.session.take() {
                 crate::session::toplevel_gone(state, client, session, self.window);
             }
+            release_toplevel_drag(state, self.toplevel_drag.take(), self.id, self.client_id);
             crate::capture::unmap_window(state, dispatcher, self.window);
             state.destroy_window(self.window);
         }

@@ -28,6 +28,7 @@ pub struct WlDataSource {
     mime_types: Vec<String>,
     dnd_actions: u32,
     used: SourceUse,
+    toplevel_drag: Option<Resolved<crate::protocol_generated::XdgToplevelDragV1Id>>,
 }
 
 impl WlDataSource {
@@ -39,6 +40,7 @@ impl WlDataSource {
             mime_types: Vec::new(),
             dnd_actions: 0,
             used: SourceUse::Unused,
+            toplevel_drag: None,
         }
     }
 
@@ -74,6 +76,19 @@ impl WlDataSource {
 
     pub fn used(&self) -> SourceUse {
         self.used
+    }
+
+    pub(crate) fn toplevel_drag(
+        &self,
+    ) -> Option<Resolved<crate::protocol_generated::XdgToplevelDragV1Id>> {
+        self.toplevel_drag
+    }
+
+    pub(crate) fn set_toplevel_drag(
+        &mut self,
+        drag: Option<Resolved<crate::protocol_generated::XdgToplevelDragV1Id>>,
+    ) {
+        self.toplevel_drag = drag;
     }
 
     pub fn set_used(&mut self, used: SourceUse) {
@@ -138,7 +153,9 @@ impl Object for WlDataSource {
         match client.parse::<Self>(req, dispatcher)? {
             Offer { mime_type } => self.offer(mime_type),
             Destroy => {
-                destroy_source(client, state, dispatcher, self.id);
+                let drag = self.toplevel_drag();
+                destroy_source(client, state, dispatcher, self.id)?;
+                clear_drag_source(state, drag);
                 client.delete_id(&WlDisplay::default(), state, dispatcher, self.id.into());
             }
             SetActions { dnd_actions } => {
@@ -175,7 +192,33 @@ impl Object for WlDataSource {
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
     ) {
-        clear_selection_source(client, state, dispatcher, self.id, Some(client.client_id()));
+        let drag = self.toplevel_drag();
+        let _ =
+            clear_selection_source(client, state, dispatcher, self.id, Some(client.client_id()));
+        clear_drag_source(state, drag);
+    }
+}
+
+fn clear_drag_source(
+    state: &mut State,
+    drag: Option<Resolved<crate::protocol_generated::XdgToplevelDragV1Id>>,
+) {
+    let Some(drag) = drag else {
+        return;
+    };
+    let pending = drag.try_ref_mut(state).and_then(|mut drag| {
+        drag.clear_source();
+        drag.take_pending()
+    });
+    // `end` already dropped an attached toplevel. A drag that never started still
+    // holds the toplevel link on `pending`.
+    let Some((toplevel, _)) = pending else {
+        return;
+    };
+    if let Some(mut toplevel) = toplevel.try_ref_mut(state) {
+        if toplevel.toplevel_drag() == Some(drag) {
+            toplevel.set_toplevel_drag(None);
+        }
     }
 }
 

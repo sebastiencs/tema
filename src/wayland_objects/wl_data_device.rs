@@ -199,6 +199,15 @@ fn set_selection(
                 );
                 return Ok(());
             }
+            if source_object.toplevel_drag().is_some() {
+                client.protocol_violation_disconnect(
+                    dispatcher,
+                    source.wayland_id().into(),
+                    crate::protocol_generated::wl_data_source::Error::InvalidSource as u32,
+                    "source is used for xdg_toplevel_drag",
+                );
+                return Ok(());
+            }
             // Real clients sometimes reuse the same wl_data_source object for multiple
             // selection operations. wlroots and Smithay are intentionally permissive
             // here, so we keep the source usable instead of disconnecting.
@@ -285,6 +294,9 @@ fn start_drag(
         negotiation: Default::default(),
         phase: DragPhase::Dragging,
     });
+    if let Some(source) = source {
+        crate::input::toplevel_drag::begin(state, dispatcher, source, origin);
+    }
     if icon.is_some() {
         dispatcher.dispatch_to(client_id, ClientAction::RefreshSurfaceOutputs);
         crate::drm::request_active_output(state, dispatcher);

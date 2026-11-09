@@ -5,7 +5,10 @@ pub(crate) mod interaction;
 pub(crate) mod pick;
 pub(crate) mod pointer_confine;
 pub(crate) mod pointer_lock;
+pub(crate) mod toplevel_drag;
 pub(crate) mod types;
+
+pub(crate) use toplevel_drag::{ToplevelDragEnd, ToplevelDragState};
 
 pub use types::SurfaceFocus;
 pub(crate) use {

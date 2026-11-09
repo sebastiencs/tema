@@ -12,7 +12,8 @@ use crate::{
     input::{
         apply_pointer_press_keyboard_focus, maybe_dismiss_popup_grab_on_button,
         popup_keyboard_focus, refresh_drag_focus, set_keyboard_focus, ActiveGrabState, ImeState,
-        PointerInteractiveGrab, ScenePick, SurfaceFocusPick, WindowHit,
+        PointerInteractiveGrab, ScenePick, SurfaceFocusPick, ToplevelDragEnd, ToplevelDragState,
+        WindowHit,
     },
     protocol_generated::{
         Array, ExtDataControlDeviceV1Id, WlDataDeviceId, WlDataOfferId, WlDataSourceId,
@@ -344,6 +345,8 @@ pub struct SeatState {
     primary_selection_source: Option<PrimarySelectionSourceState>,
     primary_selection_serial: u32,
     active_drag: Option<DragState>,
+    /// `xdg_toplevel_drag_v1` riding on `active_drag`, when the source has one.
+    pub(crate) toplevel_drag: Option<ToplevelDragState>,
     pointer_resources: BTreeMap<ClientId, Vec<Resolved<WlPointerId>>>,
     relative_pointers: BTreeMap<Resolved<WlPointerId>, Vec<Resolved<ZwpRelativePointerV1Id>>>,
     pub(crate) active_pointer_lock: Option<Resolved<ZwpLockedPointerV1Id>>,
@@ -389,6 +392,7 @@ impl Default for SeatState {
             primary_selection_source: None,
             primary_selection_serial: 0,
             active_drag: None,
+            toplevel_drag: None,
             pointer_resources: BTreeMap::default(),
             relative_pointers: BTreeMap::default(),
             active_pointer_lock: None,
@@ -1032,6 +1036,15 @@ impl SeatState {
 
     pub(crate) fn remove_client(&mut self, client_id: ClientId) -> SeatClientRemovalResult {
         let mut result = SeatClientRemovalResult::default();
+        if self.toplevel_drag.as_ref().is_some_and(|drag| {
+            drag.source.client_id() == client_id
+                || drag
+                    .attached
+                    .is_some_and(|attached| attached.toplevel.client_id() == client_id)
+        }) {
+            // The client's windows are going away, so there is nothing to place.
+            self.toplevel_drag = None;
+        }
         self.client_serials.remove(&client_id);
         self.data_device_resources.remove(&client_id);
         self.data_control_devices.remove(&client_id);
@@ -1132,6 +1145,14 @@ impl SeatState {
     pub(crate) fn next_serial(&mut self) -> u32 {
         let serial = self.current_serial;
         self.current_serial = self.current_serial.wrapping_add(1).max(1);
+        serial
+    }
+
+    /// A pointer press `start_drag` will accept for `focus`.
+    #[cfg(test)]
+    pub(crate) fn test_arm_drag_serial(&mut self, focus: SurfaceFocus) -> u32 {
+        let serial = self.next_serial();
+        self.record_pointer_button(1, serial, Some(focus));
         serial
     }
 
@@ -1727,6 +1748,8 @@ pub fn gate_for_session_lock(state: &mut State, dispatcher: &mut Dispatcher) {
 }
 
 pub fn quiesce_for_session_pause(state: &mut State, dispatcher: &mut Dispatcher) {
+    // Cancel before replaying buttons. A release would otherwise complete a drop.
+    cancel_active_drag(state, dispatcher, None);
     let time = monotonic_time_msec();
     if state.seat.pointer_interactive_grab.is_some() {
         abort_pointer_interactive_grab(state, dispatcher, time);
@@ -1739,7 +1762,6 @@ pub fn quiesce_for_session_pause(state: &mut State, dispatcher: &mut Dispatcher)
     for button in buttons {
         handle_pointer_button(state, dispatcher, button, 0, time);
     }
-    cancel_active_drag(state, dispatcher, None);
     if let Some((client_id, popups)) = state.seat.dismiss_popup_grab() {
         dispatcher.dispatch_to(client_id, ClientAction::DismissPopupGrab { popups });
     }
@@ -1985,6 +2007,7 @@ pub(crate) fn monotonic_time_msec() -> u32 {
 }
 
 pub fn finish_active_drag(state: &mut State, dispatcher: &mut Dispatcher) {
+    crate::input::toplevel_drag::end(state, dispatcher, ToplevelDragEnd::Cancelled);
     let Some(drag) = state.seat.clear_active_drag() else {
         return;
     };
@@ -2007,6 +2030,7 @@ pub fn cancel_active_drag(
     dispatcher: &mut Dispatcher,
     source: Option<Resolved<WlDataSourceId>>,
 ) {
+    crate::input::toplevel_drag::end(state, dispatcher, ToplevelDragEnd::Cancelled);
     let Some(drag) = state.seat.clear_active_drag() else {
         return;
     };
@@ -2167,13 +2191,14 @@ fn output_bounds(state: &State) -> Option<crate::region::RectI> {
     state.output_layout_bounds()
 }
 
-fn complete_drag_drop(state: &mut State, dispatcher: &mut Dispatcher) {
+pub(crate) fn complete_drag_drop(state: &mut State, dispatcher: &mut Dispatcher) {
     let Some(drag) = state.seat.active_drag() else {
         return;
     };
     if state.seat.active_drag_can_drop() {
         let target = drag.target.expect("validated active drag target");
         state.seat.set_active_drag_phase(DragPhase::DropSent);
+        crate::input::toplevel_drag::end(state, dispatcher, ToplevelDragEnd::Dropped);
         dispatcher.dispatch_to(target.client_id(), ClientAction::DataDeviceDragDrop);
         if let Some(source) = drag.source.resolved() {
             dispatcher.dispatch_to(
@@ -2187,6 +2212,7 @@ fn complete_drag_drop(state: &mut State, dispatcher: &mut Dispatcher) {
             finish_active_drag(state, dispatcher);
         }
     } else {
+        crate::input::toplevel_drag::end(state, dispatcher, ToplevelDragEnd::ReleasedWithoutTarget);
         cancel_active_drag(state, dispatcher, None);
     }
 }

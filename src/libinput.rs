@@ -433,6 +433,11 @@ impl Model for Libinput {
                 crate::input::pointer_lock::release_active_pointer_lock(state, dispatcher);
                 crate::input::pointer_confine::release_active_pointer_confine(state, dispatcher);
                 crate::input::abort_pointer_interactive_grab(state, dispatcher, 0);
+                crate::input::toplevel_drag::end(
+                    state,
+                    dispatcher,
+                    crate::input::ToplevelDragEnd::Cancelled,
+                );
                 state.seat.clear_device_state();
             }
             CloseSessionFds => {
