@@ -257,22 +257,105 @@ pub(crate) fn focused_window_close(
 
 /// Pointer refresh, then a same-workspace successor when the closed surface owned the keyboard.
 /// A destroy that leaves the keyboard on some other live surface does not move it.
+///
+/// `released_keyboard` is the focus whose `wl_keyboard.leave` was already written, before
+/// `delete_id`. The stored focus is clear, so this function enters the next window only.
 pub(crate) fn refocus_after_surface_destroy(
     state: &mut State,
     dispatcher: &mut Dispatcher,
     closed_window: Option<ClosedWindowFocus>,
+    released_keyboard: Option<SurfaceFocus>,
 ) {
     refresh_pointer_focus(state, dispatcher, monotonic_time_msec(), false);
     if let Some(close) = closed_window {
         focus_after_focused_window_close(state, dispatcher, close);
+    } else {
+        let keyboard_surface_gone = state
+            .seat
+            .keyboard_focus()
+            .is_some_and(|focus| !focus.surface.exists(state));
+        if released_keyboard.is_some() || keyboard_surface_gone {
+            refresh_keyboard_focus(state, dispatcher);
+        }
+    }
+    finish_released_keyboard(state, dispatcher, released_keyboard);
+}
+
+/// Write pointer and keyboard leave for `surface` while its id is still live, then clear that focus.
+///
+/// Returns the keyboard focus that was cleared. The caller destroys the surface after this returns.
+pub(crate) fn leave_destroyed_surface_focus(
+    state: &mut State,
+    dispatcher: &mut ClientDispatcher,
+    surface: Resolved<WlSurfaceId>,
+) -> Option<SurfaceFocus> {
+    if state
+        .seat
+        .pointer_focus
+        .is_some_and(|focus| focus.target.surface == surface)
+    {
+        let serial = state.seat.next_serial();
+        let client_id = surface.client_id();
+        for pointer in state.seat.pointer_resources(client_id) {
+            if !pointer.exists(state) {
+                continue;
+            }
+            state.seat.record_client_serial(client_id, serial);
+            let pointer = pointer.ref_mut(state);
+            pointer.send_leave(serial, surface, dispatcher);
+            pointer.send_frame(dispatcher);
+        }
+        state.seat.pointer_focus = None;
+        state.seat.clear_pointer_enter();
+    }
+
+    let old_keyboard = state
+        .seat
+        .keyboard_focus
+        .filter(|focus| focus.surface == surface);
+    if let Some(old_keyboard) = old_keyboard {
+        let serial = state.seat.next_serial();
+        let client_id = surface.client_id();
+        for keyboard in state.seat.keyboard_resources(client_id) {
+            if !keyboard.exists(state) {
+                continue;
+            }
+            state.seat.record_client_serial(client_id, serial);
+            keyboard
+                .ref_mut(state)
+                .send_leave(serial, surface, dispatcher);
+        }
+        state.seat.keyboard_focus = None;
+        return Some(old_keyboard);
+    }
+    None
+}
+
+/// Side effects of clearing the keyboard that `set_keyboard_focus` no longer sees,
+/// because the leave was sent and the stored focus cleared before `delete_id`.
+fn finish_released_keyboard(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    released: Option<SurfaceFocus>,
+) {
+    let Some(old) = released else {
+        return;
+    };
+    let new_focus = state.seat.keyboard_focus();
+    if new_focus.is_none() {
+        crate::input::pointer_lock::release_pointer_lock_unless_surface(state, dispatcher, None);
+        crate::input::pointer_confine::release_pointer_confine_unless_surface(
+            state, dispatcher, None,
+        );
+        dispatcher.dispatch(crate::xwayland::XwaylandAction::KeyboardFocus);
+        refresh_selection_focus_clients(dispatcher, Some(old), None);
+        crate::capture::sync_activated_from_keyboard_focus(state, dispatcher);
+        crate::input::pointer_lock::maybe_activate_pointer_lock(state, dispatcher);
+        crate::input::pointer_confine::maybe_activate_pointer_confine(state, dispatcher);
         return;
     }
-    let keyboard_surface_gone = state
-        .seat
-        .keyboard_focus()
-        .is_some_and(|focus| !focus.surface.exists(state));
-    if keyboard_surface_gone {
-        refresh_keyboard_focus(state, dispatcher);
+    if new_focus.is_some_and(|focus| focus.client_id() != old.client_id()) {
+        refresh_selection_focus_clients(dispatcher, Some(old), new_focus);
     }
 }
 
@@ -936,7 +1019,7 @@ mod tests {
         set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.closing)));
         state.seat.pointer_pos = (50.0, 10.0);
 
-        refocus_after_surface_destroy(&mut state, &mut dispatcher, Some(close_of(&windows)));
+        refocus_after_surface_destroy(&mut state, &mut dispatcher, Some(close_of(&windows)), None);
 
         assert_eq!(
             state.seat.keyboard_focus().map(|focus| focus.surface),
@@ -953,7 +1036,7 @@ mod tests {
         set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.closing)));
         state.seat.pointer_pos = (90.0, 90.0);
 
-        refocus_after_surface_destroy(&mut state, &mut dispatcher, Some(close_of(&windows)));
+        refocus_after_surface_destroy(&mut state, &mut dispatcher, Some(close_of(&windows)), None);
 
         assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(windows.older));
     }
@@ -966,7 +1049,7 @@ mod tests {
         set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.closing)));
         state.seat.pointer_pos = (90.0, 90.0);
 
-        refocus_after_surface_destroy(&mut state, &mut dispatcher, Some(close_of(&windows)));
+        refocus_after_surface_destroy(&mut state, &mut dispatcher, Some(close_of(&windows)), None);
 
         assert_eq!(
             state.seat.keyboard_focus().map(|focus| focus.surface),

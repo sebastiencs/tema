@@ -1285,14 +1285,16 @@ impl Client {
                 }
             }
             SeatClientEvent::PointerLeave { serial, surface } => {
-                for pointer in state.seat.pointer_resources(self.id) {
-                    if !pointer.exists(state) {
-                        continue;
+                if surface.exists(state) {
+                    for pointer in state.seat.pointer_resources(self.id) {
+                        if !pointer.exists(state) {
+                            continue;
+                        }
+                        state.seat.record_client_serial(self.id, serial);
+                        pointer
+                            .ref_mut(state)
+                            .send_leave(serial, surface, dispatcher);
                     }
-                    state.seat.record_client_serial(self.id, serial);
-                    pointer
-                        .ref_mut(state)
-                        .send_leave(serial, surface, dispatcher);
                 }
             }
             SeatClientEvent::PointerMotion { time, x, y } => {
@@ -1401,14 +1403,16 @@ impl Client {
                 }
             }
             SeatClientEvent::KeyboardLeave { serial, surface } => {
-                for keyboard in state.seat.keyboard_resources(self.id) {
-                    if !keyboard.exists(state) {
-                        continue;
+                if surface.exists(state) {
+                    for keyboard in state.seat.keyboard_resources(self.id) {
+                        if !keyboard.exists(state) {
+                            continue;
+                        }
+                        state.seat.record_client_serial(self.id, serial);
+                        keyboard
+                            .ref_mut(state)
+                            .send_leave(serial, surface, dispatcher);
                     }
-                    state.seat.record_client_serial(self.id, serial);
-                    keyboard
-                        .ref_mut(state)
-                        .send_leave(serial, surface, dispatcher);
                 }
             }
             SeatClientEvent::KeyboardKey { serial, time, key, state: key_state } => {

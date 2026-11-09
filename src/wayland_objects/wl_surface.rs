@@ -78,8 +78,13 @@ pub(crate) fn should_focus_new_toplevel_on_map(
 }
 
 enum PostWlSurface {
-    FocusNewToplevel { root_surface: Resolved<WlSurfaceId> },
-    ClearFocusAfterDestroy { closed_window: Option<crate::input::focus::ClosedWindowFocus> },
+    FocusNewToplevel {
+        root_surface: Resolved<WlSurfaceId>,
+    },
+    ClearFocusAfterDestroy {
+        closed_window: Option<crate::input::focus::ClosedWindowFocus>,
+        released_keyboard: Option<crate::input::SurfaceFocus>,
+    },
     FocusSuccessorAfterClose(crate::input::focus::ClosedWindowFocus),
     CancelTiledDrag,
 }
@@ -101,11 +106,12 @@ impl PostAction for PostWlSurface {
                     );
                 }
             }
-            PostWlSurface::ClearFocusAfterDestroy { closed_window } => {
+            PostWlSurface::ClearFocusAfterDestroy { closed_window, released_keyboard } => {
                 crate::input::focus::refocus_after_surface_destroy(
                     state,
                     dispatcher,
                     closed_window,
+                    released_keyboard,
                 );
             }
             PostWlSurface::FocusSuccessorAfterClose(close) => {
@@ -3291,8 +3297,15 @@ impl WlSurface {
         }
         self.cleanup_extension_objects();
         let closed_window = crate::input::focus::focused_window_close(state, object);
+        // Leave goes out while this id is still live. delete_id below retires it,
+        // and the post-action enters the next window without naming this surface.
+        let released_keyboard =
+            crate::input::focus::leave_destroyed_surface_focus(state, dispatcher, object);
         state.unregister_root_surface(object);
-        dispatcher.dispatch_post_action(PostWlSurface::ClearFocusAfterDestroy { closed_window });
+        dispatcher.dispatch_post_action(PostWlSurface::ClearFocusAfterDestroy {
+            closed_window,
+            released_keyboard,
+        });
         crate::idle_inhibit::queue_refresh(dispatcher);
         use crate::wayland_objects::wl_display::WlDisplay;
         client.delete_id(&WlDisplay::default(), state, dispatcher, self.id.into());
@@ -3525,13 +3538,14 @@ mod tests {
             },
             cursor::CursorSourceRef,
             drm::VisualAnimationPumpAction,
-            input::{focus::set_keyboard_focus, SurfaceFocus},
+            input::{focus::set_keyboard_focus, SurfaceFocus, SurfaceFocusPick, SurfaceRect},
             io_uring::model::IoUringAction,
             object::{Object, RequestResult},
             protocol_generated::{
-                xdg_wm_base, WaylandId, WlBufferId, WlSubsurfaceId, WlSurfaceId,
-                WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId,
-                WpViewportId, XdgSurfaceId, XdgToplevelId, XdgWmBaseId, XwaylandSurfaceV1Id,
+                xdg_wm_base, WaylandId, WlBufferId, WlKeyboardId, WlPointerId, WlSubsurfaceId,
+                WlSurfaceId, WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id,
+                WpPresentationFeedbackId, WpViewportId, XdgSurfaceId, XdgToplevelId, XdgWmBaseId,
+                XwaylandSurfaceV1Id,
             },
             region::{DamageRegion, RectI, RegionSpec, RegionValue},
             runner::{Dispatcher, Model},
@@ -3549,6 +3563,8 @@ mod tests {
             visual_animation::WindowLifecycleAnim,
             wayland_objects::{
                 wl_buffer::WlBuffer,
+                wl_keyboard::WlKeyboard,
+                wl_pointer::WlPointer,
                 wl_subsurface::WlSubsurface,
                 wp_fractional_scale_v1::WpFractionalScaleV1,
                 wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
@@ -4895,6 +4911,32 @@ mod tests {
         assert_eq!(state.closing_snapshots[0].source(), focused);
     }
 
+    fn sent_events(dispatcher: &Dispatcher) -> Vec<(u32, u32, u32, u32)> {
+        let mut sent = Vec::new();
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            let IoUringAction::Sendmsg { buffer, .. } = action else {
+                return;
+            };
+            if buffer.len() < 8 {
+                return;
+            }
+            let object = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
+            let opcode = u32::from_ne_bytes(buffer[4..8].try_into().unwrap()) & 0xffff;
+            let arg = if buffer.len() >= 12 {
+                u32::from_ne_bytes(buffer[8..12].try_into().unwrap())
+            } else {
+                0
+            };
+            let second = if buffer.len() >= 16 {
+                u32::from_ne_bytes(buffer[12..16].try_into().unwrap())
+            } else {
+                0
+            };
+            sent.push((object, opcode, arg, second));
+        });
+        sent
+    }
+
     fn surface_origin(state: &State, surface_object_id: ObjectId) -> (i32, i32) {
         let bounds = state
             .objects
@@ -4941,6 +4983,128 @@ mod tests {
             client_dispatcher.drain_post_actions(&mut client, &mut state);
         }
         assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(remaining));
+    }
+
+    #[test]
+    fn destroying_the_focused_surface_leaves_before_delete_id() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(5usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let closing_id = map_closing_candidate(&mut state, &mut client, &mut dispatcher, 250);
+        let remaining_id = map_closing_candidate(&mut state, &mut client, &mut dispatcher, 260);
+        let closing = root(&state, closing_id);
+        let remaining = root(&state, remaining_id);
+        let (keyboard, _) =
+            client.insert_object(&mut state, WlKeyboard::new(WlKeyboardId::from(80)));
+        state.seat.register_keyboard(keyboard);
+        let (pointer, _) =
+            client.insert_object(&mut state, WlPointer::new(WlPointerId::from(81), 5));
+        state.seat.register_pointer(pointer);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            set_keyboard_focus(
+                &mut state,
+                &mut client_dispatcher,
+                Some(SurfaceFocus::new(remaining)),
+            );
+            set_keyboard_focus(
+                &mut state,
+                &mut client_dispatcher,
+                Some(SurfaceFocus::new(closing)),
+            );
+        }
+        let (x, y) = surface_origin(&state, closing_id);
+        state.seat.pointer_pos = (x as f64 + 1.0, y as f64 + 1.0);
+        state.seat.pointer_focus = Some(SurfaceFocusPick {
+            target: SurfaceFocus::new(closing),
+            rect: SurfaceRect { x, y, width: 8, height: 8 },
+        });
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            {
+                let mut surface = state.objects.grab_object::<WlSurface>(closing_id);
+                surface.delete_self(&mut client, &mut state, &mut client_dispatcher);
+            }
+            client_dispatcher.drain_post_actions(&mut client, &mut state);
+        }
+
+        let sent = sent_events(&dispatcher);
+        let surface_id = u32::from(closing.wayland_id());
+        let delete_at = sent
+            .iter()
+            .position(|(object, opcode, arg, _)| *object == 1 && *opcode == 1 && *arg == surface_id)
+            .expect("delete_id");
+        let keyboard_leave_at = sent
+            .iter()
+            .position(|(object, opcode, _, surface)| {
+                *object == 80 && *opcode == 2 && *surface == surface_id
+            })
+            .expect("wl_keyboard.leave");
+        let pointer_leave_at = sent
+            .iter()
+            .position(|(object, opcode, _, surface)| {
+                *object == 81 && *opcode == 1 && *surface == surface_id
+            })
+            .expect("wl_pointer.leave");
+        let pointer_frame_at = sent
+            .iter()
+            .position(|(object, opcode, _, _)| *object == 81 && *opcode == 5)
+            .expect("wl_pointer.frame");
+        assert!(keyboard_leave_at < delete_at);
+        assert!(pointer_leave_at < pointer_frame_at);
+        assert!(pointer_frame_at < delete_at);
+        assert_eq!(
+            sent.iter()
+                .filter(|(object, opcode, _, surface)| {
+                    *object == 80 && *opcode == 2 && *surface == surface_id
+                })
+                .count(),
+            1
+        );
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(remaining));
+        assert_ne!(state.seat.pointer_focus.map(|focus| focus.target.surface), Some(closing));
+    }
+
+    #[test]
+    fn destroying_the_last_focused_window_still_drops_keyboard_focus() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(5usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let closing_id = map_closing_candidate(&mut state, &mut client, &mut dispatcher, 270);
+        let closing = root(&state, closing_id);
+        let (keyboard, _) =
+            client.insert_object(&mut state, WlKeyboard::new(WlKeyboardId::from(82)));
+        state.seat.register_keyboard(keyboard);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            set_keyboard_focus(
+                &mut state,
+                &mut client_dispatcher,
+                Some(SurfaceFocus::new(closing)),
+            );
+        }
+        let before =
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::KeyboardFocus)
+            });
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            {
+                let mut surface = state.objects.grab_object::<WlSurface>(closing_id);
+                surface.delete_self(&mut client, &mut state, &mut client_dispatcher);
+            }
+            client_dispatcher.drain_post_actions(&mut client, &mut state);
+        }
+        let after =
+            dispatcher.test_count_queued_action::<crate::xwayland::XwaylandAction>(|action| {
+                matches!(action, crate::xwayland::XwaylandAction::KeyboardFocus)
+            });
+        assert!(after > before);
+        assert!(state.seat.keyboard_focus().is_none());
     }
 
     #[test]
