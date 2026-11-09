@@ -96,6 +96,16 @@ pub enum WlBufferError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IconBufferError {
+    Destroyed,
+    NotShm,
+    Format,
+    NotSquare,
+    Stride,
+    Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureBufferError {
     Destroyed,
     NotShm,
@@ -345,6 +355,47 @@ impl WlBuffer {
             height: *buffer_height,
             stride: *stride,
         })
+    }
+
+    /// Square SHM icon pixels, tightly packed. `XRGB8888` alpha is forced to opaque.
+    pub(crate) fn copy_shm_square_argb(&self) -> Result<(u32, Vec<u8>), IconBufferError> {
+        if self.destroyed {
+            return Err(IconBufferError::Destroyed);
+        }
+        let BufferBacking::Shm { offset, width, height, stride, format, mem } = &self.backing
+        else {
+            return Err(IconBufferError::NotShm);
+        };
+        if format.drm != crate::drm::ARGB8888.drm && format.drm != crate::drm::XRGB8888.drm {
+            return Err(IconBufferError::Format);
+        }
+        if *width == 0 || width != height {
+            return Err(IconBufferError::NotSquare);
+        }
+        let row = width.checked_mul(4).ok_or(IconBufferError::Overflow)?;
+        if *stride < row {
+            return Err(IconBufferError::Stride);
+        }
+        let len = stride
+            .checked_mul(*height)
+            .ok_or(IconBufferError::Overflow)?;
+        let end = offset.checked_add(len).ok_or(IconBufferError::Overflow)?;
+        if end > mem.len() {
+            return Err(IconBufferError::Overflow);
+        }
+        let tight = row.checked_mul(*height).ok_or(IconBufferError::Overflow)?;
+        let src = mem.bytes_at(*offset, len);
+        let mut out = Vec::with_capacity(tight);
+        for y in 0..*height {
+            let start = y * *stride;
+            out.extend_from_slice(&src[start..start + row]);
+        }
+        if format.drm == crate::drm::XRGB8888.drm {
+            for px in out.chunks_exact_mut(4) {
+                px[3] = 0xff;
+            }
+        }
+        Ok((u32::try_from(*width).map_err(|_| IconBufferError::Overflow)?, out))
     }
 
     pub fn shm_cursor_argb8888(&self) -> Option<CursorShmBuffer> {

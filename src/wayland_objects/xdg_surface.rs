@@ -378,7 +378,7 @@ impl XdgSurface {
         &mut self,
         client: &mut Client,
         state: &mut State,
-        _dispatcher: &mut ClientDispatcher,
+        dispatcher: &mut ClientDispatcher,
         role_changes: CommitRoleChanges,
     ) {
         if role_changes.apply_window_geometry {
@@ -391,6 +391,25 @@ impl XdgSurface {
                 if let Some(mut toplevel) = id.try_grab(state) {
                     toplevel.set_window_geometry(self.current_window_geometry);
                 }
+            }
+        }
+        if let RoleObject::Toplevel(id) = self.role_object {
+            let applied = id.try_grab(state).and_then(|mut toplevel| {
+                toplevel.apply_pending_icon().then(|| {
+                    let window = toplevel.window();
+                    let metadata = toplevel.metadata();
+                    (window, metadata)
+                })
+            });
+            if let Some((window, (tag, description, icon))) = applied {
+                crate::capture::note_window_metadata(
+                    state,
+                    dispatcher,
+                    window,
+                    tag,
+                    description,
+                    icon,
+                );
             }
         }
         if role_changes.initial_commit_complete {
@@ -725,7 +744,7 @@ impl Object for XdgSurface {
 }
 
 pub mod xdg_toplevel {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, rc::Rc};
 
     use crate::{
         clients::{
@@ -766,6 +785,8 @@ pub mod xdg_toplevel {
         app_id: String,
         tag: Option<String>,
         description: Option<String>,
+        icon: Option<Rc<crate::toplevel_icon::ToplevelIcon>>,
+        pending_icon: Option<Option<Rc<crate::toplevel_icon::ToplevelIcon>>>,
         parent: Option<Resolved<XdgToplevelId>>,
         parent_window: Option<WindowId>,
         min_size: Option<(i32, i32)>,
@@ -828,6 +849,8 @@ pub mod xdg_toplevel {
                 app_id: String::new(),
                 tag: None,
                 description: None,
+                icon: None,
+                pending_icon: None,
                 parent: None,
                 parent_window: None,
                 min_size: None,
@@ -1178,10 +1201,29 @@ pub mod xdg_toplevel {
             true
         }
 
+        pub(crate) fn set_pending_icon(
+            &mut self,
+            pending: Option<Rc<crate::toplevel_icon::ToplevelIcon>>,
+        ) {
+            self.pending_icon = Some(pending);
+        }
+
+        pub(crate) fn apply_pending_icon(&mut self) -> bool {
+            let Some(pending) = self.pending_icon.take() else {
+                return false;
+            };
+            self.icon = pending;
+            true
+        }
+
         pub(crate) fn metadata(
             &self,
         ) -> (Option<String>, Option<String>, Option<crate::capture::IconSummary>) {
-            (self.tag.clone(), self.description.clone(), None)
+            (
+                self.tag.clone(),
+                self.description.clone(),
+                self.icon.as_ref().map(|icon| icon.summary()),
+            )
         }
 
         #[cfg(test)]
@@ -1587,6 +1629,10 @@ pub mod xdg_toplevel {
 
         fn description(&self) -> Option<&str> {
             self.description.as_deref()
+        }
+
+        fn icon(&self) -> Option<&Rc<crate::toplevel_icon::ToplevelIcon>> {
+            self.icon.as_ref()
         }
 
         fn size_constraints(&self) -> InteractiveSizeConstraints {

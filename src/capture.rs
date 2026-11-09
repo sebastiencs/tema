@@ -2888,21 +2888,24 @@ fn send_wlr_parent(
 
 /// Publish one mapped window. A later map gets a new identifier.
 ///
-/// Title, app id, tag, and description come from the toplevel trait. Shell bits come from the
-/// xdg role's last configure. Another role sets them through [`sync_layout_shell_state`].
+/// Title, app id, tag, description, and icon come from the toplevel trait. Shell bits come from
+/// the xdg role's last configure. Another role sets them through [`sync_layout_shell_state`].
 pub(crate) fn map_window(state: &mut State, dispatcher: &mut Dispatcher, window: WindowId) {
     if state.capture.by_window.contains_key(&window) {
         return;
     }
-    let Some((title, app_id, parent, tag, description)) = state.toplevel(window).map(|toplevel| {
-        (
-            toplevel.title().to_string(),
-            toplevel.app_id().to_string(),
-            toplevel.parent_window(),
-            toplevel.tag().map(str::to_owned),
-            toplevel.description().map(str::to_owned),
-        )
-    }) else {
+    let Some((title, app_id, parent, tag, description, icon)) =
+        state.toplevel(window).map(|toplevel| {
+            (
+                toplevel.title().to_string(),
+                toplevel.app_id().to_string(),
+                toplevel.parent_window(),
+                toplevel.tag().map(str::to_owned),
+                toplevel.description().map(str::to_owned),
+                toplevel.icon().map(|icon| icon.summary()),
+            )
+        })
+    else {
         return;
     };
     let shell = state.window_role_object(window).and_then(|role| {
@@ -2917,6 +2920,7 @@ pub(crate) fn map_window(state: &mut State, dispatcher: &mut Dispatcher, window:
     if let Some(record) = state.capture.toplevels.get_mut(&key) {
         record.tag = tag;
         record.description = description;
+        record.icon = icon;
     }
     if let Some((maximized, fullscreen)) = shell {
         note_shell_state(state, dispatcher, key, maximized, fullscreen);

@@ -201,6 +201,7 @@ mod sync;
 #[cfg(test)]
 mod test_support;
 mod tiling;
+mod toplevel_icon;
 mod transform;
 mod udev;
 mod utils;

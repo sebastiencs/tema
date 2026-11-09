@@ -97,6 +97,10 @@ pub trait Toplevel {
     fn description(&self) -> Option<&str> {
         None
     }
+    /// Icon set by `xdg_toplevel_icon_v1`. Absent for X windows.
+    fn icon(&self) -> Option<&std::rc::Rc<crate::toplevel_icon::ToplevelIcon>> {
+        None
+    }
     /// Minimum and maximum size for interactive resize.
     fn size_constraints(&self) -> InteractiveSizeConstraints;
     /// Minimum size the layout uses when tiling.
