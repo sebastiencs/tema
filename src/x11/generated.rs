@@ -1092,6 +1092,14 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct ClientDisconnectFlags: u32 {
+        const Default = 0u32;
+        const Terminate = 1u32 << 0;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub(crate) struct ClientIdMask: u32 {
         const ClientXID = 1u32 << 0;
         const LocalClientPID = 1u32 << 1;
@@ -3305,6 +3313,23 @@ impl Request for XFixesSelectSelectionInput {
         self.window.serialize(writer);
         self.selection.serialize(writer);
         writer.u32(self.event_mask.bits());
+        writer.finish_request()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct XFixesSetClientDisconnectMode {
+    pub(crate) disconnect_mode: ClientDisconnectFlags,
+}
+
+impl Request for XFixesSetClientDisconnectMode {
+    const NAME: &'static str = "XFixesSetClientDisconnectMode";
+    const EXTENSION: Option<ExtensionName> = Some(ExtensionName::XFixes);
+    const OPCODE: u8 = 33;
+    type Reply = NoReply;
+    fn serialize(&self, writer: &mut Writer<'_>, major_opcode: u8) -> Result<(), WireError> {
+        writer.begin_request(major_opcode, Self::OPCODE);
+        writer.u32(self.disconnect_mode.bits());
         writer.finish_request()
     }
 }

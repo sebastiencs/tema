@@ -883,6 +883,7 @@ mod tests {
                     request.args,
                     [
                         "-terminate",
+                        launch::TERMINATE_DELAY_SECS,
                         "-rootless",
                         "-verbose",
                         "10",

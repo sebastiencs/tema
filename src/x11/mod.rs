@@ -24,20 +24,20 @@ pub(crate) use atoms::{AtomCache, AtomInternEvent, Atoms, NAMES};
 pub(crate) use connection::{ConnectionError, Read, State, XConnection, XReplyError};
 #[allow(unused_imports)]
 pub(crate) use generated::{
-    Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientIdMask, ClientIdSpec,
-    ClientIdValue, ClientMessage, ClientMessageData, Colormap, CompositeRedirectSubwindows,
-    ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow, ConfigureWindowAux,
-    ConvertSelection, CreateGc, CreateGcAux, CreateNotify, CreatePixmap, CreateWindow,
-    CreateWindowAux, Cursor, DeleteProperty, DestroyNotify, Directformat, Drawable, Event,
-    EventMask, FocusIn, FreeGc, FreePixmap, Gcontext, GetAtomName, GetAtomNameReply, GetProperty,
-    ImageFormat, InputFocus, InternAtom, InternAtomReply, KillClient, MapNotify, MapRequest,
-    MapWindow, NoReply, NotifyDetail, NotifyMode, PictType, Pictformat, Pictforminfo, Picture,
-    Pixmap, PropMode, Property as PropertyState, PropertyNotify, PutImage, Redirect,
+    Atom, ChangeWindowAttributes, ChangeWindowAttributesAux, ClientDisconnectFlags, ClientIdMask,
+    ClientIdSpec, ClientIdValue, ClientMessage, ClientMessageData, Colormap,
+    CompositeRedirectSubwindows, ConfigWindow, ConfigureNotify, ConfigureRequest, ConfigureWindow,
+    ConfigureWindowAux, ConvertSelection, CreateGc, CreateGcAux, CreateNotify, CreatePixmap,
+    CreateWindow, CreateWindowAux, Cursor, DeleteProperty, DestroyNotify, Directformat, Drawable,
+    Event, EventMask, FocusIn, FreeGc, FreePixmap, Gcontext, GetAtomName, GetAtomNameReply,
+    GetProperty, ImageFormat, InputFocus, InternAtom, InternAtomReply, KillClient, MapNotify,
+    MapRequest, MapWindow, NoReply, NotifyDetail, NotifyMode, PictType, Pictformat, Pictforminfo,
+    Picture, Pixmap, PropMode, Property as PropertyState, PropertyNotify, PutImage, Redirect,
     RenderCreateCursor, RenderCreatePicture, RenderCreatePictureAux, RenderFreePicture,
     RenderQueryPictFormats, RenderQueryPictFormatsReply, Request, ResQueryClientIds,
     ResQueryClientIdsReply, SelectionClear, SelectionEvent, SelectionEventMask, SelectionNotify,
     SelectionRequest, SendEvent, SetInputFocus, SetSelectionOwner, StackMode, UnmapNotify, Window,
-    WindowClass, XFixesSelectSelectionInput, XFixesSelectionNotify,
+    WindowClass, XFixesSelectSelectionInput, XFixesSelectionNotify, XFixesSetClientDisconnectMode,
 };
 #[allow(unused_imports)]
 pub(crate) use io::XIo;

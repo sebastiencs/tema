@@ -4,9 +4,10 @@
 
 use crate::x11::{
     change_property_atoms, change_property_u32s, change_property_utf8, Atom,
-    ChangeWindowAttributes, ChangeWindowAttributesAux, CompositeRedirectSubwindows,
-    ConnectionError, CreateWindow, CreateWindowAux, EventMask, Redirect, SelectionEventMask,
-    SetSelectionOwner, Window, WindowClass, XConnection, XFixesSelectSelectionInput,
+    ChangeWindowAttributes, ChangeWindowAttributesAux, ClientDisconnectFlags,
+    CompositeRedirectSubwindows, ConnectionError, CreateWindow, CreateWindowAux, EventMask,
+    Redirect, SelectionEventMask, SetSelectionOwner, Window, WindowClass, XConnection,
+    XFixesSelectSelectionInput, XFixesSetClientDisconnectMode,
 };
 
 use super::{
@@ -58,6 +59,11 @@ pub(super) fn claim(
     let on_check =
         change_property_u32s(check, atoms._NET_SUPPORTING_WM_CHECK, atoms.WINDOW, &[supporting]);
     connection.send_void(&on_check.request())?;
+    // Owning WM_S0 opens the listen socket. The terminate flag is set first, so
+    // -terminate counts application clients and then waits out its delay.
+    connection.send_void(&XFixesSetClientDisconnectMode {
+        disconnect_mode: ClientDisconnectFlags::Terminate,
+    })?;
     connection.send_void(&SetSelectionOwner { owner: check, selection: atoms.WM_S0, time: 0 })?;
     connection.send_void(&SetSelectionOwner {
         owner: check,

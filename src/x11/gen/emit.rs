@@ -79,6 +79,7 @@ pub(crate) const SELECTION: &[(&str, &str, SelectionKind)] = &[
     ("composite", "RedirectSubwindows", SelectionKind::Request),
     ("xfixes", "QueryVersion", SelectionKind::Request),
     ("xfixes", "SelectSelectionInput", SelectionKind::Request),
+    ("xfixes", "SetClientDisconnectMode", SelectionKind::Request),
     ("xfixes", "SelectionNotify", SelectionKind::Event),
     ("res", "QueryVersion", SelectionKind::Request),
     ("res", "QueryClientIds", SelectionKind::Request),

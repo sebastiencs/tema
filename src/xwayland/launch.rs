@@ -12,6 +12,8 @@ use crate::{
 };
 
 pub(crate) const PROGRAM: &str = "Xwayland";
+/// Seconds Xwayland waits after the last application disconnects.
+pub(crate) const TERMINATE_DELAY_SECS: &str = "10";
 pub(crate) const STDERR_SLOT: i32 = 2;
 pub(crate) const DISPLAYFD_SLOT: i32 = 3;
 pub(crate) const LISTEN_SLOT: i32 = 4;
@@ -59,6 +61,7 @@ impl Launch {
 fn args() -> Vec<String> {
     vec![
         "-terminate".to_string(),
+        TERMINATE_DELAY_SECS.to_string(),
         "-rootless".to_string(),
         "-verbose".to_string(),
         "10".to_string(),
@@ -104,6 +107,7 @@ mod tests {
             args(),
             [
                 "-terminate",
+                TERMINATE_DELAY_SECS,
                 "-rootless",
                 "-verbose",
                 "10",
@@ -116,9 +120,9 @@ mod tests {
             ]
             .map(str::to_string)
         );
-        assert_eq!(args()[5], DISPLAYFD_SLOT.to_string());
-        assert_eq!(args()[7], LISTEN_SLOT.to_string());
-        assert_eq!(args()[9], WM_SLOT.to_string());
+        assert_eq!(args()[6], DISPLAYFD_SLOT.to_string());
+        assert_eq!(args()[8], LISTEN_SLOT.to_string());
+        assert_eq!(args()[10], WM_SLOT.to_string());
         assert_eq!(
             env(),
             vec![

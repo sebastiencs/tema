@@ -854,7 +854,7 @@ A completion tagged with an older launch is ignored. A pid that arrives after `S
 
 ### File descriptors
 
-Xwayland is started as `Xwayland -terminate -rootless -verbose 10 -displayfd 3 -listenfd 4 -wm 5`. Descriptors 0 and 1 stay `/dev/null`. The spawn also sets `WAYLAND_SOCKET=6` and removes `LIBEI_SOCKET`.
+Xwayland is started as `Xwayland -terminate 10 -rootless -verbose 10 -displayfd 3 -listenfd 4 -wm 5`. Descriptors 0 and 1 stay `/dev/null`. The spawn also sets `WAYLAND_SOCKET=6` and removes `LIBEI_SOCKET`.
 
 | Slot | In Xwayland | Kept by the compositor |
 | --- | --- | --- |
@@ -884,7 +884,7 @@ Give-up logs `Xwayland gave up: …`, unlinks both files, removes `DISPLAY` from
 
 ### `WM_S0`
 
-`-wm 5` is always passed, and our end of that socket stays open. Displayfd readiness starts the window manager in section 20 on that socket. Xwayland accepts clients on the listen socket once that window manager owns the `WM_S0` selection.
+`-wm 5` is always passed, and our end of that socket stays open. Displayfd readiness starts the window manager in section 20 on that socket. Before that window manager owns the `WM_S0` selection, it sends `XFixesSetClientDisconnectMode` with the terminate flag. Xwayland accepts clients on the listen socket once that selection is owned. The flag tells the server this connection may stay open while the server exits, so `-terminate 10` waits ten seconds after the last application disconnects and then exits.
 
 ### Xwayland-only globals
 
