@@ -51,6 +51,7 @@ pub struct RuntimeConfig {
     path: PathBuf,
     pub general: GeneralConfig,
     pub xwayland: XwaylandConfig,
+    pub session_management: SessionManagementConfig,
     pub tiling: TilingConfig,
     pub decorations: DecorationsConfig,
     pub effects: EffectsConfig,
@@ -107,6 +108,11 @@ impl fmt::Display for XwaylandScalingMode {
 pub struct XwaylandConfig {
     pub enabled: bool,
     pub scaling_mode: XwaylandScalingMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionManagementConfig {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -422,6 +428,7 @@ pub enum ConfigWatcherAction {
 struct ConfigFile {
     general: GeneralConfigFile,
     xwayland: XwaylandConfigFile,
+    session_management: SessionManagementConfigFile,
     tiling: TilingConfigFile,
     decorations: DecorationsConfigFile,
     effects: EffectsConfigFile,
@@ -544,6 +551,12 @@ fn output_scale_setting_from_f64(scale: f64) -> anyhow::Result<OutputScaleSettin
 struct XwaylandConfigFile {
     enabled: bool,
     scaling_mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SessionManagementConfigFile {
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -672,6 +685,9 @@ impl RuntimeConfig {
                 enabled: parsed.xwayland.enabled,
                 scaling_mode: parse_xwayland_scaling_mode(&parsed.xwayland.scaling_mode)?,
             },
+            session_management: SessionManagementConfig {
+                enabled: parsed.session_management.enabled,
+            },
             tiling: TilingConfig {
                 drag: TilingDragConfig {
                     threshold: sanitize_non_negative_i32(parsed.tiling.drag.threshold),
@@ -707,6 +723,7 @@ impl RuntimeConfig {
                 allow_tearing: true,
             },
             xwayland: XwaylandConfig::default(),
+            session_management: SessionManagementConfig::default(),
             tiling: TilingConfig::default(),
             decorations: DecorationsConfig::default(),
             effects: EffectsConfig::default(),
@@ -907,6 +924,19 @@ impl Default for XwaylandConfigFile {
             enabled: defaults.enabled,
             scaling_mode: defaults.scaling_mode.to_string(),
         }
+    }
+}
+
+impl Default for SessionManagementConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Default for SessionManagementConfigFile {
+    fn default() -> Self {
+        let defaults = SessionManagementConfig::default();
+        Self { enabled: defaults.enabled }
     }
 }
 
@@ -2652,6 +2682,33 @@ mod tests {
     fn rejects_unknown_xwayland_keys() {
         let error =
             RuntimeConfig::parse_for_test("[xwayland]\nbogus = 1\n", &Xkb::new()).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error:#}");
+    }
+
+    #[test]
+    fn session_management_defaults_to_enabled_and_rejects_unknown_keys() {
+        let xkb = Xkb::new();
+        assert!(RuntimeConfig::default().session_management.enabled);
+        assert!(
+            RuntimeConfig::parse_for_test("", &xkb)
+                .unwrap()
+                .session_management
+                .enabled
+        );
+        assert!(
+            RuntimeConfig::parse_for_test("[session_management]\nenabled = true\n", &xkb)
+                .unwrap()
+                .session_management
+                .enabled
+        );
+        assert!(
+            !RuntimeConfig::parse_for_test("[session_management]\nenabled = false\n", &xkb)
+                .unwrap()
+                .session_management
+                .enabled
+        );
+        let error =
+            RuntimeConfig::parse_for_test("[session_management]\nbogus = 1\n", &xkb).unwrap_err();
         assert!(error.to_string().contains("unknown field"), "{error:#}");
     }
 

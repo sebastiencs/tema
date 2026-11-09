@@ -36,6 +36,12 @@ enabled = true
 # They must scale themselves (set GDK_SCALE=2 for GTK).
 scaling_mode = "default"
 
+# xdg-session-management: apps can ask tema to remember where their windows were.
+# Data lives in $XDG_STATE_HOME/tema/sessions.json. Disabling hides the protocol
+# from new clients; stored data is kept. Applies on reload.
+[session_management]
+enabled = true
+
 # Mouse move of a tiled window.
 # threshold is logical pixels before the window is picked up; 0 picks it up immediately.
 # precise_mouse_move false splits a wide tile left/right and a tall tile top/bottom.

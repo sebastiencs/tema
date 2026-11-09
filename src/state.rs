@@ -1128,6 +1128,8 @@ pub struct State {
     pub(crate) bell_last: BTreeMap<Option<WindowId>, Instant>,
     /// Loaded xdg session store. `None` when no state directory is available.
     pub(crate) session_store: Option<crate::session_store::SessionStore>,
+    /// Advertised `xdg_session_manager_v1`, when the config and the store both allow it.
+    pub(crate) session_manager_global: Option<GlobalName>,
 }
 
 const INITIAL_WORKSPACES_PER_OUTPUT: usize = 4;
@@ -1236,6 +1238,7 @@ impl State {
             ipc_enabled: false,
             bell_last: BTreeMap::new(),
             session_store: None,
+            session_manager_global: None,
         }
     }
 
