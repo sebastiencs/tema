@@ -53,6 +53,45 @@ fn focused_window(state: &State) -> Option<proto::Window> {
         fullscreen: info.fullscreen,
         tag: info.tag.map(str::to_owned),
         description: info.description.map(str::to_owned),
+        icon: info.icon.map(|icon| proto::WindowIconInfo {
+            name: icon.name.clone(),
+            sizes: icon
+                .sizes
+                .iter()
+                .map(|&(size, scale)| proto::IconSize { size, scale })
+                .collect(),
+        }),
+    })
+}
+
+pub(crate) fn window_icon(
+    state: &State,
+    id: u64,
+    size: u32,
+    scale: u32,
+) -> Result<proto::WindowIcon, String> {
+    let window = state
+        .window_from_ipc_id(id)
+        .ok_or_else(|| "no such window".to_string())?;
+    let toplevel = state
+        .toplevel(window)
+        .ok_or_else(|| "no such window".to_string())?;
+    let icon = toplevel.icon();
+    let name = icon.and_then(|icon| icon.name.clone());
+    let pixmap = icon.and_then(|icon| icon.best(size, scale));
+    let (pixmap_size, pixmap_scale, data) = match pixmap {
+        Some(pixmap) => {
+            (Some(pixmap.size), Some(pixmap.scale), Some(proto::base64_encode(&pixmap.argb8888)))
+        }
+        None => (None, None, None),
+    };
+    Ok(proto::WindowIcon {
+        id,
+        name,
+        size: pixmap_size,
+        scale: pixmap_scale,
+        format: "argb8888_premultiplied".to_string(),
+        data,
     })
 }
 
@@ -333,6 +372,7 @@ mod tests {
         assert_eq!(window.output.as_deref(), Some("DP-1"));
         assert!(window.floating);
         assert!(window.fullscreen);
+        assert!(window.icon.is_none());
         assert_eq!(
             topic(&snapshot, proto::Topic::FocusedWindow),
             Some(proto::Event::FocusedWindow { window: Some(window) })
@@ -449,5 +489,103 @@ mod tests {
         assert!(workspace.outputs.is_empty());
         assert!(workspace.coordinates.is_empty());
         assert!(!workspace.active);
+    }
+
+    fn pixmap(size: u32, scale: u32, byte: u8) -> crate::toplevel_icon::IconPixmap {
+        let len = (size as usize)
+            .saturating_mul(size as usize)
+            .saturating_mul(4);
+        crate::toplevel_icon::IconPixmap {
+            size,
+            scale,
+            argb8888: vec![byte; len].into_boxed_slice(),
+        }
+    }
+
+    fn install_icon(state: &mut State, window: WindowId, icon: crate::toplevel_icon::ToplevelIcon) {
+        let role = state.window_role_object(window).unwrap();
+        let mut toplevel = state
+            .objects
+            .try_ref_object_mut::<XdgToplevel>(role)
+            .unwrap();
+        toplevel.set_pending_icon(Some(std::rc::Rc::new(icon)));
+        assert!(toplevel.apply_pending_icon());
+    }
+
+    #[test]
+    fn window_icon_reports_an_unknown_window_and_selects_a_pixmap() {
+        let mut fixture = mapped_window("nvim — ~/src", "Alacritty");
+        let id = fixture.window.as_u64();
+        assert_eq!(window_icon(&fixture.state, id + 1, 32, 1), Err("no such window".to_string()));
+
+        let empty = window_icon(&fixture.state, id, 32, 1).unwrap();
+        assert_eq!(empty.id, id);
+        assert_eq!(empty.name, None);
+        assert_eq!(empty.size, None);
+        assert_eq!(empty.scale, None);
+        assert_eq!(empty.data, None);
+        assert_eq!(empty.format, "argb8888_premultiplied");
+
+        install_icon(
+            &mut fixture.state,
+            fixture.window,
+            crate::toplevel_icon::ToplevelIcon {
+                name: Some("firefox".to_string()),
+                pixmaps: vec![],
+            },
+        );
+        let named = window_icon(&fixture.state, id, 32, 1).unwrap();
+        assert_eq!(named.name.as_deref(), Some("firefox"));
+        assert_eq!(named.size, None);
+        assert_eq!(named.scale, None);
+        assert_eq!(named.data, None);
+
+        install_icon(
+            &mut fixture.state,
+            fixture.window,
+            crate::toplevel_icon::ToplevelIcon {
+                name: Some("firefox".to_string()),
+                pixmaps: vec![pixmap(1, 1, 1), pixmap(4, 1, 4)],
+            },
+        );
+        let exact = window_icon(&fixture.state, id, 1, 1).unwrap();
+        assert_eq!(exact.size, Some(1));
+        assert_eq!(exact.scale, Some(1));
+        assert_eq!(proto::base64_decode(exact.data.as_deref().unwrap()), Ok(vec![1, 1, 1, 1]));
+        let larger = window_icon(&fixture.state, id, 2, 1).unwrap();
+        assert_eq!(larger.size, Some(4));
+        assert_eq!(larger.scale, Some(1));
+        assert_eq!(
+            proto::base64_decode(larger.data.as_deref().unwrap())
+                .unwrap()
+                .len(),
+            4 * 4 * 4
+        );
+        assert!(proto::base64_decode(larger.data.as_deref().unwrap())
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 4));
+
+        let summary = fixture
+            .state
+            .toplevel(fixture.window)
+            .unwrap()
+            .icon()
+            .unwrap()
+            .summary();
+        capture::note_window_metadata(
+            &mut fixture.state,
+            &mut fixture.dispatcher,
+            fixture.window,
+            None,
+            None,
+            Some(summary),
+        );
+        let listed = build(&fixture.state).focused_window.unwrap().icon.unwrap();
+        assert_eq!(listed.name.as_deref(), Some("firefox"));
+        assert_eq!(
+            listed.sizes,
+            vec![proto::IconSize { size: 1, scale: 1 }, proto::IconSize { size: 4, scale: 1 }]
+        );
     }
 }

@@ -176,6 +176,12 @@ impl State {
         self.windows.get(&id).map(|entry| entry.role_object)
     }
 
+    /// `id` is the `u64` published on the IPC `Window`.
+    pub(crate) fn window_from_ipc_id(&self, id: u64) -> Option<WindowId> {
+        let window = WindowId(id);
+        self.windows.contains_key(&window).then_some(window)
+    }
+
     /// Role object for `window`.
     ///
     /// Panics when that object is grabbed. A request handler uses `self` instead.

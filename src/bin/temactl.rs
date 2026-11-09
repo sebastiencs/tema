@@ -24,6 +24,7 @@ Commands:
   outputs [-j]
   workspaces [-j]
   focused-window [-j]
+  window-icon ID [--size N] [--scale S] [-o FILE] [-j]
   subscribe [TOPIC...]
   waybar window [--format FMT] [--tooltip-format FMT] [--empty TEXT]
                 [--no-escape] [--once]
@@ -47,6 +48,7 @@ enum Command {
     Outputs { json: bool },
     Workspaces { json: bool },
     FocusedWindow { json: bool },
+    WindowIcon(WindowIconCommand),
     Subscribe { topics: Vec<proto::Topic> },
     WaybarWindow(WaybarWindow),
 }
@@ -58,6 +60,15 @@ struct WaybarWindow {
     empty: String,
     escape: bool,
     once: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowIconCommand {
+    id: u64,
+    size: u32,
+    scale: u32,
+    output: Option<String>,
+    json: bool,
 }
 
 impl Default for WaybarWindow {
@@ -114,6 +125,10 @@ fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Command, ()
         ["workspaces", "-j"] => Ok(Command::Workspaces { json: true }),
         ["focused-window"] => Ok(Command::FocusedWindow { json: false }),
         ["focused-window", "-j"] => Ok(Command::FocusedWindow { json: true }),
+        ["window-icon", id, flags @ ..] => {
+            let id = id.parse().map_err(|_| ())?;
+            Ok(Command::WindowIcon(parse_window_icon_flags(id, flags)?))
+        }
         ["subscribe", topics @ ..] => {
             let mut parsed = Vec::with_capacity(topics.len());
             for topic in topics {
@@ -140,6 +155,21 @@ fn parse_waybar_flags(flags: &[&str]) -> Result<WaybarWindow, ()> {
         }
     }
     Ok(opts)
+}
+
+fn parse_window_icon_flags(id: u64, flags: &[&str]) -> Result<WindowIconCommand, ()> {
+    let mut command = WindowIconCommand { id, size: 32, scale: 1, output: None, json: false };
+    let mut flags = flags.iter().copied();
+    while let Some(flag) = flags.next() {
+        match flag {
+            "--size" => command.size = flags.next().ok_or(())?.parse().map_err(|_| ())?,
+            "--scale" => command.scale = flags.next().ok_or(())?.parse().map_err(|_| ())?,
+            "-o" => command.output = Some(flags.next().ok_or(())?.to_string()),
+            "-j" => command.json = true,
+            _ => return Err(()),
+        }
+    }
+    Ok(command)
 }
 
 fn parse_topic(name: &str) -> Result<proto::Topic, ()> {
@@ -180,6 +210,7 @@ fn execute(command: Command) -> Result<(), Failure> {
                 _ => None,
             })
         }
+        Command::WindowIcon(command) => show_window_icon(command),
         Command::Subscribe { topics } => subscribe_at(&proto::socket_path(), &topics, emit_stdout),
         Command::WaybarWindow(opts) => run_waybar_window(&opts),
     }
@@ -199,6 +230,27 @@ fn show(
         return Err(Failure::Reply("unexpected reply".to_string()));
     };
     print!("{text}");
+    Ok(())
+}
+
+fn show_window_icon(command: WindowIconCommand) -> Result<(), Failure> {
+    let reply = request(&proto::Request::WindowIcon {
+        id: command.id,
+        size: command.size,
+        scale: command.scale,
+    })?;
+    let proto::Response::WindowIcon(icon) = ok_response(reply)? else {
+        return Err(Failure::Reply("unexpected reply".to_string()));
+    };
+    if let Some(path) = &command.output {
+        let png = icon_png(&icon).map_err(|message| Failure::Reply(message))?;
+        std::fs::write(path, png).map_err(io_failure)?;
+    }
+    if command.json {
+        print!("{}", json_line(&proto::Response::WindowIcon(icon)));
+    } else if command.output.is_none() {
+        print!("{}", format_window_icon(&icon));
+    }
     Ok(())
 }
 
@@ -304,6 +356,133 @@ fn format_focused_window(window: Option<&proto::Window>) -> String {
         text.push_str(&format!("  Description: {description}\n"));
     }
     text
+}
+
+fn format_window_icon(icon: &proto::WindowIcon) -> String {
+    let name = icon.name.as_deref().unwrap_or("none");
+    if icon.data.is_none() {
+        format!("name: {name}\nno pixels\n")
+    } else {
+        format!(
+            "name: {name}\nsize: {}\nscale: {}\n",
+            icon.size.unwrap_or(0),
+            icon.scale.unwrap_or(0)
+        )
+    }
+}
+
+fn icon_png(icon: &proto::WindowIcon) -> Result<Vec<u8>, String> {
+    let Some(size) = icon.size else {
+        return Err("window has no icon pixels".to_string());
+    };
+    let Some(data) = icon.data.as_deref() else {
+        return Err("window has no icon pixels".to_string());
+    };
+    let pixels = proto::base64_decode(data).map_err(|()| "malformed icon data".to_string())?;
+    let expected = (size as usize)
+        .saturating_mul(size as usize)
+        .saturating_mul(4);
+    if size == 0 || pixels.len() != expected {
+        return Err("malformed icon data".to_string());
+    }
+    Ok(png_rgba(size, size, &unpremultiply_bgra(&pixels)))
+}
+
+fn unpremultiply_bgra(pixels: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(pixels.len());
+    for px in pixels.chunks_exact(4) {
+        let (blue, green, red, alpha) = (px[0], px[1], px[2], px[3]);
+        let channel = |component: u8| {
+            if alpha == 0 {
+                0
+            } else {
+                ((u32::from(component) * 255 / u32::from(alpha)).min(255)) as u8
+            }
+        };
+        rgba.extend([channel(red), channel(green), channel(blue), alpha]);
+    }
+    rgba
+}
+
+fn png_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let row_bytes = (width as usize).saturating_mul(4);
+    let mut raw = Vec::with_capacity((row_bytes + 1).saturating_mul(height as usize));
+    for y in 0..height as usize {
+        raw.push(0);
+        let start = y.saturating_mul(row_bytes);
+        raw.extend_from_slice(&rgba[start..start + row_bytes]);
+    }
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend(width.to_be_bytes());
+    ihdr.extend(height.to_be_bytes());
+    ihdr.extend([8, 6, 0, 0, 0]);
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend(png_chunk(b"IHDR", &ihdr));
+    png.extend(png_chunk(b"IDAT", &zlib_store(&raw)));
+    png.extend(png_chunk(b"IEND", &[]));
+    png
+}
+
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = Vec::with_capacity(12 + data.len());
+    chunk.extend(u32::try_from(data.len()).unwrap_or(u32::MAX).to_be_bytes());
+    chunk.extend(kind);
+    chunk.extend(data);
+    let mut crc_bytes = kind.to_vec();
+    crc_bytes.extend(data);
+    chunk.extend(crc32(&crc_bytes).to_be_bytes());
+    chunk
+}
+
+fn zlib_store(data: &[u8]) -> Vec<u8> {
+    let mut zlib = Vec::with_capacity(data.len() + 16);
+    zlib.extend([0x78, 0x01]);
+    zlib.extend(deflate_stored(data));
+    zlib.extend(adler32(data).to_be_bytes());
+    zlib
+}
+
+fn deflate_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 8);
+    let mut offset = 0;
+    loop {
+        let end = (offset + 65_535).min(data.len());
+        let chunk = &data[offset..end];
+        let last = end == data.len();
+        out.push(if last { 1 } else { 0 });
+        let len = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+        out.extend(len.to_le_bytes());
+        out.extend((!len).to_le_bytes());
+        out.extend(chunk);
+        if last {
+            break;
+        }
+        offset = end;
+    }
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for byte in data {
+        a = (a + u32::from(*byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
 }
 
 fn json_line(response: &proto::Response) -> String {
@@ -731,6 +910,7 @@ mod tests {
             fullscreen: false,
             tag: None,
             description: None,
+            icon: None,
         }
     }
 
@@ -792,6 +972,35 @@ mod tests {
         assert!(parse_args(["waybar"]).is_err());
         assert!(parse_args(["waybar", "window", "--format"]).is_err());
         assert!(parse_args(["waybar", "--once", "window"]).is_err());
+        assert!(parse_args(["window-icon"]).is_err());
+        assert!(parse_args(["window-icon", "nope"]).is_err());
+        assert!(parse_args(["window-icon", "12", "--size"]).is_err());
+        assert!(parse_args(["window-icon", "12", "--size", "big"]).is_err());
+    }
+
+    #[test]
+    fn window_icon_flags_default_to_32_at_scale_one() {
+        assert_eq!(
+            parse_args(["window-icon", "12"]).unwrap(),
+            Command::WindowIcon(WindowIconCommand {
+                id: 12,
+                size: 32,
+                scale: 1,
+                output: None,
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse_args(["window-icon", "9", "-j", "--scale", "2", "-o", "i.png", "--size", "64"])
+                .unwrap(),
+            Command::WindowIcon(WindowIconCommand {
+                id: 9,
+                size: 64,
+                scale: 2,
+                output: Some("i.png".to_string()),
+                json: true,
+            })
+        );
     }
 
     #[test]
@@ -1042,7 +1251,131 @@ Window 12: nvim — ~/src
         bare.fullscreen = true;
         assert!(format_focused_window(Some(&bare))
             .contains("  Workspace: none\n  Output: none\n  Floating: yes\n  Fullscreen: yes\n"));
+
+        let named = proto::WindowIcon {
+            id: 12,
+            name: Some("firefox".to_string()),
+            size: Some(32),
+            scale: Some(1),
+            format: "argb8888_premultiplied".to_string(),
+            data: Some("AQIDBA==".to_string()),
+        };
+        assert_eq!(format_window_icon(&named), "name: firefox\nsize: 32\nscale: 1\n");
+        let mut bare_icon = named;
+        bare_icon.name = None;
+        bare_icon.size = None;
+        bare_icon.scale = None;
+        bare_icon.data = None;
+        assert_eq!(format_window_icon(&bare_icon), "name: none\nno pixels\n");
+        assert_eq!(icon_png(&bare_icon).unwrap_err(), "window has no icon pixels");
         assert_eq!(format_focused_window(None), "No focused window\n");
+    }
+
+    #[test]
+    fn png_chunks_match_recomputed_crc_and_adler() {
+        let one = png_rgba(1, 1, &[10, 20, 30, 255]);
+        assert_png(&one, 1, 1, &[10, 20, 30, 255]);
+        let mut six = Vec::new();
+        for pixel in 0..6u8 {
+            six.extend([pixel, pixel.wrapping_add(1), pixel.wrapping_add(2), 255]);
+        }
+        assert_png(&png_rgba(3, 2, &six), 3, 2, &six);
+        let wide = vec![7u8; 16_384 * 4];
+        assert_png(&png_rgba(16_384, 1, &wide), 16_384, 1, &wide);
+
+        let icon = proto::WindowIcon {
+            id: 1,
+            name: None,
+            size: Some(1),
+            scale: Some(1),
+            format: "argb8888_premultiplied".to_string(),
+            data: Some(proto::base64_encode(&[128, 0, 0, 128])),
+        };
+        assert_eq!(icon_png(&icon).unwrap(), png_rgba(1, 1, &[0, 0, 255, 128]));
+    }
+
+    struct PngChunk {
+        kind: [u8; 4],
+        data: Vec<u8>,
+        crc: u32,
+    }
+
+    fn assert_png(png: &[u8], width: u32, height: u32, rgba: &[u8]) {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let mut rest = &png[8..];
+        let ihdr = read_chunk(&mut rest);
+        assert_eq!(ihdr.kind, *b"IHDR");
+        assert_eq!(u32::from_be_bytes(ihdr.data[0..4].try_into().unwrap()), width);
+        assert_eq!(u32::from_be_bytes(ihdr.data[4..8].try_into().unwrap()), height);
+        assert_eq!(&ihdr.data[8..], &[8, 6, 0, 0, 0]);
+        assert_eq!(ihdr.crc, chunk_crc(&ihdr));
+        let idat = read_chunk(&mut rest);
+        assert_eq!(idat.kind, *b"IDAT");
+        assert_eq!(idat.crc, chunk_crc(&idat));
+        assert_eq!(&idat.data[..2], &[0x78, 0x01]);
+        let stored = inflate_stored(&idat.data[2..idat.data.len() - 4]);
+        let adler = u32::from_be_bytes(idat.data[idat.data.len() - 4..].try_into().unwrap());
+        assert_eq!(adler, adler_of(&stored));
+        let mut expected = Vec::new();
+        let row = (width as usize).saturating_mul(4);
+        for y in 0..height as usize {
+            expected.push(0);
+            expected.extend_from_slice(&rgba[y * row..(y + 1) * row]);
+        }
+        assert_eq!(stored, expected);
+        let iend = read_chunk(&mut rest);
+        assert_eq!(iend.kind, *b"IEND");
+        assert!(iend.data.is_empty());
+        assert_eq!(iend.crc, chunk_crc(&iend));
+        assert!(rest.is_empty());
+    }
+
+    fn read_chunk(rest: &mut &[u8]) -> PngChunk {
+        let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+        let kind = rest[4..8].try_into().unwrap();
+        let data = rest[8..8 + len].to_vec();
+        let crc = u32::from_be_bytes(rest[8 + len..12 + len].try_into().unwrap());
+        *rest = &rest[12 + len..];
+        PngChunk { kind, data, crc }
+    }
+
+    fn chunk_crc(chunk: &PngChunk) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for byte in chunk.kind.into_iter().chain(chunk.data.iter().copied()) {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    fn adler_of(data: &[u8]) -> u32 {
+        let mut a = 1u32;
+        let mut b = 0u32;
+        for byte in data {
+            a = (a + u32::from(*byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
+    fn inflate_stored(mut data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let header = data[0];
+            data = &data[1..];
+            let len = u16::from_le_bytes(data[..2].try_into().unwrap()) as usize;
+            let nlen = u16::from_le_bytes(data[2..4].try_into().unwrap());
+            assert_eq!(nlen, !(len as u16));
+            data = &data[4..];
+            out.extend_from_slice(&data[..len]);
+            data = &data[len..];
+            if header & 1 == 1 {
+                assert!(data.is_empty());
+                return out;
+            }
+        }
     }
 
     #[test]

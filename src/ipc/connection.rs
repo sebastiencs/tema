@@ -281,6 +281,12 @@ pub(crate) fn handle_line(state: &State, line: &str) -> Vec<u8> {
             Reply::Ok(Response::FocusedWindow(snapshot::build(state).focused_window))
         }
         Ok(Request::Subscribe { .. }) => Reply::Ok(Response::Subscribed),
+        Ok(Request::WindowIcon { id, size, scale }) => {
+            match snapshot::window_icon(state, id, size, scale) {
+                Ok(icon) => Reply::Ok(Response::WindowIcon(icon)),
+                Err(error) => Reply::Error(error),
+            }
+        }
         Err(_) => Reply::Error(request_error(line)),
     };
     proto::encode_line(&reply)
@@ -308,7 +314,7 @@ fn request_error(line: &str) -> String {
         return "malformed request".to_string();
     };
     match name {
-        "version" | "outputs" | "workspaces" | "focused_window" | "subscribe" => {
+        "version" | "outputs" | "workspaces" | "focused_window" | "subscribe" | "window_icon" => {
             "malformed request".to_string()
         }
         other => format!("unknown request `{other}`"),
@@ -448,6 +454,10 @@ mod tests {
         assert_eq!(
             text(&handle_line(&state, r#"{"request":"foo"}"#)),
             "{\"error\":\"unknown request `foo`\"}\n",
+        );
+        assert_eq!(
+            text(&handle_line(&state, r#"{"request":"window_icon"}"#)),
+            "{\"error\":\"malformed request\"}\n",
         );
         assert_eq!(
             text(&handle_line(&state, r#"{"request":"subscribe","events":["outputs"]}"#)),

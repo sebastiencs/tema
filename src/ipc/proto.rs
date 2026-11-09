@@ -28,7 +28,24 @@ pub enum Request {
     Outputs,
     Workspaces,
     FocusedWindow,
-    Subscribe { events: Vec<Topic> },
+    Subscribe {
+        events: Vec<Topic>,
+    },
+    WindowIcon {
+        id: u64,
+        #[serde(default = "default_icon_size")]
+        size: u32,
+        #[serde(default = "one")]
+        scale: u32,
+    },
+}
+
+fn default_icon_size() -> u32 {
+    32
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -56,6 +73,7 @@ pub enum Response {
     Outputs(Vec<Output>),
     Workspaces(Vec<Workspace>),
     FocusedWindow(Option<Window>),
+    WindowIcon(WindowIcon),
     Subscribed,
 }
 
@@ -90,6 +108,32 @@ pub struct Window {
     /// Absent on older clients. An empty protocol string is stored as `None`.
     #[serde(default)]
     pub description: Option<String>,
+    /// Absent on older clients.
+    #[serde(default)]
+    pub icon: Option<WindowIconInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowIconInfo {
+    pub name: Option<String>,
+    pub sizes: Vec<IconSize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IconSize {
+    pub size: u32,
+    pub scale: u32,
+}
+
+/// One icon image. `data` is standard base64 of little-endian premultiplied BGRA.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowIcon {
+    pub id: u64,
+    pub name: Option<String>,
+    pub size: Option<u32>,
+    pub scale: Option<u32>,
+    pub format: String,
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +164,76 @@ pub struct Output {
     pub refresh_mhz: i32,
     pub scale: f64,
     pub active_workspace: Option<String>,
+}
+
+const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with `=` padding.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in chunks.by_ref() {
+        let value = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        push_base64(&mut out, value, 4);
+    }
+    match chunks.remainder() {
+        [b0] => push_base64(&mut out, u32::from(*b0) << 16, 2),
+        [b0, b1] => push_base64(&mut out, (u32::from(*b0) << 16) | (u32::from(*b1) << 8), 3),
+        _ => {}
+    }
+    out
+}
+
+fn push_base64(out: &mut String, value: u32, chars: usize) {
+    for shift in [18, 12, 6, 0].into_iter().take(chars) {
+        out.push(BASE64[((value >> shift) & 0x3f) as usize] as char);
+    }
+    for _ in chars..4 {
+        out.push('=');
+    }
+}
+
+/// Standard base64 with `=` padding. Rejects a missing or misplaced pad.
+pub fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
+    if text.len() % 4 != 0 {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let bytes = text.as_bytes();
+    for chunk in bytes.chunks_exact(4) {
+        let (a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+        if a == b'=' || b == b'=' || (c == b'=' && d != b'=') {
+            return Err(());
+        }
+        let pad = match (c, d) {
+            (b'=', b'=') => 2,
+            (_, b'=') => 1,
+            _ => 0,
+        };
+        let value = (base64_value(a)? << 18)
+            | (base64_value(b)? << 12)
+            | (base64_value(if pad == 2 { b'A' } else { c })? << 6)
+            | base64_value(if pad >= 1 { b'A' } else { d })?;
+        out.push((value >> 16) as u8);
+        if pad < 2 {
+            out.push((value >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(value as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn base64_value(byte: u8) -> Result<u32, ()> {
+    match byte {
+        b'A'..=b'Z' => Ok(u32::from(byte - b'A')),
+        b'a'..=b'z' => Ok(u32::from(byte - b'a') + 26),
+        b'0'..=b'9' => Ok(u32::from(byte - b'0') + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(()),
+    }
 }
 
 pub fn encode_line<T: Serialize>(value: &T) -> Vec<u8> {
@@ -239,6 +353,7 @@ mod tests {
             fullscreen: false,
             tag: None,
             description: None,
+            icon: None,
         }
     }
 
@@ -288,6 +403,14 @@ mod tests {
             &Request::Subscribe { events: vec![] },
             r#"{"request":"subscribe","events":[]}"#,
         );
+        assert_json(
+            &Request::WindowIcon { id: 12, size: 32, scale: 1 },
+            r#"{"request":"window_icon","id":12,"size":32,"scale":1}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"request":"window_icon","id":12}"#).unwrap(),
+            Request::WindowIcon { id: 12, size: 32, scale: 1 },
+        );
     }
 
     #[test]
@@ -307,10 +430,21 @@ mod tests {
         );
         assert_json(
             &Reply::Ok(Response::FocusedWindow(Some(window()))),
-            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null}}}"#,
+            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null}}}"#,
         );
         assert_json(&Reply::Ok(Response::FocusedWindow(None)), r#"{"ok":{"focused_window":null}}"#);
         assert_json(&Reply::Ok(Response::Subscribed), r#"{"ok":"subscribed"}"#);
+        assert_json(
+            &Reply::Ok(Response::WindowIcon(WindowIcon {
+                id: 12,
+                name: Some("firefox".to_string()),
+                size: Some(32),
+                scale: Some(1),
+                format: "argb8888_premultiplied".to_string(),
+                data: Some(base64_encode(&[1, 2, 3, 4])),
+            })),
+            r#"{"ok":{"window_icon":{"id":12,"name":"firefox","size":32,"scale":1,"format":"argb8888_premultiplied","data":"AQIDBA=="}}}"#,
+        );
         assert_json(
             &Reply::Error("unknown request `foo`".to_string()),
             r#"{"error":"unknown request `foo`"}"#,
@@ -318,7 +452,7 @@ mod tests {
 
         assert_json(
             &Event::FocusedWindow { window: Some(window()) },
-            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null}}"#,
+            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null}}"#,
         );
         assert_json(
             &Event::FocusedWindow { window: None },
@@ -346,7 +480,7 @@ mod tests {
         nulls.output = None;
         assert_json(
             &nulls,
-            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false,"tag":null,"description":null}"#,
+            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null}"#,
         );
         let mut disabled = output();
         disabled.active_workspace = None;
@@ -354,6 +488,18 @@ mod tests {
             &Reply::Ok(Response::Outputs(vec![disabled])),
             r#"{"ok":{"outputs":[{"name":"DP-1","make":"Dell","model":"U2723QE","description":"Dell Inc. U2723QE","enabled":true,"x":0,"y":0,"width":2560,"height":1440,"refresh_mhz":239960,"scale":1.25,"active_workspace":null}]}}"#,
         );
+    }
+
+    #[test]
+    fn base64_round_trips_short_inputs_and_a_known_vector() {
+        for length in 0..=5 {
+            let bytes: Vec<u8> = (0..length).map(|index| index * 17).collect();
+            assert_eq!(base64_decode(&base64_encode(&bytes)), Ok(bytes));
+        }
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_decode("Zm9vYmFy"), Ok(b"foobar".to_vec()));
+        assert!(base64_decode("Zm9vYmF").is_err());
+        assert!(base64_decode("Zm9vYm=A").is_err());
     }
 
     #[test]
@@ -384,6 +530,7 @@ mod tests {
         assert_eq!(window.id, 1);
         assert_eq!(window.tag, None);
         assert_eq!(window.description, None);
+        assert_eq!(window.icon, None);
 
         let error = serde_json::from_str::<Request>(r#"{"request":"foo"}"#).unwrap_err();
         let message = error.to_string();
