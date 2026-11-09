@@ -14,8 +14,9 @@ use crate::{
         wl_pointer, wl_surface, wp_fractional_scale_v1, wp_linux_drm_syncobj_surface_v1,
         wp_viewport, xdg_wm_base, ExtSessionLockSurfaceV1Id, WaylandId, WlBufferId, WlCallbackId,
         WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId, WpFractionalScaleV1Id,
-        WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpViewportId, XdgSurfaceId,
-        XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id, ZwpInputPopupSurfaceV2Id,
+        WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpTearingControlV1Id, WpViewportId,
+        XdgSurfaceId, XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
+        ZwpInputPopupSurfaceV2Id,
     },
     region::{DamageRegion, RectI, RegionValue},
     scene::visibility::root_participates_in_input,
@@ -144,6 +145,14 @@ pub enum Role {
     InputPopup,
 }
 
+/// Double-buffered `wp_tearing_control_v1` presentation hint. `Vsync` is the protocol default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PresentationHint {
+    #[default]
+    Vsync,
+    Async,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShellSurfaceObject {
     XdgSurface(Resolved<XdgSurfaceId>),
@@ -207,6 +216,7 @@ pub struct WlSurface {
     blocked_waiter_id: Option<crate::sync::AcquireReadyWaiterId>,
     syncobj_surface_object: Option<Resolved<WpLinuxDrmSyncobjSurfaceV1Id>>,
     fractional_scale_object: Option<Resolved<WpFractionalScaleV1Id>>,
+    tearing_control_object: Option<Resolved<WpTearingControlV1Id>>,
     viewport_object: Option<Resolved<WpViewportId>>,
     retired_buffers: Vec<RetiredBufferCandidate>,
     /// `wl_surface.frame` callbacks to complete on the next `commit`.
@@ -243,6 +253,7 @@ struct Pending {
     buffer_transform: BufferTransform,
     buffer_scale: i32,
     viewport: SurfaceViewport,
+    presentation_hint: PresentationHint,
     damage_surface: Vec<DamageRect>,
     damage_buffer: Vec<DamageRect>,
     input_region: Option<RegionValue>,
@@ -262,6 +273,7 @@ impl Default for Pending {
             buffer_transform: BufferTransform::Normal,
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
+            presentation_hint: PresentationHint::Vsync,
             damage_surface: Vec::new(),
             damage_buffer: Vec::new(),
             input_region: None,
@@ -281,6 +293,7 @@ struct SurfaceCommitPayload {
     buffer_transform: BufferTransform,
     buffer_scale: i32,
     viewport: SurfaceViewport,
+    presentation_hint: PresentationHint,
     damage_surface: Vec<DamageRect>,
     damage_buffer: Vec<DamageRect>,
     input_region: RegionValue,
@@ -317,6 +330,7 @@ struct OnScreen {
     buffer_transform: BufferTransform,
     buffer_scale: i32,
     viewport: SurfaceViewport,
+    presentation_hint: PresentationHint,
     logical_size: Option<SizeI>,
     sample_transform: transform::Mat3,
     damage: DamageRegion,
@@ -340,6 +354,7 @@ impl Default for OnScreen {
             buffer_transform: BufferTransform::Normal,
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
+            presentation_hint: PresentationHint::Vsync,
             logical_size: None,
             sample_transform: transform::Mat3::identity(),
             damage: DamageRegion::new(),
@@ -383,6 +398,7 @@ struct BlockedSurfaceState {
     buffer_transform: BufferTransform,
     buffer_scale: i32,
     viewport: SurfaceViewport,
+    presentation_hint: PresentationHint,
     input_region: RegionValue,
     opaque_region: RegionValue,
     release_callbacks: Vec<Resolved<WlCallbackId>>,
@@ -543,6 +559,7 @@ impl WlSurface {
             blocked_waiter_id: None,
             syncobj_surface_object: None,
             fractional_scale_object: None,
+            tearing_control_object: None,
             viewport_object: None,
             retired_buffers: Vec::new(),
             pending_frame_callbacks: Vec::new(),
@@ -654,6 +671,10 @@ impl WlSurface {
 
         if self.viewport_object.take().is_some() {
             self.pending.viewport = SurfaceViewport::default();
+        }
+
+        if self.tearing_control_object.take().is_some() {
+            self.pending.presentation_hint = PresentationHint::Vsync;
         }
 
         if self.syncobj_surface_object.take().is_some() {
@@ -1239,6 +1260,40 @@ impl WlSurface {
         self.viewport_object.is_some()
     }
 
+    pub fn set_tearing_control_object(
+        &mut self,
+        object: Resolved<WpTearingControlV1Id>,
+    ) -> Result<(), ()> {
+        if self.tearing_control_object.is_some() {
+            return Err(());
+        }
+        self.tearing_control_object = Some(object);
+        Ok(())
+    }
+
+    pub fn clear_tearing_control_object(&mut self, object: Resolved<WpTearingControlV1Id>) {
+        if self.tearing_control_object == Some(object) {
+            self.tearing_control_object = None;
+            self.pending.presentation_hint = PresentationHint::Vsync;
+        }
+    }
+
+    pub fn has_tearing_control_object(&self) -> bool {
+        self.tearing_control_object.is_some()
+    }
+
+    pub(crate) fn set_pending_presentation_hint(&mut self, hint: PresentationHint) {
+        self.pending.presentation_hint = hint;
+    }
+
+    pub(crate) fn committed_presentation_hint(&self) -> PresentationHint {
+        self.on_screen.presentation_hint
+    }
+
+    pub(crate) fn test_set_committed_presentation_hint(&mut self, hint: PresentationHint) {
+        self.on_screen.presentation_hint = hint;
+    }
+
     fn send_syncobj_surface_error(
         &self,
         client: &Client,
@@ -1442,6 +1497,7 @@ impl WlSurface {
             buffer_transform: self.on_screen.buffer_transform,
             buffer_scale: self.on_screen.buffer_scale,
             viewport: self.on_screen.viewport,
+            presentation_hint: self.on_screen.presentation_hint,
             logical_size: None,
             sample_transform: transform::Mat3::identity(),
             damage: DamageRegion::new(),
@@ -1484,6 +1540,7 @@ impl WlSurface {
             buffer_transform: self.pending.buffer_transform,
             buffer_scale: self.pending.buffer_scale,
             viewport: self.pending.viewport,
+            presentation_hint: self.pending.presentation_hint,
             damage_surface: std::mem::take(&mut self.pending.damage_surface),
             damage_buffer: std::mem::take(&mut self.pending.damage_buffer),
             input_region,
@@ -1631,6 +1688,7 @@ impl WlSurface {
                 cached.payload.buffer_transform = payload.buffer_transform;
                 cached.payload.buffer_scale = payload.buffer_scale;
                 cached.payload.viewport = payload.viewport;
+                cached.payload.presentation_hint = payload.presentation_hint;
                 cached.payload.damage_surface.extend(payload.damage_surface);
                 cached.payload.damage_buffer.extend(payload.damage_buffer);
                 cached.payload.input_region = payload.input_region;
@@ -1874,6 +1932,7 @@ impl WlSurface {
             buffer_transform: payload.buffer_transform,
             buffer_scale: payload.buffer_scale,
             viewport: payload.viewport,
+            presentation_hint: payload.presentation_hint,
             input_region: payload.input_region.clone(),
             opaque_region: payload.opaque_region.clone(),
             release_callbacks: payload.release_callbacks.clone(),
@@ -2093,6 +2152,7 @@ impl WlSurface {
                     buffer_transform: payload.buffer_transform,
                     buffer_scale: payload.buffer_scale,
                     viewport: payload.viewport,
+                    presentation_hint: payload.presentation_hint,
                     logical_size: None,
                     sample_transform: transform::Mat3::identity(),
                     damage: DamageRegion::new(),
@@ -2174,6 +2234,7 @@ impl WlSurface {
                     buffer_transform: payload.buffer_transform,
                     buffer_scale: payload.buffer_scale,
                     viewport: payload.viewport,
+                    presentation_hint: payload.presentation_hint,
                     damage_surface: Vec::new(),
                     damage_buffer: Vec::new(),
                     input_region: self.on_screen.input_region.clone(),
@@ -2194,6 +2255,7 @@ impl WlSurface {
         }
 
         if !commit_blocked {
+            self.on_screen.presentation_hint = payload.presentation_hint;
             self.on_screen.input_region = payload.input_region.clone();
             self.on_screen.opaque_region = payload.opaque_region.clone();
             self.on_screen.wire_inputs = payload.wire_inputs.clone();
@@ -3093,6 +3155,7 @@ impl WlSurface {
             buffer_transform: BufferTransform::Normal,
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
+            presentation_hint: PresentationHint::Vsync,
             logical_size: Some(SizeI { width, height }),
             sample_transform: transform::Mat3::identity(),
             damage: Self::full_damage_for_logical_size(SizeI { width, height }),
@@ -3167,6 +3230,7 @@ impl WlSurface {
             buffer_transform: next.buffer_transform,
             buffer_scale: next.buffer_scale,
             viewport: next.viewport,
+            presentation_hint: next.presentation_hint,
             logical_size: Some(SizeI { width: next.width, height: next.height }),
             sample_transform: next.tex_transform,
             damage: Self::full_damage_for_logical_size(SizeI {
@@ -3563,8 +3627,8 @@ pub(crate) fn test_commit_new_buffer(
 mod tests {
     use {
         super::{
-            DamageRect, OnScreen, Role, SurfaceCommitPayload, SurfacePresentationFeedback,
-            WlSurface,
+            DamageRect, OnScreen, PresentationHint, Role, SurfaceCommitPayload,
+            SurfacePresentationFeedback, WlSurface,
         },
         crate::{
             capture::{test_sent_arg, test_sent_opcodes},
@@ -3625,6 +3689,7 @@ mod tests {
             buffer_transform: BufferTransform::Normal,
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
+            presentation_hint: PresentationHint::Vsync,
             logical_size: Some(SizeI { width: 100, height: 80 }),
             sample_transform: transform::Mat3::identity(),
             damage: DamageRegion::new(),
@@ -6868,6 +6933,7 @@ mod tests {
                 buffer_transform: BufferTransform::Normal,
                 buffer_scale: 1,
                 viewport: SurfaceViewport::default(),
+                presentation_hint: PresentationHint::Vsync,
                 damage_surface: vec![DamageRect { x: 0, y: 0, width: 10, height: 10 }],
                 damage_buffer: vec![],
                 input_region: RegionValue::infinite(),
@@ -6887,6 +6953,7 @@ mod tests {
                 buffer_transform: BufferTransform::FlipRotate180,
                 buffer_scale: 2,
                 viewport: SurfaceViewport::default(),
+                presentation_hint: PresentationHint::Async,
                 damage_surface: vec![DamageRect { x: 5, y: 6, width: 7, height: 8 }],
                 damage_buffer: vec![],
                 input_region: RegionValue::empty(),
@@ -6904,6 +6971,7 @@ mod tests {
         assert_eq!(cached.payload.offset, (30, 40));
         assert_eq!(cached.payload.buffer_transform, BufferTransform::FlipRotate180);
         assert_eq!(cached.payload.buffer_scale, 2);
+        assert_eq!(cached.payload.presentation_hint, PresentationHint::Async);
         assert_eq!(cached.payload.damage_surface.len(), 2);
         assert_eq!(cached.frame_callbacks, vec![resolved_callback(7), resolved_callback(8),]);
         assert_eq!(cached.presentation_feedbacks, vec![feedback(18, 2)]);

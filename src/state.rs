@@ -300,6 +300,8 @@ pub struct Output {
     pub vrr_capable: bool,
     pub vrr_policy_enabled: bool,
     pub vrr_enabled: bool,
+    /// The last successful submission used an async page flip.
+    pub tearing_active: bool,
     pub vrr_range: Option<VrrRange>,
     pub gamma_control_object_id: Option<Resolved<ZwlrGammaControlV1Id>>,
     pub x: i32,
@@ -353,6 +355,7 @@ impl Output {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 0,
@@ -1139,6 +1142,15 @@ fn workspace_transition_direction(
         }
         _ => WorkspaceTransitionDirection::Next,
     }
+}
+
+/// Why [`State::output_tearing_candidate`] found no window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TearingCandidateDenial {
+    Config,
+    SessionLock,
+    WorkspaceTransition,
+    Hint,
 }
 
 impl State {
@@ -3139,6 +3151,51 @@ impl State {
         tiling::window_is_floating(self, window)
     }
 
+    /// Fullscreen root on the output's active workspace, when that window asked to tear
+    /// and this output is allowed to. A session lock or a live workspace transition hides it.
+    pub fn output_tearing_candidate(&self, output_id: OutputId) -> Option<Resolved<WlSurfaceId>> {
+        self.classify_tearing_candidate(output_id).ok()
+    }
+
+    pub(crate) fn classify_tearing_candidate(
+        &self,
+        output_id: OutputId,
+    ) -> Result<Resolved<WlSurfaceId>, TearingCandidateDenial> {
+        let output = self
+            .outputs
+            .try_get(output_id)
+            .ok_or(TearingCandidateDenial::Hint)?;
+        if !self.config.output_allows_tearing(&output.name) {
+            return Err(TearingCandidateDenial::Config);
+        }
+        if self.session_lock.input_gated() {
+            return Err(TearingCandidateDenial::SessionLock);
+        }
+        if self.output_has_live_workspace_transition(output_id) {
+            return Err(TearingCandidateDenial::WorkspaceTransition);
+        }
+        let workspace_id = self
+            .active_workspace_for_output(output_id)
+            .ok_or(TearingCandidateDenial::Hint)?;
+        let window = self
+            .workspaces
+            .try_get(workspace_id)
+            .and_then(|workspace| workspace.layout.fullscreen.as_ref())
+            .map(|fullscreen| fullscreen.window)
+            .ok_or(TearingCandidateDenial::Hint)?;
+        let surface = self
+            .window_root_surface(window)
+            .ok_or(TearingCandidateDenial::Hint)?;
+        let async_hint = surface.try_ref(self).is_some_and(|wl_surface| {
+            wl_surface.committed_presentation_hint()
+                == crate::wayland_objects::wl_surface::PresentationHint::Async
+        });
+        if !async_hint {
+            return Err(TearingCandidateDenial::Hint);
+        }
+        Ok(surface)
+    }
+
     pub fn is_tiled_root_surface(&self, surface: Resolved<WlSurfaceId>) -> bool {
         self.window_for_root(surface)
             .is_some_and(|window| self.window_is_tiled(window))
@@ -5126,6 +5183,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: -100,
@@ -5151,6 +5209,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 0,
@@ -5186,6 +5245,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 0,
@@ -5211,6 +5271,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 100,
@@ -5246,6 +5307,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 0,
@@ -5271,6 +5333,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 200,
@@ -5320,6 +5383,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 0,
@@ -5345,6 +5409,7 @@ mod tests {
             vrr_capable: false,
             vrr_policy_enabled: false,
             vrr_enabled: false,
+            tearing_active: false,
             vrr_range: None,
             gamma_control_object_id: None,
             x: 0,

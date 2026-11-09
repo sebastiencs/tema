@@ -58,6 +58,7 @@ pub struct RuntimeConfig {
     pub bindings: Vec<Binding>,
     pub mouse_bindings: Vec<MouseBinding>,
     output_scales: BTreeMap<String, OutputScaleSetting>,
+    output_tearing: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +117,7 @@ pub struct GeneralConfig {
     pub inner_gap: i32,
     pub renderer: RendererSelection,
     pub import_environment: bool,
+    pub allow_tearing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -501,6 +503,8 @@ struct OpacityConfigFile {
 struct OutputConfigFile {
     #[serde(default)]
     scales: BTreeMap<String, OutputScaleSettingFile>,
+    #[serde(default)]
+    tearing: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -551,6 +555,7 @@ struct GeneralConfigFile {
     inner_gap: i32,
     renderer: String,
     import_environment: bool,
+    allow_tearing: bool,
 }
 
 impl RuntimeConfig {
@@ -661,6 +666,7 @@ impl RuntimeConfig {
                 inner_gap: sanitize_non_negative_i32(parsed.general.inner_gap),
                 renderer: parse_renderer(&parsed.general.renderer)?,
                 import_environment: parsed.general.import_environment,
+                allow_tearing: parsed.general.allow_tearing,
             },
             xwayland: XwaylandConfig {
                 enabled: parsed.xwayland.enabled,
@@ -684,6 +690,7 @@ impl RuntimeConfig {
             bindings,
             mouse_bindings,
             output_scales,
+            output_tearing: parsed.output.tearing,
         })
     }
 
@@ -697,6 +704,7 @@ impl RuntimeConfig {
                 inner_gap: 0,
                 renderer: RendererSelection::OpenGl,
                 import_environment: GeneralConfig::default_import_environment(),
+                allow_tearing: true,
             },
             xwayland: XwaylandConfig::default(),
             tiling: TilingConfig::default(),
@@ -706,6 +714,7 @@ impl RuntimeConfig {
             bindings: Vec::new(),
             mouse_bindings: Vec::new(),
             output_scales: BTreeMap::new(),
+            output_tearing: BTreeMap::new(),
         }
     }
 
@@ -715,6 +724,15 @@ impl RuntimeConfig {
 
     pub fn output_scale(&self, output_name: &str) -> Option<OutputScaleSetting> {
         self.output_scales.get(output_name).copied()
+    }
+
+    /// Per-output override when present, otherwise `general.allow_tearing`.
+    /// `output_name` is the connector name, the same key `[output.scales]` uses.
+    pub fn output_allows_tearing(&self, output_name: &str) -> bool {
+        self.output_tearing
+            .get(output_name)
+            .copied()
+            .unwrap_or(self.general.allow_tearing)
     }
 
     pub fn binding_for_key(&self, keyboard: &KeyboardState, key: u32) -> Option<CompositorAction> {
@@ -799,6 +817,10 @@ impl GeneralConfig {
     }
 
     pub fn default_import_environment() -> bool {
+        true
+    }
+
+    pub fn default_allow_tearing() -> bool {
         true
     }
 }
@@ -907,6 +929,7 @@ impl Default for GeneralConfigFile {
             inner_gap: GeneralConfig::default_inner_gap(),
             renderer: RendererSelection::default().to_string(),
             import_environment: GeneralConfig::default_import_environment(),
+            allow_tearing: GeneralConfig::default_allow_tearing(),
         }
     }
 }
@@ -1998,7 +2021,7 @@ mod tests {
             runner::Dispatcher,
             state::{BackendOutputRef, DrmId, OutputId},
             test_support::{
-                insert_window, state_for_tests, state_for_tests_with_config,
+                insert_window, state_for_tests, state_for_tests_with_config, test_output,
                 test_output_with_crtc_name,
             },
             wayland_objects::wl_surface::WlSurface,
@@ -2825,6 +2848,86 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("failed to parse"));
         assert_eq!(state.config, config);
+    }
+
+    #[test]
+    fn tearing_defaults_on_and_a_per_output_value_wins() {
+        let xkb = Xkb::new();
+        let defaults = RuntimeConfig::parse_for_test("", &xkb).unwrap();
+        assert!(defaults.general.allow_tearing);
+        assert!(defaults.output_allows_tearing("DP-1"));
+
+        let config = RuntimeConfig::parse_for_test(
+            r#"
+            [general]
+            allow_tearing = false
+
+            [output.tearing]
+            "DP-1" = true
+            "#,
+            &xkb,
+        )
+        .unwrap();
+        assert!(!config.general.allow_tearing);
+        assert!(config.output_allows_tearing("DP-1"));
+        assert!(!config.output_allows_tearing("eDP-1"));
+        assert!(!config.output_allows_tearing("dp-1"));
+    }
+
+    #[test]
+    fn reload_keeps_last_good_config_when_tearing_value_has_the_wrong_type() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            [general]
+            allow_tearing = false
+
+            [output.tearing]
+            "DP-1" = true
+            "#,
+        )
+        .unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config.clone());
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[output.tearing]\n\"DP-1\" = \"yes\"\n").unwrap();
+
+        let error = reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding)
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to parse"));
+        assert_eq!(state.config, config);
+        assert!(state.config.output_allows_tearing("DP-1"));
+    }
+
+    #[test]
+    fn reload_requests_a_frame_when_tearing_changes() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[general]\nallow_tearing = true\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let output_id = state.insert_output(test_output(backend, 1, 0, 0, 100, 100, "DP-1"));
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[general]\nallow_tearing = true\n\n[output.tearing]\n\"DP-1\" = false\n")
+            .unwrap();
+
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+
+        assert!(changed);
+        assert!(!state.config.output_allows_tearing("DP-1"));
+        assert!(output_frame_requested(&dispatcher, output_id));
     }
 
     #[test]

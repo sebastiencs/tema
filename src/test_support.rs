@@ -116,6 +116,7 @@ pub fn test_output(
         vrr_capable: false,
         vrr_policy_enabled: false,
         vrr_enabled: false,
+        tearing_active: false,
         vrr_range: None,
         gamma_control_object_id: None,
         x,
