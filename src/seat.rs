@@ -1793,6 +1793,15 @@ pub fn handle_keyboard_key(
         return;
     }
 
+    if key_state == 1 && state.session_active {
+        if let Some(vt) = state.keyboard.vt_for_key(key) {
+            log::info!("seat VT switch key={} vt={}", key, vt);
+            state.seat.intercept_keyboard_key(key);
+            dispatcher.dispatch(crate::dbus::DbusAction::SwitchVt { vt });
+            return;
+        }
+    }
+
     if key_state == 1 && !state.session_lock.input_gated() {
         if let Some(action) = state.config.binding_for_key(&state.keyboard, key) {
             log::info!("seat executing compositor binding key={} action={:?}", key, action);
@@ -6094,6 +6103,115 @@ mod xdg_seat_tests {
                 )
             }
         ));
+    }
+
+    fn queued_switch_vts(dispatcher: &Dispatcher) -> Vec<u32> {
+        let mut vts = Vec::new();
+        dispatcher.test_for_each_queued_action(|action: &crate::dbus::DbusAction| {
+            if let crate::dbus::DbusAction::SwitchVt { vt } = action {
+                vts.push(*vt);
+            }
+        });
+        vts
+    }
+
+    fn client_saw_key(dispatcher: &Dispatcher, key: u32) -> bool {
+        dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId::from_raw(7),
+            |action| {
+                matches!(
+                    action,
+                    ClientAction::SeatEvent {
+                        event: SeatClientEvent::KeyboardKey { key: event_key, .. },
+                    } if *event_key == key
+                )
+            },
+        )
+    }
+
+    fn press_ctrl_alt(state: &mut State, dispatcher: &mut Dispatcher) {
+        handle_keyboard_key(state, dispatcher, 29, 1, 10);
+        handle_keyboard_key(state, dispatcher, 56, 1, 11);
+    }
+
+    #[test]
+    fn ctrl_alt_f1_switches_vt_and_swallows_the_key() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        state.seat.keyboard_focus = Some(fake_focus(ClientId::from_raw(7), WlSurfaceId::from(10)));
+
+        press_ctrl_alt(&mut state, &mut dispatcher);
+        handle_keyboard_key(&mut state, &mut dispatcher, 59, 1, 20);
+        assert_eq!(queued_switch_vts(&dispatcher), vec![1]);
+        assert!(!client_saw_key(&dispatcher, 59));
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 59, 0, 30);
+        assert_eq!(queued_switch_vts(&dispatcher), vec![1]);
+        assert!(!client_saw_key(&dispatcher, 59));
+    }
+
+    #[test]
+    fn ctrl_alt_f1_switches_vt_while_the_session_is_locked() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        state.seat.keyboard_focus = Some(fake_focus(ClientId::from_raw(7), WlSurfaceId::from(10)));
+        state
+            .session_lock
+            .set_phase_for_tests(crate::session_lock::SessionLockPhase::Locked);
+
+        press_ctrl_alt(&mut state, &mut dispatcher);
+        handle_keyboard_key(&mut state, &mut dispatcher, 59, 1, 20);
+        assert_eq!(queued_switch_vts(&dispatcher), vec![1]);
+        assert!(!client_saw_key(&dispatcher, 59));
+    }
+
+    #[test]
+    fn ctrl_alt_f1_does_not_switch_vt_while_the_session_is_paused() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        state.seat.keyboard_focus = Some(fake_focus(ClientId::from_raw(7), WlSurfaceId::from(10)));
+        state.session_active = false;
+
+        press_ctrl_alt(&mut state, &mut dispatcher);
+        handle_keyboard_key(&mut state, &mut dispatcher, 59, 1, 20);
+        assert!(queued_switch_vts(&dispatcher).is_empty());
+        assert!(client_saw_key(&dispatcher, 59));
+    }
+
+    #[test]
+    fn vt_switch_runs_before_a_binding_on_the_same_chord() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        state.config = RuntimeConfig::parse_for_test(
+            r#"
+            [bindings]
+            "Ctrl+Alt+XF86Switch_VT_1" = { action = "quit" }
+            "#,
+            &state.xkb,
+        )
+        .unwrap();
+        state.seat.keyboard_focus = Some(fake_focus(ClientId::from_raw(7), WlSurfaceId::from(10)));
+
+        press_ctrl_alt(&mut state, &mut dispatcher);
+        assert_eq!(
+            state.config.binding_for_key(&state.keyboard, 59),
+            Some(crate::config::CompositorAction::Quit)
+        );
+        handle_keyboard_key(&mut state, &mut dispatcher, 59, 1, 20);
+        assert_eq!(queued_switch_vts(&dispatcher), vec![1]);
+        assert!(!dispatcher.shutdown_requested());
+        assert!(!client_saw_key(&dispatcher, 59));
+    }
+
+    #[test]
+    fn plain_f1_reaches_the_focused_client() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        state.seat.keyboard_focus = Some(fake_focus(ClientId::from_raw(7), WlSurfaceId::from(10)));
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 59, 1, 20);
+        assert!(queued_switch_vts(&dispatcher).is_empty());
+        assert!(client_saw_key(&dispatcher, 59));
     }
 
     #[test]

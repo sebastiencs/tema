@@ -70,6 +70,7 @@ enum Pending {
     TakeDevice { devnum: libc::dev_t },
     SubscribeSessionSignals,
     GetSessionActive,
+    SwitchVt { vt: u32 },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,6 +90,7 @@ pub struct Dbus {
     socket: UnixStream,
     session_path: String,
     seat: String,
+    seat_path: String,
     current_serial: DbusSerial,
     pending: BTreeMap<DbusSerial, Pending>,
     devices: BTreeMap<libc::dev_t, DeviceLease>,
@@ -376,12 +378,36 @@ fn get_session_path(buffered_socket: &mut BufReader<UnixStream>) -> Result<Strin
     Ok(session_path)
 }
 
+fn seat_path_fallback(name: &str) -> String {
+    format!("/org/freedesktop/login1/seat/{name}")
+}
+
+/// `(name, object path)` from a logind `Seat` property body.
+///
+/// The property is a variant of struct `(so)`. A missing or non-path second
+/// field falls back to `/org/freedesktop/login1/seat/<name>`.
+fn parse_seat_property(body: &[Value]) -> Option<(String, String)> {
+    let Value::Variant(variant) = body.first()? else {
+        return None;
+    };
+    let Value::Struct(values) = variant.as_ref() else {
+        return None;
+    };
+    let values = values.as_ref();
+    let Value::String(name) = values.first()? else {
+        return None;
+    };
+    let path = match values.get(1) {
+        Some(Value::ObjectPath(path)) => path.clone().into(),
+        _ => seat_path_fallback(name),
+    };
+    Some((name.clone(), path))
+}
+
 fn get_seat(
     buffered_socket: &mut BufReader<UnixStream>,
     session_path: &str,
-) -> Result<String, DbusError> {
-    let make_err = |msg: &Message| Err::<String, _>(DbusError::SeatNotFound(format!("{:?}", msg)));
-
+) -> Result<(String, String), DbusError> {
     let mut msg = make_method_call(MethodCallParams {
         destination: "org.freedesktop.login1".into(),
         object_path: session_path.into(),
@@ -397,16 +423,7 @@ fn get_seat(
     let mut buffer = vec![0u8; 32 * 1024];
     let msg = read_sync(buffered_socket, &mut buffer)?;
 
-    let Some(Value::Variant(variant)) = msg.get_body().first() else {
-        return make_err(&msg);
-    };
-    let Value::Struct(values) = &**variant else {
-        return make_err(&msg);
-    };
-    let Some(Value::String(seat)) = values.as_ref().first() else {
-        return make_err(&msg);
-    };
-    Ok(seat.clone())
+    parse_seat_property(msg.get_body()).ok_or_else(|| DbusError::SeatNotFound(format!("{:?}", msg)))
 }
 
 fn take_session_control(
@@ -452,7 +469,7 @@ pub fn init() -> Result<Dbus, DbusError> {
     say_hello(&mut socket)?;
 
     let session_path = get_session_path(&mut socket)?;
-    let seat = get_seat(&mut socket, &session_path)?;
+    let (seat, seat_path) = get_seat(&mut socket, &session_path)?;
     let (current_serial, took_control) = take_session_control(&mut socket, &session_path)?;
 
     let socket = socket.into_inner();
@@ -461,6 +478,7 @@ pub fn init() -> Result<Dbus, DbusError> {
         socket,
         session_path,
         seat,
+        seat_path,
         current_serial,
         pending,
         devices: BTreeMap::new(),
@@ -543,6 +561,7 @@ impl Dbus {
                             log::warn!("session Active reply is missing its value");
                         }
                     }
+                    Pending::SwitchVt { .. } => {}
                 }
             }
             Error => {
@@ -559,11 +578,20 @@ impl Dbus {
                             error_name.as_deref().unwrap_or("unknown error")
                         ),
                     ));
-                } else if let Some(Pending::TakeDevice { devnum }) = pending {
-                    log::warn!("TakeDevice failed for {devnum}: {error_name:?}");
-                    dispatcher.dispatch(crate::udev::UdevAction::DeviceTakeFailed { devnum });
                 } else {
-                    log::warn!("dbus error pending={pending:?} name={error_name:?}");
+                    match pending {
+                        Some(Pending::TakeDevice { devnum }) => {
+                            log::warn!("TakeDevice failed for {devnum}: {error_name:?}");
+                            dispatcher
+                                .dispatch(crate::udev::UdevAction::DeviceTakeFailed { devnum });
+                        }
+                        Some(Pending::SwitchVt { vt }) => {
+                            log::warn!("could not switch to VT {vt}: {error_name:?}");
+                        }
+                        pending => {
+                            log::warn!("dbus error pending={pending:?} name={error_name:?}");
+                        }
+                    }
                 }
             }
             Signal => self.handle_signal(state, msg, fds, dispatcher),
@@ -820,6 +848,23 @@ impl Dbus {
         }
     }
 
+    fn switch_vt(&mut self, vt: u32, dispatcher: &mut Dispatcher) {
+        if !self.took_control || self.released_control {
+            log::debug!("not switching to VT {vt}: session control is not held");
+            return;
+        }
+        let mut msg = make_method_call(MethodCallParams {
+            destination: "org.freedesktop.login1".into(),
+            object_path: self.seat_path.as_str().into(),
+            interface: "org.freedesktop.login1.Seat".into(),
+            member: "SwitchTo".into(),
+        });
+        msg.set_serial(self.next_serial().as_u32());
+        msg.add_value(Value::Uint32(vt));
+        self.send_message(msg, Pending::SwitchVt { vt }, dispatcher);
+        log::info!("switching to VT {vt}");
+    }
+
     fn set_locked_hint(&mut self, locked: bool, dispatcher: &mut Dispatcher) {
         if self.released_control || self.session_path.is_empty() {
             return;
@@ -1009,6 +1054,10 @@ pub enum DbusAction {
     SetLockedHint {
         locked: bool,
     },
+    /// logind Seat.SwitchTo. Sent for XF86Switch_VT_n.
+    SwitchVt {
+        vt: u32,
+    },
 }
 
 impl Model for Dbus {
@@ -1043,6 +1092,7 @@ impl Model for Dbus {
             MsgReceived { msg, fds } => self.handle_message(state, msg, fds, dispatcher),
             DevicePauseQuiesced { devnum } => self.finish_device_pause(devnum, dispatcher),
             SetLockedHint { locked } => self.set_locked_hint(locked, dispatcher),
+            SwitchVt { vt } => self.switch_vt(vt, dispatcher),
             PauseAckFinished { devnum, error } => {
                 if let Some(error) = error {
                     isolate_session_fault(
@@ -1336,6 +1386,7 @@ mod session_release_tests {
                 socket,
                 session_path: "/org/freedesktop/login1/session/self".into(),
                 seat: "seat0".into(),
+                seat_path: "/org/freedesktop/login1/seat/seat0".into(),
                 current_serial: super::DbusSerial(1),
                 pending: Default::default(),
                 devices: Default::default(),
@@ -1611,6 +1662,125 @@ mod session_release_tests {
                 .any(|window| window == b"SetLockedHint")
         });
         assert_eq!(written, 1);
+    }
+
+    fn write_buffers(dispatcher: &crate::runner::Dispatcher) -> Vec<Vec<u8>> {
+        use crate::io_uring::model::IoUringAction;
+
+        let mut buffers = Vec::new();
+        dispatcher.test_for_each_queued_action(|action: &IoUringAction| {
+            if let IoUringAction::Write { buffer, .. } = action {
+                buffers.push(buffer.to_vec());
+            }
+        });
+        buffers
+    }
+
+    #[test]
+    fn switch_vt_writes_seat_switch_to() {
+        use dbus_message_parser::{message::Message, value::Value};
+
+        let mut session = dbus_for_tests();
+        let mut state = crate::test_support::state_for_tests();
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        session
+            .process(&mut state, super::DbusAction::SwitchVt { vt: 3 }, &mut dispatcher)
+            .expect("switch");
+        let buffers = write_buffers(&dispatcher);
+        assert_eq!(buffers.len(), 1);
+        let (message, _) = Message::decode(buffers[0].clone().into()).expect("SwitchTo encodes");
+        assert_eq!(message.get_member().map(|member| member.as_ref()), Some("SwitchTo"));
+        assert_eq!(
+            message.get_interface().map(|interface| interface.as_ref()),
+            Some("org.freedesktop.login1.Seat")
+        );
+        assert_eq!(
+            message.get_path().map(|path| path.as_ref()),
+            Some("/org/freedesktop/login1/seat/seat0")
+        );
+        assert_eq!(message.get_body(), &[Value::Uint32(3)]);
+        assert!(matches!(
+            session.pending.get(&super::DbusSerial(1)),
+            Some(super::Pending::SwitchVt { vt: 3 })
+        ));
+    }
+
+    #[test]
+    fn switch_vt_is_skipped_without_session_control() {
+        let mut session = dbus_for_tests();
+        session.took_control = false;
+        let mut state = crate::test_support::state_for_tests();
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        session
+            .process(&mut state, super::DbusAction::SwitchVt { vt: 3 }, &mut dispatcher)
+            .expect("skip");
+        assert!(write_buffers(&dispatcher).is_empty());
+        assert!(session.pending.is_empty());
+    }
+
+    #[test]
+    fn switch_vt_is_skipped_after_release() {
+        let mut session = dbus_for_tests();
+        session.released_control = true;
+        let mut state = crate::test_support::state_for_tests();
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        session
+            .process(&mut state, super::DbusAction::SwitchVt { vt: 3 }, &mut dispatcher)
+            .expect("skip");
+        assert!(write_buffers(&dispatcher).is_empty());
+        assert!(session.pending.is_empty());
+    }
+
+    #[test]
+    fn switch_vt_error_reply_is_not_fatal() {
+        use crate::udev::UdevAction;
+
+        let mut session = dbus_for_tests();
+        session
+            .pending
+            .insert(super::DbusSerial(4), super::Pending::SwitchVt { vt: 2 });
+        let mut state = crate::test_support::state_for_tests();
+        let mut dispatcher = crate::runner::Dispatcher::default();
+        session.handle_message(
+            &mut state,
+            error_reply(4, "org.freedesktop.DBus.Error.Failed"),
+            Vec::new(),
+            &mut dispatcher,
+        );
+        assert!(!dispatcher.shutdown_requested());
+        assert_eq!(dispatcher.test_count_queued_action(|_: &UdevAction| true), 0);
+        assert!(session.pending.is_empty());
+    }
+
+    #[test]
+    fn parse_seat_property_keeps_the_object_path_and_falls_back() {
+        use dbus_message_parser::value::Value;
+
+        let path = "/org/freedesktop/login1/seat/seat0";
+        let with_path = vec![Value::Variant(Box::new(Value::Struct(
+            vec![Value::String("seat0".into()), Value::ObjectPath(path.try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+        )))];
+        assert_eq!(super::parse_seat_property(&with_path), Some(("seat0".into(), path.into())));
+
+        let name_only = vec![Value::Variant(Box::new(Value::Struct(
+            vec![Value::String("seat0".into())].try_into().unwrap(),
+        )))];
+        assert_eq!(super::parse_seat_property(&name_only), Some(("seat0".into(), path.into())));
+
+        let string_path = vec![Value::Variant(Box::new(Value::Struct(
+            vec![Value::String("seat0".into()), Value::String(path.into())]
+                .try_into()
+                .unwrap(),
+        )))];
+        assert_eq!(super::parse_seat_property(&string_path), Some(("seat0".into(), path.into())));
+
+        assert_eq!(super::parse_seat_property(&[]), None);
+        assert_eq!(
+            super::parse_seat_property(&[Value::Variant(Box::new(Value::String("seat0".into())))]),
+            None
+        );
     }
 
     #[test]

@@ -171,11 +171,19 @@ The relay lives in `src/input/ime.rs`. An enable on the focused surface sends `a
 
 Each client has its own keymap. The hardware keymap is id 0. A virtual keyboard compiles the keymap string it sends and switches the focused client to that blob: if keys are held, the client gets `leave`, the new keymap, `enter` with those keys, then modifiers. The next hardware key or focus change switches back to the hardware keymap. Replacing or destroying a virtual keyboard releases the keys it still has down.
 
-`zwp_input_method_keyboard_grab_v2` is consulted after compositor key bindings and before the focused client. A press goes to the grab and is recorded. Its release stays with the grab, and is swallowed if the grab has already gone. Presses that happened before the grab, or while the session is locked, still reach the client. The lock screen bypasses the grab, and input-method popups are not drawn on it.
+VT switching (section 5.2) runs first. `zwp_input_method_keyboard_grab_v2` is consulted after compositor key bindings and before the focused client. A press goes to the grab and is recorded. Its release stays with the grab, and is swallowed if the grab has already gone. Presses that happened before the grab, or while the session is locked, still reach the client. The lock screen bypasses the grab, and input-method popups are not drawn on it.
 
 `zwp_input_popup_surface_v2` is the candidate window. It is placed below the cursor rectangle on the output that contains the caret, flipped above when it would leave that output, then clamped inside it. `text_input_rectangle` tells the input method where the caret sits in popup-local coordinates. The popup is not a pointer target and never takes keyboard focus.
 
 An on-screen keyboard is a layer-shell surface, usually with `keyboard_interactivity = none`, plus a virtual keyboard. A click on that layer leaves keyboard focus where it is, so the tap does not deactivate the input method. `on_demand` and `exclusive` layers still take focus. Other focus requests, including an explicit `set_keyboard_focus` of a `none` layer, still go through the normal focus normalization.
+
+## 5.2 VT switching
+
+Ctrl+Alt+F1 through Ctrl+Alt+F12 are built in. The `pc` keymap includes `srvr_ctrl`, so that chord produces `XF86Switch_VT_1` through `XF86Switch_VT_12`. A press of one of those keysyms calls logind `Seat.SwitchTo(n)` on the seat object path. The matching release is swallowed, so the client never sees that F-key. Ctrl and Alt still reach the client.
+
+The check runs before compositor bindings, the input-method grab, and the lock gate. A locked session still switches and comes back locked. A binding on that chord never runs. While the session is paused, the key stays on the normal path and `SwitchTo` is not sent.
+
+`SwitchTo` is not sent when tema is nested under X11, because session control was not taken, or after session control has been released on shutdown. An error reply logs `could not switch to VT n: …` and leaves the session running. Pause, quiesce, and resume are the existing session pause path: `PauseDevice`, then `Active=false`, then the resume signals on the way back.
 
 ## 6. Linux Graphics Stack: The Lower Half
 

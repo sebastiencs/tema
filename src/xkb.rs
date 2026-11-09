@@ -120,6 +120,10 @@ impl KeyboardState {
         self.state.key_get_one_sym((key + 8).into())
     }
 
+    pub fn vt_for_key(&self, key: u32) -> Option<u32> {
+        vt_for_keysym(self.key_get_one_sym(key))
+    }
+
     pub fn update_key(&mut self, key: u32, is_pressed: bool) -> Option<KeyboardModifiers> {
         let changed = if is_pressed {
             if self.pressed_keys.contains(&key) {
@@ -149,6 +153,17 @@ impl KeyboardState {
 
         self.modifiers = modifiers;
         Some(modifiers)
+    }
+}
+
+/// VT number for an `XF86Switch_VT_n` keysym (1..=12).
+pub fn vt_for_keysym(keysym: xkb::Keysym) -> Option<u32> {
+    let raw = keysym.raw();
+    let first = xkb::keysyms::KEY_XF86Switch_VT_1;
+    if (first..=xkb::keysyms::KEY_XF86Switch_VT_12).contains(&raw) {
+        Some(raw - first + 1)
+    } else {
+        None
     }
 }
 
@@ -225,4 +240,35 @@ fn new_memfd(data: *const u8, size: usize) -> std::io::Result<MemFd> {
     };
 
     Ok(MemFd { fd: Rc::new(fd), size })
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{vt_for_keysym, Xkb},
+        xkbcommon::xkb::{self, keysyms},
+    };
+
+    #[test]
+    fn vt_for_keysym_maps_switch_vt_and_rejects_neighbors() {
+        assert_eq!(vt_for_keysym(xkb::Keysym::from(keysyms::KEY_XF86Switch_VT_1)), Some(1));
+        assert_eq!(vt_for_keysym(xkb::Keysym::from(keysyms::KEY_XF86Switch_VT_12)), Some(12));
+        assert_eq!(vt_for_keysym(xkb::Keysym::from(keysyms::KEY_F1)), None);
+        assert_eq!(vt_for_keysym(xkb::Keysym::from(keysyms::KEY_NoSymbol)), None);
+        assert_eq!(vt_for_keysym(xkb::Keysym::from(0x1008_FE00)), None);
+        assert_eq!(vt_for_keysym(xkb::Keysym::from(0x1008_FE0D)), None);
+    }
+
+    #[test]
+    fn default_keymap_maps_ctrl_alt_f1_to_vt_1() {
+        // Evdev codes: left Ctrl 29, left Alt 56, F1 59.
+        let xkb = Xkb::new();
+        let mut keyboard = xkb.create_keyboard_state();
+        assert_eq!(keyboard.vt_for_key(59), None);
+
+        keyboard.update_key(29, true);
+        keyboard.update_key(56, true);
+        keyboard.update_key(59, true);
+        assert_eq!(keyboard.vt_for_key(59), Some(1));
+    }
 }

@@ -1820,7 +1820,37 @@ fn parse_binding(description: &str, keymap: &xkb::Keymap) -> anyhow::Result<KeyB
         bail!("unknown keysym `{}`", key_name);
     }
     let modifiers = parse_modifier_mask(modifier_names, keymap)?;
+    if binding_shadowed_by_vt_switch(keysym, modifier_names) {
+        log::warn!(
+            "binding `{description}` is shadowed by VT switching; Ctrl+Alt+F1..F12 is built in"
+        );
+    }
     Ok(KeyBinding { description: description.to_string(), keysym, modifiers })
+}
+
+fn binding_shadowed_by_vt_switch(keysym: xkb::Keysym, modifier_names: &[&str]) -> bool {
+    if crate::xkb::vt_for_keysym(keysym).is_some() {
+        return true;
+    }
+    let raw = keysym.raw();
+    (xkb::keysyms::KEY_F1..=xkb::keysyms::KEY_F12).contains(&raw)
+        && modifiers_are_exactly_ctrl_alt(modifier_names)
+}
+
+fn modifiers_are_exactly_ctrl_alt(modifier_names: &[&str]) -> bool {
+    if modifier_names.len() != 2 {
+        return false;
+    }
+    let mut ctrl = false;
+    let mut alt = false;
+    for name in modifier_names {
+        match normalize_modifier_name(name) {
+            Some(name) if name == xkb::MOD_NAME_CTRL && !ctrl => ctrl = true,
+            Some(name) if name == xkb::MOD_NAME_ALT && !alt => alt = true,
+            _ => return false,
+        }
+    }
+    ctrl && alt
 }
 
 fn parse_mouse_binding(
@@ -2228,6 +2258,47 @@ mod tests {
 
         let error = RuntimeConfig::compile(PathBuf::from("config.toml"), parsed, &xkb).unwrap_err();
         assert!(error.to_string().contains("duplicate binding"));
+    }
+
+    #[test]
+    fn vt_switch_bindings_still_load() {
+        assert!(binding_shadowed_by_vt_switch(
+            xkb::Keysym::from(xkb::keysyms::KEY_XF86Switch_VT_1),
+            &[],
+        ));
+        assert!(binding_shadowed_by_vt_switch(
+            xkb::Keysym::from(xkb::keysyms::KEY_XF86Switch_VT_12),
+            &["Super"],
+        ));
+        assert!(binding_shadowed_by_vt_switch(
+            xkb::Keysym::from(xkb::keysyms::KEY_F1),
+            &["Ctrl", "Alt"]
+        ));
+        assert!(binding_shadowed_by_vt_switch(
+            xkb::Keysym::from(xkb::keysyms::KEY_F12),
+            &["Alt", "control"]
+        ));
+        assert!(!binding_shadowed_by_vt_switch(
+            xkb::Keysym::from(xkb::keysyms::KEY_F1),
+            &["Super"]
+        ));
+        assert!(!binding_shadowed_by_vt_switch(
+            xkb::Keysym::from(xkb::keysyms::KEY_F1),
+            &["Ctrl", "Alt", "Shift"]
+        ));
+        assert!(!binding_shadowed_by_vt_switch(xkb::Keysym::from(xkb::keysyms::KEY_F1), &[]));
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::parse_for_test(
+            r#"
+            [bindings]
+            "Ctrl+Alt+F1" = { action = "quit" }
+            "Ctrl+Alt+XF86Switch_VT_2" = { action = "close" }
+            "#,
+            &xkb,
+        )
+        .unwrap();
+        assert_eq!(config.bindings.len(), 2);
     }
 
     #[test]

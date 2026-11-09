@@ -150,6 +150,7 @@ style = "fade"
 
 [bindings]
 # Key names follow xkb (e.g. Super, Ctrl, Alt, Shift). Last segment is the key.
+# Ctrl+Alt+F1..F12 switch VT (built in); bindings on those chords never fire.
 "Super+Escape" = { action = "quit" }
 "Super+Shift+C" = { action = "reload-config" }
 "Super+Return" = { action = "spawn", command = "alacritty" }
