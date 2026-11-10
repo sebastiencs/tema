@@ -1316,6 +1316,45 @@ pub mod xdg_toplevel {
             );
         }
 
+        /// Tiled configure during an interactive resize: skipped when unchanged,
+        /// and held back while the previous resize configure is not committed yet
+        /// (up to `RESIZE_CONFIGURE_TIMEOUT`).
+        pub fn send_tiled_resize_configure_throttled(
+            &mut self,
+            client: &Client,
+            state: &State,
+            xdg_surface: &mut XdgSurface,
+            geometry: crate::root_geometry::CommittedRootGeometry,
+            configure_geometry: crate::root_geometry::ConfigureGeometry,
+            now: std::time::Instant,
+            dispatcher: &mut ClientDispatcher,
+        ) {
+            let (width, height) = configure_geometry.size;
+            let states = self.layout_states(geometry.fullscreen, true);
+            if self.configure_is_current(
+                xdg_surface,
+                width,
+                height,
+                &states,
+                Some(configure_geometry.size),
+            ) {
+                return;
+            }
+            if !xdg_surface.resize_configure_allowed(now) {
+                return;
+            }
+            self.send_tiled_layout_configure(
+                client,
+                state,
+                xdg_surface,
+                geometry,
+                configure_geometry,
+                true,
+                dispatcher,
+            );
+            xdg_surface.note_resize_configure_sent(now);
+        }
+
         pub fn send_layout_configure(
             &mut self,
             client: &Client,
@@ -3145,6 +3184,98 @@ mod tests {
         assert!(xdg_surface.resize_throttle.is_none());
         assert!(!xdg_surface.deferred_resize_configure);
         assert!(xdg_surface.resize_configure_allowed(t0));
+    }
+
+    fn geometry_for_size(width: i32, height: i32) -> crate::root_geometry::CommittedRootGeometry {
+        crate::root_geometry::CommittedRootGeometry {
+            layout_rect_global: RectI { x: 0, y: 0, width, height },
+            root_pos: (0, 0),
+            surface_bounds_local: None,
+            logical_window_local: None,
+            decoration_mode: None,
+            decoration_insets: crate::config::DecorationInsets {
+                top: 0,
+                right: 0,
+                bottom: 0,
+                left: 0,
+            },
+            tiled_edges: 0,
+            fullscreen: false,
+        }
+    }
+
+    fn send_tiled_resize(
+        toplevel: &mut XdgToplevel,
+        xdg_surface: &mut XdgSurface,
+        width: i32,
+        height: i32,
+        now: std::time::Instant,
+    ) {
+        let state = state_for_tests();
+        let client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let geometry = geometry_for_size(width, height);
+        let configure_geometry = crate::root_geometry::project_configure_geometry(geometry);
+        toplevel.send_tiled_resize_configure_throttled(
+            &client,
+            &state,
+            xdg_surface,
+            geometry,
+            configure_geometry,
+            now,
+            &mut client_dispatcher,
+        );
+    }
+
+    #[test]
+    fn tiled_resize_configure_is_throttled_to_one_in_flight() {
+        let mut xdg_surface = test_xdg_surface();
+        let mut toplevel = test_toplevel();
+        let t0 = std::time::Instant::now();
+
+        send_tiled_resize(&mut toplevel, &mut xdg_surface, 100, 80, t0);
+        assert_eq!(xdg_surface.test_pending_configure_count(), 1);
+
+        send_tiled_resize(
+            &mut toplevel,
+            &mut xdg_surface,
+            110,
+            80,
+            t0 + std::time::Duration::from_millis(10),
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 1);
+        assert!(xdg_surface.deferred_resize_configure);
+
+        send_tiled_resize(
+            &mut toplevel,
+            &mut xdg_surface,
+            100,
+            80,
+            t0 + std::time::Duration::from_millis(10),
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 1);
+
+        send_tiled_resize(
+            &mut toplevel,
+            &mut xdg_surface,
+            110,
+            80,
+            t0 + std::time::Duration::from_millis(60),
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 2);
+
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+        xdg_surface.pending_configures.clear();
+        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        send_tiled_resize(
+            &mut toplevel,
+            &mut xdg_surface,
+            120,
+            80,
+            t0 + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 1);
     }
 
     #[test]

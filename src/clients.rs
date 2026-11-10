@@ -2629,15 +2629,27 @@ impl Client {
             if let Some((geometry, configure_geometry)) =
                 tiled_geometry.zip(tiled_configure_geometry)
             {
-                toplevel.send_tiled_layout_configure_if_changed(
-                    self,
-                    state,
-                    &mut xdg_surface,
-                    geometry,
-                    configure_geometry,
-                    resizing,
-                    dispatcher,
-                );
+                if resizing {
+                    toplevel.send_tiled_resize_configure_throttled(
+                        self,
+                        state,
+                        &mut xdg_surface,
+                        geometry,
+                        configure_geometry,
+                        std::time::Instant::now(),
+                        dispatcher,
+                    );
+                } else {
+                    toplevel.send_tiled_layout_configure_if_changed(
+                        self,
+                        state,
+                        &mut xdg_surface,
+                        geometry,
+                        configure_geometry,
+                        resizing,
+                        dispatcher,
+                    );
+                }
             } else if let Some(remembered_state) = scheduled_floating_restore {
                 toplevel.send_interactive_resize_configure(
                     self,
