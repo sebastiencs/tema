@@ -512,6 +512,19 @@ impl WindowGeometryAnimation {
         self.position.active || self.size.active
     }
 
+    /// The animation is at rest at a goal other than `committed`.
+    ///
+    /// False while unarmed, while a goal is pending, while either axis is
+    /// running, or while the opening pose is still to be played.
+    pub fn settled_away_from(self, committed: RectI) -> bool {
+        self.armed
+            && self.pending.is_none()
+            && !self.position.active
+            && !self.size.active
+            && !self.opening_pose
+            && !self.goal_is(committed)
+    }
+
     /// The next layout-driven goal should use the relocation position node.
     pub fn prefer_relocation(&mut self) {
         self.relocation_pending = true;
@@ -1000,6 +1013,35 @@ mod tests {
         geometry.advance(now + Duration::from_millis(50), linear(100), linear(100));
         assert_eq!(geometry.visual_rect(), Some(rect(30, 0, 10, 10)));
         assert!(!geometry.is_active());
+    }
+
+    #[test]
+    fn settled_away_from_is_true_only_at_rest_on_a_different_goal() {
+        let now = Instant::now();
+        let mut geometry = WindowGeometryAnimation::unarmed();
+        assert!(!geometry.settled_away_from(rect(0, 0, 10, 10)));
+
+        geometry.set_goal(rect(0, 0, 10, 10), WindowGeometryMotion::Warp);
+        geometry.advance(now, linear(100), linear(100));
+        assert!(!geometry.settled_away_from(rect(0, 0, 10, 10)));
+        assert!(geometry.settled_away_from(rect(0, 0, 12, 10)));
+
+        geometry.set_goal(rect(0, 0, 20, 10), WindowGeometryMotion::Layout);
+        geometry.advance(now, linear(100), linear(100));
+        assert!(geometry.is_active());
+        assert!(!geometry.settled_away_from(rect(0, 0, 20, 10)));
+
+        geometry.advance(now + Duration::from_millis(100), linear(100), linear(100));
+        assert!(!geometry.is_active());
+        geometry.set_goal(rect(0, 0, 30, 10), WindowGeometryMotion::Layout);
+        assert_eq!(geometry.goal_rect(), Some(rect(0, 0, 30, 10)));
+        assert!(!geometry.settled_away_from(rect(0, 0, 30, 10)));
+
+        let mut opening = WindowGeometryAnimation::unarmed();
+        opening.set_goal(rect(0, 0, 10, 10), WindowGeometryMotion::Warp);
+        opening.advance(now, linear(100), linear(100));
+        opening.arm_opening_pose();
+        assert!(!opening.settled_away_from(rect(0, 0, 12, 10)));
     }
 
     #[test]
