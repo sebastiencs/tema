@@ -132,6 +132,15 @@ impl WlDataOffer {
         self.role == DataOfferRole::Drag && state.seat.active_drag_contains_offer(client_id, offer)
     }
 
+    fn log_ignored(&self, client: &Client, request: &str) {
+        log::debug!(
+            "ignoring {request} on inactive drag offer {:?} (client {:?}, detached: {})",
+            self.id,
+            client.client_id(),
+            self.detached,
+        );
+    }
+
     pub fn before_destroy(
         &mut self,
         owner_client_id: ClientId,
@@ -243,6 +252,7 @@ impl Object for WlDataOffer {
                         return Ok(());
                     };
                     if !self.is_active_drag_offer(state, client.client_id(), offer) {
+                        self.log_ignored(client, "wl_data_offer.accept");
                         return Ok(());
                     }
                     let _ = state.seat.set_active_drag_accepted_mime(
@@ -277,6 +287,7 @@ impl Object for WlDataOffer {
                         !self.is_active_drag_offer(state, client.client_id(), offer)
                     })
                 {
+                    self.log_ignored(client, "wl_data_offer.receive");
                     drop(fd);
                     return Ok(());
                 }
@@ -318,6 +329,7 @@ impl Object for WlDataOffer {
                     return Ok(());
                 };
                 if !self.is_active_drag_offer(state, client.client_id(), offer) {
+                    self.log_ignored(client, "wl_data_offer.finish");
                     return Ok(());
                 }
                 let Some(drag) = state.seat.active_drag() else {
@@ -397,6 +409,7 @@ impl Object for WlDataOffer {
                     return Ok(());
                 };
                 if !self.is_active_drag_offer(state, client.client_id(), offer) {
+                    self.log_ignored(client, "wl_data_offer.set_actions");
                     return Ok(());
                 }
                 const VALID_MASK: u32 = wl_data_device_manager::DndAction::Copy as u32
