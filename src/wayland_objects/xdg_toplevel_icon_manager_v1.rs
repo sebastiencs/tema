@@ -406,6 +406,7 @@ mod tests {
                     sampling_device: None,
                 },
                 y_inverted: false,
+                import_rejected: false,
             })
             .unwrap(),
         );

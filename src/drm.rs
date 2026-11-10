@@ -6955,7 +6955,10 @@ fn rgba_to_drm_argb8888(
     dst
 }
 
-fn import_client_texture(drm: &mut Drm, buffer: &WlBuffer) -> Option<Rc<dyn Texture>> {
+fn import_client_texture(
+    drm: &mut Drm,
+    buffer: &crate::buffer_content::BufferContent,
+) -> Option<Rc<dyn Texture>> {
     if buffer.import_rejected() {
         log::warn!("skipping dma-buf wl_buffer rejected at creation");
         return None;
@@ -7053,15 +7056,11 @@ fn push_scene_items_from_snapshots(
             log::warn!("collect_render_items: buffer object {:?} missing (destroyed?)", buffer_oid);
             continue;
         }
-        let Some(_) = objects.try_ref_object::<WlBuffer>(buffer_oid) else {
+        let Some(buffer) = objects.try_ref_object::<WlBuffer>(buffer_oid) else {
             log::warn!("collect_render_items: object {:?} is not a WlBuffer", buffer_oid);
             continue;
         };
-
-        let mut obj = objects.grab(surface_state.buffer.object_id());
-        let Some(buffer) = obj.downcast_mut::<WlBuffer>() else {
-            continue;
-        };
+        let buffer = buffer.content();
         let Some(bounds) =
             RectI::new(surface_state.x, surface_state.y, surface_state.width, surface_state.height)
         else {
@@ -7386,7 +7385,7 @@ fn build_surface_cursor_plane_request(
     }
     let content_revision = surface.content_revision();
     let buffer_ref = render_state.buffer.try_ref(state)?;
-    let Some(buffer) = buffer_ref.shm_cursor_argb8888() else {
+    let Some(buffer) = buffer_ref.content().shm_cursor_argb8888() else {
         return None;
     };
     let bounds =
@@ -7949,8 +7948,8 @@ fn realize_closing_texture(
     drm.bind_context();
     let mut uploaded = Vec::new();
     for surface in &plan.surfaces {
-        let mut obj = objects.grab(surface.buffer.object_id());
-        let buffer = obj.downcast_mut::<WlBuffer>()?;
+        let buffer = objects.try_ref_object::<WlBuffer>(surface.buffer.object_id())?;
+        let buffer = buffer.content();
         let _ = drm.renderer.wait_acquire(&surface.sync.acquire);
         let texture = import_client_texture(drm, buffer)?;
         let tex_transform = buffer.base_tex_transform().mul(surface.tex_transform);

@@ -1003,7 +1003,7 @@ fn cursor_snapshot(
                 return None;
             }
             let buffer = render.buffer.try_ref(state)?;
-            let shm = buffer.shm_cursor_argb8888()?;
+            let shm = buffer.content().shm_cursor_argb8888()?;
             let argb = shm.argb_bytes();
             if argb.is_empty() || render.width <= 0 || render.height <= 0 {
                 return None;

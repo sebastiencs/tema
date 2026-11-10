@@ -1653,7 +1653,7 @@ impl WlSurface {
         let viewport = logical_viewport(raw.viewport, scale);
         if let Some(buffer_id) = self.on_screen.buffer_object_id {
             if let Some(buffer) = buffer_id.try_ref(state) {
-                let (width, height) = buffer.dimensions();
+                let (width, height) = buffer.content().dimensions();
                 let buffer_size = SizeI { width, height };
                 self.on_screen.logical_size = Some(transform::derive_logical_size(
                     buffer_size,
@@ -1814,7 +1814,7 @@ impl WlSurface {
             None => self.on_screen.buffer_object_id?,
         };
         let buffer = buffer_id.try_ref(state)?;
-        let (width, height) = buffer.dimensions();
+        let (width, height) = buffer.content().dimensions();
         Some(transform::derive_logical_size(
             SizeI { width, height },
             self.pending.buffer_transform,
@@ -1893,7 +1893,7 @@ impl WlSurface {
             return true;
         };
 
-        let buffer_size = buffer.dimensions();
+        let buffer_size = buffer.content().dimensions();
         let buffer_size = SizeI { width: buffer_size.0, height: buffer_size.1 };
         let base =
             transform::pre_viewport_logical_size(buffer_size, buffer_transform, buffer_scale);
@@ -1940,7 +1940,7 @@ impl WlSurface {
         payload: &SurfaceCommitPayload,
     ) -> Option<BlockedSurfaceState> {
         let buffer = buffer_object_id.try_ref(state)?;
-        let buffer_size = buffer.dimensions();
+        let buffer_size = buffer.content().dimensions();
         let buffer_size = SizeI { width: buffer_size.0, height: buffer_size.1 };
         let logical_size = transform::derive_logical_size(
             buffer_size,
@@ -1983,7 +1983,7 @@ impl WlSurface {
         payload: &SurfaceCommitPayload,
     ) -> Option<DamageScaffold> {
         let buffer = buffer_object_id.try_ref(state)?;
-        let raw_size = buffer.dimensions();
+        let raw_size = buffer.content().dimensions();
         let raw_size = SizeI { width: raw_size.0, height: raw_size.1 };
         let surface_to_buffer = payload
             .damage_surface
@@ -2814,7 +2814,7 @@ impl WlSurface {
             );
             return false;
         };
-        if !buffer.supports_explicit_sync() {
+        if !buffer.content().supports_explicit_sync() {
             self.send_syncobj_surface_error(
                 client,
                 dispatcher,

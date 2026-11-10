@@ -168,6 +168,7 @@ use crate::{
 };
 
 mod animation_config;
+mod buffer_content;
 mod capture;
 mod clients;
 mod config;

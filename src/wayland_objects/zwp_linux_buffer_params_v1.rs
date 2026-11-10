@@ -254,6 +254,7 @@ impl Object for ZwpLinuxBufferParamsV1 {
                             owner_client_id: client.client_id(),
                             dmabuf,
                             y_inverted,
+                            import_rejected: false,
                         }) {
                             Ok(buffer) => {
                                 let (buffer, _) = client.insert_object(state, buffer);
@@ -292,10 +293,10 @@ impl Object for ZwpLinuxBufferParamsV1 {
                             owner_client_id: client.client_id(),
                             dmabuf,
                             y_inverted,
+                            import_rejected: rejected,
                         }) {
-                            Ok(mut buffer) => {
+                            Ok(buffer) => {
                                 if rejected {
-                                    buffer.mark_import_rejected();
                                     client.insert_object(state, buffer);
                                     self.send_event(
                                         zwp_linux_buffer_params_v1::Event::Failed,
@@ -506,6 +507,7 @@ mod tests {
             state
                 .objects
                 .try_ref_object::<WlBuffer>(id)?
+                .content()
                 .dmabuf()
                 .and_then(|dmabuf| dmabuf.sampling_device)
         });
@@ -745,7 +747,7 @@ mod tests {
             state
                 .objects
                 .try_ref_object::<WlBuffer>(id)
-                .is_some_and(|buffer| buffer.import_rejected())
+                .is_some_and(|buffer| buffer.content().import_rejected())
         });
         assert!(rejected);
     }
