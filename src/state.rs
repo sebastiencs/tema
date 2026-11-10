@@ -3474,6 +3474,12 @@ impl State {
         workspace.layout.begin_tiled_resize(window, edges)
     }
 
+    /// Apply one pointer step of a tiled resize.
+    ///
+    /// The windows whose tiles change snap to the new rectangle. This path
+    /// follows the pointer, as Hyprland's `warpPositionSize()` does during a
+    /// mouse resize. Keyboard resizes stay on [`Self::resize_tiled_window`]
+    /// and keep the `windows` animation.
     pub fn resize_tiled_window_from_state(
         &mut self,
         window: WindowId,
@@ -3495,6 +3501,18 @@ impl State {
             .resize_tiled_window_from_state(window, resize_state, dx, dy);
         if changed {
             self.relayout_dirty_workspaces();
+            let affected = self
+                .workspaces
+                .try_get(workspace_id)
+                .and_then(|workspace| {
+                    workspace
+                        .layout
+                        .resize_affected_windows(window, resize_state)
+                })
+                .unwrap_or_default();
+            for window in affected {
+                self.sync_window_geometry_goal(window, WindowGeometryMotion::Warp);
+            }
         }
         changed
     }

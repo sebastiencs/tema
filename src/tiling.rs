@@ -3171,6 +3171,145 @@ mod tests {
         assert_eq!(first_left_weight, second_left_weight);
     }
 
+    fn arm_window_animation(state: &mut State) {
+        state
+            .config
+            .animations
+            .set_duration_msec(crate::animation_config::AnimationNode::Windows, 200);
+        state
+            .config
+            .animations
+            .set_linear(crate::animation_config::AnimationNode::Windows);
+        state.config.animations.set_open_duration_msec(0);
+    }
+
+    fn insert_live_toplevel(
+        state: &mut State,
+        client: &mut crate::clients::Client,
+        dispatcher: &mut crate::clients::ClientDispatcher<'_>,
+        surface_id: u32,
+    ) -> crate::clients::Resolved<WlSurfaceId> {
+        let (surface_object_id, _, _) = insert_root_xdg_toplevel(
+            state,
+            client,
+            dispatcher,
+            WlSurfaceId::from(surface_id),
+            XdgSurfaceId::from(surface_id + 1),
+            XdgToplevelId::from(surface_id + 2),
+            (80, 60),
+        );
+        root(state, surface_object_id)
+    }
+
+    fn settled_side_by_side(state: &mut State) -> (Resolved<WlSurfaceId>, Resolved<WlSurfaceId>) {
+        arm_window_animation(state);
+        let backend = crate::state::BackendOutputRef::new(crate::state::DrmId::from(3usize));
+        state.insert_output(crate::test_support::test_output_with_crtc_name(
+            backend, 1, 0, 0, 800, 600,
+        ));
+        let (mut client, mut dispatcher) = crate::test_support::test_client_and_dispatcher(4);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let left = insert_live_toplevel(state, &mut client, &mut client_dispatcher, 40);
+        let right = insert_live_toplevel(state, &mut client, &mut client_dispatcher, 50);
+        state.relayout_dirty_workspaces();
+        state.advance_visual_animations(std::time::Instant::now());
+        (left, right)
+    }
+
+    fn assert_geometry_snapped(state: &State, surface: Resolved<WlSurfaceId>) {
+        let window = state.managed_window(surface).unwrap().geometry_animation;
+        let logical = state
+            .committed_root_geometry(surface)
+            .unwrap()
+            .layout_rect_global;
+        assert_eq!(window.visual_rect(), Some(logical));
+        assert!(!window.is_active());
+    }
+
+    #[test]
+    fn tiled_pointer_resize_snaps_the_resized_tiles() {
+        use std::time::Instant;
+
+        let mut state = state_for_tests();
+        let (left, right) = settled_side_by_side(&mut state);
+        let left_window = state.window_for_root(left).unwrap();
+        let resize_state = state
+            .begin_tiled_window_resize(left_window, EDGE_RIGHT)
+            .expect("left leaf should support right-edge resize");
+        let now = Instant::now();
+
+        assert!(state.resize_tiled_window_from_state(left_window, resize_state, 40, 0));
+        state.advance_visual_animations(now);
+
+        assert_geometry_snapped(&state, left);
+        assert_geometry_snapped(&state, right);
+        assert_ne!(
+            state
+                .committed_root_geometry(left)
+                .unwrap()
+                .layout_rect_global
+                .width,
+            state
+                .committed_root_geometry(right)
+                .unwrap()
+                .layout_rect_global
+                .width
+        );
+    }
+
+    #[test]
+    fn tiled_pointer_resize_leaves_an_unaffected_animation_running() {
+        use std::time::{Duration, Instant};
+
+        let mut state = state_for_tests();
+        arm_window_animation(&mut state);
+        let backend = crate::state::BackendOutputRef::new(crate::state::DrmId::from(3usize));
+        state.insert_output(crate::test_support::test_output_with_crtc_name(
+            backend, 1, 0, 0, 800, 600,
+        ));
+        let (mut client, mut dispatcher) = crate::test_support::test_client_and_dispatcher(4);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let outside = insert_live_toplevel(&mut state, &mut client, &mut client_dispatcher, 40);
+        let top = insert_live_toplevel(&mut state, &mut client, &mut client_dispatcher, 50);
+        let bottom = insert_live_toplevel(&mut state, &mut client, &mut client_dispatcher, 60);
+        state.relayout_dirty_workspaces();
+        let now = Instant::now();
+        state.advance_visual_animations(now);
+
+        let origin = state
+            .committed_root_geometry(outside)
+            .unwrap()
+            .layout_rect_global;
+        let shifted = RectI { x: origin.x + 80, ..origin };
+        state
+            .managed_window_mut(outside)
+            .unwrap()
+            .geometry_animation
+            .set_goal(shifted, crate::visual_animation::WindowGeometryMotion::Layout);
+        state.advance_visual_animations(now);
+        state.advance_visual_animations(now + Duration::from_millis(50));
+        assert!(state
+            .managed_window(outside)
+            .unwrap()
+            .geometry_animation
+            .is_active());
+
+        let top_window = state.window_for_root(top).unwrap();
+        let resize_state = state
+            .begin_tiled_window_resize(top_window, EDGE_BOTTOM)
+            .expect("nested pair should support a bottom-edge resize");
+        assert!(state.resize_tiled_window_from_state(top_window, resize_state, 0, 40));
+        state.advance_visual_animations(now + Duration::from_millis(50));
+
+        assert_geometry_snapped(&state, top);
+        assert_geometry_snapped(&state, bottom);
+        assert!(state
+            .managed_window(outside)
+            .unwrap()
+            .geometry_animation
+            .is_active());
+    }
+
     #[test]
     fn clamped_resize_step_is_not_reported_again() {
         let (mut layout, left, resize_state) = two_tiled_windows();
