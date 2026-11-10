@@ -427,7 +427,8 @@ mod tests {
                 | ClientAction::InputMethodEvent { .. }
                 | ClientAction::InputPopupEvent { .. }
                 | ClientAction::TextInputEvent { .. }
-                | ClientAction::RefreshSurfaceOutputs => {
+                | ClientAction::RefreshSurfaceOutputs
+                | ClientAction::RefreshSurfaceTreeOutputs { .. } => {
                     client.process(state, action, dispatcher).unwrap();
                 }
                 _ => {}

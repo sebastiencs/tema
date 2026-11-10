@@ -676,6 +676,12 @@ pub enum ClientAction {
     WorkspaceStateChanged,
     RefreshLayerSurfaces,
     RefreshSurfaceOutputs,
+    /// Recompute output membership for one root surface tree of this client
+    /// (root, subsurfaces, popups). Cheaper than `RefreshSurfaceOutputs` when
+    /// only one tree moved, e.g. the drag icon or cursor on pointer motion.
+    RefreshSurfaceTreeOutputs {
+        root: Resolved<WlSurfaceId>,
+    },
     ReleaseBuffer {
         buffer: Resolved<crate::protocol_generated::WlBufferId>,
     },
@@ -2507,6 +2513,20 @@ impl Client {
         refresh_surface_tree_outputs(self, state, dispatcher, root_surface, 0, 0);
     }
 
+    pub(crate) fn refresh_surface_tree_outputs_for_root(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        root: Resolved<WlSurfaceId>,
+    ) {
+        if root.client_id() != self.id || !root.exists(state) {
+            return;
+        }
+        let cursor = active_cursor_surface_refresh_params(state, self.id);
+        let dnd_icon = active_dnd_icon_surface_refresh_params(state, self.id);
+        self.refresh_root_surface_outputs(state, dispatcher, root, cursor, dnd_icon);
+    }
+
     fn reconfigure_mapped_toplevels(
         &mut self,
         state: &mut State,
@@ -3165,6 +3185,9 @@ impl Model for Client {
             }
             RefreshSurfaceOutputs => {
                 self.refresh_surface_outputs(state, &mut dispatcher);
+            }
+            RefreshSurfaceTreeOutputs { root } => {
+                self.refresh_surface_tree_outputs_for_root(state, &mut dispatcher, root);
             }
             ReleaseBuffer { buffer } => {
                 let Some(live) = buffer.try_ref_mut(state) else {
@@ -4213,6 +4236,73 @@ mod surface_output_refresh_tests {
             action,
             IoUringAction::Sendmsg { .. }
         )));
+    }
+
+    fn mapped_root(
+        client: &mut Client,
+        state: &mut crate::state::State,
+        surface_id: u32,
+        buffer_id: usize,
+    ) -> Resolved<crate::protocol_generated::WlSurfaceId> {
+        let surface_id = crate::protocol_generated::WlSurfaceId::from(surface_id);
+        let (surface, _) =
+            client.insert_object(state, WlSurface::new(surface_id, client.client_id(), 6));
+        state.register_root_surface(surface);
+        state
+            .objects
+            .grab_object::<WlSurface>(surface.object_id())
+            .test_map(ObjectId::from(buffer_id), 0, 0, 20, 20);
+        surface
+    }
+
+    #[test]
+    fn targeted_refresh_updates_only_that_root() {
+        let mut state = state_for_tests();
+        let mut client = Client::new_for_tests(ClientId::from_raw(9));
+        let output_id = state.insert_output(test_output_drm1(0, 0, 200, 120));
+        let surface_a = mapped_root(&mut client, &mut state, 10, 901);
+        let surface_b = mapped_root(&mut client, &mut state, 11, 902);
+
+        let mut dispatcher = Dispatcher::default();
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.refresh_surface_tree_outputs_for_root(
+                &mut state,
+                &mut client_dispatcher,
+                surface_a,
+            );
+        }
+        assert!(surface_a.rref(&state).contains_output(output_id));
+        assert!(!surface_b.rref(&state).contains_output(output_id));
+
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.refresh_surface_outputs(&mut state, &mut client_dispatcher);
+        }
+        assert!(surface_b.rref(&state).contains_output(output_id));
+    }
+
+    #[test]
+    fn targeted_refresh_ignores_other_clients_root() {
+        let mut state = state_for_tests();
+        let mut owner = Client::new_for_tests(ClientId::from_raw(10));
+        let mut other = Client::new_for_tests(ClientId::from_raw(9));
+        let output_id = state.insert_output(test_output_drm1(0, 0, 200, 120));
+        let surface = mapped_root(&mut owner, &mut state, 10, 903);
+
+        let mut dispatcher = Dispatcher::default();
+        {
+            let mut client_dispatcher = other.test_dispatcher(&mut dispatcher);
+            other.refresh_surface_tree_outputs_for_root(
+                &mut state,
+                &mut client_dispatcher,
+                surface,
+            );
+        }
+        assert!(!surface.rref(&state).contains_output(output_id));
+        assert!(!dispatcher.test_has_queued_action::<IoUringAction>(|action| {
+            matches!(action, IoUringAction::Sendmsg { .. })
+        }));
     }
 
     #[test]
