@@ -1002,8 +1002,7 @@ fn cursor_snapshot(
             if render.tex_transform != crate::transform::Mat3::identity() {
                 return None;
             }
-            let buffer = render.buffer.try_ref(state)?;
-            let shm = buffer.content().shm_cursor_argb8888()?;
+            let shm = render.buffer.content.shm_cursor_argb8888()?;
             let argb = shm.argb_bytes();
             if argb.is_empty() || render.width <= 0 || render.height <= 0 {
                 return None;
@@ -4398,6 +4397,7 @@ mod tests {
             })
             .unwrap(),
         );
+        let shown = crate::buffer_content::AttachedBuffer::resolve(&state, cursor_buffer).unwrap();
         let surface = {
             let (resolved, surface) = client.insert_object(
                 &mut state,
@@ -4408,6 +4408,7 @@ mod tests {
                 ),
             );
             surface.test_map(cursor_buffer.object_id(), 0, 0, 1, 1);
+            surface.test_show_buffer(shown);
             resolved
         };
         state.seat.set_cursor_surface(surface, 0, 0);

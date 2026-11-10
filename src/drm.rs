@@ -48,7 +48,7 @@ use crate::{
     transform::{self, OutputPresentationTransform},
     visual_animation::{FrozenClosingBlur, RetainedClosingSnapshot, WorkspaceMotion},
     wayland_objects::{
-        wl_buffer::{CursorShmBuffer, WlBuffer},
+        wl_buffer::CursorShmBuffer,
         wl_surface::{
             Role, StackEntry, SurfacePresentationFeedback, SurfaceRenderState, WlSurface,
         },
@@ -7038,7 +7038,7 @@ fn sample_damage_padding_for(
 
 fn push_scene_items_from_snapshots(
     items: &mut Vec<SceneItem>,
-    objects: &mut Box<crate::state::IndexMap<ObjectId, Box<dyn Object>>>,
+    _objects: &mut Box<crate::state::IndexMap<ObjectId, Box<dyn Object>>>,
     drm: &mut Drm,
     drm_fd: &DrmFd,
     drm_crtc_id: u32,
@@ -7051,16 +7051,7 @@ fn push_scene_items_from_snapshots(
     output_scale: crate::state::FractionalScale,
 ) {
     for surface_state in snapshots {
-        let buffer_oid = surface_state.buffer.object_id();
-        if !objects.contains(buffer_oid) {
-            log::warn!("collect_render_items: buffer object {:?} missing (destroyed?)", buffer_oid);
-            continue;
-        }
-        let Some(buffer) = objects.try_ref_object::<WlBuffer>(buffer_oid) else {
-            log::warn!("collect_render_items: object {:?} is not a WlBuffer", buffer_oid);
-            continue;
-        };
-        let buffer = buffer.content();
+        let buffer = &surface_state.buffer.content;
         let Some(bounds) =
             RectI::new(surface_state.x, surface_state.y, surface_state.width, surface_state.height)
         else {
@@ -7152,7 +7143,7 @@ fn push_scene_items_from_snapshots(
             state: SceneItemState {
                 key: SceneItemKey::Surface(surface_key),
                 surface_key: Some(surface_key),
-                content_key: SceneItemContentKey::Buffer(surface_state.buffer),
+                content_key: SceneItemContentKey::Buffer(surface_state.buffer.object),
                 bounds,
                 tex_transform,
                 alpha,
@@ -7384,8 +7375,7 @@ fn build_surface_cursor_plane_request(
         return None;
     }
     let content_revision = surface.content_revision();
-    let buffer_ref = render_state.buffer.try_ref(state)?;
-    let Some(buffer) = buffer_ref.content().shm_cursor_argb8888() else {
+    let Some(buffer) = render_state.buffer.content.shm_cursor_argb8888() else {
         return None;
     };
     let bounds =
@@ -7412,7 +7402,7 @@ fn build_surface_cursor_plane_request(
         pixel_hotspot_y,
         content_key: CursorPlaneContentKey::Surface(CursorSurfaceContentKey {
             surface: cursor.surface,
-            buffer: render_state.buffer,
+            buffer: render_state.buffer.object,
             content_revision,
             width: pixel_width,
             height: pixel_height,
@@ -7498,7 +7488,7 @@ impl ClosingRootPeek {
 }
 
 pub(crate) struct PlannedClosingSurface {
-    pub buffer: Resolved<WlBufferId>,
+    pub buffer: crate::buffer_content::AttachedBuffer,
     pub x: i32,
     pub y: i32,
     pub width: i32,
@@ -7943,13 +7933,11 @@ fn realize_closing_texture(
         .map(|output| output.scale)
         .unwrap_or(crate::state::FractionalScale::ONE);
     let (width, height) = plan.bounds.capture_pixel_size(scale)?;
-    let (objects, drm_map) = (&mut state.objects, &mut state.drm);
-    let drm = drm_map.try_get_mut(plan.drm_id)?;
+    let drm = state.drm.try_get_mut(plan.drm_id)?;
     drm.bind_context();
     let mut uploaded = Vec::new();
     for surface in &plan.surfaces {
-        let buffer = objects.try_ref_object::<WlBuffer>(surface.buffer.object_id())?;
-        let buffer = buffer.content();
+        let buffer = &surface.buffer.content;
         let _ = drm.renderer.wait_acquire(&surface.sync.acquire);
         let texture = import_client_texture(drm, buffer)?;
         let tex_transform = buffer.base_tex_transform().mul(surface.tex_transform);
@@ -12035,7 +12023,7 @@ mod surface_tree_render_tests {
 
         let ids: Vec<_> = snapshots
             .iter()
-            .map(|snapshot| snapshot.buffer.object_id())
+            .map(|snapshot| snapshot.buffer.object.object_id())
             .collect();
         let positions: Vec<_> = snapshots
             .iter()
@@ -12096,7 +12084,7 @@ mod surface_tree_render_tests {
         );
         let ids: Vec<_> = snapshots
             .iter()
-            .map(|snapshot| snapshot.buffer.object_id())
+            .map(|snapshot| snapshot.buffer.object.object_id())
             .collect();
         assert_eq!(ids, vec![ObjectId::from(121usize), ObjectId::from(120usize)]);
     }

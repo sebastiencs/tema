@@ -1,10 +1,51 @@
 use std::rc::Rc;
 
 use crate::{
+    clients::Resolved,
     dmabuf::DmaBuf,
     drm::{Format, ARGB8888},
+    protocol_generated::WlBufferId,
+    state::State,
     wayland_objects::wl_shm_pool::SharedMemory,
 };
+
+/// A buffer as a surface uses it. `object` names the `wl_buffer` (identity and
+/// release events) and goes stale when the client destroys it. `content` keeps
+/// the pixels alive for as long as this attachment exists.
+#[derive(Clone, Debug)]
+pub struct AttachedBuffer {
+    pub object: Resolved<WlBufferId>,
+    pub content: Rc<BufferContent>,
+}
+
+impl PartialEq for AttachedBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.object == other.object
+    }
+}
+
+impl Eq for AttachedBuffer {}
+
+impl AttachedBuffer {
+    /// Clone the pixels from a live `wl_buffer`. `None` when that object is gone.
+    pub fn resolve(state: &State, object: Resolved<WlBufferId>) -> Option<Self> {
+        let content = object.try_ref(state)?.content().clone();
+        Some(Self { object, content })
+    }
+
+    /// Geometry-only attachment for tests whose buffer id is not a real `wl_buffer`.
+    #[cfg(test)]
+    pub(crate) fn placeholder(object: Resolved<WlBufferId>, width: i32, height: i32) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        let stride = width.saturating_mul(4);
+        let bytes = vec![0u8; (stride as usize).saturating_mul(height as usize)];
+        let mem = crate::wayland_objects::wl_shm_pool::shared_memory_from_bytes(&bytes);
+        let content = BufferContent::new_shm(0, width, height, stride, ARGB8888, mem)
+            .expect("placeholder buffer");
+        Self { object, content }
+    }
+}
 
 /// Pixels behind a `wl_buffer`, shared by the protocol object and every
 /// surface state or render snapshot that shows it. Dropped, and its dma-buf

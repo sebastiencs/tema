@@ -271,8 +271,8 @@ pub struct WlSurface {
 
 #[derive(Clone, Debug)]
 struct Pending {
-    /// `None` = no attach this commit; `Some(None)` = detach; `Some(Some(id))` = attach.
-    buffer: Option<Option<Resolved<WlBufferId>>>,
+    /// `None` = no attach this commit; `Some(None)` = detach; `Some(Some(_))` = attach.
+    buffer: Option<Option<crate::buffer_content::AttachedBuffer>>,
     offset: (i32, i32),
     sync: SurfaceSyncState,
     buffer_transform: BufferTransform,
@@ -312,7 +312,7 @@ impl Default for Pending {
 
 #[derive(Clone, Debug)]
 struct SurfaceCommitPayload {
-    buffer: Option<Option<Resolved<WlBufferId>>>,
+    buffer: Option<Option<crate::buffer_content::AttachedBuffer>>,
     offset: (i32, i32),
     sync: SurfaceSyncState,
     buffer_transform: BufferTransform,
@@ -347,7 +347,7 @@ struct WireInputs {
 
 #[derive(Clone, Debug)]
 struct OnScreen {
-    buffer_object_id: Option<Resolved<WlBufferId>>,
+    buffer: Option<crate::buffer_content::AttachedBuffer>,
     content_revision: u64,
     x: i32,
     y: i32,
@@ -371,7 +371,7 @@ struct OnScreen {
 impl Default for OnScreen {
     fn default() -> Self {
         Self {
-            buffer_object_id: None,
+            buffer: None,
             content_revision: 0,
             x: 0,
             y: 0,
@@ -396,7 +396,7 @@ impl Default for OnScreen {
 #[derive(Clone, Debug)]
 pub struct SurfaceRenderState {
     pub surface: Option<Resolved<WlSurfaceId>>,
-    pub buffer: Resolved<WlBufferId>,
+    pub buffer: crate::buffer_content::AttachedBuffer,
     pub x: i32,
     pub y: i32,
     pub width: i32,
@@ -411,7 +411,7 @@ pub struct SurfaceRenderState {
 
 #[derive(Clone, Debug)]
 struct BlockedSurfaceState {
-    buffer_object_id: Resolved<WlBufferId>,
+    buffer: crate::buffer_content::AttachedBuffer,
     x: i32,
     y: i32,
     width: i32,
@@ -812,7 +812,7 @@ impl WlSurface {
     }
 
     pub fn has_committed_buffer(&self) -> bool {
-        self.on_screen.buffer_object_id.is_some()
+        self.on_screen.buffer.is_some()
     }
 
     pub(crate) fn assign_lock_surface_role(&mut self) -> bool {
@@ -1422,7 +1422,10 @@ impl WlSurface {
             Ok(buffer) => buffer,
             Err(_) => return Ok(()),
         };
-        self.pending.buffer = Some(Some(buffer));
+        let Some(attached) = crate::buffer_content::AttachedBuffer::resolve(state, buffer) else {
+            return Ok(());
+        };
+        self.pending.buffer = Some(Some(attached));
 
         Ok(())
     }
@@ -1523,7 +1526,7 @@ impl WlSurface {
         self.cancel_blocked(client, state, dispatcher);
         self.retire_current();
         self.on_screen = OnScreen {
-            buffer_object_id: None,
+            buffer: None,
             content_revision: self.next_content_revision(),
             x: self.on_screen.x,
             y: self.on_screen.y,
@@ -1630,7 +1633,7 @@ impl WlSurface {
     /// wire scale, without a new commit. A commit made at scale 1 has no stored
     /// raw inputs: the on-screen values are those inputs. Returns whether the
     /// on-screen state changed.
-    pub(crate) fn recompute_for_wire_scale(&mut self, state: &State, scale: WireScale) -> bool {
+    pub(crate) fn recompute_for_wire_scale(&mut self, _state: &State, scale: WireScale) -> bool {
         if self
             .on_screen
             .wire_inputs
@@ -1651,23 +1654,21 @@ impl WlSurface {
         });
         let buffer_scale = raw.buffer_scale.saturating_mul(scale.get() as i32);
         let viewport = logical_viewport(raw.viewport, scale);
-        if let Some(buffer_id) = self.on_screen.buffer_object_id {
-            if let Some(buffer) = buffer_id.try_ref(state) {
-                let (width, height) = buffer.content().dimensions();
-                let buffer_size = SizeI { width, height };
-                self.on_screen.logical_size = Some(transform::derive_logical_size(
-                    buffer_size,
-                    self.on_screen.buffer_transform,
-                    buffer_scale,
-                    viewport,
-                ));
-                self.on_screen.sample_transform = transform::surface_sample_transform(
-                    buffer_size,
-                    self.on_screen.buffer_transform,
-                    buffer_scale,
-                    viewport,
-                );
-            }
+        if let Some(attached) = self.on_screen.buffer.clone() {
+            let (width, height) = attached.content.dimensions();
+            let buffer_size = SizeI { width, height };
+            self.on_screen.logical_size = Some(transform::derive_logical_size(
+                buffer_size,
+                self.on_screen.buffer_transform,
+                buffer_scale,
+                viewport,
+            ));
+            self.on_screen.sample_transform = transform::surface_sample_transform(
+                buffer_size,
+                self.on_screen.buffer_transform,
+                buffer_scale,
+                viewport,
+            );
         }
         let (input_region, opaque_region) =
             logical_regions(raw.input_region.clone(), raw.opaque_region.clone(), scale);
@@ -1694,13 +1695,15 @@ impl WlSurface {
         match self.cached_commit.as_mut() {
             Some(cached) => {
                 if payload.buffer.is_some() {
-                    if let Some(Some(old_buffer)) = cached.payload.buffer {
-                        if Some(old_buffer) != payload.buffer.flatten() {
+                    if let Some(old_buffer) =
+                        cached.payload.buffer.as_ref().and_then(|b| b.as_ref())
+                    {
+                        if payload.buffer.as_ref().and_then(|b| b.as_ref()) != Some(old_buffer) {
                             let old_callbacks =
                                 std::mem::take(&mut cached.payload.release_callbacks);
                             if !old_callbacks.is_empty() {
                                 self.retired_buffers.push(RetiredBufferCandidate {
-                                    buffer: old_buffer,
+                                    buffer: old_buffer.object,
                                     sync: cached.payload.sync.clone(),
                                     release_callbacks: old_callbacks,
                                 });
@@ -1807,14 +1810,13 @@ impl WlSurface {
         }
     }
 
-    fn lock_commit_logical_size(&self, state: &State) -> Option<SizeI> {
-        let buffer_id = match self.pending.buffer {
+    fn lock_commit_logical_size(&self, _state: &State) -> Option<SizeI> {
+        let attached = match self.pending.buffer.as_ref() {
             Some(None) => return None,
-            Some(Some(buffer_id)) => buffer_id,
-            None => self.on_screen.buffer_object_id?,
+            Some(Some(attached)) => attached,
+            None => self.on_screen.buffer.as_ref()?,
         };
-        let buffer = buffer_id.try_ref(state)?;
-        let (width, height) = buffer.content().dimensions();
+        let (width, height) = attached.content.dimensions();
         Some(transform::derive_logical_size(
             SizeI { width, height },
             self.pending.buffer_transform,
@@ -1869,7 +1871,7 @@ impl WlSurface {
             client,
             state,
             dispatcher,
-            self.pending.buffer,
+            self.pending.buffer.clone(),
             self.pending.buffer_transform,
             self.pending.buffer_scale,
             self.pending.viewport,
@@ -1881,19 +1883,15 @@ impl WlSurface {
         client: &Client,
         state: &State,
         dispatcher: &mut ClientDispatcher,
-        buffer: Option<Option<Resolved<WlBufferId>>>,
+        buffer: Option<Option<crate::buffer_content::AttachedBuffer>>,
         buffer_transform: BufferTransform,
         buffer_scale: i32,
         viewport: SurfaceViewport,
     ) -> bool {
-        let Some(buffer_object_id) = buffer.flatten().or(self.on_screen.buffer_object_id) else {
+        let Some(attached) = buffer.flatten().or(self.on_screen.buffer.clone()) else {
             return true;
         };
-        let Some(buffer) = buffer_object_id.try_ref(state) else {
-            return true;
-        };
-
-        let buffer_size = buffer.content().dimensions();
+        let buffer_size = attached.content.dimensions();
         let buffer_size = SizeI { width: buffer_size.0, height: buffer_size.1 };
         let base =
             transform::pre_viewport_logical_size(buffer_size, buffer_transform, buffer_scale);
@@ -1933,14 +1931,13 @@ impl WlSurface {
 
     fn mapped_state_for_buffer(
         &self,
-        state: &State,
-        buffer_object_id: Resolved<WlBufferId>,
+        _state: &State,
+        attached: crate::buffer_content::AttachedBuffer,
         x: i32,
         y: i32,
         payload: &SurfaceCommitPayload,
     ) -> Option<BlockedSurfaceState> {
-        let buffer = buffer_object_id.try_ref(state)?;
-        let buffer_size = buffer.content().dimensions();
+        let buffer_size = attached.content.dimensions();
         let buffer_size = SizeI { width: buffer_size.0, height: buffer_size.1 };
         let logical_size = transform::derive_logical_size(
             buffer_size,
@@ -1955,7 +1952,7 @@ impl WlSurface {
             payload.viewport,
         );
         Some(BlockedSurfaceState {
-            buffer_object_id,
+            buffer: attached,
             x,
             y,
             width: logical_size.width,
@@ -1977,13 +1974,12 @@ impl WlSurface {
 
     fn pending_damage_scaffold(
         &self,
-        state: &State,
-        buffer_object_id: Resolved<WlBufferId>,
+        _state: &State,
+        attached: &crate::buffer_content::AttachedBuffer,
         logical_size: SizeI,
         payload: &SurfaceCommitPayload,
     ) -> Option<DamageScaffold> {
-        let buffer = buffer_object_id.try_ref(state)?;
-        let raw_size = buffer.content().dimensions();
+        let raw_size = attached.content.dimensions();
         let raw_size = SizeI { width: raw_size.0, height: raw_size.1 };
         let surface_to_buffer = payload
             .damage_surface
@@ -2039,7 +2035,7 @@ impl WlSurface {
         state: &State,
         payload: &SurfaceCommitPayload,
         logical_size: SizeI,
-        buffer_object_id: Resolved<WlBufferId>,
+        attached: &crate::buffer_content::AttachedBuffer,
     ) -> DamageRegion {
         let mut damage = DamageRegion::new();
         for rect in &payload.damage_surface {
@@ -2047,8 +2043,7 @@ impl WlSurface {
                 damage.add_rect(rect);
             }
         }
-        if let Some(scaffold) =
-            self.pending_damage_scaffold(state, buffer_object_id, logical_size, payload)
+        if let Some(scaffold) = self.pending_damage_scaffold(state, attached, logical_size, payload)
         {
             for rect in scaffold.buffer_to_surface {
                 if let Some(rect) = RectI::from_f32_bounds(rect) {
@@ -2069,7 +2064,7 @@ impl WlSurface {
         buffer_changed: bool,
         mapping_changed: bool,
     ) -> DamageRegion {
-        let Some(buffer_object_id) = self.on_screen.buffer_object_id else {
+        let Some(attached) = self.on_screen.buffer.as_ref() else {
             return DamageRegion::new();
         };
         let Some(logical_size) = self.on_screen.logical_size else {
@@ -2088,7 +2083,7 @@ impl WlSurface {
         if buffer_changed || mapping_changed {
             return Self::full_damage_for_logical_size(logical_size);
         }
-        self.explicit_damage_region(state, payload, logical_size, buffer_object_id)
+        self.explicit_damage_region(state, payload, logical_size, attached)
     }
 
     fn parent_behaves_synchronized(&self, state: &State) -> bool {
@@ -2164,7 +2159,7 @@ impl WlSurface {
         let mut committed_damage = DamageRegion::new();
         let previous_feedbacks = std::mem::take(&mut self.on_screen.presentation_feedbacks);
 
-        match payload.buffer {
+        match payload.buffer.clone() {
             None => {}
             Some(None) => {
                 let warp = self.pointer_lock_warp_geometry();
@@ -2179,7 +2174,7 @@ impl WlSurface {
                 self.cancel_blocked(client, state, dispatcher);
                 self.retire_current();
                 self.on_screen = OnScreen {
-                    buffer_object_id: None,
+                    buffer: None,
                     content_revision: self.next_content_revision(),
                     x: self.on_screen.x,
                     y: self.on_screen.y,
@@ -2218,7 +2213,7 @@ impl WlSurface {
             Some(Some(buffer_object_id)) => {
                 let Some(next) = self.mapped_state_for_buffer(
                     state,
-                    buffer_object_id,
+                    buffer_object_id.clone(),
                     self.on_screen.x + payload.offset.0,
                     self.on_screen.y + payload.offset.1,
                     payload,
@@ -2253,13 +2248,10 @@ impl WlSurface {
             }
         }
 
-        if !changes.buffer_changed
-            && changes.mapping_changed
-            && self.on_screen.buffer_object_id.is_some()
-        {
+        if !changes.buffer_changed && changes.mapping_changed && self.on_screen.buffer.is_some() {
             let Some(next) = self.mapped_state_for_buffer(
                 state,
-                self.on_screen.buffer_object_id.unwrap(),
+                self.on_screen.buffer.clone().unwrap(),
                 self.on_screen.x,
                 self.on_screen.y,
                 &SurfaceCommitPayload {
@@ -2774,7 +2766,7 @@ impl WlSurface {
 
         let pending_sync = &self.pending.sync;
         let sync_present = !pending_sync.acquire.is_none() || !pending_sync.release.is_none();
-        let Some(pending_buffer) = self.pending.buffer else {
+        let Some(pending_buffer) = self.pending.buffer.as_ref() else {
             if sync_present {
                 self.send_syncobj_surface_error(
                     client,
@@ -2800,8 +2792,8 @@ impl WlSurface {
             return true;
         };
 
-        let Some(buffer) = buffer_object_id.try_ref(state) else {
-            let msg = if state.objects.contains(buffer_object_id.object_id()) {
+        let Some(_) = buffer_object_id.object.try_ref(state) else {
+            let msg = if state.objects.contains(buffer_object_id.object.object_id()) {
                 "pending buffer object is not a wl_buffer"
             } else {
                 "pending wl_buffer disappeared before commit"
@@ -2814,7 +2806,7 @@ impl WlSurface {
             );
             return false;
         };
-        if !buffer.content().supports_explicit_sync() {
+        if !buffer_object_id.content.supports_explicit_sync() {
             self.send_syncobj_surface_error(
                 client,
                 dispatcher,
@@ -3020,7 +3012,7 @@ impl WlSurface {
         let local_bounds = RectI::new(0, 0, logical_size.width, logical_size.height)?;
         Some(SurfaceRenderState {
             surface: None,
-            buffer: self.on_screen.buffer_object_id?,
+            buffer: self.on_screen.buffer.clone()?,
             x,
             y,
             width: logical_size.width,
@@ -3184,6 +3176,7 @@ impl WlSurface {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn test_map(
         &mut self,
         buffer_object_id: ObjectId,
@@ -3192,12 +3185,17 @@ impl WlSurface {
         width: i32,
         height: i32,
     ) {
+        let object = Resolved::new(
+            self.client_id,
+            WlBufferId::from(buffer_object_id.index()),
+            buffer_object_id,
+        );
+        // Most tests only need a mapped surface. The id is remembered for identity;
+        // pixels are a blank buffer of the mapped size. A test that must show a real
+        // wl_buffer replaces this with `test_show_buffer`.
+        let attached = crate::buffer_content::AttachedBuffer::placeholder(object, width, height);
         self.on_screen = OnScreen {
-            buffer_object_id: Some(Resolved::new(
-                self.client_id,
-                WlBufferId::from(buffer_object_id.index()),
-                buffer_object_id,
-            )),
+            buffer: Some(attached),
             content_revision: 1,
             x,
             y,
@@ -3218,9 +3216,15 @@ impl WlSurface {
         };
     }
 
+    /// Replace the buffer `test_map` installed with one that carries real pixels.
+    #[cfg(test)]
+    pub(crate) fn test_show_buffer(&mut self, attached: crate::buffer_content::AttachedBuffer) {
+        self.on_screen.buffer = Some(attached);
+    }
+
     #[cfg(test)]
     pub(crate) fn test_clear_committed_buffer(&mut self) {
-        self.on_screen.buffer_object_id = None;
+        self.on_screen.buffer = None;
         self.on_screen.logical_size = None;
     }
 
@@ -3272,7 +3276,7 @@ impl WlSurface {
         frame_callbacks.extend(next.frame_callbacks.iter().copied());
         self.retire_current();
         self.on_screen = OnScreen {
-            buffer_object_id: Some(next.buffer_object_id),
+            buffer: Some(next.buffer),
             content_revision: self.next_content_revision(),
             x: next.x,
             y: next.y,
@@ -3301,24 +3305,30 @@ impl WlSurface {
     }
 
     pub(crate) fn references_buffer(&self, buffer: Resolved<WlBufferId>) -> bool {
-        let pending = self.pending.buffer.flatten() == Some(buffer);
+        let same = |attached: &crate::buffer_content::AttachedBuffer| attached.object == buffer;
+        let pending = self
+            .pending
+            .buffer
+            .as_ref()
+            .and_then(|b| b.as_ref())
+            .is_some_and(same);
         let cached = self
             .cached_commit
             .as_ref()
-            .and_then(|cached| cached.payload.buffer.flatten())
-            == Some(buffer);
+            .and_then(|cached| cached.payload.buffer.as_ref().and_then(|b| b.as_ref()))
+            .is_some_and(same);
         let blocked = self
             .blocked
             .as_ref()
-            .is_some_and(|blocked| blocked.buffer_object_id == buffer);
-        let on_screen = self.on_screen.buffer_object_id == Some(buffer);
+            .is_some_and(|blocked| same(&blocked.buffer));
+        let on_screen = self.on_screen.buffer.as_ref().is_some_and(same);
         pending || cached || blocked || on_screen
     }
 
     fn retire_current(&mut self) {
-        if let Some(buffer_object_id) = self.on_screen.buffer_object_id.take() {
+        if let Some(attached) = self.on_screen.buffer.take() {
             self.retired_buffers.push(RetiredBufferCandidate {
-                buffer: buffer_object_id,
+                buffer: attached.object,
                 sync: self.on_screen.sync.clone(),
                 release_callbacks: std::mem::take(&mut self.on_screen.release_callbacks),
             });
@@ -3355,7 +3365,7 @@ impl WlSurface {
             state,
             dispatcher,
             RetiredBufferCandidate {
-                buffer: blocked.buffer_object_id,
+                buffer: blocked.buffer.object,
                 sync: blocked.sync,
                 release_callbacks: blocked.release_callbacks,
             },
@@ -3696,7 +3706,11 @@ pub(crate) fn test_commit_new_buffer(
         width,
         height,
     );
-    let buffer = Resolved::new(client.client_id(), buffer_id, object_id);
+    let buffer = crate::buffer_content::AttachedBuffer::resolve(
+        state,
+        Resolved::new(client.client_id(), buffer_id, object_id),
+    )
+    .expect("test buffer");
     {
         let mut wl_surface = surface.grab(state);
         wl_surface.pending.buffer = Some(Some(buffer));
@@ -3767,7 +3781,7 @@ mod tests {
     fn make_surface() -> WlSurface {
         let mut surface = WlSurface::new(WlSurfaceId::from(1), ClientId::from_raw(7), 6);
         surface.on_screen = OnScreen {
-            buffer_object_id: Some(resolved_buffer(ObjectId::from(1usize))),
+            buffer: Some(fake_buffer(ObjectId::from(1usize))),
             content_revision: 1,
             x: 10,
             y: 20,
@@ -3854,8 +3868,20 @@ mod tests {
         }
     }
 
-    fn resolved_buffer(object_id: ObjectId) -> Resolved<WlBufferId> {
-        Resolved::new(ClientId::from_raw(1), WlBufferId::from(object_id.index()), object_id)
+    fn resolved_buffer(
+        state: &State,
+        object_id: ObjectId,
+    ) -> crate::buffer_content::AttachedBuffer {
+        let object =
+            Resolved::new(ClientId::from_raw(1), WlBufferId::from(object_id.index()), object_id);
+        crate::buffer_content::AttachedBuffer::resolve(state, object)
+            .unwrap_or_else(|| crate::buffer_content::AttachedBuffer::placeholder(object, 2, 2))
+    }
+
+    fn fake_buffer(object_id: ObjectId) -> crate::buffer_content::AttachedBuffer {
+        let object =
+            Resolved::new(ClientId::from_raw(1), WlBufferId::from(object_id.index()), object_id);
+        crate::buffer_content::AttachedBuffer::placeholder(object, 2, 2)
     }
 
     fn resolved_callback(id: u32) -> Resolved<crate::protocol_generated::WlCallbackId> {
@@ -4513,13 +4539,14 @@ mod tests {
         );
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(90), 2, 2);
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
 
         {
@@ -4617,13 +4644,14 @@ mod tests {
         }
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(183), 2, 2);
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -4733,13 +4761,14 @@ mod tests {
 
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(293), 80, 60);
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -4822,13 +4851,14 @@ mod tests {
         }
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(103), 2, 2);
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -4878,13 +4908,14 @@ mod tests {
 
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(90), 2, 2);
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -4946,13 +4977,14 @@ mod tests {
             8,
             8,
         );
+        let attached_buffer = resolved_buffer(state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(dispatcher);
@@ -5463,13 +5495,14 @@ mod tests {
 
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(133), 80, 60);
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -5559,13 +5592,14 @@ mod tests {
             1270,
             710,
         );
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -5654,13 +5688,14 @@ mod tests {
 
         let initial_buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(143), 2, 2);
+        let attached_buffer = resolved_buffer(&state, initial_buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(initial_buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let toplevel = state
@@ -5720,13 +5755,14 @@ mod tests {
 
         let resized_buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(144), 4, 2);
+        let attached_buffer = resolved_buffer(&state, resized_buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(resized_buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
         }
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -5854,13 +5890,14 @@ mod tests {
 
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(90), 2, 2);
+        let attached_buffer = resolved_buffer(&state, buffer_object_id);
         {
             let surface = state
                 .objects
                 .get_mut(surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.pending.buffer = Some(Some(resolved_buffer(buffer_object_id)));
+            surface.pending.buffer = Some(Some(attached_buffer));
             surface.pending.viewport.src =
                 Some(crate::transform::RectF { x: 0.0, y: 0.0, width: 10.0, height: 10.0 });
         }
@@ -6368,7 +6405,11 @@ mod tests {
                 width,
                 height,
             );
-            let buffer = Resolved::new(self.client.client_id(), buffer_id, object_id);
+            let buffer = crate::buffer_content::AttachedBuffer::resolve(
+                &self.state,
+                Resolved::new(self.client.client_id(), buffer_id, object_id),
+            )
+            .expect("test buffer");
             self.with_surface(|surface| surface.pending.buffer = Some(Some(buffer)));
         }
 
@@ -6645,10 +6686,14 @@ mod tests {
             .0;
         let buffer_id = WlBufferId::from(9100);
         let object_id = insert_test_shm_buffer(&mut state, client.client_id(), buffer_id, 200, 100);
+        let attached = crate::buffer_content::AttachedBuffer::resolve(
+            &state,
+            Resolved::new(client.client_id(), buffer_id, object_id),
+        )
+        .expect("test buffer");
         {
             let mut surface = surface.grab(&mut state);
-            surface.pending.buffer =
-                Some(Some(Resolved::new(client.client_id(), buffer_id, object_id)));
+            surface.pending.buffer = Some(Some(attached));
             surface.pending.input_region = Some(region_value(0, 0, 100, 100));
         }
         {
@@ -7013,7 +7058,7 @@ mod tests {
         let mut surface = WlSurface::new(WlSurfaceId::from(1), ClientId::from_raw(1), 6);
         let discarded = surface.cache_commit_payload(
             SurfaceCommitPayload {
-                buffer: Some(Some(resolved_buffer(ObjectId::from(1usize)))),
+                buffer: Some(Some(fake_buffer(ObjectId::from(1usize)))),
                 offset: (10, 20),
                 sync: SurfaceSyncState::default(),
                 buffer_transform: BufferTransform::Normal,
@@ -7033,7 +7078,7 @@ mod tests {
         assert!(discarded.is_empty());
         let discarded = surface.cache_commit_payload(
             SurfaceCommitPayload {
-                buffer: Some(Some(resolved_buffer(ObjectId::from(2usize)))),
+                buffer: Some(Some(fake_buffer(ObjectId::from(2usize)))),
                 offset: (30, 40),
                 sync: SurfaceSyncState::default(),
                 buffer_transform: BufferTransform::FlipRotate180,
@@ -7053,7 +7098,7 @@ mod tests {
         assert_eq!(discarded, vec![feedback(17, 2)]);
 
         let cached = surface.cached_commit.as_ref().unwrap();
-        assert_eq!(cached.payload.buffer, Some(Some(resolved_buffer(ObjectId::from(2usize)))));
+        assert_eq!(cached.payload.buffer, Some(Some(fake_buffer(ObjectId::from(2usize)))));
         assert_eq!(cached.payload.offset, (30, 40));
         assert_eq!(cached.payload.buffer_transform, BufferTransform::FlipRotate180);
         assert_eq!(cached.payload.buffer_scale, 2);
@@ -7344,7 +7389,9 @@ mod tests {
         }
 
         fn commit_buffer(&mut self, buffer: Resolved<WlBufferId>) {
-            self.surface.grab(&mut self.state).pending.buffer = Some(Some(buffer));
+            let attached = crate::buffer_content::AttachedBuffer::resolve(&self.state, buffer)
+                .expect("test buffer");
+            self.surface.grab(&mut self.state).pending.buffer = Some(Some(attached));
             let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
             let surface = self.surface.grab(&mut self.state);
             surface.on_commit(&mut self.client, &mut self.state, &mut client_dispatcher);
