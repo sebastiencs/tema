@@ -1905,7 +1905,7 @@ impl Client {
                 data_device.take_drag_offer()
             };
             if let Some(previous_offer) = previous_offer {
-                self.destroy_data_offer(state, dispatcher, previous_offer);
+                self.detach_drag_offer(state, dispatcher, previous_offer);
             }
         }
     }
@@ -5142,5 +5142,224 @@ impl Model for Boom {
             }
             BoomAction::Stop => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod drag_offer_lifetime_tests {
+    use {
+        super::{Client, ClientId, ClientManagerAction, Resolved},
+        crate::{
+            object::Object,
+            protocol_generated::{
+                wl_data_device_manager::DndAction, WlDataDeviceId, WlDataOfferId, WlDataSourceId,
+                WlSeatId,
+            },
+            runner::Dispatcher,
+            state::{
+                DataOfferRole, DragNegotiationState, DragPhase, DragSource, DragState,
+                DragTargetState, ObjectId,
+            },
+            test_support::{state_for_tests, test_resolved_wl_surface},
+            wayland_objects::{
+                wl_data_device::WlDataDevice,
+                wl_data_offer::{
+                    tests::{accept_request, destroy_request, finish_request, set_actions_request},
+                    WlDataOffer,
+                },
+            },
+        },
+    };
+
+    const SERVER_OFFER_ID: u32 = 0xff00_0000;
+
+    struct DragFixture {
+        state: crate::state::State,
+        client: Client,
+        offer: Resolved<WlDataOfferId>,
+    }
+
+    fn drag_fixture(
+        phase: DragPhase,
+        accepted_mime: Option<&str>,
+        chosen_action: u32,
+    ) -> DragFixture {
+        let mut state = state_for_tests();
+        let mut client = Client::new_for_tests(ClientId::from_raw(2));
+        let source_client_id = ClientId::from_raw(1);
+        let source_id = WlDataSourceId::from(10);
+        let offer_id = WlDataOfferId::from(SERVER_OFFER_ID);
+        let data_device_id = WlDataDeviceId::from(2);
+        let (data_device, _) = client
+            .insert_object(&mut state, WlDataDevice::new(data_device_id, WlSeatId::from(2), 3));
+        state.seat.register_data_device(data_device);
+        let (offer, _) = client.insert_object(
+            &mut state,
+            WlDataOffer::new(
+                offer_id,
+                3,
+                DataOfferRole::Drag,
+                Some(Resolved::new(source_client_id, source_id, ObjectId::from(0usize))),
+            ),
+        );
+        data_device.ref_mut(&mut state).set_drag_offer(Some(offer));
+        state.seat.set_active_drag(DragState {
+            source: DragSource::DataSource {
+                source: Resolved::new(source_client_id, source_id, ObjectId::from(0usize)),
+            },
+            origin_surface: test_resolved_wl_surface(source_client_id, 30, ObjectId::from(30usize)),
+            icon_surface: None,
+            target: Some(DragTargetState {
+                surface: test_resolved_wl_surface(client.client_id(), 31, ObjectId::from(0usize)),
+            }),
+            negotiation: DragNegotiationState {
+                offer_ids: vec![offer],
+                accepted_mime: accepted_mime.map(str::to_string),
+                destination_actions: chosen_action,
+                preferred_action: chosen_action,
+                compositor_action: 0,
+                chosen_action,
+                finished: false,
+                has_finish_capable_offer: true,
+            },
+            phase,
+        });
+        DragFixture { state, client, offer }
+    }
+
+    fn client_closed(dispatcher: &Dispatcher, client_id: ClientId) -> bool {
+        dispatcher.test_has_queued_action::<ClientManagerAction>(
+            |action| matches!(action, ClientManagerAction::Close { id } if *id == client_id),
+        )
+    }
+
+    fn leave(fixture: &mut DragFixture, dispatcher: &mut Dispatcher) {
+        let mut client_dispatcher = fixture.client.test_dispatcher(dispatcher);
+        fixture
+            .client
+            .handle_data_device_drag_leave(&mut fixture.state, &mut client_dispatcher);
+    }
+
+    #[test]
+    fn drag_leave_keeps_offer_alive_for_in_flight_requests() {
+        let mut fixture = drag_fixture(DragPhase::Dragging, None, 0);
+        let offer_id = fixture.offer.wayland_id();
+        let client_id = fixture.client.client_id();
+        let mut dispatcher = Dispatcher::default();
+        leave(&mut fixture, &mut dispatcher);
+
+        assert!(fixture.client.contains_object(offer_id, &fixture.state));
+        assert!(fixture
+            .client
+            .ref_object(offer_id, &fixture.state)
+            .is_detached());
+
+        {
+            let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            let offer_object_id = fixture.offer.object_id();
+            let offer = fixture
+                .state
+                .objects
+                .grab_object::<WlDataOffer>(offer_object_id);
+            offer
+                .on(
+                    &mut fixture.client,
+                    &mut fixture.state,
+                    set_actions_request(offer_id, DndAction::Copy as u32, DndAction::Copy as u32),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+            let offer = fixture
+                .state
+                .objects
+                .grab_object::<WlDataOffer>(offer_object_id);
+            offer
+                .on(
+                    &mut fixture.client,
+                    &mut fixture.state,
+                    accept_request(offer_id, 1, "text/plain"),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        assert!(!client_closed(&dispatcher, client_id));
+    }
+
+    #[test]
+    fn drag_leave_then_client_destroy_removes_offer() {
+        let mut fixture = drag_fixture(DragPhase::Dragging, None, 0);
+        let offer_id = fixture.offer.wayland_id();
+        let client_id = fixture.client.client_id();
+        let mut dispatcher = Dispatcher::default();
+        leave(&mut fixture, &mut dispatcher);
+        {
+            let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            let offer = fixture
+                .state
+                .objects
+                .grab_object::<WlDataOffer>(fixture.offer.object_id());
+            offer
+                .on(
+                    &mut fixture.client,
+                    &mut fixture.state,
+                    destroy_request(offer_id),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        assert!(!fixture.client.contains_object(offer_id, &fixture.state));
+        assert!(!client_closed(&dispatcher, client_id));
+    }
+
+    #[test]
+    fn drag_leave_after_finish_keeps_the_offer_until_destroy() {
+        let mut fixture =
+            drag_fixture(DragPhase::DropSent, Some("text/plain"), DndAction::Copy as u32);
+        let offer_id = fixture.offer.wayland_id();
+        let client_id = fixture.client.client_id();
+        let mut dispatcher = Dispatcher::default();
+        {
+            let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            let offer = fixture
+                .state
+                .objects
+                .grab_object::<WlDataOffer>(fixture.offer.object_id());
+            offer
+                .on(
+                    &mut fixture.client,
+                    &mut fixture.state,
+                    finish_request(offer_id),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        assert!(fixture.state.seat.active_drag().is_none());
+        assert!(!client_closed(&dispatcher, client_id));
+
+        leave(&mut fixture, &mut dispatcher);
+        assert!(fixture.client.contains_object(offer_id, &fixture.state));
+        assert!(fixture
+            .client
+            .ref_object(offer_id, &fixture.state)
+            .is_detached());
+        assert!(!client_closed(&dispatcher, client_id));
+
+        {
+            let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            let offer = fixture
+                .state
+                .objects
+                .grab_object::<WlDataOffer>(fixture.offer.object_id());
+            offer
+                .on(
+                    &mut fixture.client,
+                    &mut fixture.state,
+                    destroy_request(offer_id),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        assert!(!fixture.client.contains_object(offer_id, &fixture.state));
+        assert!(!client_closed(&dispatcher, client_id));
     }
 }

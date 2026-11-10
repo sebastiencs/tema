@@ -477,7 +477,7 @@ impl Object for WlDataOffer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use {
         super::WlDataOffer,
         crate::{
@@ -500,12 +500,12 @@ mod tests {
         std::os::fd::{FromRawFd, IntoRawFd},
     };
 
-    fn destroy_request(offer_id: WlDataOfferId) -> crate::clients::RawRequest<'static> {
+    pub(crate) fn destroy_request(offer_id: WlDataOfferId) -> crate::clients::RawRequest<'static> {
         let event = RawEvent::new(offer_id.into(), 2, 0);
         (&*event.into_bytes()).try_into().unwrap()
     }
 
-    fn finish_request(offer_id: WlDataOfferId) -> crate::clients::RawRequest<'static> {
+    pub(crate) fn finish_request(offer_id: WlDataOfferId) -> crate::clients::RawRequest<'static> {
         let event = RawEvent::new(offer_id.into(), 3, 0);
         (&*event.into_bytes()).try_into().unwrap()
     }
@@ -525,7 +525,7 @@ mod tests {
         request
     }
 
-    fn accept_request(
+    pub(crate) fn accept_request(
         offer_id: WlDataOfferId,
         serial: u32,
         mime_type: &str,
@@ -536,7 +536,7 @@ mod tests {
         (&*event.into_bytes()).try_into().unwrap()
     }
 
-    fn set_actions_request(
+    pub(crate) fn set_actions_request(
         offer_id: WlDataOfferId,
         dnd_actions: u32,
         preferred_action: u32,
