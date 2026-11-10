@@ -255,19 +255,21 @@ impl Object for WlDataOffer {
                         self.log_ignored(client, "wl_data_offer.accept");
                         return Ok(());
                     }
-                    let _ = state.seat.set_active_drag_accepted_mime(
+                    let mime_changed = state.seat.set_active_drag_accepted_mime(
                         client.client_id(),
                         offer,
                         accepted_mime.clone(),
                     );
-                    if let Some(source) = self.source() {
-                        dispatcher.dispatch_to(
-                            source.client_id(),
-                            ClientAction::DataSourceEvent {
-                                source,
-                                event: DataSourceClientEvent::Target(accepted_mime),
-                            },
-                        );
+                    if mime_changed {
+                        if let Some(source) = self.source() {
+                            dispatcher.dispatch_to(
+                                source.client_id(),
+                                ClientAction::DataSourceEvent {
+                                    source,
+                                    event: DataSourceClientEvent::Target(accepted_mime),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -458,6 +460,10 @@ impl Object for WlDataOffer {
                     preferred_action,
                     compositor_action,
                 );
+                let previous_chosen = state
+                    .seat
+                    .active_drag()
+                    .map(|drag| drag.negotiation.chosen_action);
                 let _ = state.seat.set_active_drag_negotiation_actions(
                     client.client_id(),
                     offer,
@@ -465,6 +471,7 @@ impl Object for WlDataOffer {
                     preferred_action,
                     chosen_action,
                 );
+                let chosen_changed = previous_chosen != Some(chosen_action);
                 self.send_action(chosen_action, dispatcher);
                 for other_offer in state.seat.active_drag_offer_ids(client.client_id()) {
                     if other_offer == offer || !other_offer.exists(state) {
@@ -474,14 +481,16 @@ impl Object for WlDataOffer {
                         .rref(state)
                         .send_action(chosen_action, dispatcher);
                 }
-                if let Some(source) = self.source() {
-                    dispatcher.dispatch_to(
-                        source.client_id(),
-                        ClientAction::DataSourceEvent {
-                            source,
-                            event: DataSourceClientEvent::Action { dnd_action: chosen_action },
-                        },
-                    );
+                if chosen_changed {
+                    if let Some(source) = self.source() {
+                        dispatcher.dispatch_to(
+                            source.client_id(),
+                            ClientAction::DataSourceEvent {
+                                source,
+                                event: DataSourceClientEvent::Action { dnd_action: chosen_action },
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -1330,5 +1339,250 @@ pub(crate) mod tests {
 
         assert!(!target.contains_object(offer_id, &state));
         assert_eq!(queued_actions_for(&dispatcher, source_client_id), events_after_detach);
+    }
+
+    fn source_set_actions_request(
+        source_id: WlDataSourceId,
+        dnd_actions: u32,
+    ) -> crate::clients::RawRequest<'static> {
+        let mut event = RawEvent::new(source_id.into(), 2, 1);
+        event.uint(dnd_actions);
+        (&*event.into_bytes()).try_into().unwrap()
+    }
+
+    fn insert_source_with_actions(
+        state: &mut State,
+        source_client_id: ClientId,
+        source_id: WlDataSourceId,
+        dnd_actions: u32,
+    ) -> Resolved<WlDataSourceId> {
+        let mut source_client = Client::new_for_tests(source_client_id);
+        let (source, _) =
+            source_client.insert_object(state, WlDataSource::new(source_id, source_client_id, 3));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = source_client.test_dispatcher(&mut dispatcher);
+        let source_obj = state
+            .objects
+            .grab_object::<WlDataSource>(source.object_id());
+        source_obj.on(
+            &mut source_client,
+            state,
+            source_set_actions_request(source_id, dnd_actions),
+            &mut client_dispatcher,
+        );
+        source
+    }
+
+    fn insert_offer_for_source(
+        target: &mut Client,
+        state: &mut State,
+        offer_id: WlDataOfferId,
+        source: Resolved<WlDataSourceId>,
+    ) -> Resolved<WlDataOfferId> {
+        let (offer, _) = target
+            .insert_object(state, WlDataOffer::new(offer_id, 3, DataOfferRole::Drag, Some(source)));
+        state.register_data_offer_for_source(source.object_id(), offer);
+        offer
+    }
+
+    fn queued_target_mimes(dispatcher: &Dispatcher, client_id: ClientId) -> Vec<Option<String>> {
+        let mut mimes = Vec::new();
+        dispatcher.test_matching_actions_for::<ClientAction, ClientId>(client_id, |action| {
+            if let ClientAction::DataSourceEvent {
+                event: DataSourceClientEvent::Target(mime_type),
+                ..
+            } = action
+            {
+                mimes.push(mime_type.clone());
+            }
+        });
+        mimes
+    }
+
+    fn queued_source_actions(dispatcher: &Dispatcher, client_id: ClientId) -> Vec<u32> {
+        let mut actions = Vec::new();
+        dispatcher.test_matching_actions_for::<ClientAction, ClientId>(client_id, |action| {
+            if let ClientAction::DataSourceEvent {
+                event: DataSourceClientEvent::Action { dnd_action },
+                ..
+            } = action
+            {
+                actions.push(*dnd_action);
+            }
+        });
+        actions
+    }
+
+    fn drive_offer(
+        target: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        offer: Resolved<WlDataOfferId>,
+        request: crate::clients::RawRequest<'static>,
+    ) {
+        let mut client_dispatcher = target.test_dispatcher(dispatcher);
+        let offer_obj = state.objects.grab_object::<WlDataOffer>(offer.object_id());
+        offer_obj.on(target, state, request, &mut client_dispatcher);
+    }
+
+    #[test]
+    fn repeated_accept_with_same_mime_sends_target_once() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(8);
+        let mut target = Client::new_for_tests(ClientId::from_raw(7));
+        let source_id = WlDataSourceId::from(10);
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_sourced_drag_offer(
+            &mut target,
+            &mut state,
+            offer_id,
+            source_client_id,
+            source_id,
+        );
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            accept_request(offer_id, 1, "text/plain"),
+        );
+        assert_eq!(
+            queued_target_mimes(&dispatcher, source_client_id),
+            vec![Some("text/plain".to_string())]
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            accept_request(offer_id, 2, "text/plain"),
+        );
+        assert!(queued_target_mimes(&dispatcher, source_client_id).is_empty());
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            accept_request(offer_id, 3, ""),
+        );
+        assert_eq!(queued_target_mimes(&dispatcher, source_client_id), vec![None]);
+    }
+
+    #[test]
+    fn repeated_set_actions_sends_source_action_once() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(8);
+        let source_id = WlDataSourceId::from(10);
+        let copy = wl_data_device_manager::DndAction::Copy as u32;
+        let move_action = wl_data_device_manager::DndAction::Move as u32;
+        let source =
+            insert_source_with_actions(&mut state, source_client_id, source_id, copy | move_action);
+        let mut target = Client::new_for_tests(ClientId::from_raw(7));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_offer_for_source(&mut target, &mut state, offer_id, source);
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy | move_action, move_action),
+        );
+        assert_eq!(queued_source_actions(&dispatcher, source_client_id), vec![move_action]);
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy | move_action, move_action),
+        );
+        assert!(queued_source_actions(&dispatcher, source_client_id).is_empty());
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy, copy),
+        );
+        assert_eq!(queued_source_actions(&dispatcher, source_client_id), vec![copy]);
+    }
+
+    #[test]
+    fn set_actions_changing_only_mask_does_not_resend_source_action() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(8);
+        let source_id = WlDataSourceId::from(10);
+        let copy = wl_data_device_manager::DndAction::Copy as u32;
+        let move_action = wl_data_device_manager::DndAction::Move as u32;
+        let source =
+            insert_source_with_actions(&mut state, source_client_id, source_id, copy | move_action);
+        let mut target = Client::new_for_tests(ClientId::from_raw(7));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_offer_for_source(&mut target, &mut state, offer_id, source);
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy | move_action, move_action),
+        );
+        assert_eq!(queued_source_actions(&dispatcher, source_client_id), vec![move_action]);
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, move_action, move_action),
+        );
+        assert!(queued_source_actions(&dispatcher, source_client_id).is_empty());
+        assert_eq!(
+            state
+                .seat
+                .active_drag()
+                .unwrap()
+                .negotiation
+                .destination_actions,
+            move_action
+        );
+        assert_eq!(state.seat.active_drag().unwrap().negotiation.chosen_action, move_action);
     }
 }
