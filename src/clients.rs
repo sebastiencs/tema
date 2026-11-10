@@ -2686,12 +2686,12 @@ impl Client {
         dispatcher: &mut ClientDispatcher,
         xdg_toplevel: Resolved<XdgToplevelId>,
     ) {
-        let Some(toplevel) = xdg_toplevel.try_ref(state) else {
-            return;
+        let (window, xdg_surface) = {
+            let Some(toplevel) = xdg_toplevel.try_ref(state) else {
+                return;
+            };
+            (toplevel.window(), toplevel.xdg_surface())
         };
-        let window = toplevel.window();
-        let xdg_surface = toplevel.xdg_surface();
-        drop(toplevel);
         let Some(wl_surface) = xdg_surface
             .try_ref(state)
             .map(|surface| surface.wl_surface())
