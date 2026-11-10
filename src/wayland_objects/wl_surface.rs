@@ -5017,6 +5017,42 @@ mod tests {
         assert_eq!(pending_toplevel_configures(&state, &client, xdg_surface_id), before + 1);
     }
 
+    #[test]
+    fn reconfigure_toplevels_for_roots_configures_only_the_given_root() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(43usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let first_surface = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 430);
+        let _second_surface = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 440);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        let first_before = pending_toplevel_configures(&state, &client, XdgSurfaceId::from(431));
+        let second_before = pending_toplevel_configures(&state, &client, XdgSurfaceId::from(441));
+        let first_root = root(&state, first_surface);
+        let first_window = state.window_for_root(first_root).expect("first window");
+        assert!(state.resize_tiled_window(first_window, crate::tiling::EDGE_RIGHT, 40, 0));
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_toplevels_for_roots(
+                &mut state,
+                &mut client_dispatcher,
+                vec![first_root],
+            );
+        }
+        assert_eq!(
+            pending_toplevel_configures(&state, &client, XdgSurfaceId::from(431)),
+            first_before + 1
+        );
+        assert_eq!(
+            pending_toplevel_configures(&state, &client, XdgSurfaceId::from(441)),
+            second_before
+        );
+    }
+
     fn map_closing_candidate(
         state: &mut State,
         client: &mut Client,

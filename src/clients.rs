@@ -224,6 +224,12 @@ pub enum ClientManagerAction {
         affected_outputs: Vec<OutputId>,
     },
     WorkspaceStateChanged,
+    /// One step of a tiled resize: reconfigure the windows of `roots` only.
+    /// IPC, session, idle inhibit, output membership and workspace protocols
+    /// are left for the `WorkspaceStateChanged` sent when the grab ends.
+    TiledResizeStep {
+        roots: Vec<Resolved<WlSurfaceId>>,
+    },
     LayerShellLayoutChanged,
     Close {
         id: ClientId,
@@ -497,6 +503,25 @@ impl Model for ClientManager {
                     dispatcher.dispatch_to(client_id, ClientAction::WorkspaceStateChanged);
                 }
             }
+            TiledResizeStep { roots } => {
+                if roots.is_empty() {
+                    return Ok(());
+                }
+                let mut by_client: BTreeMap<ClientId, Vec<Resolved<WlSurfaceId>>> = BTreeMap::new();
+                for root in roots {
+                    by_client.entry(root.client_id()).or_default().push(root);
+                }
+                for client_id in self.set.iter().copied() {
+                    let Some(roots) = by_client.remove(&client_id) else {
+                        continue;
+                    };
+                    dispatcher.dispatch_to(
+                        client_id,
+                        ClientAction::ReconfigureToplevelsForRoots { roots },
+                    );
+                }
+                dispatcher.dispatch(crate::xwayland::XwaylandAction::Reconfigure);
+            }
             LayerShellLayoutChanged => {
                 crate::idle_inhibit::refresh(state, dispatcher, std::time::Instant::now());
                 for client_id in self.set.iter().copied() {
@@ -681,6 +706,12 @@ pub enum ClientAction {
     /// only one tree moved, e.g. the drag icon or cursor on pointer motion.
     RefreshSurfaceTreeOutputs {
         root: Resolved<WlSurfaceId>,
+    },
+    /// Reconfigure only the toplevels whose root surface is in `roots`. Used for
+    /// each step of a tiled resize, where only the two resized subtrees change
+    /// size. Does not refresh output membership or workspace protocols.
+    ReconfigureToplevelsForRoots {
+        roots: Vec<Resolved<WlSurfaceId>>,
     },
     ReleaseBuffer {
         buffer: Resolved<crate::protocol_generated::WlBufferId>,
@@ -2630,6 +2661,33 @@ impl Client {
         }
     }
 
+    fn reconfigure_toplevels_for_roots(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        roots: Vec<Resolved<WlSurfaceId>>,
+    ) {
+        let opened = state.relayout_dirty_workspaces();
+        if !opened.is_empty() {
+            kick_visual_animation_pump(dispatcher);
+        }
+        let tiled_resize_surfaces = crate::seat::tiled_resize_active_root_surfaces(state);
+        let roots = roots.into_iter().collect::<BTreeSet<_>>();
+        let toplevels = self
+            .iter_resolved_of::<XdgToplevelId>(state)
+            .filter(|toplevel| {
+                let xdg_surface = toplevel.rref(state).xdg_surface();
+                let wl_surface = xdg_surface.rref(state).wl_surface();
+                state
+                    .root_surface_for_surface(wl_surface)
+                    .is_some_and(|root| roots.contains(&root))
+            })
+            .collect::<Vec<_>>();
+        for toplevel in toplevels {
+            self.reconfigure_mapped_toplevel(state, dispatcher, toplevel, &tiled_resize_surfaces);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_reconfigure_mapped_toplevels(
         &mut self,
@@ -2637,6 +2695,16 @@ impl Client {
         dispatcher: &mut ClientDispatcher,
     ) {
         self.reconfigure_mapped_toplevels(state, dispatcher);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reconfigure_toplevels_for_roots(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        roots: Vec<Resolved<WlSurfaceId>>,
+    ) {
+        self.reconfigure_toplevels_for_roots(state, dispatcher, roots);
     }
 
     fn handle_output_removed(
@@ -3212,6 +3280,9 @@ impl Model for Client {
                 self.reconfigure_mapped_toplevels(state, &mut dispatcher);
                 self.refresh_surface_outputs(state, &mut dispatcher);
                 self.refresh_workspace_protocols(state, &mut dispatcher);
+            }
+            ReconfigureToplevelsForRoots { roots } => {
+                self.reconfigure_toplevels_for_roots(state, &mut dispatcher, roots);
             }
             RefreshSurfaceOutputs => {
                 self.refresh_surface_outputs(state, &mut dispatcher);
@@ -4680,6 +4751,73 @@ mod socket_shutdown_tests {
 
         assert_eq!(closed.borrow().as_slice(), &[id]);
         assert!(dispatcher.test_stop_queued(id));
+    }
+
+    #[test]
+    fn tiled_resize_step_reconfigures_only_the_roots_client() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (adopted_a, notify_a) = record_ids();
+        let (_closed_a, closed_a) = record_ids();
+        let (adopted_b, notify_b) = record_ids();
+        let (_closed_b, closed_b) = record_ids();
+        let (socket_a, _peer_a) = UnixStream::pair().unwrap();
+        let (socket_b, _peer_b) = UnixStream::pair().unwrap();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AdoptClient {
+                    fd: socket_a.into(),
+                    origin: ClientOrigin { xwayland: false, pid: None },
+                    adopted: notify_a,
+                    closed: closed_a,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AdoptClient {
+                    fd: socket_b.into(),
+                    origin: ClientOrigin { xwayland: false, pid: None },
+                    adopted: notify_b,
+                    closed: closed_b,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let id_a = adopted_a.borrow()[0];
+        let id_b = adopted_b.borrow()[0];
+        let root =
+            Resolved::new(id_a, WlSurfaceId::from(1u32), crate::state::ObjectId::from(1usize));
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::TiledResizeStep { roots: vec![root] },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(id_a, |action| {
+            matches!(
+                action,
+                ClientAction::ReconfigureToplevelsForRoots { roots } if roots.as_slice() == [root]
+            )
+        }));
+        assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            id_b,
+            |action| matches!(action, ClientAction::ReconfigureToplevelsForRoots { .. })
+        ));
+        assert_eq!(
+            dispatcher.test_count_queued_action(|action: &crate::xwayland::XwaylandAction| {
+                matches!(action, crate::xwayland::XwaylandAction::Reconfigure)
+            }),
+            1
+        );
     }
 
     #[test]
