@@ -177,8 +177,16 @@ impl ZwlrScreencopyFrameV1 {
             self.fail(dispatcher);
             return;
         };
+        let Some(buffer_ref) = buffer.try_ref(state) else {
+            client.protocol_violation_disconnect(
+                dispatcher,
+                self.id.into(),
+                zwlr_screencopy_frame_v1::Error::InvalidBuffer as u32,
+                "zwlr_screencopy_frame_v1 copy buffer has the wrong size, format, or stride",
+            );
+            return;
+        };
         let stride_matches = {
-            let buffer_ref = buffer.rref(state);
             match buffer_ref.begin_capture_write(rect.width, rect.height) {
                 Ok(write) => write.stride_bytes() == rect.width as usize * 4,
                 Err(_) => false,

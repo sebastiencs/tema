@@ -236,7 +236,7 @@ impl DeferredRelease {
         if let Some(buffer) = self.plain_release {
             dispatcher.dispatch_to(
                 buffer.client_id(),
-                crate::clients::ClientAction::ReleaseBuffer { buffer_id: buffer.wayland_id() },
+                crate::clients::ClientAction::ReleaseBuffer { buffer },
             );
         }
         if !self.release_callbacks.is_empty() {

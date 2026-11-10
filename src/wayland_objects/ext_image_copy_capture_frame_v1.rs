@@ -117,8 +117,14 @@ impl ExtImageCopyCaptureFrameV1 {
             );
             return;
         };
+        let Some(buffer_ref) = buffer.try_ref(state) else {
+            self.fail_reason(
+                ext_image_copy_capture_frame_v1::FailureReason::Unknown as u32,
+                dispatcher,
+            );
+            return;
+        };
         let matches = {
-            let buffer_ref = buffer.rref(state);
             match buffer_ref.begin_capture_write(width, height) {
                 Ok(write) => write.stride_bytes() == (width as usize).saturating_mul(4),
                 Err(_) => false,
@@ -200,8 +206,14 @@ impl ExtImageCopyCaptureFrameV1 {
             self.fail_reason(reason as u32, dispatcher);
             return;
         }
+        let Some(buffer_ref) = buffer.try_ref(state) else {
+            self.fail_reason(
+                ext_image_copy_capture_frame_v1::FailureReason::Unknown as u32,
+                dispatcher,
+            );
+            return;
+        };
         let written = {
-            let buffer_ref = buffer.rref(state);
             buffer_ref
                 .begin_capture_write(width, height)
                 .and_then(|write| {

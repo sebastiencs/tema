@@ -4,7 +4,7 @@ use crate::{
     clients::{Client, ClientDispatcher, ClientId, EventWriter, RawRequest, Resolved},
     dmabuf::DmaBuf,
     drm::{Format, ARGB8888},
-    object::{Object, Parser, RequestResult},
+    object::{Object, Parser, PostAction, RequestResult},
     protocol_generated::{wl_buffer, WaylandId, WlBufferId},
     state::{GrabbedObject, ObjectId, State},
     sync::PlainRelease,
@@ -482,18 +482,38 @@ impl Object for WlBuffer {
     fn on(
         mut self: GrabbedObject<Self>,
         client: &mut Client,
-        _state: &mut State,
+        state: &mut State,
         req: RawRequest,
         dispatcher: &mut ClientDispatcher,
     ) -> RequestResult {
-        use wl_buffer::Request::*;
+        use {crate::wayland_objects::wl_display::WlDisplay, wl_buffer::Request::*};
 
         match client.parse::<Self>(req, dispatcher)? {
             Destroy => {
+                // The id is client-allocated, so the client may reuse it as soon
+                // as it sees delete_id. The pixels can still be on screen, so the
+                // object stays until nothing of this client references it.
                 self.destroyed = true;
-                client.remove_wayland_object(self.id);
+                let object_id = client.object_id(self.id);
+                let resolved = Resolved::new(self.owner_client_id, self.id, object_id);
+                client.release_client_id(&WlDisplay::default(), dispatcher, self.id.into());
+                state.destroyed_buffers.push(resolved);
+                dispatcher.dispatch_post_action(FreeDestroyedBuffers);
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) struct FreeDestroyedBuffers;
+
+impl PostAction for FreeDestroyedBuffers {
+    fn execute(
+        self: Box<Self>,
+        client: &mut Client,
+        state: &mut State,
+        _dispatcher: &mut ClientDispatcher,
+    ) {
+        state.free_unused_destroyed_buffers(client);
     }
 }

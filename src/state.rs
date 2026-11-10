@@ -1084,6 +1084,9 @@ pub struct State {
     /// `wl_data_offer`s keyed by the source object, so source teardown can drop them
     /// without scanning every client.
     pub data_offers_by_source: BTreeMap<ObjectId, BTreeSet<Resolved<WlDataOfferId>>>,
+    /// `wl_buffer`s whose client already received `delete_id`. Freed once no
+    /// surface of that client still references them.
+    pub destroyed_buffers: Vec<Resolved<crate::protocol_generated::WlBufferId>>,
     pub next_workspace_serial: u32,
     pub backend_syncobj_globals: BTreeMap<DrmId, GlobalName>,
     pub session_active: bool,
@@ -1212,6 +1215,7 @@ impl State {
             next_window_id: 1,
             ctm_control_owner: None,
             data_offers_by_source: Default::default(),
+            destroyed_buffers: Vec::new(),
             next_workspace_serial: 1,
             backend_syncobj_globals: Default::default(),
             session_active: true,
@@ -3746,6 +3750,43 @@ impl State {
                 self.data_offers_by_source.remove(&source);
             }
         }
+    }
+
+    /// Drop destroyed buffers this client no longer shows. Entries whose
+    /// object is already gone are discarded. Buffers another client owns stay.
+    pub fn free_unused_destroyed_buffers(&mut self, client: &crate::clients::Client) {
+        let client_id = client.client_id();
+        let pending = std::mem::take(&mut self.destroyed_buffers);
+        let mut kept = Vec::with_capacity(pending.len());
+        for buffer in pending {
+            if buffer.client_id() != client_id {
+                kept.push(buffer);
+                continue;
+            }
+            if !self.objects.contains(buffer.object_id()) {
+                continue;
+            }
+            if client.buffer_in_use(self, buffer) {
+                kept.push(buffer);
+                continue;
+            }
+            let _ = self.remove_object(buffer.object_id());
+        }
+        self.destroyed_buffers = kept;
+    }
+
+    /// The client is gone, so nothing of theirs can still be showing these.
+    pub fn drop_destroyed_buffers(&mut self, client_id: ClientId) {
+        let pending = std::mem::take(&mut self.destroyed_buffers);
+        let mut kept = Vec::with_capacity(pending.len());
+        for buffer in pending {
+            if buffer.client_id() != client_id {
+                kept.push(buffer);
+                continue;
+            }
+            let _ = self.remove_object(buffer.object_id());
+        }
+        self.destroyed_buffers = kept;
     }
 
     pub fn take_data_offers_for_source(

@@ -1542,6 +1542,7 @@ impl WlSurface {
             release_callbacks: Vec::new(),
             wire_inputs: self.on_screen.wire_inputs.clone(),
         };
+        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     /// Build the payload from the pending state. A wire-scaled client's
@@ -2319,6 +2320,7 @@ impl WlSurface {
             dispatcher.dispatch_post_action(crate::input::pointer_lock::RecheckPointerLock);
         }
 
+        Self::queue_destroyed_buffer_free(dispatcher);
         changes.buffer_changed || changes.mapping_changed || !committed_damage.is_empty()
     }
 
@@ -2539,6 +2541,7 @@ impl WlSurface {
             let discarded =
                 this.cache_commit_payload(payload, frame_callbacks, presentation_feedbacks);
             this.discard_presentation_feedbacks(client, state, dispatcher, discarded);
+            Self::queue_destroyed_buffer_free(dispatcher);
             return;
         }
         let lock_output = if this.role == Role::LockSurface {
@@ -3122,6 +3125,7 @@ impl WlSurface {
         }
         dispatcher
             .dispatch_to(client.client_id(), crate::clients::ClientAction::RefreshSurfaceOutputs);
+        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     pub fn take_retired_buffers(&mut self) -> Vec<RetiredBufferCandidate> {
@@ -3292,6 +3296,25 @@ impl WlSurface {
         };
     }
 
+    fn queue_destroyed_buffer_free(dispatcher: &mut ClientDispatcher) {
+        dispatcher.dispatch_post_action(crate::wayland_objects::wl_buffer::FreeDestroyedBuffers);
+    }
+
+    pub(crate) fn references_buffer(&self, buffer: Resolved<WlBufferId>) -> bool {
+        let pending = self.pending.buffer.flatten() == Some(buffer);
+        let cached = self
+            .cached_commit
+            .as_ref()
+            .and_then(|cached| cached.payload.buffer.flatten())
+            == Some(buffer);
+        let blocked = self
+            .blocked
+            .as_ref()
+            .is_some_and(|blocked| blocked.buffer_object_id == buffer);
+        let on_screen = self.on_screen.buffer_object_id == Some(buffer);
+        pending || cached || blocked || on_screen
+    }
+
     fn retire_current(&mut self) {
         if let Some(buffer_object_id) = self.on_screen.buffer_object_id.take() {
             self.retired_buffers.push(RetiredBufferCandidate {
@@ -3337,6 +3360,7 @@ impl WlSurface {
                 release_callbacks: blocked.release_callbacks,
             },
         );
+        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     pub fn cancel_blocked_if_waiter_matches(
@@ -3476,6 +3500,7 @@ impl WlSurface {
             request_outputs(state, self.output_membership_ids(), dispatcher);
             request_active_output(state, dispatcher);
         }
+        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     pub fn client_id(&self) -> ClientId {
@@ -7279,5 +7304,184 @@ mod tests {
         assert!(!super::should_focus_new_toplevel_on_map(&state, surface_resolved));
         state.managed_window_mut(surface_resolved).unwrap().mapped = true;
         assert!(super::should_focus_new_toplevel_on_map(&state, surface_resolved));
+    }
+
+    struct BufferLifetime {
+        state: State,
+        client: Client,
+        dispatcher: Dispatcher,
+        surface: Resolved<WlSurfaceId>,
+    }
+
+    impl BufferLifetime {
+        fn new() -> Self {
+            let mut state = state_for_tests();
+            let mut client = Client::new_for_tests(ClientId::from_raw(1));
+            let (surface, _) = client.insert_object(
+                &mut state,
+                WlSurface::new(WlSurfaceId::from(4), client.client_id(), 6),
+            );
+            Self { state, client, dispatcher: Dispatcher::default(), surface }
+        }
+
+        fn insert_buffer(&mut self, id: u32) -> Resolved<WlBufferId> {
+            let bytes = vec![0u8; 16];
+            let (resolved, _) = self.client.insert_object(
+                &mut self.state,
+                WlBuffer::new(crate::wayland_objects::wl_buffer::NewWlBufferParams {
+                    id: WlBufferId::from(id),
+                    owner_client_id: self.client.client_id(),
+                    offset: 0,
+                    width: 2,
+                    height: 2,
+                    stride: 8,
+                    format: &crate::drm::ARGB8888,
+                    mem: crate::wayland_objects::wl_shm_pool::shared_memory_from_bytes(&bytes),
+                })
+                .unwrap(),
+            );
+            resolved
+        }
+
+        fn commit_buffer(&mut self, buffer: Resolved<WlBufferId>) {
+            self.surface.grab(&mut self.state).pending.buffer = Some(Some(buffer));
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            let surface = self.surface.grab(&mut self.state);
+            surface.on_commit(&mut self.client, &mut self.state, &mut client_dispatcher);
+            client_dispatcher.drain_post_actions(&mut self.client, &mut self.state);
+        }
+
+        fn destroy_buffer(&mut self, buffer: Resolved<WlBufferId>) {
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(buffer.wayland_id().into());
+            let request = raw_request_from_event(RawEvent::new(buffer.wayland_id().into(), 0, 0));
+            buffer
+                .grab(&mut self.state)
+                .on(&mut self.client, &mut self.state, request, &mut client_dispatcher)
+                .unwrap();
+            client_dispatcher.drain_post_actions(&mut self.client, &mut self.state);
+        }
+    }
+
+    fn delete_id_was_sent(dispatcher: &Dispatcher, id: u32) -> bool {
+        let mut found = false;
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            let IoUringAction::Sendmsg { buffer, .. } = action else {
+                return;
+            };
+            if buffer.len() < 12 {
+                return;
+            }
+            let object = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
+            let opcode = u32::from_ne_bytes(buffer[4..8].try_into().unwrap()) & 0xffff;
+            let arg = u32::from_ne_bytes(buffer[8..12].try_into().unwrap());
+            if object == 1 && opcode == 1 && arg == id {
+                found = true;
+            }
+        });
+        found
+    }
+
+    #[test]
+    fn destroying_an_unattached_buffer_sends_delete_id_and_frees_it() {
+        let mut life = BufferLifetime::new();
+        let buffer = life.insert_buffer(20);
+        life.destroy_buffer(buffer);
+        assert!(delete_id_was_sent(&life.dispatcher, 20));
+        assert!(!life.state.objects.contains(buffer.object_id()));
+        assert!(!life
+            .client
+            .contains_object(buffer.wayland_id(), &life.state));
+    }
+
+    #[test]
+    fn destroying_an_on_screen_buffer_keeps_it_until_replaced() {
+        let mut life = BufferLifetime::new();
+        let first = life.insert_buffer(20);
+        life.commit_buffer(first);
+        life.destroy_buffer(first);
+        assert!(delete_id_was_sent(&life.dispatcher, 20));
+        assert!(life.state.objects.contains(first.object_id()));
+        assert!(first.try_ref(&life.state).is_some());
+        assert!(!life.client.contains_object(first.wayland_id(), &life.state));
+
+        let second = life.insert_buffer(21);
+        life.commit_buffer(second);
+        assert!(!life.state.objects.contains(first.object_id()));
+        assert!(life.state.objects.contains(second.object_id()));
+    }
+
+    #[test]
+    fn destroying_a_surface_frees_its_destroyed_buffer() {
+        let mut life = BufferLifetime::new();
+        let buffer = life.insert_buffer(20);
+        life.commit_buffer(buffer);
+        life.destroy_buffer(buffer);
+        assert!(life.state.objects.contains(buffer.object_id()));
+        {
+            let mut client_dispatcher = life.client.test_dispatcher(&mut life.dispatcher);
+            let mut surface = life.surface.grab(&mut life.state);
+            surface.delete_self(&mut life.client, &mut life.state, &mut client_dispatcher);
+            drop(surface);
+            client_dispatcher.drain_post_actions(&mut life.client, &mut life.state);
+        }
+        assert!(!life.state.objects.contains(buffer.object_id()));
+    }
+
+    #[test]
+    fn client_disconnect_frees_destroyed_buffers() {
+        let mut life = BufferLifetime::new();
+        let buffer = life.insert_buffer(20);
+        life.commit_buffer(buffer);
+        life.destroy_buffer(buffer);
+        assert!(life.state.objects.contains(buffer.object_id()));
+        life.client
+            .process(&mut life.state, ClientAction::Close, &mut life.dispatcher)
+            .unwrap();
+        assert!(!life.state.objects.contains(buffer.object_id()));
+    }
+
+    #[test]
+    fn reused_buffer_id_gets_its_own_release() {
+        let mut life = BufferLifetime::new();
+        let first = life.insert_buffer(20);
+        let deferred = crate::sync::DeferredRelease::from_candidate(
+            &life.state,
+            crate::sync::RetiredBufferCandidate {
+                buffer: first,
+                sync: SurfaceSyncState::default(),
+                release_callbacks: Vec::new(),
+            },
+        );
+        assert!(deferred.plain_release.is_some());
+        life.destroy_buffer(first);
+        assert!(!life.state.objects.contains(first.object_id()));
+        let second = life.insert_buffer(20);
+        deferred.resolve(&mut life.state, &mut life.dispatcher);
+        for action in life.dispatcher.test_take_queued_actions::<ClientAction>() {
+            life.client
+                .process(&mut life.state, action, &mut life.dispatcher)
+                .unwrap();
+        }
+        let mut released = false;
+        life.dispatcher
+            .test_for_each_queued_action::<IoUringAction>(|action| {
+                let IoUringAction::Sendmsg { buffer, .. } = action else {
+                    return;
+                };
+                if buffer.len() < 8 {
+                    return;
+                }
+                let object = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
+                let opcode = u32::from_ne_bytes(buffer[4..8].try_into().unwrap()) & 0xffff;
+                if object == 20 && opcode == 0 {
+                    released = true;
+                }
+            });
+        assert!(!released);
+        assert!(life.state.objects.contains(second.object_id()));
+        assert!(life
+            .client
+            .contains_object(WlBufferId::from(20), &life.state));
     }
 }
