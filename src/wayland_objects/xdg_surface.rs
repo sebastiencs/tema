@@ -1772,6 +1772,37 @@ pub mod xdg_toplevel {
             );
         }
 
+        /// Floating configure during an interactive resize: held back while the
+        /// previous resize configure is not committed yet (up to
+        /// `RESIZE_CONFIGURE_TIMEOUT`). The grab keeps the newest size in
+        /// `last_size`; the deferred flush reads it from there.
+        pub fn send_interactive_resize_configure_throttled(
+            &mut self,
+            client: &Client,
+            state: &State,
+            configure_bounds: Option<(i32, i32)>,
+            xdg_surface: &mut XdgSurface,
+            width: i32,
+            height: i32,
+            now: std::time::Instant,
+            dispatcher: &mut ClientDispatcher,
+        ) {
+            if !xdg_surface.resize_configure_allowed(now) {
+                return;
+            }
+            self.send_interactive_resize_configure(
+                client,
+                state,
+                configure_bounds,
+                xdg_surface,
+                width,
+                height,
+                true,
+                dispatcher,
+            );
+            xdg_surface.note_resize_configure_sent(now);
+        }
+
         #[cfg(test)]
         pub(crate) fn test_set_maximized(&mut self, maximized: bool) {
             self.requested_maximized = maximized;
@@ -3276,6 +3307,96 @@ mod tests {
             t0 + std::time::Duration::from_millis(1),
         );
         assert_eq!(xdg_surface.test_pending_configure_count(), 1);
+    }
+
+    fn send_floating_resize(
+        toplevel: &mut XdgToplevel,
+        xdg_surface: &mut XdgSurface,
+        width: i32,
+        height: i32,
+        now: std::time::Instant,
+    ) {
+        let state = state_for_tests();
+        let client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        toplevel.send_interactive_resize_configure_throttled(
+            &client,
+            &state,
+            None,
+            xdg_surface,
+            width,
+            height,
+            now,
+            &mut client_dispatcher,
+        );
+    }
+
+    #[test]
+    fn floating_resize_configure_is_throttled_to_one_in_flight() {
+        let mut xdg_surface = test_xdg_surface();
+        let mut toplevel = test_toplevel();
+        let t0 = std::time::Instant::now();
+
+        send_floating_resize(&mut toplevel, &mut xdg_surface, 200, 100, t0);
+        assert_eq!(xdg_surface.test_pending_configure_count(), 1);
+
+        send_floating_resize(
+            &mut toplevel,
+            &mut xdg_surface,
+            220,
+            100,
+            t0 + std::time::Duration::from_millis(10),
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 1);
+        assert!(xdg_surface.deferred_resize_configure);
+
+        send_floating_resize(
+            &mut toplevel,
+            &mut xdg_surface,
+            240,
+            100,
+            t0 + std::time::Duration::from_millis(60),
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 2);
+
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+        xdg_surface.pending_configures.clear();
+        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        send_floating_resize(
+            &mut toplevel,
+            &mut xdg_surface,
+            260,
+            100,
+            t0 + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 1);
+    }
+
+    #[test]
+    fn floating_resize_end_still_sends_while_a_throttle_is_active() {
+        let mut xdg_surface = test_xdg_surface();
+        let mut toplevel = test_toplevel();
+        let t0 = std::time::Instant::now();
+        send_floating_resize(&mut toplevel, &mut xdg_surface, 200, 100, t0);
+        assert!(xdg_surface.resize_throttle.is_some());
+
+        let state = state_for_tests();
+        let client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        toplevel.send_interactive_resize_configure(
+            &client,
+            &state,
+            None,
+            &mut xdg_surface,
+            180,
+            90,
+            false,
+            &mut client_dispatcher,
+        );
+        assert_eq!(xdg_surface.test_pending_configure_count(), 2);
+        assert!(xdg_surface.resize_throttle.is_some());
     }
 
     #[test]

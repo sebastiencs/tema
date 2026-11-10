@@ -3484,16 +3484,29 @@ impl Model for Client {
                 {
                     let mut xdg_surface = xdg_surface.grab(state);
                     let mut toplevel = xdg_toplevel.grab(state);
-                    toplevel.send_interactive_resize_configure(
-                        self,
-                        state,
-                        configure_bounds,
-                        &mut xdg_surface,
-                        width,
-                        height,
-                        resizing,
-                        &mut dispatcher,
-                    );
+                    if resizing {
+                        toplevel.send_interactive_resize_configure_throttled(
+                            self,
+                            state,
+                            configure_bounds,
+                            &mut xdg_surface,
+                            width,
+                            height,
+                            std::time::Instant::now(),
+                            &mut dispatcher,
+                        );
+                    } else {
+                        toplevel.send_interactive_resize_configure(
+                            self,
+                            state,
+                            configure_bounds,
+                            &mut xdg_surface,
+                            width,
+                            height,
+                            resizing,
+                            &mut dispatcher,
+                        );
+                    }
                 }
                 if let Some(toplevel) = xdg_toplevel.try_ref(state) {
                     let window = toplevel.window();
