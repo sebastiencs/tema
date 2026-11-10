@@ -7244,6 +7244,23 @@ fn push_scene_item_frame_elements(
     }));
 }
 
+/// Run `append`, then record every item it added as an overlay texture, in
+/// order. Overlays (IME popups, the drag icon) are painted above windows and
+/// layers and below the software cursor, which `incorporate_software_cursor`
+/// adds later.
+fn append_overlay_items(
+    items: &mut Vec<SceneItem>,
+    frame_elements: &mut Vec<RecordedFrameElement>,
+    append: impl FnOnce(&mut Vec<SceneItem>),
+) {
+    let start = items.len();
+    append(items);
+    frame_elements.extend((start..items.len()).map(|item_index| RecordedFrameElement::Texture {
+        phase: FramePhase::Overlay,
+        item_index,
+    }));
+}
+
 fn collect_cursor_surface_snapshots(
     state: &mut crate::state::State,
     retired_candidates: &mut Vec<RetiredBufferCandidate>,
@@ -12628,5 +12645,97 @@ mod tearing_policy_tests {
             false,
         )
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use {
+        super::{
+            append_overlay_items, RecordedFrameElement, SceneItem, SceneItemContentKey,
+            SceneItemKey, SceneItemMask, SceneItemState,
+        },
+        crate::{
+            clients::{ClientId, Resolved},
+            protocol_generated::{WlBufferId, WlSurfaceId},
+            region::{DamageRegion, RectI},
+            render::FramePhase,
+            state::ObjectId,
+            transform,
+        },
+    };
+
+    fn scene_item(surface_id: u32) -> SceneItem {
+        let bounds = RectI::new(0, 0, 10, 10).unwrap();
+        let surface_key = Resolved::new(
+            ClientId::from_raw(1),
+            WlSurfaceId::from(surface_id),
+            ObjectId::from(surface_id as usize),
+        );
+        let buffer = Resolved::new(
+            ClientId::from_raw(1),
+            WlBufferId::from(surface_id.saturating_add(100)),
+            ObjectId::from((surface_id as usize) + 100),
+        );
+        SceneItem {
+            state: SceneItemState {
+                key: SceneItemKey::Surface(surface_key),
+                surface_key: Some(surface_key),
+                content_key: SceneItemContentKey::Buffer(buffer),
+                bounds,
+                tex_transform: transform::Mat3::identity(),
+                alpha: u8::MAX,
+                mask: SceneItemMask::None,
+            },
+            mask: SceneItemMask::None,
+            texture: crate::render::inert_texture(),
+            damage: DamageRegion::from_rect(bounds),
+            sample_damage_padding: 0,
+            state_has_alpha: true,
+            alpha: u8::MAX,
+            opaque_region: DamageRegion::new(),
+            opaque: false,
+            sync: crate::sync::SurfaceSyncState::default(),
+            direct_scanout: None,
+            scanout_candidate: false,
+            presentation_feedbacks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn append_overlay_items_records_only_new_items_as_overlay() {
+        let mut items = vec![scene_item(1)];
+        let mut frame_elements =
+            vec![RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 }];
+
+        append_overlay_items(&mut items, &mut frame_elements, |items| {
+            items.push(scene_item(2));
+            items.push(scene_item(3));
+        });
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            frame_elements,
+            vec![
+                RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 },
+                RecordedFrameElement::Texture { phase: FramePhase::Overlay, item_index: 1 },
+                RecordedFrameElement::Texture { phase: FramePhase::Overlay, item_index: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn append_overlay_items_with_nothing_appended_records_nothing() {
+        let mut items = vec![scene_item(1)];
+        let mut frame_elements =
+            vec![RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 }];
+        let key_before = items[0].state.key;
+        let elements_before = frame_elements.clone();
+
+        append_overlay_items(&mut items, &mut frame_elements, |_| {});
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state.key, key_before);
+        assert_eq!(frame_elements, elements_before);
     }
 }
