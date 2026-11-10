@@ -496,6 +496,123 @@ mod tests {
             self.start(11, serial).unwrap();
         }
 
+        /// The fixture toplevel stays unmapped so a drag can attach it as a new window.
+        fn prepare_unmapped_toplevel(&mut self) {
+            self.bind_managed_window();
+            self.link_xdg();
+            self.set_xdg_role(self.surface);
+        }
+
+        fn begin_from(
+            &mut self,
+            origin: Resolved<WlSurfaceId>,
+            origin_wire: u32,
+            x_offset: i32,
+            y_offset: i32,
+        ) {
+            self.get_drag(20).unwrap();
+            self.dispatch(
+                self.drag(20).object_id(),
+                20,
+                attach_request(20, 13, x_offset, y_offset),
+            )
+            .unwrap();
+            let serial = self
+                .state
+                .seat
+                .test_arm_drag_serial(SurfaceFocus::new(origin));
+            self.dispatch(self.device, 14, start_request(14, 11, origin_wire, serial))
+                .unwrap();
+        }
+
+        fn map_during_drag(&mut self) {
+            assert_eq!(self.initial_configure_size(), Some((0, 0)));
+            let xdg = self.xdg();
+            let mut ack = RawEvent::new(WaylandId::from(80), 4, 1);
+            ack.uint(1);
+            self.dispatch(xdg.object_id(), 80, raw_request_from_event(ack))
+                .unwrap();
+            crate::wayland_objects::wl_surface::test_commit_new_buffer(
+                &mut self.client,
+                &mut self.state,
+                &mut self.dispatcher,
+                self.surface,
+                80,
+                60,
+            );
+        }
+
+        fn add_mapped_toplevel(
+            &mut self,
+            surface_id: u32,
+            xdg_id: u32,
+            toplevel_id: u32,
+        ) -> (Resolved<WlSurfaceId>, WindowId) {
+            let (surface, _) = self.client.insert_object(
+                &mut self.state,
+                WlSurface::new(WlSurfaceId::from(surface_id), self.client.client_id(), 6),
+            );
+            self.state.register_root_surface(surface);
+            let window = self.state.allocate_window_id();
+            let (xdg, _) = self.client.insert_object(
+                &mut self.state,
+                XdgSurface::new(
+                    XdgSurfaceId::from(xdg_id),
+                    Resolved::new(
+                        self.client.client_id(),
+                        XdgWmBaseId::from(79),
+                        ObjectId::from(79usize),
+                    ),
+                    surface,
+                    1,
+                ),
+            );
+            let (toplevel, _) = self.client.insert_object(
+                &mut self.state,
+                XdgToplevel::new(XdgToplevelId::from(toplevel_id), xdg, 1, window),
+            );
+            self.state
+                .insert_window(window, surface, toplevel.object_id());
+            self.set_xdg_role(surface);
+            surface
+                .try_ref_mut(&mut self.state)
+                .unwrap()
+                .set_xdg_surface_impl(xdg);
+            xdg.try_ref_mut(&mut self.state)
+                .unwrap()
+                .test_assign_toplevel_role(toplevel);
+            surface.try_ref_mut(&mut self.state).unwrap().test_map(
+                ObjectId::from(surface_id as usize),
+                0,
+                0,
+                200,
+                120,
+            );
+            let workspace = self
+                .state
+                .managed_window_state(window)
+                .unwrap()
+                .workspace_id;
+            crate::tiling::mark_workspace_dirty(&mut self.state, workspace);
+            self.state.relayout_dirty_workspaces();
+            self.refresh_geometry(surface);
+            (surface, window)
+        }
+
+        fn add_output_beside(&mut self) -> crate::state::OutputId {
+            let (first, _) = self.state.outputs.iter().next().unwrap();
+            let bounds = self.state.output_bounds(first).unwrap();
+            self.state
+                .insert_output(crate::test_support::test_output_with_crtc_name(
+                    crate::state::BackendOutputRef::new(crate::state::DrmId::from(2usize)),
+                    2,
+                    bounds.x + bounds.width,
+                    bounds.y,
+                    bounds.width,
+                    bounds.height,
+                ))
+        }
+
         fn initial_configure_size(&mut self) -> Option<(i32, i32)> {
             let xdg = self.xdg();
             let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
@@ -1522,6 +1639,169 @@ mod tests {
         assert!(fix.state.is_tiled_root_surface(neighbor));
         assert_eq!(layout_rect(&fix.state, neighbor).width, grown);
         assert!(fix.state.seat.active_drag().is_some());
+    }
+
+    #[test]
+    fn a_new_window_from_a_tiled_source_tiles_on_the_pointer_output() {
+        let mut fix = Fixture::new();
+        fix.prepare_unmapped_toplevel();
+        let output_b = fix.add_output_beside();
+        let (source, _) = fix.add_mapped_toplevel(40, 81, 41);
+        fix.state.seat.pointer_pos = (900.0, 300.0);
+        let (destination, _) = fix.add_mapped_toplevel(42, 82, 43);
+        let workspace_b = fix.state.active_workspace_for_output(output_b).unwrap();
+        assert_eq!(
+            fix.state
+                .managed_window_state(fix.window)
+                .unwrap()
+                .workspace_id,
+            fix.state.root_surface_workspace(source).unwrap()
+        );
+        assert_eq!(fix.state.root_surface_workspace(destination).unwrap(), workspace_b);
+        let tile = layout_rect(&fix.state, destination);
+        fix.state.seat.pointer_pos = (tile.x as f64 + tile.width as f64 / 2.0, tile.y as f64 + 5.0);
+        fix.state.config.tiling.drag.precise_mouse_move = true;
+        fix.begin_from(source, 40, 4, 8);
+        fix.map_during_drag();
+
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+
+        assert_eq!(
+            fix.state
+                .managed_window_state(fix.window)
+                .unwrap()
+                .workspace_id,
+            workspace_b
+        );
+        assert!(fix.state.is_tiled_root_surface(fix.surface));
+        let (axis, children) = tiled_split(&fix.state, fix.surface);
+        assert_eq!(axis, crate::tiling::SplitAxis::Vertical);
+        assert_eq!(children[0].0, fix.surface);
+        assert_eq!(children[1].0, destination);
+        assert!(fix.state.is_tiled_root_surface(source));
+    }
+
+    #[test]
+    fn a_new_window_from_a_floating_source_stays_floating_at_the_drop() {
+        let mut fix = Fixture::new();
+        fix.prepare_unmapped_toplevel();
+        let (source, source_window) = fix.add_mapped_toplevel(40, 81, 41);
+        fix.state.set_window_floating(source_window, true);
+        fix.state.seat.pointer_pos = (100.0, 200.0);
+        fix.begin_from(source, 40, 4, 8);
+        fix.map_during_drag();
+
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+
+        assert_eq!(fix.root_pos(), (96, 192));
+        assert!(fix.state.is_floating_root_surface(fix.surface));
+        assert!(!fix.state.is_tiled_root_surface(fix.surface));
+        assert_eq!(
+            fix.state.managed_window_state(fix.window).unwrap().mode,
+            ManagedWindowMode::Floating
+        );
+    }
+
+    #[test]
+    fn a_new_window_with_no_source_window_is_tiled() {
+        let mut fix = Fixture::new();
+        fix.prepare_unmapped_toplevel();
+        let (destination, _) = fix.add_mapped_toplevel(40, 81, 41);
+        let (origin, _) = fix.client.insert_object(
+            &mut fix.state,
+            WlSurface::new(WlSurfaceId::from(50), fix.client.client_id(), 6),
+        );
+        fix.state.register_root_surface(origin);
+        let tile = layout_rect(&fix.state, destination);
+        fix.state.seat.pointer_pos = (tile.x as f64 + tile.width as f64 / 2.0, tile.y as f64 + 5.0);
+        fix.state.config.tiling.drag.precise_mouse_move = true;
+        fix.begin_from(origin, 50, 0, 0);
+        assert!(
+            !fix.state
+                .seat
+                .toplevel_drag
+                .as_ref()
+                .unwrap()
+                .source_window_floating
+        );
+        fix.map_during_drag();
+
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+
+        assert!(fix.state.is_tiled_root_surface(fix.surface));
+        let (axis, children) = tiled_split(&fix.state, fix.surface);
+        assert_eq!(axis, crate::tiling::SplitAxis::Vertical);
+        assert_eq!(children[0].0, fix.surface);
+        assert_eq!(children[1].0, destination);
+    }
+
+    #[test]
+    fn a_new_window_dropped_on_an_empty_workspace_becomes_its_only_tile() {
+        let mut fix = Fixture::new();
+        fix.prepare_unmapped_toplevel();
+        let output_b = fix.add_output_beside();
+        let (source, _) = fix.add_mapped_toplevel(40, 81, 41);
+        let workspace_b = fix.state.active_workspace_for_output(output_b).unwrap();
+        let bounds = fix.state.output_bounds(output_b).unwrap();
+        fix.state.seat.pointer_pos =
+            (bounds.x as f64 + bounds.width as f64 / 2.0, bounds.y as f64 + 40.0);
+        fix.begin_from(source, 40, 0, 0);
+        fix.map_during_drag();
+
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+
+        assert_eq!(
+            fix.state
+                .managed_window_state(fix.window)
+                .unwrap()
+                .workspace_id,
+            workspace_b
+        );
+        assert!(fix.state.is_tiled_root_surface(fix.surface));
+        let layout = &fix.state.workspaces.try_get(workspace_b).unwrap().layout;
+        assert_eq!(layout.window_leaves.len(), 1);
+        assert!(layout.window_leaves.contains_key(&fix.window));
+        assert!(fix.state.is_tiled_root_surface(source));
+    }
+
+    #[test]
+    fn destroying_a_new_window_mid_drag_does_not_place_it() {
+        let mut fix = Fixture::new();
+        fix.prepare_unmapped_toplevel();
+        let (source, source_window) = fix.add_mapped_toplevel(40, 81, 41);
+        let before = layout_rect(&fix.state, source).width;
+        fix.state.seat.pointer_pos = (100.0, 200.0);
+        fix.begin_from(source, 40, 0, 0);
+        fix.map_during_drag();
+        fix.dispatch(fix.toplevel.object_id(), 13, empty_request(13, 0))
+            .unwrap();
+
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+
+        assert!(fix.state.seat.toplevel_drag.is_none());
+        assert_eq!(layout_rect(&fix.state, source).width, before);
+        assert!(fix.state.window_is_tiled(source_window));
+        assert!(fix.state.window_for_root(fix.surface).is_none());
+    }
+
+    #[test]
+    fn cancelling_a_new_window_leaves_it_floating() {
+        let mut fix = Fixture::new();
+        fix.prepare_unmapped_toplevel();
+        let (source, _) = fix.add_mapped_toplevel(40, 81, 41);
+        fix.state.seat.pointer_pos = (100.0, 200.0);
+        fix.begin_from(source, 40, 4, 8);
+        fix.map_during_drag();
+        assert_eq!(fix.root_pos(), (96, 192));
+
+        crate::seat::cancel_active_drag(&mut fix.state, &mut fix.dispatcher, None);
+
+        assert_eq!(fix.root_pos(), (96, 192));
+        assert_eq!(
+            fix.state.managed_window_state(fix.window).unwrap().mode,
+            ManagedWindowMode::Floating
+        );
+        assert!(!fix.state.is_tiled_root_surface(fix.surface));
     }
 
     fn layout_rect(state: &crate::state::State, surface: Resolved<WlSurfaceId>) -> RectI {

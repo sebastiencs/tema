@@ -2,8 +2,10 @@
 //!
 //! A mapped floating window follows the pointer at the client's offset. A mapped tiled
 //! window uses the tiled-drag preview, centered on the pointer. A window that was not
-//! mapped yet becomes floating and is placed when it maps. Cancelling puts a floating
-//! window back where it started, and a tiled window back in its old split.
+//! mapped yet becomes floating and is placed when it maps. Dropping that new window puts
+//! it on the workspace under the pointer: floating when the source was floating, tiled
+//! otherwise. Cancelling puts a floating window back where it started, and a tiled window
+//! back in its old split. A new window is left as it is.
 
 use crate::{
     clients::{ClientId, Resolved},
@@ -170,6 +172,60 @@ fn pickup_tiled(
     }
 }
 
+fn window_is_mapped(state: &State, window: WindowId) -> bool {
+    state.window_root_surface(window).is_some_and(|root| {
+        root.try_ref(state)
+            .is_some_and(|surface| surface.has_committed_buffer())
+    })
+}
+
+/// Move a window that mapped during the drag onto the workspace under the pointer.
+///
+/// A floating source leaves it floating. Anything else tiles it at the pointer, or as the
+/// only tile when that workspace has none. No output leaves the window where it is.
+fn follow_source_window(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    window: WindowId,
+    source_floating: bool,
+) {
+    let (px, py) = state.seat.pointer_pos;
+    let Some(output) = state
+        .output_at_point(px.round() as i32, py.round() as i32)
+        .or(state.active_output_id())
+    else {
+        return;
+    };
+    let Some(workspace_id) = state.active_workspace_for_output(output) else {
+        return;
+    };
+    let current = state
+        .managed_window_state(window)
+        .map(|managed| managed.workspace_id);
+    if current != Some(workspace_id) {
+        state.assign_window_to_workspace(window, workspace_id);
+    }
+    if source_floating {
+        // Assigning only updates the workspace id. Relayout moves the floating window
+        // into that workspace's stack without changing the drop position.
+        state.relayout_dirty_workspaces();
+        dispatcher.dispatch(crate::clients::ClientManagerAction::WorkspaceStateChanged);
+        return;
+    }
+    let precise = state.config.tiling.drag.precise_mouse_move;
+    let ratio = state.config.tiling.drag.split_ratio.get();
+    let _placed = state
+        .workspaces
+        .try_get_mut(workspace_id)
+        .is_some_and(|workspace| {
+            workspace
+                .layout
+                .place_dragged_tiled_leaf(window, px, py, precise, ratio)
+        });
+    state.retile_window_after_drag(window);
+    dispatcher.dispatch(crate::clients::ClientManagerAction::WorkspaceStateChanged);
+}
+
 fn forget_attached(state: &mut State) {
     let Some(attached) = state
         .seat
@@ -186,9 +242,10 @@ fn forget_attached(state: &mut State) {
 
 /// The drag-and-drop ended.
 ///
-/// A drop or a release leaves the window where it is. Cancelling puts a mapped floating
-/// window back. Does not clear `active_drag`. `cancel_active_drag` and `finish_active_drag`
-/// call this, so it must not call them back.
+/// A drop or a release leaves a window that was already mapped where it is, and places a
+/// window that mapped during the drag. Cancelling puts a mapped floating window back.
+/// Does not clear `active_drag`. `cancel_active_drag` and `finish_active_drag` call this,
+/// so it must not call them back.
 pub(crate) fn end(state: &mut State, dispatcher: &mut Dispatcher, how: ToplevelDragEnd) {
     let Some(session) = state.seat.toplevel_drag.take() else {
         return;
@@ -207,6 +264,16 @@ pub(crate) fn end(state: &mut State, dispatcher: &mut Dispatcher, how: ToplevelD
             if let Some(root) = state.window_root_surface(attached.window) {
                 let _ = crate::input::grab::place_grabbed_root(state, dispatcher, root, pos);
             }
+        } else if matches!(how, ToplevelDragEnd::Dropped | ToplevelDragEnd::ReleasedWithoutTarget)
+            && !attached.was_mapped_at_attach
+            && window_is_mapped(state, attached.window)
+        {
+            follow_source_window(
+                state,
+                dispatcher,
+                attached.window,
+                session.source_window_floating,
+            );
         }
         if let Some(toplevel) = attached.toplevel.try_ref_mut(state) {
             if toplevel.toplevel_drag() == Some(session.drag) {
