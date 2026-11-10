@@ -1514,27 +1514,6 @@ impl Client {
         }
     }
 
-    pub(crate) fn destroy_data_offer(
-        &mut self,
-        state: &mut State,
-        dispatcher: &mut ClientDispatcher,
-        offer: Resolved<WlDataOfferId>,
-    ) {
-        if offer.client_id() != self.id {
-            return;
-        }
-        if !offer.exists(state) {
-            return;
-        }
-        if let Some(mut offer_obj) = offer.try_grab(state) {
-            if let Some(source) = offer_obj.source_object_id() {
-                state.unregister_data_offer_for_source(source, offer);
-            }
-            offer_obj.before_destroy(self.id, offer, state, dispatcher);
-        }
-        self.delete_id(&WlDisplay::default(), state, dispatcher, offer.wayland_id().into());
-    }
-
     /// Detach a drag offer from the drag and its source without removing the
     /// Wayland object. Offers have server-allocated ids, so the client is never
     /// told about a removal (no `delete_id`); requests it already sent, or sends

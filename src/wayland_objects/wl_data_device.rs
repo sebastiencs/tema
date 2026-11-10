@@ -154,7 +154,7 @@ impl Object for WlDataDevice {
                 }
                 if let Some(offer) = self.drag_offer.take() {
                     if offer.exists(state) {
-                        client.destroy_data_offer(state, dispatcher, offer);
+                        client.detach_drag_offer(state, dispatcher, offer);
                     }
                 }
                 client.delete_id(&WlDisplay::default(), state, dispatcher, self.id.into());
@@ -317,7 +317,9 @@ mod tests {
         crate::{
             clients::{Client, ClientAction, ClientId, DataSourceClientEvent, RawEvent, Resolved},
             object::{Object, RequestResult},
-            protocol_generated::{WlDataDeviceId, WlDataSourceId, WlSeatId, WlSurfaceId},
+            protocol_generated::{
+                WlDataDeviceId, WlDataOfferId, WlDataSourceId, WlSeatId, WlSurfaceId,
+            },
             runner::{Dispatcher, Model},
             seat::{handle_keyboard_key, set_keyboard_focus_from_surface, SurfaceFocus},
             state::{
@@ -326,7 +328,9 @@ mod tests {
             },
             test_support::{state_for_tests, test_client_and_dispatcher, test_resolved_wl_surface},
             wayland_objects::{
-                wl_data_offer::WlDataOffer, wl_data_source::WlDataSource, wl_surface::WlSurface,
+                wl_data_offer::{tests::destroy_request, WlDataOffer},
+                wl_data_source::WlDataSource,
+                wl_surface::WlSurface,
             },
         },
     };
@@ -536,6 +540,80 @@ mod tests {
                 )
             }
         ));
+    }
+
+    #[test]
+    fn release_keeps_drag_offer_until_client_destroys_it() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(2);
+        let data_device_id = WlDataDeviceId::from(2);
+        let offer_id = WlDataOfferId::from(0xff00_0000);
+        let source_id = WlDataSourceId::from(10);
+        let source_client_id = ClientId::from_raw(1);
+
+        let (data_device, _) = client
+            .insert_object(&mut state, WlDataDevice::new(data_device_id, WlSeatId::from(2), 3));
+        let data_device_object_id = data_device.object_id();
+        let (offer, _) = client.insert_object(
+            &mut state,
+            WlDataOffer::new(
+                offer_id,
+                3,
+                DataOfferRole::Drag,
+                Some(Resolved::new(source_client_id, source_id, ObjectId::from(0usize))),
+            ),
+        );
+        state.seat.register_data_device(data_device);
+        state.seat.set_active_drag(DragState {
+            source: DragSource::DataSource {
+                source: Resolved::new(source_client_id, source_id, ObjectId::from(0usize)),
+            },
+            origin_surface: test_resolved_wl_surface(source_client_id, 30, ObjectId::from(30usize)),
+            icon_surface: None,
+            target: Some(DragTargetState {
+                surface: test_resolved_wl_surface(client.client_id(), 31, ObjectId::from(0usize)),
+            }),
+            negotiation: DragNegotiationState {
+                offer_ids: vec![offer],
+                accepted_mime: None,
+                destination_actions: 0,
+                preferred_action: 0,
+                compositor_action: 0,
+                chosen_action: 0,
+                finished: false,
+                has_finish_capable_offer: true,
+            },
+            phase: DragPhase::Dragging,
+        });
+        data_device.ref_mut(&mut state).set_drag_offer(Some(offer));
+
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let data_device = state
+                .objects
+                .grab_object::<WlDataDevice>(data_device_object_id);
+            data_device
+                .on(
+                    &mut client,
+                    &mut state,
+                    release_request(data_device_id),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+
+        assert!(!client.contains_object(data_device_id, &state));
+        assert!(client.contains_object(offer_id, &state));
+        assert!(client.ref_object(offer_id, &state).is_detached());
+
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let offer_obj = state.objects.grab_object::<WlDataOffer>(offer.object_id());
+            offer_obj
+                .on(&mut client, &mut state, destroy_request(offer_id), &mut client_dispatcher)
+                .unwrap();
+        }
+        assert!(!client.contains_object(offer_id, &state));
     }
 
     #[test]
