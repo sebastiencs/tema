@@ -8214,22 +8214,14 @@ fn collect_render_items_for_output_view(
             &mut retired_candidates,
         );
     }
-    collect_input_popup_render_items(
+    collect_overlay_render_items(
         state,
         drm_id,
         drm_crtc_id,
         output_id,
         output_bounds,
         &mut items,
-        &mut retired_candidates,
-    );
-    collect_dnd_render_items(
-        state,
-        drm_id,
-        drm_crtc_id,
-        output_id,
-        output_bounds,
-        &mut items,
+        &mut frame_elements,
         &mut retired_candidates,
     );
 
@@ -8284,6 +8276,46 @@ fn collect_render_items_for_output_view(
     )
 }
 
+/// Everything drawn above windows and layers and below the software
+/// cursor, in paint order: IME input popups, then the drag-and-drop icon.
+/// Each item is recorded as a frame element; an item that is only pushed
+/// to `items` is never painted.
+fn collect_overlay_render_items(
+    state: &mut State,
+    drm_id: DrmId,
+    drm_crtc_id: u32,
+    output_id: OutputId,
+    output_bounds: RectI,
+    items: &mut Vec<SceneItem>,
+    frame_elements: &mut Vec<RecordedFrameElement>,
+    retired_candidates: &mut Vec<RetiredBufferCandidate>,
+) {
+    // While locking/locked the desktop is hidden; no overlay may show.
+    if state.session_lock.input_gated() {
+        return;
+    }
+    append_overlay_items(items, frame_elements, |items| {
+        collect_input_popup_render_items(
+            state,
+            drm_id,
+            drm_crtc_id,
+            output_id,
+            output_bounds,
+            items,
+            retired_candidates,
+        );
+        collect_dnd_render_items(
+            state,
+            drm_id,
+            drm_crtc_id,
+            output_id,
+            output_bounds,
+            items,
+            retired_candidates,
+        );
+    });
+}
+
 fn collect_input_popup_render_items(
     state: &mut State,
     drm_id: DrmId,
@@ -8293,9 +8325,6 @@ fn collect_input_popup_render_items(
     items: &mut Vec<SceneItem>,
     retired_candidates: &mut Vec<RetiredBufferCandidate>,
 ) {
-    if state.session_lock.input_gated() {
-        return;
-    }
     let popups = state.seat.ime.input_popups().to_vec();
     for popup in popups {
         let Some(global) = popup.global else {
@@ -12737,5 +12766,31 @@ mod overlay_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].state.key, key_before);
         assert_eq!(frame_elements, elements_before);
+    }
+
+    #[test]
+    fn overlay_step_is_skipped_while_session_is_locked() {
+        let mut state = crate::test_support::state_for_tests();
+        state
+            .session_lock
+            .set_phase_for_tests(crate::session_lock::SessionLockPhase::Locked);
+        let mut items = Vec::new();
+        let mut frame_elements = Vec::new();
+        let mut retired_candidates = Vec::new();
+        let bounds = RectI::new(0, 0, 100, 100).unwrap();
+
+        super::collect_overlay_render_items(
+            &mut state,
+            crate::state::DrmId::from(0usize),
+            0,
+            crate::state::OutputId::from(0usize),
+            bounds,
+            &mut items,
+            &mut frame_elements,
+            &mut retired_candidates,
+        );
+
+        assert!(items.is_empty());
+        assert!(frame_elements.is_empty());
     }
 }
