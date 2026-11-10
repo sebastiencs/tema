@@ -2870,7 +2870,25 @@ fn clear_surface_tree_outputs(
     }
 }
 
-fn active_cursor_surface_refresh_params(
+/// Ordered outputs (primary first) that `root`'s own bounds overlap when
+/// placed at `base`. Same ordering as `surface_intersecting_outputs`, so it
+/// matches what `refresh_surface_tree_outputs` stores for the root.
+pub(crate) fn root_surface_outputs_at(
+    state: &State,
+    root: Resolved<WlSurfaceId>,
+    base_x: i32,
+    base_y: i32,
+) -> Vec<OutputId> {
+    let Some(surface) = root.try_ref(state) else {
+        return Vec::new();
+    };
+    let Some(render_state) = surface.render_state_at(base_x, base_y) else {
+        return Vec::new();
+    };
+    surface_intersecting_outputs(state, &render_state)
+}
+
+pub(crate) fn active_cursor_surface_refresh_params(
     state: &State,
     client_id: ClientId,
 ) -> Option<(Resolved<WlSurfaceId>, i32, i32)> {
@@ -2889,7 +2907,7 @@ fn active_cursor_surface_refresh_params(
     Some((cursor.surface, base_x, base_y))
 }
 
-fn active_dnd_icon_surface_refresh_params(
+pub(crate) fn active_dnd_icon_surface_refresh_params(
     state: &State,
     client_id: ClientId,
 ) -> Option<(Resolved<WlSurfaceId>, i32, i32)> {

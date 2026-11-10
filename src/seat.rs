@@ -5,7 +5,10 @@ use std::{
 };
 
 use crate::{
-    clients::{Client, ClientAction, ClientId, Resolved},
+    clients::{
+        active_cursor_surface_refresh_params, active_dnd_icon_surface_refresh_params,
+        root_surface_outputs_at, Client, ClientAction, ClientId, Resolved,
+    },
     config,
     cursor::{CursorSourceRef, CursorState},
     drm::request_outputs_for_points,
@@ -24,8 +27,8 @@ use crate::{
     root_geometry::WindowTargetGeometry,
     runner::Dispatcher,
     state::{
-        DragNegotiationState, DragPhase, DragState, DragTargetState, PrimarySelectionSourceState,
-        SelectionSourceState, State,
+        DragNegotiationState, DragPhase, DragState, DragTargetState, OutputId,
+        PrimarySelectionSourceState, SelectionSourceState, State,
     },
     tiling::TiledResizeState,
     wayland_objects::{
@@ -361,6 +364,10 @@ pub struct SeatState {
     /// A held key or button does not refresh it, and neither do synthetic
     /// pause releases or focus changes.
     last_real_input: Option<Instant>,
+    /// Last (surface, outputs) for which an icon or cursor tree refresh was
+    /// dispatched on pointer motion. Motion skips the refresh when this is unchanged.
+    cursor_outputs_hint: Option<(Resolved<WlSurfaceId>, Vec<OutputId>)>,
+    dnd_icon_outputs_hint: Option<(Resolved<WlSurfaceId>, Vec<OutputId>)>,
 }
 
 impl Default for SeatState {
@@ -403,6 +410,8 @@ impl Default for SeatState {
             intercepted_pointer_buttons: BTreeSet::default(),
             ime: ImeState::default(),
             last_real_input: None,
+            cursor_outputs_hint: None,
+            dnd_icon_outputs_hint: None,
         }
     }
 }
@@ -1233,6 +1242,32 @@ impl SeatState {
         self.intercepted_pointer_buttons.clear();
     }
 
+    pub(crate) fn replace_cursor_outputs_hint(
+        &mut self,
+        hint: Option<(Resolved<WlSurfaceId>, Vec<OutputId>)>,
+    ) -> bool {
+        if self.cursor_outputs_hint == hint {
+            return false;
+        }
+        self.cursor_outputs_hint = hint;
+        true
+    }
+
+    pub(crate) fn replace_dnd_icon_outputs_hint(
+        &mut self,
+        hint: Option<(Resolved<WlSurfaceId>, Vec<OutputId>)>,
+    ) -> bool {
+        if self.dnd_icon_outputs_hint == hint {
+            return false;
+        }
+        self.dnd_icon_outputs_hint = hint;
+        true
+    }
+
+    pub(crate) fn clear_dnd_icon_outputs_hint(&mut self) {
+        self.dnd_icon_outputs_hint = None;
+    }
+
     pub fn set_cursor_surface(
         &mut self,
         surface: Resolved<WlSurfaceId>,
@@ -2016,6 +2051,7 @@ pub fn finish_active_drag(state: &mut State, dispatcher: &mut Dispatcher) {
     let Some(drag) = state.seat.clear_active_drag() else {
         return;
     };
+    state.seat.clear_dnd_icon_outputs_hint();
     if drag.icon_surface.is_some() {
         dispatch_client_action(
             dispatcher,
@@ -2039,6 +2075,7 @@ pub fn cancel_active_drag(
     let Some(drag) = state.seat.clear_active_drag() else {
         return;
     };
+    state.seat.clear_dnd_icon_outputs_hint();
     if drag.icon_surface.is_some() {
         dispatch_client_action(
             dispatcher,
@@ -2252,26 +2289,63 @@ fn visible_dnd_icon_owner_client(state: &State) -> Option<ClientId> {
         .and_then(|drag| drag.icon_surface.map(|_| drag.source.initiator_client_id()))
 }
 
-fn refresh_visible_cursor_surface_outputs(state: &State, dispatcher: &mut Dispatcher) {
-    if let Some(CursorSourceRef::Surface { cursor }) = state.seat.visible_cursor_source() {
-        dispatch_client_action(
-            dispatcher,
-            cursor.surface.client_id(),
-            ClientAction::RefreshSurfaceTreeOutputs { root: cursor.surface },
-        );
+/// Root bounds only, the same rectangle `collect_dnd_render_items` uses for the
+/// icon. A subsurface that sticks out of the icon or cursor can get `enter` /
+/// `leave` late, until its next commit. Commits already trigger a full refresh.
+fn refresh_visible_cursor_surface_outputs(state: &mut State, dispatcher: &mut Dispatcher) {
+    let cursor_surface = match state.seat.visible_cursor_source() {
+        Some(CursorSourceRef::Surface { cursor }) => Some(cursor.surface),
+        _ => None,
+    };
+    let Some(cursor_surface) = cursor_surface else {
+        state.seat.replace_cursor_outputs_hint(None);
+        return;
+    };
+    let Some((surface, base_x, base_y)) =
+        active_cursor_surface_refresh_params(state, cursor_surface.client_id())
+    else {
+        state.seat.replace_cursor_outputs_hint(None);
+        return;
+    };
+    let outputs = root_surface_outputs_at(state, surface, base_x, base_y);
+    if !state
+        .seat
+        .replace_cursor_outputs_hint(Some((surface, outputs)))
+    {
+        return;
     }
-}
-
-fn refresh_visible_dnd_icon_surface_outputs(state: &State, dispatcher: &mut Dispatcher) {
-    let Some(drag) = state.seat.active_drag() else {
-        return;
-    };
-    let Some(icon) = drag.icon_surface else {
-        return;
-    };
     dispatch_client_action(
         dispatcher,
-        drag.source.initiator_client_id(),
+        surface.client_id(),
+        ClientAction::RefreshSurfaceTreeOutputs { root: surface },
+    );
+}
+
+/// See [`refresh_visible_cursor_surface_outputs`] for the root-bounds limitation.
+fn refresh_visible_dnd_icon_surface_outputs(state: &mut State, dispatcher: &mut Dispatcher) {
+    let icon_and_owner = state.seat.active_drag().and_then(|drag| {
+        drag.icon_surface
+            .map(|icon| (icon, drag.source.initiator_client_id()))
+    });
+    let Some((icon, owner)) = icon_and_owner else {
+        state.seat.replace_dnd_icon_outputs_hint(None);
+        return;
+    };
+    let Some((surface, base_x, base_y)) = active_dnd_icon_surface_refresh_params(state, owner)
+    else {
+        state.seat.replace_dnd_icon_outputs_hint(None);
+        return;
+    };
+    let outputs = root_surface_outputs_at(state, surface, base_x, base_y);
+    if !state
+        .seat
+        .replace_dnd_icon_outputs_hint(Some((surface, outputs)))
+    {
+        return;
+    }
+    dispatch_client_action(
+        dispatcher,
+        owner,
         ClientAction::RefreshSurfaceTreeOutputs { root: icon },
     );
 }
@@ -2652,10 +2726,11 @@ mod xdg_seat_tests {
             begin_popup_grab, cancel_active_drag, complete_drag_drop, handle_keyboard_key,
             handle_pointer_button, handle_pointer_motion, handle_pointer_motion_absolute,
             handle_pointer_scroll, pointer_scroll_protocol_events, quiesce_for_session_pause,
-            recover_pointer_after_interactive_grab_loss, refresh_visible_dnd_icon_surface_outputs,
-            remove_popup_grab, scene_pick_at, set_keyboard_focus, window_hit_at, HitSemantics,
-            PointerAxisChange, PointerScrollAxis, PointerScrollDirection, PointerScrollFrame,
-            PointerScrollSource, PointerScrollWireEvent, SeatClientEvent, SeatState,
+            recover_pointer_after_interactive_grab_loss, refresh_visible_cursor_surface_outputs,
+            refresh_visible_dnd_icon_surface_outputs, remove_popup_grab, scene_pick_at,
+            set_keyboard_focus, window_hit_at, HitSemantics, PointerAxisChange, PointerScrollAxis,
+            PointerScrollDirection, PointerScrollFrame, PointerScrollSource,
+            PointerScrollWireEvent, SeatClientEvent, SeatState,
         },
         crate::{
             clients::{Client, ClientAction, ClientId, DataSourceClientEvent, RawEvent, Resolved},
@@ -2677,7 +2752,7 @@ mod xdg_seat_tests {
             test_support::{
                 fake_focus, focus_for_surface, get_toplevel_request, insert_wl_subsurface,
                 raw_request_from_event, resolved_wl_surface as root, state_for_tests,
-                test_client_and_dispatcher, test_output_with_crtc_name,
+                test_client_and_dispatcher, test_output_drm1, test_output_with_crtc_name,
             },
             wayland_objects::{
                 wl_pointer::WlPointer,
@@ -6967,17 +7042,28 @@ mod xdg_seat_tests {
             }));
     }
 
-    #[test]
-    fn drag_motion_refreshes_only_icon_tree() {
-        let mut state = state_for_tests();
-        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
-        let source_client_id = ClientId::from_raw(60);
-        let icon = Resolved::new(source_client_id, WlSurfaceId::from(31), ObjectId::from(123usize));
+    fn mapped_pointer_surface(
+        state: &mut State,
+        client_id: ClientId,
+        surface_id: u32,
+        width: i32,
+        height: i32,
+    ) -> Resolved<WlSurfaceId> {
+        let mut client = Client::new_for_tests(client_id);
+        let wayland_id = WlSurfaceId::from(surface_id);
+        let (surface, _) = client.insert_object(state, WlSurface::new(wayland_id, client_id, 6));
+        state
+            .objects
+            .grab_object::<WlSurface>(surface.object_id())
+            .test_map(ObjectId::from(surface_id as usize + 500), 0, 0, width, height);
+        surface
+    }
 
+    fn drag_with_icon(state: &mut State, client_id: ClientId, icon: Resolved<WlSurfaceId>) {
         state.seat.set_active_drag(DragState {
-            source: DragSource::None { initiator_client_id: source_client_id },
+            source: DragSource::None { initiator_client_id: client_id },
             origin_surface: Resolved::new(
-                source_client_id,
+                client_id,
                 WlSurfaceId::from(30),
                 ObjectId::from(30usize),
             ),
@@ -6986,22 +7072,115 @@ mod xdg_seat_tests {
             negotiation: Default::default(),
             phase: DragPhase::Dragging,
         });
+    }
 
-        refresh_visible_dnd_icon_surface_outputs(&state, &mut dispatcher);
+    fn tree_refresh_queued(
+        dispatcher: &Dispatcher,
+        client_id: ClientId,
+        icon: Resolved<WlSurfaceId>,
+    ) -> bool {
+        dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(client_id, |action| {
+            matches!(action, ClientAction::RefreshSurfaceTreeOutputs { root } if *root == icon)
+        })
+    }
 
-        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
-            source_client_id,
-            |action| {
-                matches!(
-                    action,
-                    ClientAction::RefreshSurfaceTreeOutputs { root } if *root == icon
-                )
-            }
-        ));
+    #[test]
+    fn drag_motion_refreshes_only_icon_tree() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        let source_client_id = ClientId::from_raw(60);
+        state.insert_output(test_output_drm1(0, 0, 200, 120));
+        let icon = mapped_pointer_surface(&mut state, source_client_id, 31, 20, 20);
+        state.seat.pointer_pos = (50.0, 50.0);
+        drag_with_icon(&mut state, source_client_id, icon);
+
+        refresh_visible_dnd_icon_surface_outputs(&mut state, &mut dispatcher);
+
+        assert!(tree_refresh_queued(&dispatcher, source_client_id, icon));
         assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
             source_client_id,
             |action| matches!(action, ClientAction::RefreshSurfaceOutputs)
         ));
+    }
+
+    #[test]
+    fn dnd_icon_refresh_skipped_while_outputs_unchanged() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(60);
+        state.insert_output(test_output_drm1(0, 0, 200, 120));
+        let icon = mapped_pointer_surface(&mut state, source_client_id, 31, 20, 20);
+        state.seat.pointer_pos = (50.0, 50.0);
+        drag_with_icon(&mut state, source_client_id, icon);
+
+        let mut dispatcher = Dispatcher::default();
+        refresh_visible_dnd_icon_surface_outputs(&mut state, &mut dispatcher);
+        assert!(tree_refresh_queued(&dispatcher, source_client_id, icon));
+
+        state.seat.pointer_pos = (60.0, 60.0);
+        let mut dispatcher = Dispatcher::default();
+        refresh_visible_dnd_icon_surface_outputs(&mut state, &mut dispatcher);
+        assert!(!tree_refresh_queued(&dispatcher, source_client_id, icon));
+    }
+
+    #[test]
+    fn dnd_icon_refresh_when_crossing_outputs() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(60);
+        state.insert_output(test_output_drm1(0, 0, 200, 120));
+        state.insert_output(test_output_drm1(200, 0, 200, 120));
+        let icon = mapped_pointer_surface(&mut state, source_client_id, 31, 20, 20);
+        drag_with_icon(&mut state, source_client_id, icon);
+
+        for (x, expect_refresh) in [(50.0, true), (190.0, true), (300.0, true), (310.0, false)] {
+            state.seat.pointer_pos = (x, 50.0);
+            let mut dispatcher = Dispatcher::default();
+            refresh_visible_dnd_icon_surface_outputs(&mut state, &mut dispatcher);
+            assert_eq!(
+                tree_refresh_queued(&dispatcher, source_client_id, icon),
+                expect_refresh,
+                "pointer x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_drag_does_not_reuse_previous_icon_hint() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        let source_client_id = ClientId::from_raw(60);
+        state.insert_output(test_output_drm1(0, 0, 200, 120));
+        let icon = mapped_pointer_surface(&mut state, source_client_id, 31, 20, 20);
+        state.seat.pointer_pos = (50.0, 50.0);
+        drag_with_icon(&mut state, source_client_id, icon);
+        refresh_visible_dnd_icon_surface_outputs(&mut state, &mut dispatcher);
+        assert!(tree_refresh_queued(&dispatcher, source_client_id, icon));
+
+        cancel_active_drag(&mut state, &mut dispatcher, None);
+        drag_with_icon(&mut state, source_client_id, icon);
+        state.seat.clear_dnd_icon_outputs_hint();
+
+        let mut dispatcher = Dispatcher::default();
+        refresh_visible_dnd_icon_surface_outputs(&mut state, &mut dispatcher);
+        assert!(tree_refresh_queued(&dispatcher, source_client_id, icon));
+    }
+
+    #[test]
+    fn cursor_refresh_skipped_while_outputs_unchanged() {
+        let mut state = state_for_tests();
+        let client_id = ClientId::from_raw(60);
+        state.insert_output(test_output_drm1(0, 0, 200, 120));
+        let cursor = mapped_pointer_surface(&mut state, client_id, 31, 20, 20);
+        state.seat.set_cursor_surface(cursor, 0, 0);
+        state.seat.pointer_pos = (50.0, 50.0);
+
+        let mut dispatcher = Dispatcher::default();
+        refresh_visible_cursor_surface_outputs(&mut state, &mut dispatcher);
+        assert!(tree_refresh_queued(&dispatcher, client_id, cursor));
+
+        state.seat.pointer_pos = (60.0, 60.0);
+        let mut dispatcher = Dispatcher::default();
+        refresh_visible_cursor_surface_outputs(&mut state, &mut dispatcher);
+        assert!(!tree_refresh_queued(&dispatcher, client_id, cursor));
     }
 
     fn axis_bits(axis: PointerScrollAxis, value: f32) -> PointerScrollWireEvent {

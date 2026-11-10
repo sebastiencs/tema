@@ -288,6 +288,7 @@ fn start_drag(
 
     crate::input::pointer_lock::release_pointer_capture(state, dispatcher);
     let client_id = client.client_id();
+    state.seat.clear_dnd_icon_outputs_hint();
     state.seat.set_active_drag(DragState {
         source: source
             .map(|source| DragSource::DataSource { source })
