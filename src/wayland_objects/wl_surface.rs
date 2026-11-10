@@ -6,7 +6,7 @@ use crate::{
     },
     drm::{
         begin_managed_toplevel_close_surface, kick_visual_animation_pump, request_active_output,
-        request_outputs, request_outputs_for_rect,
+        request_outputs, request_outputs_for_rect, request_outputs_for_rects,
     },
     input::{set_keyboard_focus_from_surface, SurfaceFocus},
     object::{Object, Parser, PostAction, RequestResult},
@@ -2636,10 +2636,39 @@ impl WlSurface {
                 state.mark_root_geometry_dirty_for_surface(resolved_surface);
             });
             if changed {
-                let (regrabbed, snapped) = client.with_ungrabbed(this, state, |state| {
-                    state.snap_settled_floating_geometry(resolved_surface)
-                });
+                let (regrabbed, (moved, old_bounds, new_bounds, snapped)) =
+                    client.with_ungrabbed(this, state, |state| {
+                        let old_bounds = state
+                            .root_surface_surface_bounds_global(resolved_surface)
+                            .or_else(|| state.root_surface_content_rect_global(resolved_surface));
+                        let moved = state.apply_resize_anchor(resolved_surface);
+                        let new_bounds = state
+                            .root_surface_surface_bounds_global(resolved_surface)
+                            .or_else(|| state.root_surface_content_rect_global(resolved_surface));
+                        let snapped = state.snap_settled_floating_geometry(resolved_surface);
+                        state.clear_resize_anchor_if_idle(resolved_surface);
+                        (moved, old_bounds, new_bounds, snapped)
+                    });
                 this = regrabbed;
+                if moved {
+                    if let Some(toplevel) = state
+                        .window_for_root(resolved_surface)
+                        .and_then(|window| state.toplevel(window))
+                    {
+                        toplevel.position_changed(dispatcher);
+                    }
+                    dispatcher.dispatch_to(
+                        client.client_id(),
+                        crate::clients::ClientAction::RefreshSurfaceTreeOutputs {
+                            root: resolved_surface,
+                        },
+                    );
+                    request_outputs_for_rects(
+                        state,
+                        old_bounds.into_iter().chain(new_bounds),
+                        dispatcher,
+                    );
+                }
                 if snapped {
                     kick_visual_animation_pump(dispatcher);
                 }

@@ -156,7 +156,6 @@ pub(crate) fn apply_pointer_interactive_grab(
             let dx = (state.seat.pointer_pos.0 - initial_pointer_pos.0).round() as i32;
             let dy = (state.seat.pointer_pos.1 - initial_pointer_pos.1).round() as i32;
             let (mut width, mut height) = initial_geometry.resize_size;
-            let (mut x, mut y) = initial_geometry.root_pos;
 
             if edges & 4 != 0 {
                 width = initial_geometry.resize_size.0 - dx;
@@ -171,37 +170,12 @@ pub(crate) fn apply_pointer_interactive_grab(
                 height = initial_geometry.resize_size.1 + dy;
             }
             (width, height) = size_constraints.clamp(width, height);
-            if edges & 4 != 0 {
-                x = initial_geometry.root_pos.0 + (initial_geometry.resize_size.0 - width);
-            }
-            if edges & 1 != 0 {
-                y = initial_geometry.root_pos.1 + (initial_geometry.resize_size.1 - height);
-            }
-
-            let old_bounds = interactive_damage_rect(state, root_surface);
-            let Some(mut surface) = root_surface.try_grab(state) else {
-                abort_pointer_interactive_grab(state, dispatcher, 0);
-                return true;
-            };
-            surface.set_root_position(x, y);
-            drop(surface);
-            state.mark_root_geometry_dirty(root_surface);
+            // Left and top edges move when the client commits the new size.
+            // `resize_anchor` keeps the opposite edge fixed until then.
             state.sync_window_geometry_goal(
                 window,
                 crate::visual_animation::WindowGeometryMotion::Warp,
             );
-            let new_bounds = interactive_damage_rect(state, root_surface);
-            dispatch_client_action(
-                dispatcher,
-                root_surface.client_id(),
-                ClientAction::RefreshSurfaceTreeOutputs { root: root_surface },
-            );
-            if let Some(new_bounds) = new_bounds {
-                let rects = old_bounds.into_iter().chain(std::iter::once(new_bounds));
-                request_outputs_for_rects(state, rects, dispatcher);
-            } else {
-                request_active_output(state, dispatcher);
-            }
 
             if last_size != (width, height) {
                 if let Some(toplevel) = state.toplevel(window) {
@@ -283,6 +257,11 @@ fn settle_pointer_interactive_grab(
     }
     let origin = state.seat.tiled_drag_origin.take();
     let was_tiled_resize = matches!(grab, ActiveGrabState::ResizeTiled { .. });
+    if cancel {
+        if let ActiveGrabState::Resize { window, .. } = grab {
+            state.clear_resize_anchor(window);
+        }
+    }
     state.seat.clear_pointer_interactive_grab();
     crate::session::note_window_changed(state, dispatcher);
     if let ActiveGrabState::MoveTiled(session) = grab {
@@ -883,6 +862,7 @@ fn start_interactive_move(
     state
         .seat
         .start_toplevel_move(client_id, window, root_surface, initial_geometry);
+    state.clear_resize_anchor(window);
     true
 }
 
@@ -905,6 +885,7 @@ fn start_interactive_resize(
         edges,
         initial_geometry,
     );
+    state.note_floating_resize_anchor(window, edges, initial_geometry);
     true
 }
 

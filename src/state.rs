@@ -591,9 +591,20 @@ pub struct ManagedWindowState {
     /// Layout passes also run for the active workspace, and the fullscreen buffer is still
     /// attached then. Sampling it would park the fullscreen size on the floating origin.
     pub hold_floating_layout: bool,
+    /// Fixed edges of a floating resize, in root-position space, kept until
+    /// the client commits the final size.
+    pub resize_anchor: Option<ResizeAnchor>,
     pub focus_animation: FocusVisualAnimation,
     pub lifecycle_animation: WindowLifecycleAnimation,
     pub geometry_animation: WindowGeometryAnimation,
+}
+
+/// Opposite edge of a floating left or top resize, kept until the client commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResizeAnchor {
+    pub edges: u32,
+    pub right: i32,
+    pub bottom: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1414,6 +1425,7 @@ impl State {
             remembered_floating_state: None,
             restore_floating_state_on_next_configure: false,
             hold_floating_layout: false,
+            resize_anchor: None,
             focus_animation: FocusVisualAnimation::settled(self.focus_visual_base(root)),
             lifecycle_animation: WindowLifecycleAnimation::idle(),
             geometry_animation: WindowGeometryAnimation::unarmed(),
@@ -2262,6 +2274,92 @@ impl State {
         }
         self.sync_window_geometry_goal(window, WindowGeometryMotion::Warp);
         true
+    }
+
+    /// Remember the right and bottom edges when a floating resize drags the left or top.
+    pub(crate) fn note_floating_resize_anchor(
+        &mut self,
+        window: WindowId,
+        edges: u32,
+        initial_geometry: root_geometry::WindowTargetGeometry,
+    ) {
+        let Some(managed) = self.managed_window_state_mut(window) else {
+            return;
+        };
+        let left_or_top = edges
+            & (crate::protocol_generated::xdg_toplevel::ResizeEdge::Left as u32
+                | crate::protocol_generated::xdg_toplevel::ResizeEdge::Top as u32);
+        if left_or_top == 0 {
+            managed.resize_anchor = None;
+            return;
+        }
+        managed.resize_anchor = Some(ResizeAnchor {
+            edges,
+            right: initial_geometry.root_pos.0 + initial_geometry.resize_size.0,
+            bottom: initial_geometry.root_pos.1 + initial_geometry.resize_size.1,
+        });
+    }
+
+    pub(crate) fn clear_resize_anchor(&mut self, window: WindowId) {
+        if let Some(managed) = self.managed_window_state_mut(window) {
+            managed.resize_anchor = None;
+        }
+    }
+
+    /// Move a floating window so a left or top resize keeps the opposite edge fixed.
+    ///
+    /// Returns true when the root position changed.
+    pub(crate) fn apply_resize_anchor(&mut self, root: Resolved<WlSurfaceId>) -> bool {
+        let Some(window) = self.window_for_root(root) else {
+            return false;
+        };
+        let Some(anchor) = self
+            .managed_window_state(window)
+            .and_then(|managed| managed.resize_anchor)
+        else {
+            return false;
+        };
+        let Some(geometry) = self.ensure_root_geometry_fresh(root) else {
+            return false;
+        };
+        let content = geometry.content_rect_global();
+        let mut x = geometry.root_pos.0;
+        let mut y = geometry.root_pos.1;
+        if anchor.edges & crate::protocol_generated::xdg_toplevel::ResizeEdge::Left as u32 != 0 {
+            x = anchor.right - content.width;
+        }
+        if anchor.edges & crate::protocol_generated::xdg_toplevel::ResizeEdge::Top as u32 != 0 {
+            y = anchor.bottom - content.height;
+        }
+        if (x, y) == geometry.root_pos {
+            return false;
+        }
+        let Some(mut surface) = root.try_grab(self) else {
+            return false;
+        };
+        surface.set_root_position(x, y);
+        drop(surface);
+        self.mark_root_geometry_dirty(root);
+        true
+    }
+
+    /// Drop the anchor once the resize grab and its configure have both finished.
+    pub(crate) fn clear_resize_anchor_if_idle(&mut self, root: Resolved<WlSurfaceId>) {
+        let Some(window) = self.window_for_root(root) else {
+            return;
+        };
+        if self.seat.resize_grab_window() == Some(window) {
+            return;
+        }
+        let configure_outstanding = root
+            .try_ref(self)
+            .and_then(|surface| surface.xdg_surface())
+            .and_then(|xdg_surface| xdg_surface.try_ref(self))
+            .is_some_and(XdgSurface::resize_configure_outstanding);
+        if configure_outstanding {
+            return;
+        }
+        self.clear_resize_anchor(window);
     }
 
     /// Saved floating frame while the attached buffer is still a different size.
@@ -3305,6 +3403,9 @@ impl State {
             }
         }
         managed.mode = new_mode;
+        if !floating {
+            managed.resize_anchor = None;
+        }
         managed.awaiting_initial_layout = !floating && !managed.mapped;
         let restore_state = floating
             .then_some(managed.remembered_floating_state)
@@ -3392,6 +3493,7 @@ impl State {
         };
         let workspace_id = managed.workspace_id;
         managed.mode = ManagedWindowMode::Tiled;
+        managed.resize_anchor = None;
         managed.restore_floating_state_on_next_configure = false;
         managed.hold_floating_layout = false;
         tiling::mark_workspace_dirty(self, workspace_id);
@@ -3451,6 +3553,7 @@ impl State {
             managed.restore_floating_state_on_next_configure = false;
             managed.hold_floating_layout = false;
             managed.fullscreen = true;
+            managed.resize_anchor = None;
         } else {
             {
                 let Some(managed) = self.managed_window_state_mut(window) else {

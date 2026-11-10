@@ -1534,6 +1534,13 @@ impl SeatState {
         self.tiled_drag_origin = None;
         self.intercepted_pointer_buttons.clear();
     }
+
+    pub(crate) fn resize_grab_window(&self) -> Option<crate::window::WindowId> {
+        match self.pointer_interactive_grab {
+            Some(PointerInteractiveGrab::Resize { window, .. }) => Some(window),
+            _ => None,
+        }
+    }
 }
 
 pub fn handle_pointer_motion(
@@ -6746,7 +6753,7 @@ mod xdg_seat_tests {
             .get(wl_surface_object_id)
             .downcast_ref::<WlSurface>()
             .unwrap();
-        assert_eq!(surface.root_position(), (50, 50));
+        assert_eq!(surface.root_position(), (40, 50));
         assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
             client.client_id(),
             |action| {

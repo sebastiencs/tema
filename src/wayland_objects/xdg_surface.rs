@@ -397,6 +397,11 @@ impl XdgSurface {
         self.deferred_resize_configure = false;
     }
 
+    /// A resize configure is in flight or was deferred until the next commit.
+    pub(crate) fn resize_configure_outstanding(&self) -> bool {
+        self.resize_throttle.is_some() || self.deferred_resize_configure
+    }
+
     /// Whether a throttled resize configure may go out at `now`. When it
     /// may not, remembers that one was skipped.
     pub(crate) fn resize_configure_allowed(&mut self, now: Instant) -> bool {

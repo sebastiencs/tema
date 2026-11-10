@@ -3311,6 +3311,94 @@ mod tests {
     }
 
     #[test]
+    fn floating_left_resize_keeps_the_right_edge_and_clears_after_the_grab() {
+        use std::time::Instant;
+
+        let mut state = state_for_tests();
+        arm_window_animation(&mut state);
+        let surface = live_toplevel(&mut state);
+        state.relayout_dirty_workspaces();
+        state.advance_visual_animations(Instant::now());
+        assert!(state.set_root_surface_floating(surface, true));
+        {
+            let mut wl_surface = surface.try_grab(&mut state).unwrap();
+            wl_surface.test_map(ObjectId::from(901usize), 40, 50, 100, 80);
+        }
+        state.mark_root_geometry_dirty(surface);
+        let window = state.window_for_root(surface).unwrap();
+        state
+            .sync_window_geometry_goal(window, crate::visual_animation::WindowGeometryMotion::Warp);
+        state.advance_visual_animations(Instant::now());
+
+        let geometry = state.ensure_root_geometry_fresh(surface).unwrap();
+        let logical_size = surface.try_ref(&state).unwrap().logical_size();
+        let target = crate::root_geometry::project_window_target_geometry(geometry, logical_size);
+        let right = target.root_pos.0 + target.resize_size.0;
+        assert_eq!(target.root_pos, (40, 50));
+        assert!(target.resize_size.0 > 40);
+
+        state.seat.pointer_pos = (40.0, 90.0);
+        state.seat.start_toplevel_resize(
+            ClientId::from_raw(4),
+            window,
+            surface,
+            crate::window::InteractiveSizeConstraints::default(),
+            EDGE_LEFT,
+            target,
+        );
+        state.note_floating_resize_anchor(window, EDGE_LEFT, target);
+        state.seat.pointer_pos = (70.0, 90.0);
+        let mut dispatcher = Dispatcher::default();
+        assert!(crate::input::apply_pointer_interactive_grab(&mut state, &mut dispatcher));
+        assert_eq!(surface.try_ref(&state).unwrap().root_position(), (40, 50));
+
+        {
+            let mut wl_surface = surface.try_grab(&mut state).unwrap();
+            wl_surface.test_map(
+                ObjectId::from(902usize),
+                40,
+                50,
+                target.resize_size.0 - 40,
+                target.resize_size.1,
+            );
+        }
+        state.mark_root_geometry_dirty(surface);
+        assert!(state.apply_resize_anchor(surface));
+        let moved = state.committed_root_geometry(surface).unwrap();
+        let content = moved.content_rect_global();
+        assert_eq!(moved.root_pos.0 + content.width, right);
+        assert_eq!(moved.root_pos.1, target.root_pos.1);
+        assert_ne!(moved.root_pos.0, target.root_pos.0);
+
+        state.clear_resize_anchor_if_idle(surface);
+        assert!(state
+            .managed_window(surface)
+            .unwrap()
+            .resize_anchor
+            .is_some());
+
+        state.seat.clear_pointer_interactive_grab();
+        state.clear_resize_anchor_if_idle(surface);
+        assert!(state
+            .managed_window(surface)
+            .unwrap()
+            .resize_anchor
+            .is_none());
+
+        state.note_floating_resize_anchor(window, EDGE_LEFT, target);
+        {
+            let xdg_surface = surface.try_ref(&state).unwrap().xdg_surface().unwrap();
+            xdg_surface.grab(&mut state).test_arm_deferred_resize(7);
+        }
+        state.clear_resize_anchor_if_idle(surface);
+        assert!(state
+            .managed_window(surface)
+            .unwrap()
+            .resize_anchor
+            .is_some());
+    }
+
+    #[test]
     fn clamped_resize_step_is_not_reported_again() {
         let (mut layout, left, resize_state) = two_tiled_windows();
         assert!(layout.resize_tiled_window_from_state(left, resize_state, 10_000, 0));
