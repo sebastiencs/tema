@@ -161,7 +161,7 @@ impl Object for ExtWorkspaceHandleV1 {
             }
             Deactivate => {}
             Assign { workspace_group } => {
-                if self.removed {
+                if self.removed || self.manager.try_ref(state).is_none() {
                     return Ok(());
                 }
                 let group = client

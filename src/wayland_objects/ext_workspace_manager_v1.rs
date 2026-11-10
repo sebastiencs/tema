@@ -266,30 +266,15 @@ impl ExtWorkspaceManagerV1 {
         (affected_outputs, had_requests)
     }
 
+    /// `finished` destroys this manager. The group and workspace handles are
+    /// server-allocated, so the client never receives `delete_id` for them and
+    /// still owns the proxies. They stay in the client map until it sends
+    /// `destroy`. Clearing the maps keeps a later sync from touching them
+    /// through this manager.
     fn stop(&mut self, client: &mut Client, state: &mut State, dispatcher: &mut ClientDispatcher) {
-        let group_ids = self.group_handles.values().copied().collect::<Vec<_>>();
-        let workspace_ids = self.workspace_handles.values().copied().collect::<Vec<_>>();
         self.send_event(ext_workspace_manager_v1::Event::Finished, dispatcher);
-        for resource_id in group_ids {
-            if resource_id.exists(state) {
-                client.delete_id(
-                    &WlDisplay::default(),
-                    state,
-                    dispatcher,
-                    resource_id.wayland_id().into(),
-                );
-            }
-        }
-        for resource_id in workspace_ids {
-            if resource_id.exists(state) {
-                client.delete_id(
-                    &WlDisplay::default(),
-                    state,
-                    dispatcher,
-                    resource_id.wayland_id().into(),
-                );
-            }
-        }
+        self.group_handles.clear();
+        self.workspace_handles.clear();
         client.delete_id(&WlDisplay::default(), state, dispatcher, self.id.into());
     }
 }
@@ -320,5 +305,234 @@ impl Object for ExtWorkspaceManagerV1 {
             Stop => self.stop(client, state, dispatcher),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::ExtWorkspaceManagerV1,
+        crate::{
+            clients::{Client, ClientId, ClientManagerAction, RawEvent, Resolved},
+            io_uring::model::IoUringAction,
+            object::Object,
+            protocol_generated::{
+                ExtWorkspaceGroupHandleV1Id, ExtWorkspaceHandleV1Id, ExtWorkspaceManagerV1Id,
+                WaylandId,
+            },
+            runner::Dispatcher,
+            state::{WorkspaceGroupId, WorkspaceId},
+            test_support::state_for_tests,
+            wayland_objects::{
+                ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
+                ext_workspace_handle_v1::ExtWorkspaceHandleV1,
+            },
+        },
+    };
+
+    struct Handles {
+        state: crate::state::State,
+        client: Client,
+        manager_id: ExtWorkspaceManagerV1Id,
+        group_id: ExtWorkspaceGroupHandleV1Id,
+        workspace_id: ExtWorkspaceHandleV1Id,
+        manager: Resolved<ExtWorkspaceManagerV1Id>,
+        group: Resolved<ExtWorkspaceGroupHandleV1Id>,
+        workspace: Resolved<ExtWorkspaceHandleV1Id>,
+    }
+
+    fn handles() -> Handles {
+        let mut state = state_for_tests();
+        let mut client = Client::new_for_tests(ClientId::from_raw(1));
+        let manager_id = ExtWorkspaceManagerV1Id::from(4);
+        let group_id = ExtWorkspaceGroupHandleV1Id::from(0xff00_0000);
+        let workspace_id = ExtWorkspaceHandleV1Id::from(0xff00_0001);
+        let (manager, _) =
+            client.insert_object(&mut state, ExtWorkspaceManagerV1::new(manager_id, 1));
+        let (group, _) = client.insert_object(
+            &mut state,
+            ExtWorkspaceGroupHandleV1::new(
+                group_id,
+                manager,
+                WorkspaceGroupId::from_parts(1, 1),
+                1,
+            ),
+        );
+        let (workspace, _) = client.insert_object(
+            &mut state,
+            ExtWorkspaceHandleV1::new(workspace_id, manager, WorkspaceId::from_parts(1, 1), 1),
+        );
+        {
+            let mut manager_obj = manager.ref_mut(&mut state);
+            manager_obj
+                .group_handles
+                .insert(WorkspaceGroupId::from_parts(1, 1), group);
+            manager_obj
+                .workspace_handles
+                .insert(WorkspaceId::from_parts(1, 1), workspace);
+        }
+        Handles {
+            state,
+            client,
+            manager_id,
+            group_id,
+            workspace_id,
+            manager,
+            group,
+            workspace,
+        }
+    }
+
+    fn empty_request(id: impl Into<WaylandId>, opcode: u16) -> crate::clients::RawRequest<'static> {
+        let event = RawEvent::new(id.into(), opcode, 0);
+        (&*event.into_bytes()).try_into().unwrap()
+    }
+
+    fn create_workspace_request(
+        id: ExtWorkspaceGroupHandleV1Id,
+    ) -> crate::clients::RawRequest<'static> {
+        let mut event = RawEvent::new(id.into(), 0, 1);
+        event.string("spare".to_string());
+        (&*event.into_bytes()).try_into().unwrap()
+    }
+
+    fn stopped(dispatcher: &Dispatcher, manager_id: ExtWorkspaceManagerV1Id) -> bool {
+        let mut found = false;
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            let IoUringAction::Sendmsg { buffer, .. } = action else {
+                return;
+            };
+            if buffer.len() < 8 {
+                return;
+            }
+            let object = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
+            let opcode = u32::from_ne_bytes(buffer[4..8].try_into().unwrap()) & 0xffff;
+            if object == u32::from(manager_id) && opcode == 3 {
+                found = true;
+            }
+        });
+        found
+    }
+
+    fn closed(dispatcher: &Dispatcher, client_id: ClientId) -> bool {
+        dispatcher.test_has_queued_action::<ClientManagerAction>(
+            |action| matches!(action, ClientManagerAction::Close { id } if *id == client_id),
+        )
+    }
+
+    fn stop(handles: &mut Handles, dispatcher: &mut Dispatcher) {
+        let mut client_dispatcher = handles.client.test_dispatcher(dispatcher);
+        client_dispatcher.set_requester_object_id_for_tests(handles.manager_id.into());
+        let manager = handles
+            .state
+            .objects
+            .grab_object::<ExtWorkspaceManagerV1>(handles.manager.object_id());
+        manager
+            .on(
+                &mut handles.client,
+                &mut handles.state,
+                empty_request(handles.manager_id, 1),
+                &mut client_dispatcher,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stop_keeps_handles_until_client_destroys_them() {
+        let mut handles = handles();
+        let mut dispatcher = Dispatcher::default();
+        stop(&mut handles, &mut dispatcher);
+
+        assert!(stopped(&dispatcher, handles.manager_id));
+        assert!(!handles
+            .client
+            .contains_object(handles.manager_id, &handles.state));
+        assert!(handles
+            .client
+            .contains_object(handles.group_id, &handles.state));
+        assert!(handles
+            .client
+            .contains_object(handles.workspace_id, &handles.state));
+    }
+
+    #[test]
+    fn handle_requests_after_stop_are_ignored() {
+        let mut handles = handles();
+        let client_id = handles.client.client_id();
+        let mut dispatcher = Dispatcher::default();
+        stop(&mut handles, &mut dispatcher);
+        {
+            let mut client_dispatcher = handles.client.test_dispatcher(&mut dispatcher);
+            let workspace = handles
+                .state
+                .objects
+                .grab_object::<ExtWorkspaceHandleV1>(handles.workspace.object_id());
+            workspace
+                .on(
+                    &mut handles.client,
+                    &mut handles.state,
+                    empty_request(handles.workspace_id, 1),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+            let group = handles
+                .state
+                .objects
+                .grab_object::<ExtWorkspaceGroupHandleV1>(handles.group.object_id());
+            group
+                .on(
+                    &mut handles.client,
+                    &mut handles.state,
+                    create_workspace_request(handles.group_id),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        assert!(!closed(&dispatcher, client_id));
+    }
+
+    #[test]
+    fn handle_destroy_after_stop_removes_it() {
+        let mut handles = handles();
+        let mut dispatcher = Dispatcher::default();
+        stop(&mut handles, &mut dispatcher);
+        {
+            let mut client_dispatcher = handles.client.test_dispatcher(&mut dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(handles.group_id.into());
+            let group = handles
+                .state
+                .objects
+                .grab_object::<ExtWorkspaceGroupHandleV1>(handles.group.object_id());
+            group
+                .on(
+                    &mut handles.client,
+                    &mut handles.state,
+                    empty_request(handles.group_id, 1),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        {
+            let mut client_dispatcher = handles.client.test_dispatcher(&mut dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(handles.workspace_id.into());
+            let workspace = handles
+                .state
+                .objects
+                .grab_object::<ExtWorkspaceHandleV1>(handles.workspace.object_id());
+            workspace
+                .on(
+                    &mut handles.client,
+                    &mut handles.state,
+                    empty_request(handles.workspace_id, 0),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        assert!(!handles
+            .client
+            .contains_object(handles.group_id, &handles.state));
+        assert!(!handles
+            .client
+            .contains_object(handles.workspace_id, &handles.state));
     }
 }
