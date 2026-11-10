@@ -2257,15 +2257,23 @@ fn refresh_visible_cursor_surface_outputs(state: &State, dispatcher: &mut Dispat
         dispatch_client_action(
             dispatcher,
             cursor.surface.client_id(),
-            ClientAction::RefreshSurfaceOutputs,
+            ClientAction::RefreshSurfaceTreeOutputs { root: cursor.surface },
         );
     }
 }
 
 fn refresh_visible_dnd_icon_surface_outputs(state: &State, dispatcher: &mut Dispatcher) {
-    if let Some(owner_client_id) = visible_dnd_icon_owner_client(state) {
-        dispatch_client_action(dispatcher, owner_client_id, ClientAction::RefreshSurfaceOutputs);
-    }
+    let Some(drag) = state.seat.active_drag() else {
+        return;
+    };
+    let Some(icon) = drag.icon_surface else {
+        return;
+    };
+    dispatch_client_action(
+        dispatcher,
+        drag.source.initiator_client_id(),
+        ClientAction::RefreshSurfaceTreeOutputs { root: icon },
+    );
 }
 
 pub fn begin_popup_grab(
@@ -2644,10 +2652,10 @@ mod xdg_seat_tests {
             begin_popup_grab, cancel_active_drag, complete_drag_drop, handle_keyboard_key,
             handle_pointer_button, handle_pointer_motion, handle_pointer_motion_absolute,
             handle_pointer_scroll, pointer_scroll_protocol_events, quiesce_for_session_pause,
-            recover_pointer_after_interactive_grab_loss, remove_popup_grab, scene_pick_at,
-            set_keyboard_focus, window_hit_at, HitSemantics, PointerAxisChange, PointerScrollAxis,
-            PointerScrollDirection, PointerScrollFrame, PointerScrollSource,
-            PointerScrollWireEvent, SeatClientEvent, SeatState,
+            recover_pointer_after_interactive_grab_loss, refresh_visible_dnd_icon_surface_outputs,
+            remove_popup_grab, scene_pick_at, set_keyboard_focus, window_hit_at, HitSemantics,
+            PointerAxisChange, PointerScrollAxis, PointerScrollDirection, PointerScrollFrame,
+            PointerScrollSource, PointerScrollWireEvent, SeatClientEvent, SeatState,
         },
         crate::{
             clients::{Client, ClientAction, ClientId, DataSourceClientEvent, RawEvent, Resolved},
@@ -6957,6 +6965,43 @@ mod xdg_seat_tests {
             .test_has_queued_action_for::<ClientAction, ClientId>(source_client_id, |action| {
                 matches!(action, ClientAction::RefreshSurfaceOutputs)
             }));
+    }
+
+    #[test]
+    fn drag_motion_refreshes_only_icon_tree() {
+        let mut state = state_for_tests();
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
+        let source_client_id = ClientId::from_raw(60);
+        let icon = Resolved::new(source_client_id, WlSurfaceId::from(31), ObjectId::from(123usize));
+
+        state.seat.set_active_drag(DragState {
+            source: DragSource::None { initiator_client_id: source_client_id },
+            origin_surface: Resolved::new(
+                source_client_id,
+                WlSurfaceId::from(30),
+                ObjectId::from(30usize),
+            ),
+            icon_surface: Some(icon),
+            target: None,
+            negotiation: Default::default(),
+            phase: DragPhase::Dragging,
+        });
+
+        refresh_visible_dnd_icon_surface_outputs(&state, &mut dispatcher);
+
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            source_client_id,
+            |action| {
+                matches!(
+                    action,
+                    ClientAction::RefreshSurfaceTreeOutputs { root } if *root == icon
+                )
+            }
+        ));
+        assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            source_client_id,
+            |action| matches!(action, ClientAction::RefreshSurfaceOutputs)
+        ));
     }
 
     fn axis_bits(axis: PointerScrollAxis, value: f32) -> PointerScrollWireEvent {

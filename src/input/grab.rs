@@ -194,7 +194,7 @@ pub(crate) fn apply_pointer_interactive_grab(
             dispatch_client_action(
                 dispatcher,
                 root_surface.client_id(),
-                ClientAction::RefreshSurfaceOutputs,
+                ClientAction::RefreshSurfaceTreeOutputs { root: root_surface },
             );
             if let Some(new_bounds) = new_bounds {
                 let rects = old_bounds.into_iter().chain(std::iter::once(new_bounds));
@@ -845,7 +845,7 @@ pub(crate) fn place_grabbed_root(
     dispatch_client_action(
         dispatcher,
         root_surface.client_id(),
-        ClientAction::RefreshSurfaceOutputs,
+        ClientAction::RefreshSurfaceTreeOutputs { root: root_surface },
     );
     if let Some(new_bounds) = new_bounds {
         let rects = old_bounds.into_iter().chain(std::iter::once(new_bounds));
@@ -987,7 +987,7 @@ fn refresh_visible_cursor_surface_outputs(state: &State, dispatcher: &mut Dispat
         dispatch_client_action(
             dispatcher,
             cursor.surface.client_id(),
-            ClientAction::RefreshSurfaceOutputs,
+            ClientAction::RefreshSurfaceTreeOutputs { root: cursor.surface },
         );
     }
 }
