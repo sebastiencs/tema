@@ -1084,6 +1084,30 @@ pub mod xdg_toplevel {
             );
         }
 
+        /// Compositor-driven reconfigure: skips the configure when it would
+        /// repeat the last one sent. Replies to client requests must use the
+        /// plain method, which always sends.
+        pub(crate) fn schedule_configure_if_changed(
+            &mut self,
+            client: &Client,
+            state: &State,
+            configure_bounds: Option<(i32, i32)>,
+            xdg_surface: &mut XdgSurface,
+            dispatcher: &mut ClientDispatcher,
+        ) {
+            let states = self.effective_states();
+            if self.configure_is_current(
+                xdg_surface,
+                self.current_width,
+                self.current_height,
+                &states,
+                configure_bounds,
+            ) {
+                return;
+            }
+            self.schedule_configure(client, state, configure_bounds, xdg_surface, dispatcher);
+        }
+
         pub(crate) fn schedule_configure_with_known_decoration(
             &mut self,
             client: &Client,
@@ -1163,6 +1187,41 @@ pub mod xdg_toplevel {
                 width,
                 height,
                 geometry.fullscreen,
+                resizing,
+                dispatcher,
+            );
+        }
+
+        /// Compositor-driven reconfigure: skips the configure when it would
+        /// repeat the last one sent. Replies to client requests must use the
+        /// plain method, which always sends.
+        pub fn send_tiled_layout_configure_if_changed(
+            &mut self,
+            client: &Client,
+            state: &State,
+            xdg_surface: &mut XdgSurface,
+            geometry: crate::root_geometry::CommittedRootGeometry,
+            configure_geometry: crate::root_geometry::ConfigureGeometry,
+            resizing: bool,
+            dispatcher: &mut ClientDispatcher,
+        ) {
+            let (width, height) = configure_geometry.size;
+            let states = self.layout_states(geometry.fullscreen, resizing);
+            if self.configure_is_current(
+                xdg_surface,
+                width,
+                height,
+                &states,
+                Some(configure_geometry.size),
+            ) {
+                return;
+            }
+            self.send_tiled_layout_configure(
+                client,
+                state,
+                xdg_surface,
+                geometry,
+                configure_geometry,
                 resizing,
                 dispatcher,
             );

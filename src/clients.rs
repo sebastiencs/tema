@@ -2579,7 +2579,7 @@ impl Client {
                 if let Some((geometry, configure_geometry)) =
                     tiled_geometry.zip(tiled_configure_geometry)
                 {
-                    toplevel.send_tiled_layout_configure(
+                    toplevel.send_tiled_layout_configure_if_changed(
                         self,
                         state,
                         &mut xdg_surface,
@@ -2600,7 +2600,7 @@ impl Client {
                         dispatcher,
                     );
                 } else {
-                    toplevel.schedule_configure(
+                    toplevel.schedule_configure_if_changed(
                         self,
                         state,
                         configure_bounds,

@@ -4917,6 +4917,106 @@ mod tests {
         assert!(state.seat.keyboard_focus.is_none());
     }
 
+    fn mapped_xdg_toplevel(
+        state: &mut State,
+        client: &mut Client,
+        dispatcher: &mut crate::runner::Dispatcher,
+        surface_id: u32,
+    ) -> ObjectId {
+        let surface_object_id = create_root_xdg_toplevel(
+            state,
+            client,
+            dispatcher,
+            WlSurfaceId::from(surface_id),
+            XdgSurfaceId::from(surface_id + 1),
+            XdgToplevelId::from(surface_id + 2),
+        );
+        commit_initial_xdg_toplevel(
+            state,
+            client,
+            dispatcher,
+            surface_object_id,
+            XdgSurfaceId::from(surface_id + 1),
+        );
+        let buffer_object_id = insert_test_shm_buffer(
+            state,
+            client.client_id(),
+            WlBufferId::from(surface_id + 3),
+            80,
+            60,
+        );
+        let attached_buffer = resolved_buffer(state, buffer_object_id);
+        {
+            let surface = state
+                .objects
+                .get_mut(surface_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            surface.pending.buffer = Some(Some(attached_buffer));
+        }
+        {
+            let mut client_dispatcher = client.test_dispatcher(dispatcher);
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.on_commit(client, state, &mut client_dispatcher);
+        }
+        surface_object_id
+    }
+
+    fn pending_toplevel_configures(
+        state: &State,
+        client: &Client,
+        xdg_surface_id: XdgSurfaceId,
+    ) -> usize {
+        state
+            .objects
+            .try_ref_object::<XdgSurface>(client.object_id(xdg_surface_id))
+            .unwrap()
+            .test_pending_configure_count()
+    }
+
+    #[test]
+    fn reconfigure_mapped_toplevels_skips_unchanged_configure() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(41usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 410);
+        let xdg_surface_id = XdgSurfaceId::from(411);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        let before = pending_toplevel_configures(&state, &client, xdg_surface_id);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        assert_eq!(pending_toplevel_configures(&state, &client, xdg_surface_id), before);
+    }
+
+    #[test]
+    fn reconfigure_mapped_toplevels_sends_when_state_changes() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(42usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 420);
+        let xdg_surface_id = XdgSurfaceId::from(421);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        let before = pending_toplevel_configures(&state, &client, xdg_surface_id);
+        assert!(state.set_root_surface_fullscreen(root(&state, surface_object_id), true));
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        assert_eq!(pending_toplevel_configures(&state, &client, xdg_surface_id), before + 1);
+    }
+
     fn map_closing_candidate(
         state: &mut State,
         client: &mut Client,
