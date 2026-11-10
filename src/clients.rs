@@ -2419,44 +2419,42 @@ impl Client {
         let active_dnd_icon_surface = active_dnd_icon_surface_refresh_params(state, self.id);
         log::debug!("refresh_surface_outputs client={:?} roots={:?}", self.id, root_surface_ids);
         for root_surface in root_surface_ids {
-            let Some(surface) = root_surface.try_ref(state) else {
-                continue;
-            };
-            log::debug!(
-                "refresh_surface_outputs root candidate object={:?} client={:?} is_root={}",
-                surface.object_id(),
-                surface.client_id(),
-                surface.is_root()
+            self.refresh_root_surface_outputs(
+                state,
+                dispatcher,
+                root_surface,
+                active_cursor_surface,
+                active_dnd_icon_surface,
             );
-            if surface.client_id() != self.id || !surface.is_root() {
-                continue;
-            }
-            if state.is_popup_root_surface(root_surface) {
-                continue;
-            }
-            if surface.has_cursor_role() {
-                if let Some((active_surface, base_x, base_y)) = active_cursor_surface {
-                    if active_surface == root_surface {
-                        refresh_surface_tree_outputs(
-                            self,
-                            state,
-                            dispatcher,
-                            root_surface,
-                            base_x,
-                            base_y,
-                        );
-                    } else {
-                        clear_surface_tree_outputs(self, state, dispatcher, root_surface);
-                    }
-                } else {
-                    clear_surface_tree_outputs(self, state, dispatcher, root_surface);
-                }
-                continue;
-            }
-            if surface.has_input_popup_role() {
-                if let Some((base_x, base_y)) =
-                    crate::input::ime::popup_output_base(state, root_surface)
-                {
+        }
+    }
+
+    fn refresh_root_surface_outputs(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        root_surface: Resolved<WlSurfaceId>,
+        active_cursor_surface: Option<(Resolved<WlSurfaceId>, i32, i32)>,
+        active_dnd_icon_surface: Option<(Resolved<WlSurfaceId>, i32, i32)>,
+    ) {
+        let Some(surface) = root_surface.try_ref(state) else {
+            return;
+        };
+        log::debug!(
+            "refresh_surface_outputs root candidate object={:?} client={:?} is_root={}",
+            surface.object_id(),
+            surface.client_id(),
+            surface.is_root()
+        );
+        if surface.client_id() != self.id || !surface.is_root() {
+            return;
+        }
+        if state.is_popup_root_surface(root_surface) {
+            return;
+        }
+        if surface.has_cursor_role() {
+            if let Some((active_surface, base_x, base_y)) = active_cursor_surface {
+                if active_surface == root_surface {
                     refresh_surface_tree_outputs(
                         self,
                         state,
@@ -2468,33 +2466,45 @@ impl Client {
                 } else {
                     clear_surface_tree_outputs(self, state, dispatcher, root_surface);
                 }
-                continue;
+            } else {
+                clear_surface_tree_outputs(self, state, dispatcher, root_surface);
             }
-            if surface.has_dnd_icon_role() {
-                if let Some((active_surface, base_x, base_y)) = active_dnd_icon_surface {
-                    if active_surface == root_surface {
-                        refresh_surface_tree_outputs(
-                            self,
-                            state,
-                            dispatcher,
-                            root_surface,
-                            base_x,
-                            base_y,
-                        );
-                    } else {
-                        clear_surface_tree_outputs(self, state, dispatcher, root_surface);
-                    }
+            return;
+        }
+        if surface.has_input_popup_role() {
+            if let Some((base_x, base_y)) =
+                crate::input::ime::popup_output_base(state, root_surface)
+            {
+                refresh_surface_tree_outputs(self, state, dispatcher, root_surface, base_x, base_y);
+            } else {
+                clear_surface_tree_outputs(self, state, dispatcher, root_surface);
+            }
+            return;
+        }
+        if surface.has_dnd_icon_role() {
+            if let Some((active_surface, base_x, base_y)) = active_dnd_icon_surface {
+                if active_surface == root_surface {
+                    refresh_surface_tree_outputs(
+                        self,
+                        state,
+                        dispatcher,
+                        root_surface,
+                        base_x,
+                        base_y,
+                    );
                 } else {
                     clear_surface_tree_outputs(self, state, dispatcher, root_surface);
                 }
-                continue;
-            }
-            if !root_has_protocol_visibility(state, root_surface) {
+            } else {
                 clear_surface_tree_outputs(self, state, dispatcher, root_surface);
-                continue;
             }
-            refresh_surface_tree_outputs(self, state, dispatcher, root_surface, 0, 0);
+            return;
         }
+        if !root_has_protocol_visibility(state, root_surface) {
+            clear_surface_tree_outputs(self, state, dispatcher, root_surface);
+            return;
+        }
+        refresh_surface_tree_outputs(self, state, dispatcher, root_surface, 0, 0);
     }
 
     fn reconfigure_mapped_toplevels(
