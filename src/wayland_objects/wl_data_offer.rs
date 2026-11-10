@@ -1322,6 +1322,7 @@ pub(crate) mod tests {
         {
             let offer_obj = state.objects.grab_object::<WlDataOffer>(offer_object_id);
             let mut client_dispatcher = target.test_dispatcher(&mut dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(offer_id.into());
             offer_obj
                 .on(&mut target, &mut state, destroy_request(offer_id), &mut client_dispatcher)
                 .unwrap();

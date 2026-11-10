@@ -608,6 +608,7 @@ mod tests {
 
         {
             let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(offer_id.into());
             let offer_obj = state.objects.grab_object::<WlDataOffer>(offer.object_id());
             offer_obj
                 .on(&mut client, &mut state, destroy_request(offer_id), &mut client_dispatcher)

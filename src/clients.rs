@@ -543,6 +543,13 @@ impl ProcessInfo {
 
 const MIN_SERVER_ID: u32 = 0xff00_0000;
 
+/// A server-allocated id may only disappear while its own destructor is the
+/// request being handled. Anything else leaves the client holding a proxy
+/// whose next request is a fatal protocol error.
+fn is_server_side_removal_of_server_id(id: WaylandId, requester: Option<WaylandId>) -> bool {
+    u32::from(id) >= MIN_SERVER_ID && requester != Some(id)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ClientObjectEntry {
     type_id: TypeId,
@@ -1172,6 +1179,13 @@ impl Client {
         dispatcher: &mut ClientDispatcher,
         id: WaylandId,
     ) {
+        if is_server_side_removal_of_server_id(id, dispatcher.requester_object_id()) {
+            log::warn!(
+                "removing server-allocated object {id:?} of client {:?} outside its own request; \
+                 the client still holds it and its next request on it will be a fatal error",
+                self.id,
+            );
+        }
         let object_id = self.objects.remove(&id).unwrap().object_id;
         state.remove_object(object_id);
         // `delete_id` exists so the client can reuse *client-allocated* ids. Server-created
@@ -2901,6 +2915,10 @@ impl<'a> ClientDispatcher<'a> {
     /// The wire scale of the client this dispatcher sends events to.
     pub fn wire_scale(&self) -> WireScale {
         self.wire_scale
+    }
+
+    pub(crate) fn requester_object_id(&self) -> Option<WaylandId> {
+        self.requester_object_id
     }
 
     #[cfg(test)]
@@ -5131,8 +5149,8 @@ mod drag_offer_lifetime_tests {
         crate::{
             object::Object,
             protocol_generated::{
-                wl_data_device_manager::DndAction, WlDataDeviceId, WlDataOfferId, WlDataSourceId,
-                WlSeatId,
+                wl_data_device_manager::DndAction, WaylandId, WlDataDeviceId, WlDataOfferId,
+                WlDataSourceId, WlSeatId,
             },
             runner::Dispatcher,
             state::{
@@ -5273,6 +5291,7 @@ mod drag_offer_lifetime_tests {
         leave(&mut fixture, &mut dispatcher);
         {
             let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(offer_id.into());
             let offer = fixture
                 .state
                 .objects
@@ -5325,6 +5344,7 @@ mod drag_offer_lifetime_tests {
 
         {
             let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            client_dispatcher.set_requester_object_id_for_tests(offer_id.into());
             let offer = fixture
                 .state
                 .objects
@@ -5406,5 +5426,19 @@ mod drag_offer_lifetime_tests {
                 .unwrap();
         }
         assert!(!client_closed(&dispatcher, client_id));
+    }
+
+    #[test]
+    fn delete_id_of_server_id_during_its_own_request_does_not_warn() {
+        let id = WaylandId::from(0xff00_0000);
+        assert!(!super::is_server_side_removal_of_server_id(id, Some(id)));
+        assert!(!super::is_server_side_removal_of_server_id(WaylandId::from(20), None));
+    }
+
+    #[test]
+    fn delete_id_of_server_id_outside_its_request_warns() {
+        let id = WaylandId::from(0xff00_0000);
+        assert!(super::is_server_side_removal_of_server_id(id, None));
+        assert!(super::is_server_side_removal_of_server_id(id, Some(WaylandId::from(1))));
     }
 }
