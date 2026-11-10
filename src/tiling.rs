@@ -605,6 +605,8 @@ impl WorkspaceLayout {
         })
     }
 
+    /// Returns `true` when the step changed the split; `false` when it was a
+    /// no-op or the window is not in a resizable split.
     pub fn resize_tiled_window_from_state(
         &mut self,
         window: WindowId,
@@ -659,6 +661,11 @@ impl WorkspaceLayout {
         let Some(LayoutNode::Container(container)) = self.nodes.get_mut(&parent_id) else {
             return false;
         };
+        let leaf_weight = container.children[resize_state.leaf_index].weight;
+        let neighbor_weight = container.children[resize_state.neighbor_index].weight;
+        if leaf_weight == updated_leaf_weight && neighbor_weight == updated_neighbor_weight {
+            return false;
+        }
         container.children[resize_state.leaf_index].weight = updated_leaf_weight;
         container.children[resize_state.neighbor_index].weight = updated_neighbor_weight;
         self.mark_dirty();
@@ -3123,8 +3130,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tiled_resize_uses_grab_start_weights() {
+    fn root_child_weight(layout: &WorkspaceLayout, index: usize) -> f64 {
+        match layout.nodes.get(&layout.root.unwrap()).unwrap() {
+            LayoutNode::Container(container) => container.children[index].weight,
+            LayoutNode::Leaf(_) => panic!("root should be a container"),
+        }
+    }
+
+    fn two_tiled_windows() -> (WorkspaceLayout, WindowId, TiledResizeState) {
         let mut layout = WorkspaceLayout::default();
         let left = WindowId::for_tests(1);
         let right = WindowId::for_tests(2);
@@ -3140,23 +3153,36 @@ mod tests {
             &BTreeMap::default(),
             &BTreeMap::default(),
         );
-
         let resize_state = layout
             .begin_tiled_resize(left, EDGE_RIGHT)
             .expect("left leaf should support right-edge resize");
-        assert!(layout.resize_tiled_window_from_state(left, resize_state, 10, 0));
-        let first_left_weight = match layout.nodes.get(&layout.root.unwrap()).unwrap() {
-            LayoutNode::Container(container) => container.children[0].weight,
-            LayoutNode::Leaf(_) => panic!("root should be a container"),
-        };
+        (layout, left, resize_state)
+    }
 
+    #[test]
+    fn repeated_resize_step_is_reported_once() {
+        let (mut layout, left, resize_state) = two_tiled_windows();
         assert!(layout.resize_tiled_window_from_state(left, resize_state, 10, 0));
-        let second_left_weight = match layout.nodes.get(&layout.root.unwrap()).unwrap() {
-            LayoutNode::Container(container) => container.children[0].weight,
-            LayoutNode::Leaf(_) => panic!("root should be a container"),
-        };
+        let first_left_weight = root_child_weight(&layout, 0);
+
+        assert!(!layout.resize_tiled_window_from_state(left, resize_state, 10, 0));
+        let second_left_weight = root_child_weight(&layout, 0);
 
         assert_eq!(first_left_weight, second_left_weight);
+    }
+
+    #[test]
+    fn clamped_resize_step_is_not_reported_again() {
+        let (mut layout, left, resize_state) = two_tiled_windows();
+        assert!(layout.resize_tiled_window_from_state(left, resize_state, 10_000, 0));
+        assert!(!layout.resize_tiled_window_from_state(left, resize_state, 20_000, 0));
+    }
+
+    #[test]
+    fn resize_step_back_to_start_is_reported() {
+        let (mut layout, left, resize_state) = two_tiled_windows();
+        assert!(layout.resize_tiled_window_from_state(left, resize_state, 10, 0));
+        assert!(layout.resize_tiled_window_from_state(left, resize_state, 0, 0));
     }
 
     #[test]
