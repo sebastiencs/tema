@@ -2635,6 +2635,15 @@ impl WlSurface {
             (this, _) = client.with_ungrabbed(this, state, |state| {
                 state.mark_root_geometry_dirty_for_surface(resolved_surface);
             });
+            if changed {
+                let (regrabbed, snapped) = client.with_ungrabbed(this, state, |state| {
+                    state.snap_settled_floating_geometry(resolved_surface)
+                });
+                this = regrabbed;
+                if snapped {
+                    kick_visual_animation_pump(dispatcher);
+                }
+            }
         }
         let is_mapped = this.global_logical_bounds().is_some();
         let mut bounds_after_first_map_relayout = None;
@@ -5303,6 +5312,107 @@ mod tests {
         assert!(dispatcher
             .test_take_queued_actions::<ClientManagerAction>()
             .is_empty());
+    }
+
+    fn settle_floating_toplevel(state: &mut State, surface: Resolved<WlSurfaceId>) -> RectI {
+        state
+            .config
+            .animations
+            .set_duration_msec(crate::animation_config::AnimationNode::Windows, 200);
+        state
+            .config
+            .animations
+            .set_linear(crate::animation_config::AnimationNode::Windows);
+        state.config.animations.set_open_duration_msec(0);
+        assert!(state.set_root_surface_floating(surface, true));
+        let window = state.window_for_root(surface).expect("window");
+        state
+            .sync_window_geometry_goal(window, crate::visual_animation::WindowGeometryMotion::Warp);
+        state.advance_visual_animations(std::time::Instant::now());
+        let geometry = state.managed_window(surface).unwrap().geometry_animation;
+        assert!(!geometry.is_active());
+        geometry.visual_rect().unwrap()
+    }
+
+    #[test]
+    fn floating_commit_snaps_a_settled_window_to_its_new_size() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(49usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 510);
+        let root_surface = root(&state, surface_object_id);
+        let before = settle_floating_toplevel(&mut state, root_surface);
+        let _ = dispatcher.test_take_queued_actions::<VisualAnimationPumpAction>();
+
+        super::test_commit_new_buffer(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            root_surface,
+            120,
+            90,
+        );
+
+        assert!(dispatcher.test_has_queued_action::<VisualAnimationPumpAction>(|action| {
+            matches!(action, VisualAnimationPumpAction::Kick)
+        }));
+        state.advance_visual_animations(std::time::Instant::now());
+        let logical = state
+            .committed_root_geometry(root_surface)
+            .unwrap()
+            .layout_rect_global;
+        assert_ne!(logical, before);
+        let geometry = state
+            .managed_window(root_surface)
+            .unwrap()
+            .geometry_animation;
+        assert_eq!(geometry.visual_rect(), Some(logical));
+        assert!(!geometry.is_active());
+    }
+
+    #[test]
+    fn floating_commit_keeps_a_held_layout_goal() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(50usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 520);
+        let root_surface = root(&state, surface_object_id);
+        let before = settle_floating_toplevel(&mut state, root_surface);
+        state
+            .managed_window_mut(root_surface)
+            .unwrap()
+            .hold_floating_layout = true;
+        let _ = dispatcher.test_take_queued_actions::<VisualAnimationPumpAction>();
+
+        super::test_commit_new_buffer(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            root_surface,
+            120,
+            90,
+        );
+
+        assert!(!dispatcher.test_has_queued_action::<VisualAnimationPumpAction>(|action| {
+            matches!(action, VisualAnimationPumpAction::Kick)
+        }));
+        state.advance_visual_animations(std::time::Instant::now());
+        let logical = state
+            .committed_root_geometry(root_surface)
+            .unwrap()
+            .layout_rect_global;
+        assert_ne!(logical, before);
+        let geometry = state
+            .managed_window(root_surface)
+            .unwrap()
+            .geometry_animation;
+        assert_eq!(geometry.visual_rect(), Some(before));
+        assert_eq!(geometry.goal_rect(), Some(before));
+        assert!(!geometry.is_active());
     }
 
     fn map_closing_candidate(

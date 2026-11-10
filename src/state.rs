@@ -2229,6 +2229,41 @@ impl State {
             .set_goal(geometry.layout_rect_global, motion);
     }
 
+    /// Snap a settled floating window to its committed geometry.
+    ///
+    /// A floating window's size comes from its buffer, so nothing else
+    /// updates the goal when the client commits a new size: during an
+    /// interactive resize, after it, or when the client resizes itself.
+    /// Returns true when the goal changed.
+    pub(crate) fn snap_settled_floating_geometry(&mut self, root: Resolved<WlSurfaceId>) -> bool {
+        let Some(window) = self.window_for_root(root) else {
+            return false;
+        };
+        let Some(managed) = self.managed_window_state(window) else {
+            return false;
+        };
+        if managed.mode != ManagedWindowMode::Floating
+            || managed.fullscreen
+            || managed.hold_floating_layout
+        {
+            return false;
+        }
+        let Some(committed) = self
+            .ensure_root_geometry_fresh(root)
+            .map(|geometry| geometry.layout_rect_global)
+        else {
+            return false;
+        };
+        let Some(managed) = self.managed_window_state(window) else {
+            return false;
+        };
+        if !managed.geometry_animation.settled_away_from(committed) {
+            return false;
+        }
+        self.sync_window_geometry_goal(window, WindowGeometryMotion::Warp);
+        true
+    }
+
     /// Saved floating frame while the attached buffer is still a different size.
     fn held_floating_layout(&mut self, window: WindowId) -> Option<RectI> {
         let surface = self.window_root_surface(window)?;
