@@ -6550,7 +6550,7 @@ fn collect_protected_scene(
     push_scene_item_frame_elements(&mut frame_elements, surface_start..items.len());
     let deferred_releases = retired_candidates
         .into_iter()
-        .map(|retired| DeferredRelease::from_candidate(state, retired))
+        .map(|retired| DeferredRelease::from_candidate(retired))
         .collect();
     (items, frame_elements, deferred_releases)
 }
@@ -8254,7 +8254,7 @@ fn collect_render_items_for_output_view(
     }
 
     for retired in retired_candidates {
-        deferred_releases.push(DeferredRelease::from_candidate(state, retired));
+        deferred_releases.push(DeferredRelease::from_candidate(retired));
     }
 
     (
@@ -11499,7 +11499,6 @@ mod presentation_timing_tests {
         let buffer_object_id = state
             .insert_object(WlBuffer::test_argb8888_shm(
                 WlBufferId::from(1),
-                ClientId::from_raw(1),
                 16,
                 12,
                 vec![0x80; 16 * 12 * 4],

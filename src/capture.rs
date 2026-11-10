@@ -490,6 +490,8 @@ pub(crate) fn target_is_live(state: &State, target: CaptureTarget) -> bool {
 pub enum CaptureQueueError {
     SourceGone,
     Buffer(crate::wayland_objects::wl_buffer::CaptureBufferError),
+    /// The destination `wl_buffer` was destroyed before the capture could write it.
+    BufferGone,
     BufferBusy,
     EmptyRegion,
     /// The session is protected, so a toplevel image would expose the hidden desktop.
@@ -524,11 +526,10 @@ pub(crate) fn submit_capture(
         return Err(CaptureQueueError::BufferBusy);
     }
     let Some(buffer) = request.buffer.try_ref(state) else {
-        return Err(CaptureQueueError::Buffer(
-            crate::wayland_objects::wl_buffer::CaptureBufferError::Destroyed,
-        ));
+        return Err(CaptureQueueError::BufferGone);
     };
     buffer
+        .content()
         .begin_capture_write(request.width, request.height)
         .map_err(CaptureQueueError::Buffer)?;
     let outputs = schedule_capture(state, dispatcher, request.target);
@@ -592,6 +593,7 @@ pub(crate) fn complete_capture(
     }
     let written = buffer.try_ref(state).is_some_and(|buffer| {
         buffer
+            .content()
             .begin_capture_write(width, height)
             .and_then(|write| write.write_top_left(src, src_stride))
             .is_ok()
@@ -1293,7 +1295,10 @@ pub(crate) fn output_copy_specs(
         else {
             continue;
         };
-        let Ok(write) = buffer.begin_capture_write(rect.width, rect.height) else {
+        let Ok(write) = buffer
+            .content()
+            .begin_capture_write(rect.width, rect.height)
+        else {
             continue;
         };
         specs.push(OutputCopySpec {
@@ -1360,6 +1365,7 @@ pub(crate) fn apply_rendered_output(
             continue;
         };
         let written = buffer
+            .content()
             .begin_capture_write(stored.width, stored.height)
             .and_then(|write| write.write_top_left(&copy.bytes, copy.stride))
             .is_ok();
@@ -1875,6 +1881,7 @@ pub(crate) fn apply_rendered_toplevel(
         return;
     };
     let written = buffer
+        .content()
         .begin_capture_write(stored.width, stored.height)
         .and_then(|write| write.write_top_left(&copy.bytes, copy.stride))
         .is_ok();
@@ -3392,7 +3399,6 @@ mod tests {
             state,
             WlBuffer::new(NewWlBufferParams {
                 id: WlBufferId::from(BUFFER),
-                owner_client_id: client.client_id(),
                 offset: 0,
                 width: 2,
                 height: 2,
@@ -3665,6 +3671,7 @@ mod tests {
             .resolve(WlBufferId::from(BUFFER), &state)
             .unwrap()
             .rref(&state)
+            .content()
             .begin_capture_write(2, 2)
             .unwrap();
         assert_eq!(stored.as_slice()[..8], [9, 9, 9, 9, 9, 9, 9, 9]);
@@ -4325,6 +4332,7 @@ mod tests {
             .resolve(WlBufferId::from(BUFFER), &state)
             .unwrap()
             .rref(&state)
+            .content()
             .begin_capture_write(2, 2)
             .unwrap();
         assert_eq!(stored.as_slice()[..4], [4, 5, 6, 7]);
@@ -4387,7 +4395,6 @@ mod tests {
             &mut state,
             WlBuffer::new(NewWlBufferParams {
                 id: WlBufferId::from(70),
-                owner_client_id: client.client_id(),
                 offset: 0,
                 width: 1,
                 height: 1,
@@ -4448,7 +4455,6 @@ mod tests {
             &mut state,
             WlBuffer::new(NewWlBufferParams {
                 id: WlBufferId::from(71),
-                owner_client_id: client.client_id(),
                 offset: 0,
                 width: 1,
                 height: 1,
@@ -4488,6 +4494,7 @@ mod tests {
             .resolve(WlBufferId::from(71), &state)
             .unwrap()
             .rref(&state)
+            .content()
             .begin_capture_write(1, 1)
             .unwrap();
         assert_eq!(stored.as_slice(), [10, 20, 30, 255]);
@@ -4862,7 +4869,6 @@ mod tests {
                 state,
                 WlBuffer::new(NewWlBufferParams {
                     id: crate::protocol_generated::WlBufferId::from(id),
-                    owner_client_id: client.client_id(),
                     offset: 0,
                     width,
                     height,
@@ -4877,7 +4883,7 @@ mod tests {
 
     #[test]
     fn capture_shm_rejects_a_buffer_that_cannot_hold_the_image() {
-        let (mut client, _, mut state) = client_state();
+        let (mut client, mut dispatcher, mut state) = client_state();
         let tight = shm_capture_buffer(
             &mut client,
             &mut state,
@@ -4889,7 +4895,11 @@ mod tests {
             crate::drm::ARGB8888,
         );
         assert_eq!(
-            tight.rref(&state).begin_capture_write(1, 2).unwrap_err(),
+            tight
+                .rref(&state)
+                .content()
+                .begin_capture_write(1, 2)
+                .unwrap_err(),
             crate::wayland_objects::wl_buffer::CaptureBufferError::Size
         );
         let short_stride = shm_capture_buffer(
@@ -4905,6 +4915,7 @@ mod tests {
         assert_eq!(
             short_stride
                 .rref(&state)
+                .content()
                 .begin_capture_write(2, 1)
                 .unwrap_err(),
             crate::wayland_objects::wl_buffer::CaptureBufferError::Stride
@@ -4920,21 +4931,34 @@ mod tests {
             crate::drm::XRGB8888,
         );
         assert_eq!(
-            overflow.rref(&state).begin_capture_write(2, 2).unwrap_err(),
+            overflow
+                .rref(&state)
+                .content()
+                .begin_capture_write(2, 2)
+                .unwrap_err(),
             crate::wayland_objects::wl_buffer::CaptureBufferError::Overflow
         );
-        tight.ref_mut(&mut state).mark_destroyed();
-        assert_eq!(
-            tight.rref(&state).begin_capture_write(2, 2).unwrap_err(),
-            crate::wayland_objects::wl_buffer::CaptureBufferError::Destroyed
-        );
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.delete_id(
+                &crate::wayland_objects::wl_display::WlDisplay::default(),
+                &mut state,
+                &mut client_dispatcher,
+                tight.wayland_id().into(),
+            );
+        }
+        assert!(tight.try_ref(&state).is_none());
         let format = Box::leak(Box::new(crate::drm::Format {
             drm: drm::buffer::DrmFourcc::Abgr8888,
             ..*crate::drm::ARGB8888
         }));
         let foreign = shm_capture_buffer(&mut client, &mut state, 73, 1, 1, 4, vec![0; 4], format);
         assert_eq!(
-            foreign.rref(&state).begin_capture_write(1, 1).unwrap_err(),
+            foreign
+                .rref(&state)
+                .content()
+                .begin_capture_write(1, 1)
+                .unwrap_err(),
             crate::wayland_objects::wl_buffer::CaptureBufferError::Format
         );
     }
@@ -5015,6 +5039,7 @@ mod tests {
         assert_eq!(
             buffer
                 .rref(&state)
+                .content()
                 .begin_capture_write(2, 1)
                 .unwrap()
                 .as_slice(),
@@ -5027,6 +5052,7 @@ mod tests {
         assert_eq!(
             buffer
                 .rref(&state)
+                .content()
                 .begin_capture_write(2, 1)
                 .unwrap()
                 .as_slice()[0],
@@ -5041,6 +5067,7 @@ mod tests {
         assert_eq!(
             other
                 .rref(&state)
+                .content()
                 .begin_capture_write(2, 1)
                 .unwrap()
                 .as_slice(),
@@ -5230,6 +5257,7 @@ mod tests {
         assert_eq!(
             hidden
                 .rref(&state)
+                .content()
                 .begin_capture_write(4, 2)
                 .unwrap()
                 .as_slice()[..4],
@@ -5568,6 +5596,7 @@ mod tests {
         assert_eq!(
             hidden
                 .rref(&state)
+                .content()
                 .begin_capture_write(38, 40)
                 .unwrap()
                 .as_slice()[..4],

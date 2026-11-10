@@ -1545,7 +1545,6 @@ impl WlSurface {
             release_callbacks: Vec::new(),
             wire_inputs: self.on_screen.wire_inputs.clone(),
         };
-        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     /// Build the payload from the pending state. A wire-scaled client's
@@ -2312,7 +2311,6 @@ impl WlSurface {
             dispatcher.dispatch_post_action(crate::input::pointer_lock::RecheckPointerLock);
         }
 
-        Self::queue_destroyed_buffer_free(dispatcher);
         changes.buffer_changed || changes.mapping_changed || !committed_damage.is_empty()
     }
 
@@ -2533,7 +2531,6 @@ impl WlSurface {
             let discarded =
                 this.cache_commit_payload(payload, frame_callbacks, presentation_feedbacks);
             this.discard_presentation_feedbacks(client, state, dispatcher, discarded);
-            Self::queue_destroyed_buffer_free(dispatcher);
             return;
         }
         let lock_output = if this.role == Role::LockSurface {
@@ -3117,7 +3114,6 @@ impl WlSurface {
         }
         dispatcher
             .dispatch_to(client.client_id(), crate::clients::ClientAction::RefreshSurfaceOutputs);
-        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     pub fn take_retired_buffers(&mut self) -> Vec<RetiredBufferCandidate> {
@@ -3300,31 +3296,6 @@ impl WlSurface {
         };
     }
 
-    fn queue_destroyed_buffer_free(dispatcher: &mut ClientDispatcher) {
-        dispatcher.dispatch_post_action(crate::wayland_objects::wl_buffer::FreeDestroyedBuffers);
-    }
-
-    pub(crate) fn references_buffer(&self, buffer: Resolved<WlBufferId>) -> bool {
-        let same = |attached: &crate::buffer_content::AttachedBuffer| attached.object == buffer;
-        let pending = self
-            .pending
-            .buffer
-            .as_ref()
-            .and_then(|b| b.as_ref())
-            .is_some_and(same);
-        let cached = self
-            .cached_commit
-            .as_ref()
-            .and_then(|cached| cached.payload.buffer.as_ref().and_then(|b| b.as_ref()))
-            .is_some_and(same);
-        let blocked = self
-            .blocked
-            .as_ref()
-            .is_some_and(|blocked| same(&blocked.buffer));
-        let on_screen = self.on_screen.buffer.as_ref().is_some_and(same);
-        pending || cached || blocked || on_screen
-    }
-
     fn retire_current(&mut self) {
         if let Some(attached) = self.on_screen.buffer.take() {
             self.retired_buffers.push(RetiredBufferCandidate {
@@ -3370,7 +3341,6 @@ impl WlSurface {
                 release_callbacks: blocked.release_callbacks,
             },
         );
-        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     pub fn cancel_blocked_if_waiter_matches(
@@ -3510,7 +3480,6 @@ impl WlSurface {
             request_outputs(state, self.output_membership_ids(), dispatcher);
             request_active_output(state, dispatcher);
         }
-        Self::queue_destroyed_buffer_free(dispatcher);
     }
 
     pub fn client_id(&self) -> ClientId {
@@ -7375,7 +7344,6 @@ mod tests {
                 &mut self.state,
                 WlBuffer::new(crate::wayland_objects::wl_buffer::NewWlBufferParams {
                     id: WlBufferId::from(id),
-                    owner_client_id: self.client.client_id(),
                     offset: 0,
                     width: 2,
                     height: 2,
@@ -7408,6 +7376,27 @@ mod tests {
                 .unwrap();
             client_dispatcher.drain_post_actions(&mut self.client, &mut self.state);
         }
+
+        fn content_weak(
+            &self,
+            buffer: Resolved<WlBufferId>,
+        ) -> std::rc::Weak<crate::buffer_content::BufferContent> {
+            std::rc::Rc::downgrade(buffer.try_ref(&self.state).unwrap().content())
+        }
+
+        /// Deliver releases for buffers this surface just retired, the way a frame would.
+        fn release_retired(&mut self) {
+            let retired = self.surface.grab(&mut self.state).take_retired_buffers();
+            for candidate in retired {
+                crate::sync::DeferredRelease::from_candidate(candidate)
+                    .resolve(&mut self.state, &mut self.dispatcher);
+            }
+            for action in self.dispatcher.test_take_queued_actions::<ClientAction>() {
+                self.client
+                    .process(&mut self.state, action, &mut self.dispatcher)
+                    .unwrap();
+            }
+        }
     }
 
     fn delete_id_was_sent(dispatcher: &Dispatcher, id: u32) -> bool {
@@ -7429,42 +7418,70 @@ mod tests {
         found
     }
 
+    fn buffer_release_was_sent(dispatcher: &Dispatcher, id: u32) -> bool {
+        let mut found = false;
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            let IoUringAction::Sendmsg { buffer, .. } = action else {
+                return;
+            };
+            if buffer.len() < 8 {
+                return;
+            }
+            let object = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
+            let opcode = u32::from_ne_bytes(buffer[4..8].try_into().unwrap()) & 0xffff;
+            if object == id && opcode == 0 {
+                found = true;
+            }
+        });
+        found
+    }
+
     #[test]
     fn destroying_an_unattached_buffer_sends_delete_id_and_frees_it() {
         let mut life = BufferLifetime::new();
         let buffer = life.insert_buffer(20);
+        let content = life.content_weak(buffer);
         life.destroy_buffer(buffer);
         assert!(delete_id_was_sent(&life.dispatcher, 20));
         assert!(!life.state.objects.contains(buffer.object_id()));
         assert!(!life
             .client
             .contains_object(buffer.wayland_id(), &life.state));
+        assert!(content.upgrade().is_none());
     }
 
     #[test]
-    fn destroying_an_on_screen_buffer_keeps_it_until_replaced() {
+    fn destroying_an_on_screen_buffer_keeps_its_pixels_until_replaced() {
         let mut life = BufferLifetime::new();
         let first = life.insert_buffer(20);
         life.commit_buffer(first);
+        let content = life.content_weak(first);
         life.destroy_buffer(first);
         assert!(delete_id_was_sent(&life.dispatcher, 20));
-        assert!(life.state.objects.contains(first.object_id()));
-        assert!(first.try_ref(&life.state).is_some());
+        assert!(!life.state.objects.contains(first.object_id()));
         assert!(!life.client.contains_object(first.wayland_id(), &life.state));
+        let shown = content.upgrade().expect("surface still shows the pixels");
+        {
+            let surface = life.surface.grab(&mut life.state);
+            let attached = surface.on_screen.buffer.as_ref().unwrap();
+            assert!(std::rc::Rc::ptr_eq(&attached.content, &shown));
+        }
+        drop(shown);
 
         let second = life.insert_buffer(21);
         life.commit_buffer(second);
-        assert!(!life.state.objects.contains(first.object_id()));
+        assert!(content.upgrade().is_none());
         assert!(life.state.objects.contains(second.object_id()));
     }
 
     #[test]
-    fn destroying_a_surface_frees_its_destroyed_buffer() {
+    fn destroying_a_surface_drops_its_destroyed_buffer_content() {
         let mut life = BufferLifetime::new();
         let buffer = life.insert_buffer(20);
         life.commit_buffer(buffer);
+        let content = life.content_weak(buffer);
         life.destroy_buffer(buffer);
-        assert!(life.state.objects.contains(buffer.object_id()));
+        assert!(content.upgrade().is_some());
         {
             let mut client_dispatcher = life.client.test_dispatcher(&mut life.dispatcher);
             let mut surface = life.surface.grab(&mut life.state);
@@ -7472,35 +7489,46 @@ mod tests {
             drop(surface);
             client_dispatcher.drain_post_actions(&mut life.client, &mut life.state);
         }
-        assert!(!life.state.objects.contains(buffer.object_id()));
+        assert!(content.upgrade().is_none());
     }
 
     #[test]
-    fn client_disconnect_frees_destroyed_buffers() {
+    fn client_disconnect_drops_destroyed_buffer_content() {
         let mut life = BufferLifetime::new();
         let buffer = life.insert_buffer(20);
         life.commit_buffer(buffer);
+        let content = life.content_weak(buffer);
         life.destroy_buffer(buffer);
-        assert!(life.state.objects.contains(buffer.object_id()));
+        assert!(content.upgrade().is_some());
         life.client
             .process(&mut life.state, ClientAction::Close, &mut life.dispatcher)
             .unwrap();
-        assert!(!life.state.objects.contains(buffer.object_id()));
+        assert!(content.upgrade().is_none());
+    }
+
+    #[test]
+    fn release_for_destroyed_buffer_is_not_sent() {
+        let mut life = BufferLifetime::new();
+        let first = life.insert_buffer(20);
+        life.commit_buffer(first);
+        life.destroy_buffer(first);
+        let second = life.insert_buffer(21);
+        life.commit_buffer(second);
+        life.release_retired();
+        assert!(!buffer_release_was_sent(&life.dispatcher, 20));
+        assert!(life.state.objects.contains(second.object_id()));
     }
 
     #[test]
     fn reused_buffer_id_gets_its_own_release() {
         let mut life = BufferLifetime::new();
         let first = life.insert_buffer(20);
-        let deferred = crate::sync::DeferredRelease::from_candidate(
-            &life.state,
-            crate::sync::RetiredBufferCandidate {
+        let deferred =
+            crate::sync::DeferredRelease::from_candidate(crate::sync::RetiredBufferCandidate {
                 buffer: first,
                 sync: SurfaceSyncState::default(),
                 release_callbacks: Vec::new(),
-            },
-        );
-        assert!(deferred.plain_release.is_some());
+            });
         life.destroy_buffer(first);
         assert!(!life.state.objects.contains(first.object_id()));
         let second = life.insert_buffer(20);

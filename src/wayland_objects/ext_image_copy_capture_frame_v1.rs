@@ -125,7 +125,7 @@ impl ExtImageCopyCaptureFrameV1 {
             return;
         };
         let matches = {
-            match buffer_ref.begin_capture_write(width, height) {
+            match buffer_ref.content().begin_capture_write(width, height) {
                 Ok(write) => write.stride_bytes() == (width as usize).saturating_mul(4),
                 Err(_) => false,
             }
@@ -155,7 +155,11 @@ impl ExtImageCopyCaptureFrameV1 {
             Err(CaptureQueueError::Protected | CaptureQueueError::SourceGone) => {
                 self.fail_stopped(dispatcher);
             }
-            Err(CaptureQueueError::Buffer(_) | CaptureQueueError::EmptyRegion) => {
+            Err(
+                CaptureQueueError::Buffer(_)
+                | CaptureQueueError::BufferGone
+                | CaptureQueueError::EmptyRegion,
+            ) => {
                 self.fail_reason(
                     ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints as u32,
                     dispatcher,
@@ -215,6 +219,7 @@ impl ExtImageCopyCaptureFrameV1 {
         };
         let written = {
             buffer_ref
+                .content()
                 .begin_capture_write(width, height)
                 .and_then(|write| {
                     write.write_top_left(&placement.image.argb, placement.image.stride)

@@ -17,7 +17,6 @@ use crate::{
     protocol_generated::{WlBufferId, WlSurfaceId},
     runner::{Dispatcher, Model, Redispatcher},
     state::State,
-    wayland_objects::wl_buffer::WlBuffer,
 };
 
 #[derive(Debug)]
@@ -98,12 +97,9 @@ pub struct RetiredBufferCandidate {
 #[derive(Debug, Clone)]
 pub struct DeferredRelease {
     pub buffer: Resolved<WlBufferId>,
-    pub plain_release: Option<PlainRelease>,
     pub release: ReleasePoint,
     pub release_callbacks: Vec<Resolved<crate::protocol_generated::WlCallbackId>>,
 }
-
-pub type PlainRelease = Resolved<WlBufferId>;
 
 impl AcquireSync {
     pub fn from_sync_file(fd: OwnedFd) -> Self {
@@ -216,29 +212,23 @@ impl ReleasePoint {
 }
 
 impl DeferredRelease {
-    pub fn from_candidate(state: &State, candidate: RetiredBufferCandidate) -> Self {
-        let plain_release = state
-            .objects
-            .try_ref_object::<WlBuffer>(candidate.buffer.object_id())
-            .and_then(|buffer| buffer.plain_release_target(candidate.buffer.object_id()));
-
+    pub fn from_candidate(candidate: RetiredBufferCandidate) -> Self {
         Self {
             buffer: candidate.buffer,
-            plain_release,
             release: candidate.sync.release,
             release_callbacks: candidate.release_callbacks,
         }
     }
 
-    pub fn resolve(self, state: &mut State, dispatcher: &mut Dispatcher) {
+    pub fn resolve(self, _state: &mut State, dispatcher: &mut Dispatcher) {
         self.release.signal();
 
-        if let Some(buffer) = self.plain_release {
-            dispatcher.dispatch_to(
-                buffer.client_id(),
-                crate::clients::ClientAction::ReleaseBuffer { buffer },
-            );
-        }
+        // A destroyed buffer is already gone. ReleaseBuffer skips a stale handle,
+        // so a reused wayland id does not receive this buffer's release.
+        dispatcher.dispatch_to(
+            self.buffer.client_id(),
+            crate::clients::ClientAction::ReleaseBuffer { buffer: self.buffer },
+        );
         if !self.release_callbacks.is_empty() {
             dispatcher.dispatch_to(
                 self.buffer.client_id(),
@@ -247,8 +237,6 @@ impl DeferredRelease {
                 },
             );
         }
-
-        let _ = state;
     }
 }
 
@@ -421,12 +409,7 @@ pub fn resolve_unused_candidate_immediately(
     let callbacks = candidate.release_callbacks;
     let client_id = candidate.buffer.client_id();
     if let Some(buffer) = candidate.buffer.try_ref_mut(state) {
-        if buffer
-            .plain_release_target(candidate.buffer.object_id())
-            .is_some()
-        {
-            buffer.send_release(dispatcher);
-        }
+        buffer.send_release(dispatcher);
     }
     if !callbacks.is_empty() {
         dispatcher.dispatch_to(

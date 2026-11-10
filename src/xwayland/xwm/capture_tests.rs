@@ -1408,7 +1408,6 @@ fn shm_buffer(
             state,
             WlBuffer::new(NewWlBufferParams {
                 id: WlBufferId::from(id),
-                owner_client_id: client.client_id(),
                 offset: 0,
                 width,
                 height,

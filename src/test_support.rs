@@ -200,7 +200,6 @@ pub fn insert_test_shm_buffer(
         .insert_object(
             WlBuffer::new(NewWlBufferParams {
                 id: buffer_id,
-                owner_client_id: client_id,
                 offset: 0,
                 width,
                 height,

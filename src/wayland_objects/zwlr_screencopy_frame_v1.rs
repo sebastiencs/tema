@@ -187,7 +187,10 @@ impl ZwlrScreencopyFrameV1 {
             return;
         };
         let stride_matches = {
-            match buffer_ref.begin_capture_write(rect.width, rect.height) {
+            match buffer_ref
+                .content()
+                .begin_capture_write(rect.width, rect.height)
+            {
                 Ok(write) => write.stride_bytes() == rect.width as usize * 4,
                 Err(_) => false,
             }
@@ -217,7 +220,7 @@ impl ZwlrScreencopyFrameV1 {
                 self.buffer = Some(buffer);
                 state.capture.bind_screencopy_job(self.id, job);
             }
-            Err(CaptureQueueError::Buffer(_)) => {
+            Err(CaptureQueueError::Buffer(_) | CaptureQueueError::BufferGone) => {
                 client.protocol_violation_disconnect(
                     dispatcher,
                     self.id.into(),

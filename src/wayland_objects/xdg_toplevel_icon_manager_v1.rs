@@ -377,7 +377,6 @@ mod tests {
             &mut fixture.state,
             WlBuffer::new(NewWlBufferParams {
                 id: WlBufferId::from(id),
-                owner_client_id: fixture.client.client_id(),
                 offset: 0,
                 width,
                 height,
@@ -395,7 +394,6 @@ mod tests {
             &mut fixture.state,
             WlBuffer::new_dmabuf(NewDmabufWlBufferParams {
                 id: WlBufferId::from(id),
-                owner_client_id: fixture.client.client_id(),
                 dmabuf: DmaBuf {
                     id: DmaBufId::next(),
                     width: 1,
@@ -596,11 +594,15 @@ mod tests {
         add_buffer(&mut fixture, icon, 30, 1).unwrap();
         set_icon(&mut fixture, ICON).unwrap();
         dispatch_icon(&mut fixture, icon, icon_request(ICON, 0, 0, |_| {})).unwrap();
-        fixture
-            .state
-            .objects
-            .grab_object::<WlBuffer>(buffer.object_id())
-            .mark_destroyed();
+        {
+            let mut client_dispatcher = fixture.client.test_dispatcher(&mut fixture.dispatcher);
+            fixture.client.delete_id(
+                &crate::wayland_objects::wl_display::WlDisplay::default(),
+                &mut fixture.state,
+                &mut client_dispatcher,
+                buffer.wayland_id().into(),
+            );
+        }
         apply(&mut fixture);
         assert_eq!(stored_pixels(&fixture, 1, 1).as_deref(), Some(&pixels[..]));
         assert!(!fixture

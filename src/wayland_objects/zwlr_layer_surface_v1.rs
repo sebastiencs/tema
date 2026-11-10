@@ -1942,7 +1942,6 @@ mod tests {
             crate::wayland_objects::wl_buffer::WlBuffer::new(
                 crate::wayland_objects::wl_buffer::NewWlBufferParams {
                     id: crate::protocol_generated::WlBufferId::from(17u32),
-                    owner_client_id: client.client_id(),
                     offset: 0,
                     width: 2,
                     height: 2,

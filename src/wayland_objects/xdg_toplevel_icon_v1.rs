@@ -112,7 +112,7 @@ impl Object for XdgToplevelIconV1 {
                     );
                     return Ok(());
                 }
-                let copied = buffer.rref(state).copy_shm_square_argb();
+                let copied = buffer.rref(state).content().copy_shm_square_argb();
                 let (size, pixels) = match copied {
                     Err(IconBufferError::NotShm | IconBufferError::NotSquare) => {
                         self.protocol_error(
@@ -129,11 +129,7 @@ impl Object for XdgToplevelIconV1 {
                         );
                         return Ok(());
                     }
-                    Err(
-                        IconBufferError::Destroyed
-                        | IconBufferError::Stride
-                        | IconBufferError::Overflow,
-                    ) => {
+                    Err(IconBufferError::Stride | IconBufferError::Overflow) => {
                         self.protocol_error(
                             client,
                             dispatcher,

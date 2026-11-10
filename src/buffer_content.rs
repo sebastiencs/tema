@@ -144,7 +144,6 @@ pub enum WlBufferError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IconBufferError {
-    Destroyed,
     NotShm,
     Format,
     NotSquare,
@@ -154,7 +153,6 @@ pub enum IconBufferError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureBufferError {
-    Destroyed,
     NotShm,
     Format,
     Size,

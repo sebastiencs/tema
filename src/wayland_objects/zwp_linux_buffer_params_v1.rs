@@ -251,7 +251,6 @@ impl Object for ZwpLinuxBufferParamsV1 {
                         }
                         match WlBuffer::new_dmabuf(NewDmabufWlBufferParams {
                             id: client.allocate_server_object_id(),
-                            owner_client_id: client.client_id(),
                             dmabuf,
                             y_inverted,
                             import_rejected: false,
@@ -290,7 +289,6 @@ impl Object for ZwpLinuxBufferParamsV1 {
                         let rejected = !client_dmabuf_importable(state, &dmabuf);
                         match WlBuffer::new_dmabuf(NewDmabufWlBufferParams {
                             id: buffer_id,
-                            owner_client_id: client.client_id(),
                             dmabuf,
                             y_inverted,
                             import_rejected: rejected,

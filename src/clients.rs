@@ -1076,24 +1076,6 @@ impl Client {
         })
     }
 
-    /// A destroyed buffer stays allocated while this client still has it attached,
-    /// cached, blocked, or on screen. Other clients' surfaces do not count.
-    pub(crate) fn buffer_in_use(
-        &self,
-        state: &State,
-        buffer: Resolved<crate::protocol_generated::WlBufferId>,
-    ) -> bool {
-        if buffer.client_id() != self.id {
-            return false;
-        }
-        self.iter_resolved_of::<crate::protocol_generated::WlSurfaceId>(state)
-            .any(|surface| {
-                surface
-                    .try_ref(state)
-                    .is_some_and(|surface| surface.references_buffer(buffer))
-            })
-    }
-
     fn iter_resolved_of<'a, K>(&'a self, state: &'a State) -> impl Iterator<Item = Resolved<K>> + 'a
     where
         K: IdToObject,
@@ -1137,20 +1119,6 @@ impl Client {
 
     pub fn object_id_for_wayland<K: Into<WaylandId>>(&self, id: K) -> Option<ObjectId> {
         self.objects.get(&id.into()).map(|entry| entry.object_id)
-    }
-
-    /// Forget the client's name for `id` and send `wl_display.delete_id`.
-    /// The object stays in [`State`] until the caller frees it. `id` is
-    /// client-allocated; server ids are never released this way.
-    pub fn release_client_id(
-        &mut self,
-        wl_display: &WlDisplay,
-        dispatcher: &mut ClientDispatcher,
-        id: WaylandId,
-    ) {
-        debug_assert!(u32::from(id) < MIN_SERVER_ID);
-        self.objects.remove(&id);
-        wl_display.send_event(wl_display::Event::DeleteId { id: id.into() }, dispatcher);
     }
 
     pub fn allocate_server_object_id<I>(&mut self) -> I
@@ -3192,9 +3160,7 @@ impl Model for Client {
                 let Some(live) = buffer.try_ref_mut(state) else {
                     return Ok(());
                 };
-                if !live.is_destroyed() {
-                    live.send_release(&mut dispatcher);
-                }
+                live.send_release(&mut dispatcher);
             }
             CompleteBufferReleaseCallbacks { callbacks } => {
                 use crate::wayland_objects::wl_display::WlDisplay;
@@ -3427,7 +3393,6 @@ impl Model for Client {
                     self.objects.remove(&wid);
                     let _ = state.remove_object(object_id);
                 }
-                state.drop_destroyed_buffers(self.id);
                 let seat_removal = state.seat.remove_client(self.id);
                 if seat_removal.selection_cleared {
                     state
