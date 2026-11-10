@@ -229,10 +229,7 @@ pub(crate) fn apply_pointer_interactive_grab(
         } => {
             let dx = (state.seat.pointer_pos.0 - initial_pointer_pos.0).round() as i32;
             let dy = (state.seat.pointer_pos.1 - initial_pointer_pos.1).round() as i32;
-            if state.resize_tiled_window_from_state(window, resize_state, dx, dy) {
-                dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
-                request_active_output(state, dispatcher);
-            }
+            let changed = state.resize_tiled_window_from_state(window, resize_state, dx, dy);
             state.seat.pointer_interactive_grab = Some(ActiveGrabState::ResizeTiled {
                 window,
                 root_surface,
@@ -240,6 +237,13 @@ pub(crate) fn apply_pointer_interactive_grab(
                 initial_pointer_pos,
                 resize_state,
             });
+            if changed {
+                let roots = tiled_resize_active_root_surfaces(state)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                dispatcher.dispatch(ClientManagerAction::TiledResizeStep { roots });
+                request_active_output(state, dispatcher);
+            }
         }
     }
     true

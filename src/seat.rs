@@ -2723,9 +2723,10 @@ mod surface_tree_hit_test_tests {
 mod xdg_seat_tests {
     use {
         super::{
-            begin_popup_grab, cancel_active_drag, complete_drag_drop, handle_keyboard_key,
-            handle_pointer_button, handle_pointer_motion, handle_pointer_motion_absolute,
-            handle_pointer_scroll, pointer_scroll_protocol_events, quiesce_for_session_pause,
+            begin_popup_grab, cancel_active_drag, complete_drag_drop,
+            finish_pointer_interactive_grab, handle_keyboard_key, handle_pointer_button,
+            handle_pointer_motion, handle_pointer_motion_absolute, handle_pointer_scroll,
+            pointer_scroll_protocol_events, quiesce_for_session_pause,
             recover_pointer_after_interactive_grab_loss, refresh_visible_cursor_surface_outputs,
             refresh_visible_dnd_icon_surface_outputs, remove_popup_grab, scene_pick_at,
             set_keyboard_focus, window_hit_at, HitSemantics, PointerAxisChange, PointerScrollAxis,
@@ -2733,7 +2734,10 @@ mod xdg_seat_tests {
             PointerScrollWireEvent, SeatClientEvent, SeatState,
         },
         crate::{
-            clients::{Client, ClientAction, ClientId, DataSourceClientEvent, RawEvent, Resolved},
+            clients::{
+                Client, ClientAction, ClientId, ClientManagerAction, DataSourceClientEvent,
+                RawEvent, Resolved,
+            },
             config::RuntimeConfig,
             cursor::CursorSourceRef,
             object::Object,
@@ -6185,6 +6189,31 @@ mod xdg_seat_tests {
         assert!(removal.interactive_grab_cleared);
         assert!(state.seat.pointer_interactive_grab.is_none());
         assert!(state.seat.intercepted_pointer_buttons.is_empty());
+    }
+
+    #[test]
+    fn tiled_resize_release_dispatches_workspace_state_changed() {
+        let mut state = state_for_tests();
+        let (client, mut dispatcher) = test_client_and_dispatcher(7);
+
+        state.seat.pointer_interactive_grab = Some(super::PointerInteractiveGrab::ResizeTiled {
+            window: crate::window::WindowId::for_tests(1),
+            root_surface: crate::clients::Resolved::new(
+                client.client_id(),
+                WlSurfaceId::from(999u32),
+                ObjectId::from(999usize),
+            ),
+            edges: xdg_toplevel::ResizeEdge::Right as u32,
+            initial_pointer_pos: (10.0, 20.0),
+            resize_state: crate::tiling::test_tiled_resize_state(),
+        });
+
+        finish_pointer_interactive_grab(&mut state, &mut dispatcher, 0);
+
+        assert!(state.seat.pointer_interactive_grab.is_none());
+        assert!(dispatcher.test_has_queued_action(|action: &ClientManagerAction| {
+            matches!(action, ClientManagerAction::WorkspaceStateChanged)
+        }));
     }
 
     #[test]

@@ -5053,6 +5053,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tiled_resize_step_dispatches_narrow_action() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(44usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let first_surface = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 450);
+        let second_surface = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 460);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        let first_root = root(&state, first_surface);
+        let second_root = root(&state, second_surface);
+        let first_window = state.window_for_root(first_root).expect("first window");
+        state.seat.pointer_pos = (100.0, 50.0);
+        let resize_state = state
+            .begin_tiled_window_resize(first_window, crate::tiling::EDGE_RIGHT)
+            .expect("left leaf should support right-edge resize");
+        state.seat.start_toplevel_tiled_resize(
+            client.client_id(),
+            first_window,
+            first_root,
+            crate::tiling::EDGE_RIGHT,
+            resize_state,
+        );
+        let _ = dispatcher.test_take_queued_actions::<ClientManagerAction>();
+
+        state.seat.pointer_pos = (110.0, 50.0);
+        assert!(crate::input::apply_pointer_interactive_grab(&mut state, &mut dispatcher));
+        let actions = dispatcher.test_take_queued_actions::<ClientManagerAction>();
+        let mut stepped = actions.iter().filter_map(|action| match action {
+            ClientManagerAction::TiledResizeStep { roots } => Some(roots.clone()),
+            _ => None,
+        });
+        let roots = stepped.next().expect("tiled resize step");
+        assert!(stepped.next().is_none());
+        assert_eq!(
+            roots
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [first_root, second_root].into_iter().collect()
+        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, ClientManagerAction::WorkspaceStateChanged)));
+
+        assert!(crate::input::apply_pointer_interactive_grab(&mut state, &mut dispatcher));
+        assert!(dispatcher
+            .test_take_queued_actions::<ClientManagerAction>()
+            .is_empty());
+    }
+
     fn map_closing_candidate(
         state: &mut State,
         client: &mut Client,
