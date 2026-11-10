@@ -8474,6 +8474,29 @@ fn build_output_frame_recipe(
     items: &[SceneItem],
     frame_elements: &[RecordedFrameElement],
 ) -> OutputFrameRecipe {
+    #[cfg(debug_assertions)]
+    {
+        let mut painted = vec![false; items.len()];
+        for element in frame_elements {
+            if let RecordedFrameElement::Texture { item_index, .. } = element {
+                debug_assert!(
+                    *item_index < items.len(),
+                    "frame element points past the scene items: {item_index} >= {}",
+                    items.len()
+                );
+                if let Some(slot) = painted.get_mut(*item_index) {
+                    *slot = true;
+                }
+            }
+        }
+        if let Some(missing) = painted.iter().position(|painted| !painted) {
+            debug_assert!(
+                false,
+                "scene item {missing} ({:?}) has no frame element and would never be painted",
+                items[missing].state.key
+            );
+        }
+    }
     OutputFrameRecipe {
         elements: frame_elements
             .iter()
@@ -12909,5 +12932,25 @@ mod overlay_tests {
         assert!(items
             .iter()
             .all(|item| !matches!(item.state.key, SceneItemKey::Cursor)));
+    }
+
+    #[test]
+    #[should_panic(expected = "has no frame element")]
+    fn recipe_guard_rejects_item_without_frame_element() {
+        let items = vec![scene_item(1), scene_item(2)];
+        let frame_elements =
+            vec![RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 }];
+        let _ = super::build_output_frame_recipe(&items, &frame_elements);
+    }
+
+    #[test]
+    fn recipe_guard_accepts_fully_recorded_scene() {
+        let items = vec![scene_item(1), scene_item(2)];
+        let frame_elements = vec![
+            RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 },
+            RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 1 },
+        ];
+        let recipe = super::build_output_frame_recipe(&items, &frame_elements);
+        assert_eq!(recipe.elements.len(), 2);
     }
 }
