@@ -21,6 +21,9 @@ pub struct WlDataOffer {
     role: DataOfferRole,
     source: Option<SelectionSourceState>,
     finished: bool,
+    /// Set once a drag offer has been taken off the drag. The Wayland object
+    /// stays until the client destroys it; `before_destroy` already ran.
+    detached: bool,
 }
 
 impl WlDataOffer {
@@ -36,6 +39,7 @@ impl WlDataOffer {
             role,
             source: source.map(SelectionSourceState::WlData),
             finished: false,
+            detached: false,
         }
     }
 
@@ -50,6 +54,7 @@ impl WlDataOffer {
             role: DataOfferRole::Selection,
             source: Some(selection),
             finished: false,
+            detached: false,
         }
     }
 
@@ -59,6 +64,16 @@ impl WlDataOffer {
 
     pub fn clear_source(&mut self) {
         self.source = None;
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached
+    }
+
+    /// Drop the source link and remember that drag side effects already ran.
+    pub(crate) fn mark_detached(&mut self) {
+        self.detached = true;
+        self.clear_source();
     }
 
     /// Detach a selection offer without destroying the Wayland object. The client
@@ -275,8 +290,12 @@ impl Object for WlDataOffer {
                 }
             }
             Destroy => {
-                if let Some(offer) = client.resolve(self.id, state) {
-                    self.before_destroy(client.client_id(), offer, state, dispatcher);
+                // Detach already ran `before_destroy`. Running it again would
+                // cancel or finish a drag the leave already settled.
+                if !self.detached {
+                    if let Some(offer) = client.resolve(self.id, state) {
+                        self.before_destroy(client.client_id(), offer, state, dispatcher);
+                    }
                 }
                 client.delete_id(
                     &crate::wayland_objects::wl_display::WlDisplay::default(),
@@ -1106,5 +1125,196 @@ mod tests {
                 )
             }
         ));
+    }
+
+    fn queued_actions_for(dispatcher: &Dispatcher, client_id: ClientId) -> usize {
+        let mut count = 0;
+        dispatcher.test_matching_actions_for::<ClientAction, ClientId>(client_id, |_| {
+            count += 1;
+        });
+        count
+    }
+
+    fn insert_sourced_drag_offer(
+        target: &mut Client,
+        state: &mut State,
+        offer_id: WlDataOfferId,
+        source_client_id: ClientId,
+        source_id: WlDataSourceId,
+    ) -> Resolved<WlDataOfferId> {
+        let source = Resolved::new(source_client_id, source_id, ObjectId::from(0usize));
+        let (offer, _) = target
+            .insert_object(state, WlDataOffer::new(offer_id, 3, DataOfferRole::Drag, Some(source)));
+        state.register_data_offer_for_source(source.object_id(), offer);
+        offer
+    }
+
+    fn set_drag_with_offers(
+        state: &mut State,
+        source_client_id: ClientId,
+        source_id: WlDataSourceId,
+        target_client_id: ClientId,
+        offers: Vec<Resolved<WlDataOfferId>>,
+        phase: DragPhase,
+    ) {
+        state.seat.set_active_drag(DragState {
+            source: DragSource::DataSource {
+                source: Resolved::new(source_client_id, source_id, ObjectId::from(0usize)),
+            },
+            origin_surface: test_resolved_wl_surface(source_client_id, 30, ObjectId::from(30usize)),
+            icon_surface: None,
+            target: Some(DragTargetState {
+                surface: test_resolved_wl_surface(target_client_id, 31, ObjectId::from(0usize)),
+            }),
+            negotiation: DragNegotiationState {
+                offer_ids: offers,
+                accepted_mime: None,
+                destination_actions: 0,
+                preferred_action: 0,
+                compositor_action: 0,
+                chosen_action: 0,
+                finished: false,
+                has_finish_capable_offer: true,
+            },
+            phase,
+        });
+    }
+
+    #[test]
+    fn detach_drag_offer_keeps_object_and_clears_source() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(1);
+        let source_id = WlDataSourceId::from(10);
+        let mut target = Client::new_for_tests(ClientId::from_raw(2));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_sourced_drag_offer(
+            &mut target,
+            &mut state,
+            offer_id,
+            source_client_id,
+            source_id,
+        );
+        let sibling_id = WlDataOfferId::from(21);
+        let sibling = insert_sourced_drag_offer(
+            &mut target,
+            &mut state,
+            sibling_id,
+            source_client_id,
+            source_id,
+        );
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer, sibling],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = target.test_dispatcher(&mut dispatcher);
+        target.detach_drag_offer(&mut state, &mut client_dispatcher, offer);
+
+        assert!(target.contains_object(offer_id, &state));
+        let detached = target.ref_object(offer_id, &state);
+        assert!(detached.is_detached());
+        assert!(detached.source().is_none());
+        let drag = state
+            .seat
+            .active_drag()
+            .expect("sibling offer keeps the drag");
+        assert_eq!(drag.negotiation.offer_ids, vec![sibling]);
+    }
+
+    #[test]
+    fn detach_drag_offer_twice_runs_side_effects_once() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(1);
+        let source_id = WlDataSourceId::from(10);
+        let mut target = Client::new_for_tests(ClientId::from_raw(2));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_sourced_drag_offer(
+            &mut target,
+            &mut state,
+            offer_id,
+            source_client_id,
+            source_id,
+        );
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        {
+            let mut client_dispatcher = target.test_dispatcher(&mut dispatcher);
+            target.detach_drag_offer(&mut state, &mut client_dispatcher, offer);
+        }
+        assert_eq!(queued_actions_for(&dispatcher, source_client_id), 1);
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            source_client_id,
+            |action| {
+                matches!(
+                    action,
+                    ClientAction::DataSourceEvent {
+                        source: queued_source,
+                        event: DataSourceClientEvent::Cancelled,
+                    } if queued_source.wayland_id() == source_id
+                )
+            }
+        ));
+
+        {
+            let mut client_dispatcher = target.test_dispatcher(&mut dispatcher);
+            target.detach_drag_offer(&mut state, &mut client_dispatcher, offer);
+        }
+        assert_eq!(queued_actions_for(&dispatcher, source_client_id), 1);
+    }
+
+    #[test]
+    fn destroy_after_detach_removes_object_without_side_effects() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(1);
+        let source_id = WlDataSourceId::from(10);
+        let mut target = Client::new_for_tests(ClientId::from_raw(2));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_sourced_drag_offer(
+            &mut target,
+            &mut state,
+            offer_id,
+            source_client_id,
+            source_id,
+        );
+        let offer_object_id = offer.object_id();
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        {
+            let mut client_dispatcher = target.test_dispatcher(&mut dispatcher);
+            target.detach_drag_offer(&mut state, &mut client_dispatcher, offer);
+        }
+        let events_after_detach = queued_actions_for(&dispatcher, source_client_id);
+
+        {
+            let offer_obj = state.objects.grab_object::<WlDataOffer>(offer_object_id);
+            let mut client_dispatcher = target.test_dispatcher(&mut dispatcher);
+            offer_obj
+                .on(&mut target, &mut state, destroy_request(offer_id), &mut client_dispatcher)
+                .unwrap();
+        }
+
+        assert!(!target.contains_object(offer_id, &state));
+        assert_eq!(queued_actions_for(&dispatcher, source_client_id), events_after_detach);
     }
 }
