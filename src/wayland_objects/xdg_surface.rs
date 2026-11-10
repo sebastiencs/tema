@@ -222,6 +222,21 @@ impl XdgSurface {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_latest_pending_serial(&self) -> Option<u32> {
+        self.pending_configures
+            .back()
+            .map(|configure| configure.serial)
+    }
+
+    /// Pretend a throttled resize configure with `serial` is in flight and a
+    /// later one was skipped. Tests use this to drive the commit release.
+    #[cfg(test)]
+    pub(crate) fn test_arm_deferred_resize(&mut self, serial: u32) {
+        self.resize_throttle = Some(ResizeThrottle { serial, sent_at: Instant::now() });
+        self.deferred_resize_configure = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_latest_pending_decoration_mode(
         &self,
     ) -> Option<crate::wayland_objects::xdg_surface::xdg_toplevel::ToplevelDecorationMode> {
@@ -526,6 +541,14 @@ impl XdgSurface {
                 popup.mark_unmapped();
             }
             self.reset_configure_state();
+        }
+        if self.release_resize_throttle_on_commit() {
+            if let RoleObject::Toplevel(xdg_toplevel) = self.role_object {
+                dispatcher.dispatch_to(
+                    client.client_id(),
+                    crate::clients::ClientAction::FlushDeferredResizeConfigure { xdg_toplevel },
+                );
+            }
         }
     }
 

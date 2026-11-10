@@ -757,6 +757,11 @@ pub enum ClientAction {
         height: i32,
         resizing: bool,
     },
+    /// A throttled resize configure was skipped while the window was busy, and
+    /// the window has now committed. Work out the newest size and send it.
+    FlushDeferredResizeConfigure {
+        xdg_toplevel: Resolved<XdgToplevelId>,
+    },
     Close,
     /// Send capture `stopped`, `failed`, `closed`, or foreign-toplevel announcements queued for
     /// this client.
@@ -2661,6 +2666,53 @@ impl Client {
         }
     }
 
+    /// The window committed the resize configure it was busy with. Send the
+    /// newest size if one was skipped, through the same path a resize step uses.
+    fn flush_deferred_resize_configure(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        xdg_toplevel: Resolved<XdgToplevelId>,
+    ) {
+        let Some(toplevel) = xdg_toplevel.try_ref(state) else {
+            return;
+        };
+        let window = toplevel.window();
+        let xdg_surface = toplevel.xdg_surface();
+        drop(toplevel);
+        let Some(wl_surface) = xdg_surface
+            .try_ref(state)
+            .map(|surface| surface.wl_surface())
+        else {
+            return;
+        };
+        let Some(root) = state.root_surface_for_surface(wl_surface) else {
+            return;
+        };
+        if let Some(crate::input::types::ActiveGrab::Resize {
+            window: grab_window,
+            last_size,
+            ..
+        }) = state.seat.pointer_interactive_grab
+        {
+            if grab_window == window {
+                dispatcher.dispatch_to(
+                    self.id,
+                    ClientAction::InteractiveResizeConfigure {
+                        xdg_toplevel,
+                        width: last_size.0,
+                        height: last_size.1,
+                        resizing: true,
+                    },
+                );
+                return;
+            }
+        }
+        if state.tiled_window_geometry(window).is_some() {
+            self.reconfigure_toplevels_for_roots(state, dispatcher, vec![root]);
+        }
+    }
+
     fn reconfigure_toplevels_for_roots(
         &mut self,
         state: &mut State,
@@ -2705,6 +2757,16 @@ impl Client {
         roots: Vec<Resolved<WlSurfaceId>>,
     ) {
         self.reconfigure_toplevels_for_roots(state, dispatcher, roots);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flush_deferred_resize_configure(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        xdg_toplevel: Resolved<XdgToplevelId>,
+    ) {
+        self.flush_deferred_resize_configure(state, dispatcher, xdg_toplevel);
     }
 
     fn handle_output_removed(
@@ -3387,6 +3449,9 @@ impl Model for Client {
             }
             DismissPopupGrab { popups } => {
                 self.dismiss_popup_ids(state, &mut dispatcher, popups, None);
+            }
+            FlushDeferredResizeConfigure { xdg_toplevel } => {
+                self.flush_deferred_resize_configure(state, &mut dispatcher, xdg_toplevel);
             }
             InteractiveResizeConfigure { xdg_toplevel, width, height, resizing } => {
                 let Some(xdg_surface) = xdg_toplevel

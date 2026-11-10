@@ -5053,6 +5053,160 @@ mod tests {
         );
     }
 
+    fn arm_latest_pending_resize(
+        state: &mut State,
+        client: &Client,
+        xdg_surface_id: XdgSurfaceId,
+    ) -> u32 {
+        let xdg_surface = state
+            .objects
+            .try_ref_object::<XdgSurface>(client.object_id(xdg_surface_id))
+            .unwrap();
+        let serial = xdg_surface
+            .test_latest_pending_serial()
+            .expect("pending configure");
+        drop(xdg_surface);
+        state
+            .objects
+            .get_mut(client.object_id(xdg_surface_id))
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .test_arm_deferred_resize(serial);
+        serial
+    }
+
+    fn flush_deferred_queued(
+        dispatcher: &Dispatcher,
+        client_id: ClientId,
+        toplevel_id: XdgToplevelId,
+    ) -> bool {
+        dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(client_id, |action| {
+            matches!(
+                action,
+                ClientAction::FlushDeferredResizeConfigure { xdg_toplevel }
+                    if xdg_toplevel.wayland_id() == toplevel_id
+            )
+        })
+    }
+
+    #[test]
+    fn commit_after_acked_resize_configure_flushes_the_deferred_one() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(45usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 470);
+        let _sibling = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 474);
+        let xdg_surface_id = XdgSurfaceId::from(471);
+        let toplevel_id = XdgToplevelId::from(472);
+        let root_surface = root(&state, surface_object_id);
+        let window = state.window_for_root(root_surface).expect("window");
+        assert!(state.resize_tiled_window(window, crate::tiling::EDGE_RIGHT, 40, 0));
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_toplevels_for_roots(
+                &mut state,
+                &mut client_dispatcher,
+                vec![root_surface],
+            );
+        }
+        let serial = arm_latest_pending_resize(&mut state, &client, xdg_surface_id);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut xdg_surface = client.grab_object(xdg_surface_id, &mut state);
+            xdg_surface
+                .on(
+                    &mut client,
+                    &mut state,
+                    ack_configure_request(xdg_surface_id, serial),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.on_commit(&mut client, &mut state, &mut client_dispatcher);
+        }
+        assert!(flush_deferred_queued(&dispatcher, client.client_id(), toplevel_id));
+        let queued = dispatcher.test_count_queued_action::<ClientAction>(|action| {
+            matches!(action, ClientAction::FlushDeferredResizeConfigure { .. })
+        });
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.on_commit(&mut client, &mut state, &mut client_dispatcher);
+        }
+        assert_eq!(
+            dispatcher.test_count_queued_action::<ClientAction>(|action| {
+                matches!(action, ClientAction::FlushDeferredResizeConfigure { .. })
+            }),
+            queued
+        );
+    }
+
+    #[test]
+    fn commit_without_acking_the_resize_configure_queues_nothing() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(46usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 480);
+        let _sibling = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 484);
+        let xdg_surface_id = XdgSurfaceId::from(481);
+        let toplevel_id = XdgToplevelId::from(482);
+        let root_surface = root(&state, surface_object_id);
+        let window = state.window_for_root(root_surface).expect("window");
+        assert!(state.resize_tiled_window(window, crate::tiling::EDGE_RIGHT, 40, 0));
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_toplevels_for_roots(
+                &mut state,
+                &mut client_dispatcher,
+                vec![root_surface],
+            );
+        }
+        let _serial = arm_latest_pending_resize(&mut state, &client, xdg_surface_id);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+            surface.on_commit(&mut client, &mut state, &mut client_dispatcher);
+        }
+        assert!(!flush_deferred_queued(&dispatcher, client.client_id(), toplevel_id));
+    }
+
+    #[test]
+    fn flush_deferred_resize_of_an_unchanged_tiled_window_sends_no_configure() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(47usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 490);
+        let xdg_surface_id = XdgSurfaceId::from(491);
+        let toplevel_id = XdgToplevelId::from(492);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        let root_surface = root(&state, surface_object_id);
+        let window = state.window_for_root(root_surface).expect("window");
+        assert!(state.tiled_window_geometry(window).is_some());
+        let before = pending_toplevel_configures(&state, &client, xdg_surface_id);
+        let xdg_toplevel = client.resolve(toplevel_id, &state).expect("toplevel");
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_flush_deferred_resize_configure(
+                &mut state,
+                &mut client_dispatcher,
+                xdg_toplevel,
+            );
+        }
+        assert_eq!(pending_toplevel_configures(&state, &client, xdg_surface_id), before);
+    }
+
     #[test]
     fn tiled_resize_step_dispatches_narrow_action() {
         let mut state = state_for_tests();
