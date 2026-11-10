@@ -12731,6 +12731,60 @@ mod overlay_tests {
         }
     }
 
+    fn place(mut item: SceneItem, bounds: RectI) -> SceneItem {
+        item.state.bounds = bounds;
+        item.damage = DamageRegion::from_rect(bounds);
+        item
+    }
+
+    fn cursor_item(bounds: RectI) -> SceneItem {
+        let mut cursor = place(scene_item(0), bounds);
+        cursor.state.key = SceneItemKey::Cursor;
+        cursor.state.surface_key = None;
+        cursor.state.content_key =
+            SceneItemContentKey::NamedCursor(crate::cursor::CursorImageContentKey {
+                width: bounds.width,
+                height: bounds.height,
+                fingerprint: 7,
+            });
+        cursor.state_has_alpha = true;
+        cursor
+    }
+
+    fn painted_item_keys(
+        items: &[SceneItem],
+        frame_elements: &[RecordedFrameElement],
+    ) -> Vec<SceneItemKey> {
+        let recipe = super::build_output_frame_recipe(items, frame_elements);
+        let textures: Vec<_> = recipe
+            .elements
+            .iter()
+            .filter_map(|element| match element {
+                crate::render::FrameElement::Texture { element, .. } => Some(element),
+                crate::render::FrameElement::Effect { .. } => None,
+            })
+            .collect();
+        let indices: Vec<_> = frame_elements
+            .iter()
+            .filter_map(|element| match element {
+                RecordedFrameElement::Texture { item_index, .. } => Some(*item_index),
+                RecordedFrameElement::Effect { .. } => None,
+            })
+            .collect();
+        assert_eq!(textures.len(), indices.len());
+        for (texture, index) in textures.iter().zip(&indices) {
+            let bounds = items[*index].state.bounds;
+            assert_eq!(
+                (texture.x, texture.y, texture.width, texture.height),
+                (bounds.x, bounds.y, bounds.width, bounds.height)
+            );
+        }
+        indices
+            .into_iter()
+            .map(|index| items[index].state.key)
+            .collect()
+    }
+
     #[test]
     fn append_overlay_items_records_only_new_items_as_overlay() {
         let mut items = vec![scene_item(1)];
@@ -12792,5 +12846,68 @@ mod overlay_tests {
 
         assert!(items.is_empty());
         assert!(frame_elements.is_empty());
+    }
+
+    #[test]
+    fn overlays_paint_above_content_and_below_software_cursor() {
+        let content_bounds = RectI::new(0, 0, 200, 100).unwrap();
+        let ime_bounds = RectI::new(8, 12, 40, 20).unwrap();
+        let icon_bounds = RectI::new(30, 40, 170, 108).unwrap();
+        let cursor_bounds = RectI::new(12, 18, 24, 24).unwrap();
+        let content = place(scene_item(1), content_bounds);
+        let content_key = content.state.key;
+        let mut items = vec![content];
+        let mut frame_elements =
+            vec![RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 }];
+        append_overlay_items(&mut items, &mut frame_elements, |items| {
+            items.push(place(scene_item(2), ime_bounds));
+            items.push(place(scene_item(3), icon_bounds));
+        });
+        let ime_key = items[1].state.key;
+        let icon_key = items[2].state.key;
+        let mut software_cursor_items = vec![cursor_item(cursor_bounds)];
+
+        super::render_planner::incorporate_software_cursor(
+            &mut items,
+            &mut software_cursor_items,
+            &mut frame_elements,
+            false,
+        );
+
+        assert_eq!(
+            painted_item_keys(&items, &frame_elements),
+            vec![content_key, ime_key, icon_key, SceneItemKey::Cursor]
+        );
+    }
+
+    #[test]
+    fn overlays_still_paint_when_cursor_is_on_a_hardware_plane() {
+        let content = place(scene_item(1), RectI::new(0, 0, 200, 100).unwrap());
+        let content_key = content.state.key;
+        let mut items = vec![content];
+        let mut frame_elements =
+            vec![RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 }];
+        append_overlay_items(&mut items, &mut frame_elements, |items| {
+            items.push(place(scene_item(2), RectI::new(8, 12, 40, 20).unwrap()));
+            items.push(place(scene_item(3), RectI::new(30, 40, 170, 108).unwrap()));
+        });
+        let ime_key = items[1].state.key;
+        let icon_key = items[2].state.key;
+        let mut software_cursor_items = vec![cursor_item(RectI::new(12, 18, 24, 24).unwrap())];
+
+        super::render_planner::incorporate_software_cursor(
+            &mut items,
+            &mut software_cursor_items,
+            &mut frame_elements,
+            true,
+        );
+
+        assert_eq!(
+            painted_item_keys(&items, &frame_elements),
+            vec![content_key, ime_key, icon_key]
+        );
+        assert!(items
+            .iter()
+            .all(|item| !matches!(item.state.key, SceneItemKey::Cursor)));
     }
 }
