@@ -1040,6 +1040,7 @@ impl SeatState {
             drag.source.client_id() == client_id
                 || drag
                     .attached
+                    .as_ref()
                     .is_some_and(|attached| attached.toplevel.client_id() == client_id)
         }) {
             // The client's windows are going away, so there is nothing to place.

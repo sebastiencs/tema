@@ -99,7 +99,7 @@ impl XdgToplevelDragV1 {
             DragObjPhase::NotStarted => self.pending.map(|(toplevel, _)| toplevel),
             DragObjPhase::Active => state.seat.toplevel_drag.as_ref().and_then(|session| {
                 (session.drag == self.resolved())
-                    .then_some(session.attached.map(|attached| attached.toplevel))
+                    .then(|| session.attached.as_ref().map(|attached| attached.toplevel))
                     .flatten()
             }),
             DragObjPhase::Ended => None,
@@ -403,6 +403,99 @@ mod tests {
             );
         }
 
+        fn set_xdg_role(&mut self, surface: Resolved<WlSurfaceId>) {
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            surface
+                .try_ref_mut(&mut self.state)
+                .unwrap()
+                .set_role(
+                    crate::wayland_objects::wl_surface::Role::XdgSurface,
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+
+        /// The fixture window and one other window, both tiled on the only output.
+        ///
+        /// The fixture window is the one a drag attaches.
+        fn tile_with_neighbor(&mut self) -> Resolved<WlSurfaceId> {
+            self.state.config.decorations.border.size = 0;
+            self.bind_managed_window();
+            self.link_xdg();
+            self.set_xdg_role(self.surface);
+            self.map(200, 120);
+
+            let (neighbor, _) = self.client.insert_object(
+                &mut self.state,
+                WlSurface::new(WlSurfaceId::from(40), self.client.client_id(), 6),
+            );
+            self.state.register_root_surface(neighbor);
+            let neighbor_window = self.state.allocate_window_id();
+            let (xdg, _) = self.client.insert_object(
+                &mut self.state,
+                XdgSurface::new(
+                    XdgSurfaceId::from(81),
+                    Resolved::new(
+                        self.client.client_id(),
+                        XdgWmBaseId::from(79),
+                        ObjectId::from(79usize),
+                    ),
+                    neighbor,
+                    1,
+                ),
+            );
+            let (toplevel, _) = self.client.insert_object(
+                &mut self.state,
+                XdgToplevel::new(XdgToplevelId::from(41), xdg, 1, neighbor_window),
+            );
+            self.state
+                .insert_window(neighbor_window, neighbor, toplevel.object_id());
+            self.set_xdg_role(neighbor);
+            neighbor
+                .try_ref_mut(&mut self.state)
+                .unwrap()
+                .set_xdg_surface_impl(xdg);
+            xdg.try_ref_mut(&mut self.state)
+                .unwrap()
+                .test_assign_toplevel_role(toplevel);
+            neighbor.try_ref_mut(&mut self.state).unwrap().test_map(
+                ObjectId::from(2usize),
+                0,
+                0,
+                200,
+                120,
+            );
+            let workspace = self
+                .state
+                .managed_window_state(self.window)
+                .unwrap()
+                .workspace_id;
+            crate::tiling::mark_workspace_dirty(&mut self.state, workspace);
+            self.state.relayout_dirty_workspaces();
+            self.refresh_geometry(self.surface);
+            self.refresh_geometry(neighbor);
+            assert!(self.state.window_is_tiled(self.window));
+            assert!(self.state.window_is_tiled(neighbor_window));
+            neighbor
+        }
+
+        fn refresh_geometry(&mut self, surface: Resolved<WlSurfaceId>) {
+            self.state.mark_root_geometry_dirty(surface);
+            let _ = self.state.committed_root_geometry(surface);
+        }
+
+        fn begin_attached(&mut self, x_offset: i32, y_offset: i32) {
+            self.get_drag(20).unwrap();
+            self.dispatch(
+                self.drag(20).object_id(),
+                20,
+                attach_request(20, 13, x_offset, y_offset),
+            )
+            .unwrap();
+            let serial = self.arm();
+            self.start(11, serial).unwrap();
+        }
+
         fn initial_configure_size(&mut self) -> Option<(i32, i32)> {
             let xdg = self.xdg();
             let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
@@ -534,11 +627,26 @@ mod tests {
         assert!(errors(&fix.dispatcher).is_empty());
         assert_eq!(fix.phase(20), DragObjPhase::Active);
         assert!(fix.state.seat.active_drag().is_some());
-        let attached = fix.state.seat.toplevel_drag.unwrap().attached.unwrap();
+        let attached = fix
+            .state
+            .seat
+            .toplevel_drag
+            .as_ref()
+            .unwrap()
+            .attached
+            .as_ref()
+            .unwrap();
         assert_eq!(attached.offset, (4, 8));
         assert!(!attached.was_mapped_at_attach);
         assert!(attached.start_root_pos.is_none());
-        assert!(!fix.state.seat.toplevel_drag.unwrap().source_window_floating);
+        assert!(
+            !fix.state
+                .seat
+                .toplevel_drag
+                .as_ref()
+                .unwrap()
+                .source_window_floating
+        );
     }
 
     #[test]
@@ -562,9 +670,9 @@ mod tests {
         let serial = fix.arm();
         fix.start(11, serial).unwrap();
 
-        let session = fix.state.seat.toplevel_drag.unwrap();
+        let session = fix.state.seat.toplevel_drag.as_ref().unwrap();
         assert!(session.source_window_floating);
-        let attached = session.attached.unwrap();
+        let attached = session.attached.as_ref().unwrap();
         assert!(attached.was_mapped_at_attach);
         assert_eq!(attached.start_root_pos, Some((40, 50)));
     }
@@ -928,7 +1036,14 @@ mod tests {
             .unwrap();
         let serial = fix.arm();
         fix.start(11, serial).unwrap();
-        assert!(fix.state.seat.toplevel_drag.unwrap().attached.is_some());
+        assert!(fix
+            .state
+            .seat
+            .toplevel_drag
+            .as_ref()
+            .unwrap()
+            .attached
+            .is_some());
 
         let mut client_dispatcher = fix.client.test_dispatcher(&mut fix.dispatcher);
         fix.state
@@ -954,7 +1069,14 @@ mod tests {
             .unwrap();
         client_dispatcher.drain_post_actions(&mut fix.client, &mut fix.state);
 
-        assert!(fix.state.seat.toplevel_drag.unwrap().attached.is_none());
+        assert!(fix
+            .state
+            .seat
+            .toplevel_drag
+            .as_ref()
+            .unwrap()
+            .attached
+            .is_none());
         assert!(fix.state.seat.active_drag().is_some());
         assert!(fix
             .toplevel
@@ -976,7 +1098,14 @@ mod tests {
             .unwrap();
 
         assert!(fix.state.seat.active_drag().is_some());
-        assert!(fix.state.seat.toplevel_drag.unwrap().attached.is_none());
+        assert!(fix
+            .state
+            .seat
+            .toplevel_drag
+            .as_ref()
+            .unwrap()
+            .attached
+            .is_none());
         assert_eq!(fix.phase(20), DragObjPhase::Active);
         assert!(!closed(&fix.dispatcher));
     }
@@ -1222,6 +1351,250 @@ mod tests {
         crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
         assert_eq!(fix.root_pos(), (106, 187));
         assert_eq!(fix.phase(20), DragObjPhase::Ended);
+    }
+
+    #[test]
+    fn a_tiled_window_is_picked_up_immediately_and_ignores_the_offset() {
+        let mut fix = Fixture::new();
+        let neighbor = fix.tile_with_neighbor();
+        let tile = layout_rect(&fix.state, fix.surface);
+        let pointer = (tile.x as f64 + 40.0, tile.y as f64 + 30.0);
+        fix.state.seat.pointer_pos = pointer;
+        let focus = crate::input::SurfaceFocusPick {
+            target: SurfaceFocus::new(neighbor),
+            rect: crate::input::SurfaceRect { x: 1, y: 2, width: 3, height: 4 },
+        };
+        fix.state.seat.pointer_focus = Some(focus);
+        let cursor = cursor_name(&fix.state);
+
+        fix.begin_attached(4, 8);
+
+        let preview = scaled_preview(tile);
+        assert_eq!(fix.root_pos(), preview_origin(pointer, preview));
+        assert_ne!(fix.root_pos(), (pointer.0.round() as i32 - 4, pointer.1.round() as i32 - 8));
+        let attached = fix
+            .state
+            .seat
+            .toplevel_drag
+            .as_ref()
+            .unwrap()
+            .attached
+            .as_ref()
+            .unwrap();
+        assert!(attached.tiled.is_some_and(|session| session.picked_up));
+        assert!(attached.start_root_pos.is_none());
+        assert!(fix.state.seat.tiled_drag_origin.is_none());
+        assert!(fix.state.seat.pointer_interactive_grab.is_none());
+        assert_eq!(fix.state.seat.pointer_focus, Some(focus));
+        assert_eq!(cursor_name(&fix.state), cursor);
+        assert!(fix.state.is_floating_root_surface(fix.surface));
+        assert!(!fix.state.is_tiled_root_surface(fix.surface));
+
+        crate::seat::handle_pointer_motion(
+            &mut fix.state,
+            &mut fix.dispatcher,
+            30.0,
+            -10.0,
+            30.0,
+            -10.0,
+            2,
+            0,
+        );
+        let moved = fix.state.seat.pointer_pos;
+        assert_eq!(fix.root_pos(), preview_origin(moved, preview));
+        assert!(fix.state.seat.pointer_interactive_grab.is_none());
+        assert_eq!(cursor_name(&fix.state), cursor);
+    }
+
+    #[test]
+    fn dropping_a_tiled_toplevel_drag_splits_by_the_pointer_quadrant() {
+        let mut fix = Fixture::new();
+        let neighbor = fix.tile_with_neighbor();
+        let tile = layout_rect(&fix.state, fix.surface);
+        fix.state.seat.pointer_pos = (tile.x as f64 + 20.0, tile.y as f64 + 20.0);
+        fix.begin_attached(4, 8);
+        fix.state.config.tiling.drag.precise_mouse_move = true;
+        let stayed = layout_rect(&fix.state, neighbor);
+        move_pointer(&mut fix, stayed.x as f64 + stayed.width as f64 / 2.0, stayed.y as f64 + 5.0);
+
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+
+        assert!(fix.state.is_tiled_root_surface(fix.surface));
+        assert!(fix.state.is_tiled_root_surface(neighbor));
+        let (axis, children) = tiled_split(&fix.state, fix.surface);
+        assert_eq!(axis, crate::tiling::SplitAxis::Vertical);
+        assert_eq!(children[0].0, fix.surface);
+        assert_eq!(children[1].0, neighbor);
+        assert!(fix.state.seat.pointer_interactive_grab.is_none());
+    }
+
+    #[test]
+    fn releasing_a_tiled_toplevel_drag_over_nothing_still_drops_it() {
+        let mut fix = Fixture::new();
+        let neighbor = fix.tile_with_neighbor();
+        fix.state.config.general.outer_gap = 80;
+        let workspace = fix
+            .state
+            .managed_window_state(fix.window)
+            .unwrap()
+            .workspace_id;
+        crate::tiling::mark_workspace_dirty(&mut fix.state, workspace);
+        fix.state.relayout_dirty_workspaces();
+        fix.refresh_geometry(fix.surface);
+        fix.refresh_geometry(neighbor);
+        let tile = layout_rect(&fix.state, fix.surface);
+        fix.state.seat.pointer_pos = (tile.x as f64 + 20.0, tile.y as f64 + 20.0);
+        fix.begin_attached(0, 0);
+        move_pointer(&mut fix, 1.0, 1.0);
+
+        crate::seat::complete_drag_drop(&mut fix.state, &mut fix.dispatcher);
+
+        assert!(fix.state.is_tiled_root_surface(fix.surface));
+        let (axis, children) = tiled_split(&fix.state, fix.surface);
+        assert_eq!(axis, crate::tiling::SplitAxis::Horizontal);
+        assert_eq!(children[0].0, fix.surface);
+        assert_eq!(children[1].0, neighbor);
+    }
+
+    #[test]
+    fn locking_cancels_a_tiled_toplevel_drag_back_into_its_split() {
+        let mut fix = Fixture::new();
+        let neighbor = fix.tile_with_neighbor();
+        let before = layout_rect(&fix.state, neighbor).width;
+        let tile = layout_rect(&fix.state, fix.surface);
+        fix.state.seat.pointer_pos = (tile.x as f64 + 20.0, tile.y as f64 + 20.0);
+        fix.begin_attached(4, 8);
+        assert!(layout_rect(&fix.state, neighbor).width > before);
+
+        crate::seat::gate_for_session_lock(&mut fix.state, &mut fix.dispatcher);
+
+        assert!(fix.state.seat.pointer_interactive_grab.is_none());
+        assert!(fix.state.seat.tiled_drag_origin.is_none());
+        assert_eq!(layout_rect(&fix.state, neighbor).width, before);
+        assert!(fix.state.is_tiled_root_surface(fix.surface));
+        assert!(fix.state.is_tiled_root_surface(neighbor));
+    }
+
+    #[test]
+    fn unmapping_a_tiled_toplevel_drag_does_not_restore_it() {
+        let mut fix = Fixture::new();
+        let neighbor = fix.tile_with_neighbor();
+        let before = layout_rect(&fix.state, neighbor).width;
+        let tile = layout_rect(&fix.state, fix.surface);
+        fix.state.seat.pointer_pos = (tile.x as f64 + 20.0, tile.y as f64 + 20.0);
+        fix.begin_attached(0, 0);
+        let grown = layout_rect(&fix.state, neighbor).width;
+        assert!(grown > before);
+
+        let mut client_dispatcher = fix.client.test_dispatcher(&mut fix.dispatcher);
+        fix.state
+            .objects
+            .grab(fix.surface.object_id())
+            .on(
+                &mut fix.client,
+                &mut fix.state,
+                {
+                    let mut event = RawEvent::new(WaylandId::from(12), 1, 3);
+                    event.id(crate::protocol_generated::WlBufferId::from(0));
+                    event.int(0);
+                    event.int(0);
+                    raw_request_from_event(event)
+                },
+                &mut client_dispatcher,
+            )
+            .unwrap();
+        fix.state
+            .objects
+            .grab(fix.surface.object_id())
+            .on(&mut fix.client, &mut fix.state, empty_request(12, 6), &mut client_dispatcher)
+            .unwrap();
+        client_dispatcher.drain_post_actions(&mut fix.client, &mut fix.state);
+
+        assert!(fix
+            .state
+            .seat
+            .toplevel_drag
+            .as_ref()
+            .unwrap()
+            .attached
+            .is_none());
+        assert!(!fix.state.is_tiled_root_surface(fix.surface));
+        assert!(fix.state.is_tiled_root_surface(neighbor));
+        assert_eq!(layout_rect(&fix.state, neighbor).width, grown);
+        assert!(fix.state.seat.active_drag().is_some());
+    }
+
+    fn layout_rect(state: &crate::state::State, surface: Resolved<WlSurfaceId>) -> RectI {
+        state
+            .committed_root_geometry(surface)
+            .unwrap()
+            .layout_rect_global
+    }
+
+    fn scaled_preview(tile: RectI) -> (i32, i32) {
+        (
+            ((tile.width as f64) * 0.8489).floor() as i32,
+            ((tile.height as f64) * 0.8489).floor() as i32,
+        )
+    }
+
+    fn preview_origin(pointer: (f64, f64), size: (i32, i32)) -> (i32, i32) {
+        (
+            (pointer.0 - size.0 as f64 / 2.0).round() as i32,
+            (pointer.1 - size.1 as f64 / 2.0).round() as i32,
+        )
+    }
+
+    fn cursor_name(state: &crate::state::State) -> Option<String> {
+        state
+            .seat
+            .visible_cursor_source()
+            .map(|source| match source {
+                crate::cursor::CursorSourceRef::Named { name, .. } => name.to_string(),
+                crate::cursor::CursorSourceRef::Surface { .. } => String::from("surface"),
+            })
+    }
+
+    fn move_pointer(fix: &mut Fixture, x: f64, y: f64) {
+        let current = fix.state.seat.pointer_pos;
+        crate::seat::handle_pointer_motion(
+            &mut fix.state,
+            &mut fix.dispatcher,
+            x - current.0,
+            y - current.1,
+            x - current.0,
+            y - current.1,
+            3,
+            0,
+        );
+    }
+
+    fn tiled_split(
+        state: &crate::state::State,
+        surface: Resolved<WlSurfaceId>,
+    ) -> (crate::tiling::SplitAxis, Vec<(Resolved<WlSurfaceId>, f64)>) {
+        let window = state.window_for_root(surface).unwrap();
+        let workspace_id = state.root_surface_workspace(surface).unwrap();
+        let layout = &state.workspaces.try_get(workspace_id).unwrap().layout;
+        let leaf_id = layout.window_leaves[&window];
+        let crate::tiling::LayoutNode::Leaf(leaf) = &layout.nodes[&leaf_id] else {
+            panic!("tiled drag surface is not a leaf");
+        };
+        let parent_id = leaf.parent.expect("dropped window has a split parent");
+        let crate::tiling::LayoutNode::Container(container) = &layout.nodes[&parent_id] else {
+            panic!("split parent is a container");
+        };
+        let children = container
+            .children
+            .iter()
+            .map(|child| {
+                let crate::tiling::LayoutNode::Leaf(leaf) = &layout.nodes[&child.node_id] else {
+                    panic!("drag split child is a leaf");
+                };
+                (state.window_root_surface(leaf.window).unwrap(), child.weight)
+            })
+            .collect();
+        (container.axis, children)
     }
 }
 

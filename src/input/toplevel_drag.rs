@@ -1,14 +1,21 @@
 //! An `xdg_toplevel_drag_v1` riding on the seat's drag-and-drop.
 //!
-//! A mapped window, tiled or floating, follows the pointer. A window that was not
-//! mapped yet becomes floating and is placed when it maps. Cancelling puts a
-//! floating window back where it started. A tiled drag session is not picked up here.
+//! A mapped floating window follows the pointer at the client's offset. A mapped tiled
+//! window uses the tiled-drag preview, centered on the pointer. A window that was not
+//! mapped yet becomes floating and is placed when it maps. Cancelling puts a floating
+//! window back where it started, and a tiled window back in its old split.
 
 use crate::{
     clients::{ClientId, Resolved},
+    input::grab::{
+        tiled_drag_motion, tiled_drag_pickup, tiled_drag_session_new, tiled_drag_settle,
+        TiledDragEnd, TiledDragSession,
+    },
     protocol_generated::{WlDataSourceId, WlSurfaceId, XdgToplevelDragV1Id, XdgToplevelId},
+    root_geometry::project_window_target_geometry,
     runner::Dispatcher,
     state::State,
+    tiling::ExtractedTiledLeaf,
     window::WindowId,
 };
 
@@ -19,7 +26,7 @@ pub(crate) enum ToplevelDragEnd {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct AttachedToplevel {
     pub toplevel: Resolved<XdgToplevelId>,
     pub window: WindowId,
@@ -27,9 +34,12 @@ pub(crate) struct AttachedToplevel {
     pub was_mapped_at_attach: bool,
     /// Root position captured for a mapped floating window. Restored on cancel.
     pub start_root_pos: Option<(i32, i32)>,
+    /// Set when a mapped tiled window was picked up. The preview ignores `offset`.
+    pub tiled: Option<TiledDragSession>,
+    pub tiled_origin: Option<ExtractedTiledLeaf>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct ToplevelDragState {
     pub drag: Resolved<XdgToplevelDragV1Id>,
     pub source: Resolved<WlDataSourceId>,
@@ -99,9 +109,15 @@ pub(crate) fn attach(
         offset,
         was_mapped_at_attach,
         start_root_pos,
+        tiled: None,
+        tiled_origin: None,
     });
-    if was_mapped_at_attach {
-        // A mapped tiled window is placed like a floating one until tiled drags exist.
+    if was_mapped_at_attach && state.window_is_tiled(window) {
+        if !pickup_tiled(state, dispatcher, window, root) {
+            log::debug!("xdg toplevel drag could not pick up a tiled window");
+            forget_attached(state);
+        }
+    } else if was_mapped_at_attach {
         state.raise_window(window);
         let Some(root) = root else {
             return;
@@ -115,6 +131,59 @@ pub(crate) fn attach(
     }
 }
 
+/// Pick up a mapped tiled window immediately. The pointer grab and the cursor stay untouched.
+fn pickup_tiled(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    window: WindowId,
+    root: Option<Resolved<WlSurfaceId>>,
+) -> bool {
+    let Some(root) = root else {
+        return false;
+    };
+    let Some(committed) = state.committed_root_geometry(root) else {
+        return false;
+    };
+    let geometry = project_window_target_geometry(committed, None);
+    let Some((size_constraints, decoration_mode)) = state
+        .toplevel(window)
+        .map(|toplevel| (toplevel.size_constraints(), toplevel.decoration_mode()))
+    else {
+        return false;
+    };
+    let mut session =
+        tiled_drag_session_new(state, window, root, size_constraints, decoration_mode, geometry, 0);
+    match tiled_drag_pickup(state, dispatcher, &mut session) {
+        Ok(origin) => {
+            if let Some(attached) = state
+                .seat
+                .toplevel_drag
+                .as_mut()
+                .and_then(|drag| drag.attached.as_mut())
+            {
+                attached.tiled = Some(session);
+                attached.tiled_origin = origin;
+            }
+            true
+        }
+        Err(()) => false,
+    }
+}
+
+fn forget_attached(state: &mut State) {
+    let Some(attached) = state
+        .seat
+        .toplevel_drag
+        .as_mut()
+        .and_then(|drag| drag.attached.take())
+    else {
+        return;
+    };
+    if let Some(toplevel) = attached.toplevel.try_ref_mut(state) {
+        toplevel.set_toplevel_drag(None);
+    }
+}
+
 /// The drag-and-drop ended.
 ///
 /// A drop or a release leaves the window where it is. Cancelling puts a mapped floating
@@ -124,37 +193,64 @@ pub(crate) fn end(state: &mut State, dispatcher: &mut Dispatcher, how: ToplevelD
     let Some(session) = state.seat.toplevel_drag.take() else {
         return;
     };
-    if let Some(attached) = session.attached {
-        if let (ToplevelDragEnd::Cancelled, Some(pos)) = (how, attached.start_root_pos) {
+    if let Some(mut attached) = session.attached {
+        if let Some(tiled) = attached.tiled.take() {
+            let origin = attached.tiled_origin.take();
+            let end = match how {
+                ToplevelDragEnd::Dropped | ToplevelDragEnd::ReleasedWithoutTarget => {
+                    TiledDragEnd::Drop
+                }
+                ToplevelDragEnd::Cancelled => TiledDragEnd::Cancel,
+            };
+            tiled_drag_settle(state, dispatcher, tiled, origin, end);
+        } else if let (ToplevelDragEnd::Cancelled, Some(pos)) = (how, attached.start_root_pos) {
             if let Some(root) = state.window_root_surface(attached.window) {
                 let _ = crate::input::grab::place_grabbed_root(state, dispatcher, root, pos);
+            }
+        }
+        if let Some(toplevel) = attached.toplevel.try_ref_mut(state) {
+            if toplevel.toplevel_drag() == Some(session.drag) {
+                toplevel.set_toplevel_drag(None);
             }
         }
     }
     if let Some(drag) = session.drag.try_ref_mut(state) {
         drag.mark_ended();
     }
-    let Some(attached) = session.attached else {
-        return;
-    };
-    if let Some(toplevel) = attached.toplevel.try_ref_mut(state) {
-        if toplevel.toplevel_drag() == Some(session.drag) {
-            toplevel.set_toplevel_drag(None);
-        }
-    }
 }
 
 /// Keep an attached mapped window under the pointer. A failed grab does not abort anything else.
 pub(crate) fn motion(state: &mut State, dispatcher: &mut Dispatcher) {
-    let Some(attached) = state
+    let Some(mut attached) = state
         .seat
         .toplevel_drag
-        .as_ref()
-        .and_then(|session| session.attached)
+        .as_mut()
+        .and_then(|drag| drag.attached.take())
     else {
         return;
     };
-    let Some(root) = state.window_root_surface(attached.window) else {
+    if let Some(mut session) = attached.tiled.take() {
+        let mut origin = attached.tiled_origin.take();
+        match tiled_drag_motion(state, dispatcher, &mut session, &mut origin) {
+            Ok(()) => {
+                attached.tiled = Some(session);
+                attached.tiled_origin = origin;
+            }
+            Err(()) => {
+                tiled_drag_settle(state, dispatcher, session, origin, TiledDragEnd::Cancel);
+            }
+        }
+        if let Some(drag) = state.seat.toplevel_drag.as_mut() {
+            drag.attached = Some(attached);
+        }
+        return;
+    }
+    let window = attached.window;
+    let offset = attached.offset;
+    if let Some(drag) = state.seat.toplevel_drag.as_mut() {
+        drag.attached = Some(attached);
+    }
+    let Some(root) = state.window_root_surface(window) else {
         return;
     };
     let mapped = root
@@ -163,7 +259,7 @@ pub(crate) fn motion(state: &mut State, dispatcher: &mut Dispatcher) {
     if !mapped {
         return;
     }
-    let Some(pos) = root_for_pointer(state, root, state.seat.pointer_pos, attached.offset) else {
+    let Some(pos) = root_for_pointer(state, root, state.seat.pointer_pos, offset) else {
         return;
     };
     let _ = crate::input::grab::place_grabbed_root(state, dispatcher, root, pos);
@@ -178,16 +274,16 @@ pub(crate) fn on_mapped(
     if !tracks_root(state, root) {
         return;
     }
-    let Some(attached) = state
-        .seat
-        .toplevel_drag
-        .as_ref()
-        .and_then(|session| session.attached)
-    else {
+    let Some((window, offset)) = state.seat.toplevel_drag.as_ref().and_then(|session| {
+        session
+            .attached
+            .as_ref()
+            .map(|attached| (attached.window, attached.offset))
+    }) else {
         return;
     };
-    state.raise_window(attached.window);
-    let Some(pos) = root_for_pointer(state, root, state.seat.pointer_pos, attached.offset) else {
+    state.raise_window(window);
+    let Some(pos) = root_for_pointer(state, root, state.seat.pointer_pos, offset) else {
         return;
     };
     let _ = crate::input::grab::place_grabbed_root(state, dispatcher, root, pos);
@@ -195,12 +291,12 @@ pub(crate) fn on_mapped(
 
 /// Root of the window currently attached to the seat's toplevel drag.
 pub(crate) fn dragged_root(state: &State) -> Option<Resolved<WlSurfaceId>> {
-    let attached = state
+    let window = state
         .seat
         .toplevel_drag
         .as_ref()
-        .and_then(|session| session.attached)?;
-    state.window_root_surface(attached.window)
+        .and_then(|session| session.attached.as_ref().map(|attached| attached.window))?;
+    state.window_root_surface(window)
 }
 
 /// Root position that puts the window-geometry point `offset` on `pointer`.
@@ -224,34 +320,38 @@ fn root_for_pointer(
 }
 
 pub(crate) fn tracks_root(state: &State, root: Resolved<WlSurfaceId>) -> bool {
-    let Some(attached) = state
+    let Some(window) = state
         .seat
         .toplevel_drag
         .as_ref()
-        .and_then(|session| session.attached)
+        .and_then(|session| session.attached.as_ref().map(|attached| attached.window))
     else {
         return false;
     };
-    state.window_root_surface(attached.window) == Some(root)
+    state.window_root_surface(window) == Some(root)
 }
 
 /// The attached toplevel unmapped. The drag-and-drop keeps running.
 ///
-/// A later phase settles a tiled session as a cancel before this clear.
-pub(crate) fn detach(state: &mut State, root: Resolved<WlSurfaceId>) {
-    let Some(attached) = state
+/// A tiled preview is cancelled first. That restore only runs while the window is still mapped.
+pub(crate) fn detach(state: &mut State, dispatcher: &mut Dispatcher, root: Resolved<WlSurfaceId>) {
+    let Some(mut attached) = state
         .seat
         .toplevel_drag
-        .as_ref()
-        .and_then(|session| session.attached)
+        .as_mut()
+        .and_then(|session| session.attached.take())
     else {
         return;
     };
     if state.window_root_surface(attached.window) != Some(root) {
+        if let Some(session) = state.seat.toplevel_drag.as_mut() {
+            session.attached = Some(attached);
+        }
         return;
     }
-    if let Some(session) = state.seat.toplevel_drag.as_mut() {
-        session.attached = None;
+    if let Some(tiled) = attached.tiled.take() {
+        let origin = attached.tiled_origin.take();
+        tiled_drag_settle(state, dispatcher, tiled, origin, TiledDragEnd::Cancel);
     }
     if let Some(toplevel) = attached.toplevel.try_ref_mut(state) {
         toplevel.set_toplevel_drag(None);
@@ -260,18 +360,16 @@ pub(crate) fn detach(state: &mut State, root: Resolved<WlSurfaceId>) {
 
 /// The drag object is going away. Drop its attachment without ending the drag-and-drop.
 pub(crate) fn clear_attached_for_drag(state: &mut State, drag: Resolved<XdgToplevelDragV1Id>) {
-    let attached = state
-        .seat
-        .toplevel_drag
-        .as_ref()
-        .and_then(|session| (session.drag == drag).then_some(session.attached).flatten());
-    let Some(attached) = attached else {
+    let attached = state.seat.toplevel_drag.as_ref().and_then(|session| {
+        (session.drag == drag).then(|| session.attached.as_ref().map(|attached| attached.toplevel))
+    });
+    let Some(Some(toplevel)) = attached else {
         return;
     };
     if let Some(session) = state.seat.toplevel_drag.as_mut() {
         session.attached = None;
     }
-    if let Some(toplevel) = attached.toplevel.try_ref_mut(state) {
+    if let Some(toplevel) = toplevel.try_ref_mut(state) {
         if toplevel.toplevel_drag() == Some(drag) {
             toplevel.set_toplevel_drag(None);
         }
@@ -285,7 +383,7 @@ pub(crate) fn clear_attached_toplevel(
     client_id: ClientId,
 ) {
     let matches = state.seat.toplevel_drag.as_ref().is_some_and(|session| {
-        session.attached.is_some_and(|attached| {
+        session.attached.as_ref().is_some_and(|attached| {
             attached.toplevel.wayland_id() == toplevel && attached.toplevel.client_id() == client_id
         })
     });

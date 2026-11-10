@@ -371,10 +371,23 @@ fn restore_tiled_drag_origin(
 }
 
 pub(crate) fn tiled_drag_tracks_surface(state: &State, surface: Resolved<WlSurfaceId>) -> bool {
-    matches!(
+    let interactive = matches!(
         state.seat.pointer_interactive_grab,
         Some(ActiveGrabState::MoveTiled(session)) if session.root_surface == surface
-    )
+    );
+    if interactive {
+        return true;
+    }
+    state
+        .seat
+        .toplevel_drag
+        .as_ref()
+        .and_then(|drag| drag.attached.as_ref())
+        .is_some_and(|attached| {
+            attached
+                .tiled
+                .is_some_and(|session| session.root_surface == surface)
+        })
 }
 
 pub(crate) fn tiled_resize_active_root_surfaces(state: &State) -> BTreeSet<Resolved<WlSurfaceId>> {
