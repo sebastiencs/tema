@@ -24,6 +24,9 @@ pub struct WlDataOffer {
     /// Set once a drag offer has been taken off the drag. The Wayland object
     /// stays until the client destroys it; `before_destroy` already ran.
     detached: bool,
+    /// Last `wl_data_offer.action` sent to this offer. `None` means never sent,
+    /// so the first answer is delivered even when the action is 0.
+    last_sent_action: Option<u32>,
 }
 
 impl WlDataOffer {
@@ -40,6 +43,7 @@ impl WlDataOffer {
             source: source.map(SelectionSourceState::WlData),
             finished: false,
             detached: false,
+            last_sent_action: None,
         }
     }
 
@@ -55,6 +59,7 @@ impl WlDataOffer {
             source: Some(selection),
             finished: false,
             detached: false,
+            last_sent_action: None,
         }
     }
 
@@ -116,10 +121,14 @@ impl WlDataOffer {
         self.send_event(wl_data_offer::Event::SourceActions { source_actions }, dispatcher);
     }
 
-    pub fn send_action(&self, dnd_action: u32, dispatcher: &mut ClientDispatcher) {
+    pub fn send_action(&mut self, dnd_action: u32, dispatcher: &mut ClientDispatcher) {
         if self.version < wl_data_offer::ACTION_SINCE {
             return;
         }
+        if self.last_sent_action == Some(dnd_action) {
+            return;
+        }
+        self.last_sent_action = Some(dnd_action);
         self.send_event(wl_data_offer::Event::Action { dnd_action }, dispatcher);
     }
 
@@ -478,7 +487,7 @@ impl Object for WlDataOffer {
                         continue;
                     }
                     other_offer
-                        .rref(state)
+                        .ref_mut(state)
                         .send_action(chosen_action, dispatcher);
                 }
                 if chosen_changed {
@@ -507,9 +516,10 @@ pub(crate) mod tests {
                 Client, ClientAction, ClientId, ClientManagerAction, DataSourceClientEvent,
                 RawEvent, Resolved,
             },
+            io_uring::model::IoUringAction,
             object::{Object, RequestResult},
             protocol_generated::{
-                wl_data_device_manager, WlDataOfferId, WlDataSourceId, WlSurfaceId,
+                wl_data_device_manager, WaylandId, WlDataOfferId, WlDataSourceId, WlSurfaceId,
             },
             runner::Dispatcher,
             state::{
@@ -1584,5 +1594,155 @@ pub(crate) mod tests {
             move_action
         );
         assert_eq!(state.seat.active_drag().unwrap().negotiation.chosen_action, move_action);
+    }
+
+    fn queued_offer_actions(dispatcher: &Dispatcher, offer_id: WlDataOfferId) -> Vec<u32> {
+        let object: u32 = WaylandId::from(offer_id).into();
+        let mut actions = Vec::new();
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            let IoUringAction::Sendmsg { buffer, .. } = action else {
+                return;
+            };
+            if buffer.len() < 12 {
+                return;
+            }
+            let header_object = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
+            let opcode = u32::from_ne_bytes(buffer[4..8].try_into().unwrap()) & 0xffff;
+            if header_object == object && opcode == 2 {
+                actions.push(u32::from_ne_bytes(buffer[8..12].try_into().unwrap()));
+            }
+        });
+        actions
+    }
+
+    #[test]
+    fn repeated_set_actions_sends_offer_action_once() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(8);
+        let source_id = WlDataSourceId::from(10);
+        let copy = wl_data_device_manager::DndAction::Copy as u32;
+        let move_action = wl_data_device_manager::DndAction::Move as u32;
+        let source =
+            insert_source_with_actions(&mut state, source_client_id, source_id, copy | move_action);
+        let mut target = Client::new_for_tests(ClientId::from_raw(7));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_offer_for_source(&mut target, &mut state, offer_id, source);
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy | move_action, move_action),
+        );
+        assert_eq!(queued_offer_actions(&dispatcher, offer_id), vec![move_action]);
+        assert_eq!(target.ref_object(offer_id, &state).last_sent_action, Some(move_action));
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy | move_action, move_action),
+        );
+        assert!(queued_offer_actions(&dispatcher, offer_id).is_empty());
+    }
+
+    #[test]
+    fn first_set_actions_with_none_still_answers() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(8);
+        let mut target = Client::new_for_tests(ClientId::from_raw(7));
+        let source_id = WlDataSourceId::from(10);
+        let mut source_client = Client::new_for_tests(source_client_id);
+        let (source, _) = source_client
+            .insert_object(&mut state, WlDataSource::new(source_id, source_client_id, 3));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_offer_for_source(&mut target, &mut state, offer_id, source);
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, 0, 0),
+        );
+        assert_eq!(queued_offer_actions(&dispatcher, offer_id), vec![0]);
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, 0, 0),
+        );
+        assert!(queued_offer_actions(&dispatcher, offer_id).is_empty());
+        assert_eq!(target.ref_object(offer_id, &state).last_sent_action, Some(0));
+    }
+
+    #[test]
+    fn sibling_offer_gets_action_only_on_change() {
+        let mut state = state_for_tests();
+        let source_client_id = ClientId::from_raw(8);
+        let source_id = WlDataSourceId::from(10);
+        let copy = wl_data_device_manager::DndAction::Copy as u32;
+        let move_action = wl_data_device_manager::DndAction::Move as u32;
+        let source =
+            insert_source_with_actions(&mut state, source_client_id, source_id, copy | move_action);
+        let mut target = Client::new_for_tests(ClientId::from_raw(7));
+        let offer_id = WlDataOfferId::from(20);
+        let offer = insert_offer_for_source(&mut target, &mut state, offer_id, source);
+        let sibling_id = WlDataOfferId::from(21);
+        let sibling = insert_offer_for_source(&mut target, &mut state, sibling_id, source);
+        set_drag_with_offers(
+            &mut state,
+            source_client_id,
+            source_id,
+            target.client_id(),
+            vec![offer, sibling],
+            DragPhase::Dragging,
+        );
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy | move_action, move_action),
+        );
+        assert_eq!(target.ref_object(sibling_id, &state).last_sent_action, Some(move_action));
+        assert_eq!(queued_offer_actions(&dispatcher, sibling_id), vec![move_action]);
+
+        let mut dispatcher = Dispatcher::default();
+        drive_offer(
+            &mut target,
+            &mut state,
+            &mut dispatcher,
+            offer,
+            set_actions_request(offer_id, copy | move_action, move_action),
+        );
+        assert!(queued_offer_actions(&dispatcher, sibling_id).is_empty());
+        assert_eq!(target.ref_object(sibling_id, &state).last_sent_action, Some(move_action));
     }
 }
