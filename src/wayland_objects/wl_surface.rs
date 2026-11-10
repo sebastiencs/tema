@@ -2583,16 +2583,37 @@ impl WlSurface {
         }
 
         if changed {
-            log::debug!(
-                "wl_surface commit scheduling RefreshSurfaceOutputs client={:?} surface={:?} changed={}",
-                client.client_id(),
-                this.id,
-                changed
-            );
-            dispatcher.dispatch_to(
-                client.client_id(),
-                crate::clients::ClientAction::RefreshSurfaceOutputs,
-            );
+            let (ungrabbed, root) = client.with_ungrabbed(this, state, |state| {
+                state.root_surface_for_surface(resolved_surface)
+            });
+            this = ungrabbed;
+            match root {
+                Some(root) => {
+                    log::debug!(
+                        "wl_surface commit scheduling RefreshSurfaceTreeOutputs client={:?} surface={:?} root={:?} changed={}",
+                        client.client_id(),
+                        this.id,
+                        root,
+                        changed
+                    );
+                    dispatcher.dispatch_to(
+                        client.client_id(),
+                        crate::clients::ClientAction::RefreshSurfaceTreeOutputs { root },
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "wl_surface commit scheduling RefreshSurfaceOutputs client={:?} surface={:?} changed={}",
+                        client.client_id(),
+                        this.id,
+                        changed
+                    );
+                    dispatcher.dispatch_to(
+                        client.client_id(),
+                        crate::clients::ClientAction::RefreshSurfaceOutputs,
+                    );
+                }
+            }
         }
         if let Some(old_effective_insets) = old_effective_insets {
             let new_effective_insets =
@@ -4972,6 +4993,28 @@ mod tests {
             .try_ref_object::<XdgSurface>(client.object_id(xdg_surface_id))
             .unwrap()
             .test_pending_configure_count()
+    }
+
+    #[test]
+    fn changed_commit_refreshes_only_that_toplevel_tree() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(48usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 500);
+        let root_surface = root(&state, surface_object_id);
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            client.client_id(),
+            |action| matches!(
+                action,
+                ClientAction::RefreshSurfaceTreeOutputs { root } if *root == root_surface
+            )
+        ));
+        assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            client.client_id(),
+            |action| matches!(action, ClientAction::RefreshSurfaceOutputs)
+        ));
     }
 
     #[test]
