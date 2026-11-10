@@ -1,4 +1,7 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    time::{Duration, Instant},
+};
 
 use crate::{
     clients::{Client, ClientDispatcher, EventWriter, RawRequest, Resolved},
@@ -62,6 +65,17 @@ pub(crate) struct CommitRoleChanges {
     pub reset_on_unmap: bool,
 }
 
+/// How long a window may sit on a resize configure it has not committed
+/// before the next one is sent anyway. Same as jay's configure timeout.
+pub(crate) const RESIZE_CONFIGURE_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// The last throttled resize configure sent and not yet committed.
+#[derive(Clone, Copy, Debug)]
+struct ResizeThrottle {
+    serial: u32,
+    sent_at: Instant,
+}
+
 #[derive(Debug)]
 pub struct XdgSurface {
     id: XdgSurfaceId,
@@ -78,6 +92,11 @@ pub struct XdgSurface {
     pending_window_geometry: Option<RectI>,
     current_window_geometry: Option<RectI>,
     popup_children: Vec<Resolved<XdgPopupId>>,
+    /// Set while a throttled resize configure waits for its commit.
+    resize_throttle: Option<ResizeThrottle>,
+    /// A throttled resize configure was skipped while waiting; send the
+    /// newest size once the window commits.
+    deferred_resize_configure: bool,
 }
 
 impl XdgSurface {
@@ -101,6 +120,8 @@ impl XdgSurface {
             pending_window_geometry: None,
             current_window_geometry: None,
             popup_children: Vec::new(),
+            resize_throttle: None,
+            deferred_resize_configure: false,
         }
     }
 
@@ -357,6 +378,51 @@ impl XdgSurface {
         self.last_acked = None;
         self.pending_window_geometry = None;
         self.current_window_geometry = None;
+        self.resize_throttle = None;
+        self.deferred_resize_configure = false;
+    }
+
+    /// Whether a throttled resize configure may go out at `now`. When it
+    /// may not, remembers that one was skipped.
+    pub(crate) fn resize_configure_allowed(&mut self, now: Instant) -> bool {
+        match self.resize_throttle {
+            Some(throttle)
+                if now.saturating_duration_since(throttle.sent_at) < RESIZE_CONFIGURE_TIMEOUT =>
+            {
+                self.deferred_resize_configure = true;
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Record that a throttled resize configure was just queued.
+    /// Call right after the configure was queued.
+    pub(crate) fn note_resize_configure_sent(&mut self, now: Instant) {
+        let Some(serial) = self
+            .pending_configures
+            .back()
+            .map(|configure| configure.serial)
+        else {
+            return;
+        };
+        self.resize_throttle = Some(ResizeThrottle { serial, sent_at: now });
+        self.deferred_resize_configure = false;
+    }
+
+    /// Called on each commit. Ends the wait once the client has acked the
+    /// throttled configure (or a newer one) and committed. Returns true when
+    /// a skipped resize configure should now be sent.
+    fn release_resize_throttle_on_commit(&mut self) -> bool {
+        let Some(throttle) = self.resize_throttle else {
+            return false;
+        };
+        let acked = self.last_acked.as_ref().map(|configure| configure.serial);
+        if !acked.is_some_and(|serial| serial >= throttle.serial) {
+            return false;
+        }
+        self.resize_throttle = None;
+        std::mem::take(&mut self.deferred_resize_configure)
     }
 
     fn validate_committed_state(
@@ -2801,6 +2867,8 @@ mod tests {
             pending_window_geometry: None,
             current_window_geometry: None,
             popup_children: Vec::new(),
+            resize_throttle: None,
+            deferred_resize_configure: false,
         };
         let (xdg_surface_resolved, _) = client.insert_object(&mut state, xdg_surface);
         let xdg_surface_object_id = xdg_surface_resolved.object_id();
@@ -2979,6 +3047,84 @@ mod tests {
     }
 
     #[test]
+    fn resize_configure_allowed_when_nothing_in_flight() {
+        let mut xdg_surface = test_xdg_surface();
+        let t0 = std::time::Instant::now();
+
+        assert!(xdg_surface.resize_configure_allowed(t0));
+        assert!(!xdg_surface.deferred_resize_configure);
+    }
+
+    #[test]
+    fn resize_configure_deferred_while_in_flight() {
+        let mut xdg_surface = test_xdg_surface();
+        let t0 = std::time::Instant::now();
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.note_resize_configure_sent(t0);
+
+        assert!(!xdg_surface.resize_configure_allowed(t0 + std::time::Duration::from_millis(10)));
+        assert!(xdg_surface.deferred_resize_configure);
+    }
+
+    #[test]
+    fn resize_configure_allowed_after_timeout() {
+        let mut xdg_surface = test_xdg_surface();
+        let t0 = std::time::Instant::now();
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.note_resize_configure_sent(t0);
+
+        assert!(xdg_surface.resize_configure_allowed(t0 + std::time::Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn release_on_commit_needs_ack_of_throttled_serial() {
+        let mut xdg_surface = test_xdg_surface();
+        let t0 = std::time::Instant::now();
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.note_resize_configure_sent(t0);
+        assert!(!xdg_surface.resize_configure_allowed(t0 + std::time::Duration::from_millis(10)));
+
+        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        assert!(xdg_surface.resize_throttle.is_some());
+
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+        assert!(xdg_surface.release_resize_throttle_on_commit());
+        assert!(xdg_surface.resize_throttle.is_none());
+        assert!(!xdg_surface.deferred_resize_configure);
+        assert!(!xdg_surface.release_resize_throttle_on_commit());
+    }
+
+    #[test]
+    fn release_on_commit_accepts_newer_ack() {
+        let mut xdg_surface = test_xdg_surface();
+        let t0 = std::time::Instant::now();
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.note_resize_configure_sent(t0);
+        assert!(!xdg_surface.resize_configure_allowed(t0 + std::time::Duration::from_millis(10)));
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+
+        assert!(xdg_surface.release_resize_throttle_on_commit());
+        assert!(xdg_surface.resize_throttle.is_none());
+        assert!(!xdg_surface.deferred_resize_configure);
+    }
+
+    #[test]
+    fn reset_clears_resize_throttle() {
+        let mut xdg_surface = test_xdg_surface();
+        let t0 = std::time::Instant::now();
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.note_resize_configure_sent(t0);
+        assert!(!xdg_surface.resize_configure_allowed(t0 + std::time::Duration::from_millis(10)));
+
+        xdg_surface.reset_configure_state();
+
+        assert!(xdg_surface.resize_throttle.is_none());
+        assert!(!xdg_surface.deferred_resize_configure);
+        assert!(xdg_surface.resize_configure_allowed(t0));
+    }
+
+    #[test]
     fn destroying_toplevel_before_decoration_disconnects_client_with_orphaned_error() {
         let mut state = state_for_tests();
         let mut client = Client::new_for_tests(ClientId::from_raw(88));
@@ -3113,6 +3259,8 @@ mod tests {
                 pending_window_geometry: None,
                 current_window_geometry: None,
                 popup_children: Vec::new(),
+                resize_throttle: None,
+                deferred_resize_configure: false,
             },
         );
         let xdg_surface_object_id = xdg_surface_resolved.object_id();
@@ -3216,6 +3364,8 @@ mod tests {
                 pending_window_geometry: None,
                 current_window_geometry: None,
                 popup_children: Vec::new(),
+                resize_throttle: None,
+                deferred_resize_configure: false,
             },
         );
         let xdg_surface_object_id = xdg_surface_resolved.object_id();
@@ -3324,6 +3474,8 @@ mod tests {
                 pending_window_geometry: None,
                 current_window_geometry: None,
                 popup_children: Vec::new(),
+                resize_throttle: None,
+                deferred_resize_configure: false,
             },
         );
         let xdg_surface_object_id = xdg_surface_resolved.object_id();
