@@ -36,7 +36,7 @@ impl XdgToplevelDragV1 {
         Self {
             id,
             client_id,
-            object_id: ObjectId::from(0usize),
+            object_id: ObjectId::invalid(),
             source: Some(source),
             pending: None,
             phase: DragObjPhase::NotStarted,

@@ -58,7 +58,7 @@ impl ExtIdleNotificationV1 {
         Self {
             id,
             client_id,
-            object_id: ObjectId::from_parts(0, 0),
+            object_id: ObjectId::invalid(),
             seat,
             timeout: Duration::from_millis(u64::from(timeout_msec)),
             obey_inhibitors,

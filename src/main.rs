@@ -65,6 +65,10 @@ macro_rules! index_map_id {
                 Self { index, generation }
             }
 
+            pub fn invalid() -> Self {
+                Self { index: u32::MAX, generation: u32::MAX }
+            }
+
             pub const fn index(self) -> u32 {
                 self.index
             }
