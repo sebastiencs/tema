@@ -2541,81 +2541,93 @@ impl Client {
             .iter_resolved_of::<XdgToplevelId>(state)
             .collect::<Vec<_>>();
         for toplevel in toplevels {
-            let toplevel_ref = toplevel.rref(state);
-            let xdg_surface = toplevel_ref.xdg_surface();
-            let has_decoration_object = toplevel_ref.has_decoration_object();
-            let xdg_surface_ref = xdg_surface.rref(state);
-            let wl_surface = xdg_surface_ref.wl_surface();
-            let Some(root_surface) = state.root_surface_for_surface(wl_surface) else {
-                continue;
-            };
-            if !root_has_protocol_visibility(state, root_surface) {
-                continue;
-            }
-            let window = toplevel_ref.window();
-            let tiled_geometry = state.tiled_window_geometry(window);
-            let resizing = tiled_resize_surfaces.contains(&root_surface);
-            let surface_configure_bounds = state.configure_bounds_for_surface(wl_surface, None);
-            let scheduled_floating_restore =
-                if tiled_geometry.is_none() && !state.window_is_fullscreen(window) {
-                    state.take_window_floating_restore(window)
-                } else {
-                    None
-                };
-            let desired_decoration_mode =
-                Some(state.xdg_decoration_mode_for_surface(has_decoration_object));
-
-            {
-                let mut xdg_surface = xdg_surface.grab(state);
-                let mut toplevel = toplevel.grab(state);
-                if let Some(mode) = desired_decoration_mode {
-                    toplevel.schedule_decoration_mode(mode);
-                }
-                let tiled_configure_geometry = tiled_geometry
-                    .map(|geometry| crate::root_geometry::project_configure_geometry(geometry));
-                let configure_bounds = tiled_configure_geometry
-                    .map(|geometry| geometry.size)
-                    .or(surface_configure_bounds);
-                if let Some((geometry, configure_geometry)) =
-                    tiled_geometry.zip(tiled_configure_geometry)
-                {
-                    toplevel.send_tiled_layout_configure_if_changed(
-                        self,
-                        state,
-                        &mut xdg_surface,
-                        geometry,
-                        configure_geometry,
-                        resizing,
-                        dispatcher,
-                    );
-                } else if let Some(remembered_state) = scheduled_floating_restore {
-                    toplevel.send_interactive_resize_configure(
-                        self,
-                        state,
-                        configure_bounds,
-                        &mut xdg_surface,
-                        remembered_state.configure_size.0,
-                        remembered_state.configure_size.1,
-                        false,
-                        dispatcher,
-                    );
-                } else {
-                    toplevel.schedule_configure_if_changed(
-                        self,
-                        state,
-                        configure_bounds,
-                        &mut xdg_surface,
-                        dispatcher,
-                    );
-                }
-            }
-            if let Some(toplevel) = toplevel.try_ref(state) {
-                let window = toplevel.window();
-                let (maximized, fullscreen) = toplevel.published_shell_state();
-                crate::capture::note_window_state(state, dispatcher, window, maximized, fullscreen);
-            }
+            self.reconfigure_mapped_toplevel(state, dispatcher, toplevel, &tiled_resize_surfaces);
         }
         dispatcher.dispatch(crate::xwayland::XwaylandAction::Reconfigure);
+    }
+
+    /// Send the compositor-driven configure for one toplevel, and publish its
+    /// shell state to capture. Skips toplevels without protocol visibility.
+    fn reconfigure_mapped_toplevel(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        toplevel: Resolved<XdgToplevelId>,
+        tiled_resize_surfaces: &BTreeSet<Resolved<WlSurfaceId>>,
+    ) {
+        let toplevel_ref = toplevel.rref(state);
+        let xdg_surface = toplevel_ref.xdg_surface();
+        let has_decoration_object = toplevel_ref.has_decoration_object();
+        let xdg_surface_ref = xdg_surface.rref(state);
+        let wl_surface = xdg_surface_ref.wl_surface();
+        let Some(root_surface) = state.root_surface_for_surface(wl_surface) else {
+            return;
+        };
+        if !root_has_protocol_visibility(state, root_surface) {
+            return;
+        }
+        let window = toplevel_ref.window();
+        let tiled_geometry = state.tiled_window_geometry(window);
+        let resizing = tiled_resize_surfaces.contains(&root_surface);
+        let surface_configure_bounds = state.configure_bounds_for_surface(wl_surface, None);
+        let scheduled_floating_restore =
+            if tiled_geometry.is_none() && !state.window_is_fullscreen(window) {
+                state.take_window_floating_restore(window)
+            } else {
+                None
+            };
+        let desired_decoration_mode =
+            Some(state.xdg_decoration_mode_for_surface(has_decoration_object));
+
+        {
+            let mut xdg_surface = xdg_surface.grab(state);
+            let mut toplevel = toplevel.grab(state);
+            if let Some(mode) = desired_decoration_mode {
+                toplevel.schedule_decoration_mode(mode);
+            }
+            let tiled_configure_geometry = tiled_geometry
+                .map(|geometry| crate::root_geometry::project_configure_geometry(geometry));
+            let configure_bounds = tiled_configure_geometry
+                .map(|geometry| geometry.size)
+                .or(surface_configure_bounds);
+            if let Some((geometry, configure_geometry)) =
+                tiled_geometry.zip(tiled_configure_geometry)
+            {
+                toplevel.send_tiled_layout_configure_if_changed(
+                    self,
+                    state,
+                    &mut xdg_surface,
+                    geometry,
+                    configure_geometry,
+                    resizing,
+                    dispatcher,
+                );
+            } else if let Some(remembered_state) = scheduled_floating_restore {
+                toplevel.send_interactive_resize_configure(
+                    self,
+                    state,
+                    configure_bounds,
+                    &mut xdg_surface,
+                    remembered_state.configure_size.0,
+                    remembered_state.configure_size.1,
+                    false,
+                    dispatcher,
+                );
+            } else {
+                toplevel.schedule_configure_if_changed(
+                    self,
+                    state,
+                    configure_bounds,
+                    &mut xdg_surface,
+                    dispatcher,
+                );
+            }
+        }
+        if let Some(toplevel) = toplevel.try_ref(state) {
+            let window = toplevel.window();
+            let (maximized, fullscreen) = toplevel.published_shell_state();
+            crate::capture::note_window_state(state, dispatcher, window, maximized, fullscreen);
+        }
     }
 
     #[cfg(test)]
