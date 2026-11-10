@@ -641,6 +641,8 @@ If coming back after a long time, this order should restore the mental model qui
     How downscaled Xwayland gets one integer scale, and where that scale is applied.
 19. `src/ipc/` and section 26
     The IPC socket, the snapshot diff, and `temactl`.
+20. `src/wayland_objects/xdg_system_bell_v1.rs`, `xdg_toplevel_tag_manager_v1.rs`, `xdg_toplevel_icon_v1.rs`, `xdg_session_manager_v1.rs`, `xdg_toplevel_drag_v1.rs`, and section 27
+    The five staging protocols: bell, tag, icon, session restore, and toplevel drag.
 
 ## 14. Vocabulary
 
@@ -1540,7 +1542,13 @@ Each accepted connection is an `IpcConnection` model of its own. `version`, `out
 
 The calls are in `ClientManager`, on `WorkspaceStateChanged`, `OutputStateChanged`, and `OutputRemoved`, and in `src/capture.rs`: `announce_toplevel`, `close_toplevel`, `note_window_state`, `apply_activated` when the activated set changes, and `update_window_detail` after the title or the app id changes. Floating and fullscreen keybindings, drags, and workspace publication arrive as `WorkspaceStateChanged`.
 
-A new topic needs a field on `IpcSnapshot`, filled in by `build`, a `Topic` variant, and an `Event` variant. Call `mark_dirty` where that state changes. A query also needs a `Request` variant and a `Response` variant. `temactl subscribe` accepts any `Topic` name. `temactl waybar window` follows only the focused window.
+`Window.tag`, `Window.description`, and `Window.icon` come from the xdg toplevel. An empty tag or description is stored as absent. `icon` is a name plus the copied sizes, and is absent when the toplevel has none. `note_window_metadata` marks the snapshot dirty after a tag, description, or icon change.
+
+`bell` is a topic with no snapshot field. `ipc::bell` sends `IpcServerAction::Bell` at once. The event is `{"event":"bell","window":N}`, or `"window":null` when the ring names no window. Subscribers of `bell`, and subscribers whose topic set is empty, receive it. The initial subscribe dump does not include one, because the snapshot has no bell. The same window, and a ring with no surface, are each limited to one event per 100 ms. `destroy_window` drops that window's throttle entry. There is no sound and no urgency hint.
+
+`window_icon` is a request. `size` defaults to 32 and `scale` to 1. The reply picks the pixmap whose `size * scale` equals the request, else the next larger product, else the largest smaller one, and among those the scale closest to the request. `data` is standard base64 of little-endian premultiplied BGRA. No pixmap leaves `data`, `size`, and `scale` null and still returns the name. An unknown id is `{"error":"no such window"}`. `temactl window-icon` is this request. `--size` and `--scale` select the pixmap, `-o FILE` writes a PNG, and `-j` prints the ok value.
+
+A snapshot topic needs a field on `IpcSnapshot`, filled in by `build`, a `Topic` variant, and an `Event` variant. Call `mark_dirty` where that state changes. `bell` is the exception: it has a `Topic`, an `Event`, and its own server action, and it is not compared. A query also needs a `Request` variant and a `Response` variant. `temactl subscribe` accepts any `Topic` name. `temactl waybar window` follows only the focused window.
 
 ### Manual check
 
@@ -1550,3 +1558,70 @@ Programs tema starts have `TEMA_SOCK` set. `socat` is the wire. `temactl` is `ta
 2. `printf '%s\n' '{"request":"workspaces"}' | socat - UNIX-CONNECT:"$TEMA_SOCK"` prints one `{"ok":{"workspaces":[…]}}` line.
 3. `temactl subscribe focused_window` prints the current window, then another line when focus or the title changes, and nothing while the pointer only moves.
 4. Waybar `custom/window` as in the README shows the focused title. Stopping tema clears it. Starting tema again fills it back in without restarting Waybar.
+5. `temactl subscribe bell` prints nothing until a client rings `xdg_system_bell_v1`. The line is `{"event":"bell","window":null}` or `{"event":"bell","window":N}`. A second ring for that same window within 100 ms prints nothing.
+6. `temactl focused-window` shows `tag`, `description`, and `icon` when the focused window set them. `temactl window-icon ID` prints the name and the chosen size. `temactl window-icon ID -o /tmp/icon.png` writes a PNG.
+
+## 27. xdg staging protocols
+
+Five version-1 globals from wayland-protocols staging. The interfaces are generated from the host XML and are not vendored. Bell, tag, icon, and toplevel drag are registered in `src/globals.rs`. The session manager is added and removed on its own, as described below. X windows do not implement any of them. A protocol error uses the spec's own code and disconnects the client.
+
+### `xdg-system-bell-v1`
+
+`xdg_system_bell_v1` is `src/wayland_objects/xdg_system_bell_v1.rs`. `ring` with no surface, or with a surface that is not a window, emits the IPC `bell` from section 26 with a null window. Any other surface uses its root window. The object lives until `destroy` or the client disconnects. `ring` itself has no protocol error. Nothing is played.
+
+### Manual check
+
+1. `temactl subscribe bell`, then a client `ring` with no surface. One `{"event":"bell","window":null}` line appears. A repeat within 100 ms adds nothing.
+
+### `xdg-toplevel-tag-v1`
+
+`xdg_toplevel_tag_manager_v1` is `src/wayland_objects/xdg_toplevel_tag_manager_v1.rs`. `set_toplevel_tag` and `set_toplevel_description` write `Option<String>` on `XdgToplevel` immediately. The spec does not double-buffer them. An empty string is stored as absent. A change updates the IPC window through `note_window_metadata`. The strings die with the toplevel. An empty string is not a protocol error. An unknown toplevel disconnects through the usual object lookup. Nothing matches windows by tag or description.
+
+### Manual check
+
+1. A client sets a tag on the focused window. `temactl focused-window` shows `tag`. An empty tag removes the field.
+
+### `xdg-toplevel-icon-v1`
+
+The manager and the icon object are `src/wayland_objects/xdg_toplevel_icon_manager_v1.rs` and `xdg_toplevel_icon_v1.rs`. Bind sends `icon_size` for 16, 24, 32, 48, 64, and 128, then `done`. `set_name` stores the name. An empty name is absent. Names are not resolved through an icon theme. `add_buffer` copies square `wl_shm` `ARGB8888` or `XRGB8888` pixels at that moment. `XRGB8888` alpha is forced to opaque. At most 16 images are kept, and an edge larger than 256 is ignored. A larger image or any other shm format is ignored and logged at debug. A non-shm buffer, a non-square buffer, a destroyed buffer, a bad stride, or `scale < 1` is `invalid_buffer` and disconnects. A seventeenth new size is ignored. The same size and scale replaces the previous copy. `no_buffer` is never raised, because the pixels are already copied. `set_icon` on the manager stores a pending icon, or clears it when the icon argument is null. The toplevel's next `wl_surface.commit` freezes that icon into an `Rc` and publishes it. After that freeze the icon object is immutable: `set_name` and `add_buffer` are `immutable` and disconnect. `destroy` is still allowed. The published icon stays on the toplevel until a later commit replaces it. The IPC summary and the `window_icon` request are in section 26.
+
+### Manual check
+
+1. A client commits an icon. `temactl focused-window` shows `icon.name` and `icon.sizes`. `temactl window-icon ID --size 32 --scale 1` prints that image. A buffer that is not square disconnects the client.
+
+### `xdg-session-management-v1`
+
+The live sessions are `src/session.rs`. The file and the flush timer are `src/session_store/`. The protocol objects are `src/wayland_objects/xdg_session_manager_v1.rs`, `xdg_session_v1.rs`, and `xdg_toplevel_session_v1.rs`.
+
+The file is `$XDG_STATE_HOME/tema/sessions.json` when that variable is set and not empty, otherwise `$HOME/.local/state/tema/sessions.json`. If neither variable yields a path, `state.session_store` stays unset and the global is not advertised. The store is loaded at startup. A missing file is an empty store. An unreadable file, an unsupported version, or invalid JSON is quarantined, logged, and replaced by an empty store. `[session_management] enabled` defaults to true and only controls whether `xdg_session_manager_v1` is advertised. A reload adds or withdraws that global. Withdrawing it leaves the file in place. Saves are written five seconds after the last change, and once at shutdown.
+
+Each toplevel record stores the output connector name, the workspace name, fullscreen, and floating geometry relative to that output's origin. Tiled geometry is null. The place in the tile tree is not stored. A workspace is identified by the connector name together with the workspace name.
+
+`get_session` with an empty id, or with an id that is not in the store, creates a session and sends `created`. A known id sends `restored`. `invalid_session_id` is not raised. Invalid UTF-8 never reaches this request. Another client that already holds the id receives `replaced`, and its session object becomes inert. The same client asking again is `in_use`. An unknown reason is `invalid_reason`.
+
+`add_toplevel` and `restore_toplevel` register the name on the live session. An empty name is `invalid_name`. A toplevel that already belongs to a session is `already_added`. A name already live in this session is `name_in_use`. A name that exists only in the store is replaced by the next sample. `restore_toplevel` after the initial commit is `already_mapped`. Restore runs on that initial commit, before the first configure. A child that was tiled and not fullscreen is left unrestored. Launch and session-restore move the window only when the saved workspace is still active. Recover uses the saved workspace even when it is not active. Otherwise the active workspace of the saved output is used, when that output is still enabled. tema does not create a workspace for a restore and does not activate one. Floating geometry is placed from the saved output origin. Fullscreen is applied. A tiled window then takes part in the normal tile layout.
+
+A layout change re-samples every live toplevel. `remove` deletes the session from the store and does not sample. Destroy and client disconnect sample first, then drop the live session. X windows are not recorded.
+
+### Manual check
+
+1. With `[session_management] enabled = true`, `wayland-info` lists `xdg_session_manager_v1`. Setting `enabled = false` and saving the config removes it from a newly started client. `$XDG_STATE_HOME/tema/sessions.json` is still there.
+2. Quit an app that restores its windows, then start it again. A floating window returns to its output and its place on that output. A tiled window returns to that workspace and is tiled with the others. Its old split is not restored.
+3. Two clients restoring the same session id: the first receives `replaced`.
+
+### `xdg-toplevel-drag-v1`
+
+The protocol objects are `src/wayland_objects/xdg_toplevel_drag_manager_v1.rs` and `xdg_toplevel_drag_v1.rs`. The seat state is `src/input/toplevel_drag.rs`. `get_xdg_toplevel_drag` requires a `wl_data_source` that has not been used and that has no drag yet. Anything else is `invalid_source` on the manager. `attach` before `start_drag` is stored on the drag object and applied when the drag starts. `attach` during the drag places the window. A toplevel that already belongs to another drag, or a second mapped toplevel while one is still attached, is `toplevel_attached`. `destroy` of the drag object during the drag is `ongoing_drag`.
+
+A window that was already tiled is picked up immediately as tema's tiled-drag preview. The client's offset is ignored. The window stays on its own workspace, including when the pointer is over another output. A drop inserts it into the tile under the pointer. A button release over no accepting target is the same drop. Cancel, including a session lock, restores the previous split. Unmapping during the drag does not put the window back into the tree.
+
+A window that was already floating follows the pointer at the client's offset. A drop leaves it where it is. Cancel puts it back at the position it had when it was attached. Its workspace does not change.
+
+A window that was not mapped at attach becomes floating and is placed under the pointer when it maps. A drop moves it to the active workspace of the output under the pointer. When the drag's source window was floating, the new window stays floating. Otherwise it is tiled at the pointer, or it becomes the only tile when that workspace has none. Cancel leaves it floating where it is. Destroying it during the drag places nothing.
+
+This path does not take the compositor pointer grab and does not change the cursor. The dragged window is left out of the drop-target pick. Escape does not cancel the drag. A session pause cancels it before button releases are replayed.
+
+### Manual check
+
+1. Drag a tab out of a tiled browser window onto another tile. The new window tiles there. Drag a tab out of a floating window. The new window floats where it was dropped.
+2. Start the drag, then lock the session. A window that was already tiled is back in its old split. A window that appeared during the drag is still floating.

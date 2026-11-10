@@ -37,8 +37,10 @@ enabled = true
 scaling_mode = "default"
 
 # xdg-session-management: apps can ask tema to remember where their windows were.
-# Data lives in $XDG_STATE_HOME/tema/sessions.json. Disabling hides the protocol
-# from new clients; stored data is kept. Applies on reload.
+# The file is $XDG_STATE_HOME/tema/sessions.json when that variable is set and
+# not empty, otherwise $HOME/.local/state/tema/sessions.json. If neither is
+# usable, the protocol is not advertised. Disabling hides it from new clients;
+# stored data is kept. Applies on reload.
 [session_management]
 enabled = true
 
