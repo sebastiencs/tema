@@ -1864,7 +1864,7 @@ impl Client {
                 data_device.take_drag_offer()
             };
             if let Some(previous_offer) = previous_offer {
-                self.destroy_data_offer(state, dispatcher, previous_offer);
+                self.detach_drag_offer(state, dispatcher, previous_offer);
             }
 
             let offer = source.and_then(|source| {
@@ -5360,6 +5360,72 @@ mod drag_offer_lifetime_tests {
                 .unwrap();
         }
         assert!(!fixture.client.contains_object(offer_id, &fixture.state));
+        assert!(!client_closed(&dispatcher, client_id));
+    }
+
+    #[test]
+    fn drag_enter_detaches_previous_offer_instead_of_deleting_it() {
+        let mut fixture = drag_fixture(DragPhase::Dragging, None, 0);
+        let previous_id = fixture.offer.wayland_id();
+        let client_id = fixture.client.client_id();
+        let source_id = WlDataSourceId::from(11);
+        let (source, _) = fixture.client.insert_object(
+            &mut fixture.state,
+            crate::wayland_objects::wl_data_source::WlDataSource::new(
+                source_id,
+                fixture.client.client_id(),
+                3,
+            ),
+        );
+        let mut dispatcher = Dispatcher::default();
+        {
+            let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            fixture.client.handle_data_device_drag_enter(
+                &mut fixture.state,
+                &mut client_dispatcher,
+                1,
+                test_resolved_wl_surface(client_id, 31, ObjectId::from(0usize)),
+                1.0,
+                2.0,
+                Some(source),
+            );
+        }
+
+        assert!(fixture.client.contains_object(previous_id, &fixture.state));
+        assert!(fixture
+            .client
+            .ref_object(previous_id, &fixture.state)
+            .is_detached());
+        let data_device_id = WlDataDeviceId::from(2);
+        let new_offer = fixture
+            .client
+            .ref_object(data_device_id, &fixture.state)
+            .drag_offer()
+            .expect("enter creates the next drag offer");
+        assert_ne!(new_offer.wayland_id(), previous_id);
+        assert!(fixture
+            .client
+            .contains_object(new_offer.wayland_id(), &fixture.state));
+
+        {
+            let mut client_dispatcher = fixture.client.test_dispatcher(&mut dispatcher);
+            let previous = fixture
+                .state
+                .objects
+                .grab_object::<WlDataOffer>(fixture.offer.object_id());
+            previous
+                .on(
+                    &mut fixture.client,
+                    &mut fixture.state,
+                    set_actions_request(
+                        previous_id,
+                        DndAction::Copy as u32,
+                        DndAction::Copy as u32,
+                    ),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
         assert!(!client_closed(&dispatcher, client_id));
     }
 }

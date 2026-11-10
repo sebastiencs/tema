@@ -59,6 +59,10 @@ impl WlDataDevice {
         self.drag_offer = offer_id;
     }
 
+    pub fn drag_offer(&self) -> Option<Resolved<WlDataOfferId>> {
+        self.drag_offer
+    }
+
     pub fn send_data_offer(
         &self,
         offer: Resolved<WlDataOfferId>,
