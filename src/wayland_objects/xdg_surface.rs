@@ -35,7 +35,7 @@ enum ConfigureState {
     Popup(PopupConfigureState),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct ToplevelConfigureState {
     width: i32,
     height: i32,
@@ -299,6 +299,20 @@ impl XdgSurface {
         let serial = self.next_configure_serial;
         self.next_configure_serial = self.next_configure_serial.saturating_add(1);
         serial
+    }
+
+    /// The toplevel configure most recently sent: the newest unacked one, or
+    /// the last acked one. `None` before the first configure, after a reset,
+    /// or when the newest configure is not a toplevel configure.
+    fn latest_toplevel_configure(&self) -> Option<&ToplevelConfigureState> {
+        let latest = self
+            .pending_configures
+            .back()
+            .or(self.last_acked.as_ref())?;
+        match &latest.state {
+            ConfigureState::Toplevel(toplevel) => Some(toplevel),
+            _ => None,
+        }
     }
 
     pub(crate) fn queue_toplevel_configure(
@@ -870,6 +884,9 @@ pub mod xdg_toplevel {
         decoration_object: Option<Resolved<ZxdgToplevelDecorationV1Id>>,
         /// Version 2+ decorations switch back to an unnegotiated mode on the next surface commit.
         decoration_revert_on_commit: bool,
+        /// `configure_bounds` passed with the last configure, sent or not (old
+        /// clients do not get the event).
+        last_configure_bounds: Option<(i32, i32)>,
     }
 
     struct SyncPublishedShellState {
@@ -932,6 +949,7 @@ pub mod xdg_toplevel {
                 window_geometry: None,
                 decoration_object: None,
                 decoration_revert_on_commit: false,
+                last_configure_bounds: None,
             }
         }
 
@@ -1027,10 +1045,11 @@ pub mod xdg_toplevel {
         }
 
         fn send_configure_bounds(
-            &self,
+            &mut self,
             configure_bounds: Option<(i32, i32)>,
             dispatcher: &mut ClientDispatcher,
         ) {
+            self.last_configure_bounds = configure_bounds;
             if self.wm_base_version < proto_xdg_toplevel::CONFIGURE_BOUNDS_SINCE {
                 return;
             }
@@ -1247,6 +1266,26 @@ pub mod xdg_toplevel {
 
         pub fn decoration_mode_for_configure(&self) -> ToplevelDecorationMode {
             self.pending_decoration_mode.unwrap_or(self.decoration_mode)
+        }
+
+        /// True when a configure with these values would repeat the last one
+        /// sent, so it can be skipped.
+        pub(super) fn configure_is_current(
+            &self,
+            xdg_surface: &XdgSurface,
+            width: i32,
+            height: i32,
+            states: &[u32],
+            configure_bounds: Option<(i32, i32)>,
+        ) -> bool {
+            let Some(latest) = xdg_surface.latest_toplevel_configure() else {
+                return false;
+            };
+            latest.width == width
+                && latest.height == height
+                && latest.states == states
+                && latest.decoration_mode == self.decoration_mode_for_configure()
+                && self.last_configure_bounds == configure_bounds
         }
 
         pub fn requested_decoration_mode(&self, state: &State) -> Option<ToplevelDecorationMode> {
@@ -1583,6 +1622,11 @@ pub mod xdg_toplevel {
         #[cfg(test)]
         pub(crate) fn test_set_decoration_mode(&mut self, mode: ToplevelDecorationMode) {
             self.decoration_mode = mode;
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_set_last_configure_bounds(&mut self, bounds: Option<(i32, i32)>) {
+            self.last_configure_bounds = bounds;
         }
 
         pub fn reset_on_unmap(&mut self) {
@@ -2580,7 +2624,7 @@ mod tests {
                 wl_surface::Role,
                 xdg_popup::XdgPopup,
                 xdg_positioner::PositionerState,
-                xdg_surface::xdg_toplevel::XdgToplevel,
+                xdg_surface::xdg_toplevel::{ToplevelDecorationMode, XdgToplevel},
                 zwlr_layer_surface_v1::{LayerShellLayer, ZwlrLayerSurfaceV1},
                 zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
             },
@@ -2788,6 +2832,91 @@ mod tests {
 
         assert_eq!(xdg_surface.pending_window_geometry, None);
         assert_eq!(xdg_surface.current_window_geometry, None);
+    }
+
+    fn test_xdg_surface() -> XdgSurface {
+        XdgSurface::new(
+            XdgSurfaceId::from(11),
+            Resolved::new(ClientId::from_raw(1), XdgWmBaseId::from(1), ObjectId::from(1usize)),
+            Resolved::new(ClientId::from_raw(1), WlSurfaceId::from(10), ObjectId::from(10usize)),
+            7,
+        )
+    }
+
+    fn test_toplevel() -> XdgToplevel {
+        XdgToplevel::new(
+            XdgToplevelId::from(12),
+            Resolved::new(ClientId::from_raw(1), XdgSurfaceId::from(11), ObjectId::from(11usize)),
+            7,
+            crate::window::WindowId::for_tests(1),
+        )
+    }
+
+    fn queue_test_toplevel_configure(xdg_surface: &mut XdgSurface) -> Vec<u32> {
+        let client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let states = vec![1, 4];
+        xdg_surface.queue_toplevel_configure(
+            80,
+            60,
+            states.clone(),
+            ToplevelDecorationMode::ClientSide,
+            &mut client_dispatcher,
+        );
+        states
+    }
+
+    #[test]
+    fn configure_is_current_is_false_before_any_configure() {
+        let xdg_surface = test_xdg_surface();
+        let toplevel = test_toplevel();
+        assert!(!toplevel.configure_is_current(&xdg_surface, 80, 60, &[], None));
+    }
+
+    #[test]
+    fn configure_is_current_matches_last_pending_configure() {
+        let mut xdg_surface = test_xdg_surface();
+        let mut toplevel = test_toplevel();
+        let states = queue_test_toplevel_configure(&mut xdg_surface);
+        toplevel.test_set_last_configure_bounds(Some((80, 60)));
+
+        assert!(toplevel.configure_is_current(&xdg_surface, 80, 60, &states, Some((80, 60))));
+        assert!(!toplevel.configure_is_current(&xdg_surface, 81, 60, &states, Some((80, 60))));
+        assert!(!toplevel.configure_is_current(&xdg_surface, 80, 61, &states, Some((80, 60))));
+        let mut other_states = states.clone();
+        other_states[0] = 9;
+        assert!(!toplevel.configure_is_current(
+            &xdg_surface,
+            80,
+            60,
+            &other_states,
+            Some((80, 60)),
+        ));
+        assert!(!toplevel.configure_is_current(&xdg_surface, 80, 60, &states, Some((79, 60))));
+    }
+
+    #[test]
+    fn configure_is_current_falls_back_to_last_acked() {
+        let mut xdg_surface = test_xdg_surface();
+        let mut toplevel = test_toplevel();
+        let states = queue_test_toplevel_configure(&mut xdg_surface);
+        toplevel.test_set_last_configure_bounds(Some((80, 60)));
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+
+        assert!(xdg_surface.pending_configures.is_empty());
+        assert!(toplevel.configure_is_current(&xdg_surface, 80, 60, &states, Some((80, 60))));
+    }
+
+    #[test]
+    fn configure_is_current_is_false_after_reset() {
+        let mut xdg_surface = test_xdg_surface();
+        let mut toplevel = test_toplevel();
+        let states = queue_test_toplevel_configure(&mut xdg_surface);
+        toplevel.test_set_last_configure_bounds(Some((80, 60)));
+        xdg_surface.reset_configure_state();
+
+        assert!(!toplevel.configure_is_current(&xdg_surface, 80, 60, &states, Some((80, 60))));
     }
 
     #[test]
