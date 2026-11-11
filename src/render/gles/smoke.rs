@@ -653,3 +653,102 @@ fn gles_cursor_target_keeps_top_left_and_clears_the_rest() {
     assert_eq!(pixel(&bytes, 16, 0, 0), [255, 255, 255, 255]);
     assert_eq!(pixel(&bytes, 16, 1, 0), [0, 0, 0, 0], "previous cursor row was cleared");
 }
+
+#[test]
+fn surface_blur_covers_its_rects_and_leaves_the_gap() {
+    let Some(mut device) = device() else {
+        eprintln!("skipping GLES smoke: no DRM render node");
+        return;
+    };
+    let width = 8;
+    let height = 2;
+    let mut bytes = Vec::with_capacity((width * height * 4) as usize);
+    for _y in 0..height {
+        for x in 0..width {
+            let color = if x % 2 == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+            bytes.extend_from_slice(&color);
+        }
+    }
+    let texture = device
+        .renderer
+        .import_shm(ShmImage {
+            bytes: &bytes,
+            width,
+            height,
+            stride: (width * 4) as usize,
+            fourcc: DrmFourcc::Argb8888,
+        })
+        .expect("shm import");
+    let rect = RectI::new(0, 0, width, height).unwrap();
+    let left = RectI::new(0, 0, 2, height).unwrap();
+    let right = RectI::new(5, 0, 2, height).unwrap();
+    let region = crate::render::BlurRegion {
+        bounds: RectI::new(0, 0, 7, height).unwrap(),
+        rects: Rc::from(vec![left, right]),
+    };
+    let sharp = OutputFrameRecipe {
+        elements: vec![texture_element(Rc::clone(&texture), width, height)],
+    };
+    let blurred = OutputFrameRecipe {
+        elements: vec![
+            texture_element(texture, width, height),
+            FrameElement::Effect {
+                phase: FramePhase::UnderWindow,
+                element: EffectElement::SurfaceBlurBackdrop {
+                    region,
+                    style: crate::render::BlurVisualStyle { radius: 2, passes: 1 },
+                    alpha: u8::MAX,
+                },
+            },
+        ],
+    };
+    let mut target = device
+        .renderer
+        .create_offscreen_target(width, height)
+        .expect("offscreen");
+    let damage = DamageRegion::from_rect(rect);
+    let render = |renderer: &mut GlesRenderer,
+                  target: &mut dyn crate::render::RenderTarget,
+                  recipe: &OutputFrameRecipe| {
+        renderer
+            .render(
+                target,
+                RenderFrame {
+                    recipe,
+                    damage: &damage,
+                    preserve_contents: false,
+                    presentation_transform: OutputPresentationTransform::FlipY,
+                    sync_mode: RenderSyncMode::BlockingFinishFallback,
+                    blur_reference: None,
+                    clear_color: None,
+                    linear_blend: None,
+                },
+            )
+            .expect("render");
+    };
+    render(&mut device.renderer, &mut *target, &sharp);
+    let stride = (width * 4) as usize;
+    let mut original = vec![0u8; stride * height as usize];
+    device
+        .renderer
+        .readback(&*target, rect, stride, &mut original)
+        .expect("sharp readback");
+    render(&mut device.renderer, &mut *target, &blurred);
+    let mut painted = vec![0u8; original.len()];
+    device
+        .renderer
+        .readback(&*target, rect, stride, &mut painted)
+        .expect("blur readback");
+
+    for x in [2, 3, 4, 7] {
+        assert_eq!(
+            pixel(&painted, stride, x, 0),
+            pixel(&original, stride, x, 0),
+            "pixel outside the blur rects changed at x={x}"
+        );
+    }
+    let inside = pixel(&painted, stride, 0, 0);
+    let was = pixel(&original, stride, 0, 0);
+    assert_ne!(inside, was, "blur should mix the stripe under the first rect");
+    assert!(inside[2] > 0, "blurred red stripe should pick up blue, got {inside:?}");
+}

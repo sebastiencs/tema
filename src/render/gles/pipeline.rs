@@ -698,15 +698,20 @@ impl GlesDraw<'_> {
         .and_then(|bounds| bounds.intersection(output_bounds))
     }
 
+    /// Copy `blur_bounds` out of the framebuffer and blur it. The caller masks
+    /// the result: a window passes its padded ring box, a client region passes
+    /// `BlurRegion::bounds`.
     fn build_blurred_backdrop(
         &self,
         framebuffer_object: gl::GLuint,
         target_height: i32,
-        ring: crate::render::RoundedRing,
+        blur_bounds: RectI,
         blur_style: BlurVisualStyle,
         output_transform: OutputPresentationTransform,
     ) -> Option<(TextureFrameBuffer, RectI)> {
-        let blur_bounds = self.blur_snapshot_bounds(ring.outer, blur_style)?;
+        if blur_bounds.is_empty() {
+            return None;
+        }
         let copy_rect = framebuffer_rect_for_target(target_height, blur_bounds, output_transform)?;
         let blur_input = TextureFrameBuffer::new(blur_bounds.width, blur_bounds.height)?;
         unsafe {
@@ -1005,10 +1010,14 @@ impl GlesDraw<'_> {
                     next_index += 1;
                     match effect {
                         EffectElement::WindowBlurBackdrop { ring, style, alpha } => {
+                            let Some(blur_bounds) = self.blur_snapshot_bounds(ring.outer, *style)
+                            else {
+                                continue;
+                            };
                             let Some((texture, blur_bounds)) = self.build_blurred_backdrop(
                                 framebuffer_object,
                                 target_height,
-                                *ring,
+                                blur_bounds,
                                 *style,
                                 output_transform,
                             ) else {
@@ -1086,9 +1095,57 @@ impl GlesDraw<'_> {
                                 *alpha,
                             );
                         }
-                        EffectElement::SurfaceBlurBackdrop { .. } => {
-                            // Wired in phase 6. The region is already in the frame plan.
-                            continue;
+                        EffectElement::SurfaceBlurBackdrop { region, style, alpha } => {
+                            let Some(output_bounds) = RectI::new(0, 0, target_width, target_height)
+                            else {
+                                continue;
+                            };
+                            let Some(blur_bounds) = region.bounds.intersection(output_bounds)
+                            else {
+                                continue;
+                            };
+                            let Some((blurred, blur_bounds)) = self.build_blurred_backdrop(
+                                framebuffer_object,
+                                target_height,
+                                blur_bounds,
+                                *style,
+                                output_transform,
+                            ) else {
+                                continue;
+                            };
+                            let texture = self.borrowed_texture(blurred.texture);
+                            let mut items = Vec::new();
+                            for rect in region.rects.iter().copied() {
+                                let Some(rect) = rect.intersection(blur_bounds) else {
+                                    continue;
+                                };
+                                items.push(RenderItem {
+                                    source: TextureSource::Texture,
+                                    texture: Rc::clone(&texture),
+                                    x: rect.x,
+                                    y: rect.y,
+                                    width: rect.width,
+                                    height: rect.height,
+                                    tex_transform: blur_source_transform(blur_bounds, rect),
+                                    damage: DamageRegion::from_rect(rect),
+                                    blend: true,
+                                    alpha: *alpha,
+                                    alpha_multiplier: u32::MAX,
+                                    color: None,
+                                    alpha_mode: 0,
+                                    yuv: None,
+                                    mask: RenderItemMask::None,
+                                });
+                            }
+                            self.render_texture_elements_to_target(
+                                framebuffer_object,
+                                target_width,
+                                target_height,
+                                &items,
+                                projection,
+                                damage,
+                                output_transform,
+                            );
                         }
                         EffectElement::DimOverlay { clip, alpha } => {
                             let Some(texture) = self.dim_texture() else {
@@ -1681,6 +1738,14 @@ fn scissor_y(
         .unwrap_or(0)
 }
 
+/// Map the unit square onto `rect` inside the blurred `bounds` texture.
+fn blur_source_transform(bounds: RectI, rect: RectI) -> Mat3 {
+    let width = bounds.width as f32;
+    let height = bounds.height as f32;
+    Mat3::translation((rect.x - bounds.x) as f32 / width, (rect.y - bounds.y) as f32 / height)
+        .mul(Mat3::scale(rect.width as f32 / width, rect.height as f32 / height))
+}
+
 fn framebuffer_rect_for_target(
     target_height: i32,
     rect: RectI,
@@ -1711,8 +1776,15 @@ fn shadow_color_with_alpha(color: crate::config::RgbaColor, alpha: u8) -> [f32; 
 #[cfg(test)]
 mod tests {
     use {
-        super::{blur_pass_draws, framebuffer_rect_for_target, shadow_color_with_alpha},
-        crate::{config::RgbaColor, region::RectI, transform::OutputPresentationTransform},
+        super::{
+            blur_pass_draws, blur_source_transform, framebuffer_rect_for_target,
+            shadow_color_with_alpha,
+        },
+        crate::{
+            config::RgbaColor,
+            region::RectI,
+            transform::{Mat3, OutputPresentationTransform},
+        },
     };
 
     #[test]
@@ -1746,6 +1818,20 @@ mod tests {
         assert!(source.contains("gl::CopyTexSubImage2D("));
         assert!(source
             .contains("framebuffer_rect_for_target(target_height, blur_bounds, output_transform)"));
+    }
+
+    #[test]
+    fn blur_source_transform_selects_the_rect_inside_the_blurred_bounds() {
+        let bounds = RectI::new(10, 20, 40, 20).unwrap();
+        let whole = blur_source_transform(bounds, bounds);
+        assert_eq!(whole.transform_point(0.0, 0.0), (0.0, 0.0));
+        assert_eq!(whole.transform_point(1.0, 1.0), (1.0, 1.0));
+
+        let rect = RectI::new(30, 20, 20, 10).unwrap();
+        let source = blur_source_transform(bounds, rect);
+        assert_eq!(source.transform_point(0.0, 0.0), (0.5, 0.0));
+        assert_eq!(source.transform_point(1.0, 1.0), (1.0, 0.5));
+        assert_ne!(source, Mat3::identity());
     }
 
     #[test]
