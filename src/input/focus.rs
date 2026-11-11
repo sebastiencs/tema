@@ -109,6 +109,9 @@ fn set_keyboard_focus_with_snapshot(
     crate::capture::sync_activated_from_keyboard_focus(state, dispatcher);
     crate::input::pointer_lock::maybe_activate_pointer_lock(state, dispatcher);
     crate::input::pointer_confine::maybe_activate_pointer_confine(state, dispatcher);
+    if state.clear_urgency_for_focused_window().is_some() {
+        dispatcher.dispatch(crate::clients::ClientManagerAction::WorkspaceStateChanged);
+    }
 }
 
 pub(crate) fn set_keyboard_focus_from_surface(
@@ -1071,6 +1074,34 @@ mod tests {
             state.seat.keyboard_focus().map(|focus| focus.surface),
             Some(windows.under_pointer)
         );
+    }
+
+    #[test]
+    fn focusing_an_urgent_window_clears_it_and_republishes() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let output_id = state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 100, 100));
+        let workspace_id = state.active_workspace_for_output(output_id).unwrap();
+        let surface = insert_root(&mut state, 90);
+        let window = state.window_for_root(surface).unwrap();
+
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(surface)));
+        assert_eq!(workspace_state_changed(&dispatcher), 0);
+
+        set_keyboard_focus(&mut state, &mut dispatcher, None);
+        assert!(state.set_window_urgent(window, true));
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(surface)));
+
+        assert!(!state.managed_window_state(window).unwrap().urgent);
+        assert!(!state.workspace_is_urgent(workspace_id));
+        assert_eq!(workspace_state_changed(&dispatcher), 1);
+    }
+
+    fn workspace_state_changed(dispatcher: &Dispatcher) -> usize {
+        dispatcher.test_count_queued_action::<crate::clients::ClientManagerAction>(|action| {
+            matches!(action, crate::clients::ClientManagerAction::WorkspaceStateChanged)
+        })
     }
 }
 

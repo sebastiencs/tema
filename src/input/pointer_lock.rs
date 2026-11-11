@@ -511,6 +511,7 @@ mod tests {
                 hold_floating_layout: false,
                 resize_anchor: None,
                 tiled_content_basis: None,
+                urgent: false,
                 focus_animation: FocusVisualAnimation::settled(WindowVisualBase {
                     content_alpha: 255,
                     dim_alpha: 0,

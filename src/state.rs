@@ -612,6 +612,8 @@ pub struct ManagedWindowState {
     /// content size. `None` until that first happens, and cleared when the
     /// window leaves tiling or becomes fullscreen.
     pub tiled_content_basis: Option<RectI>,
+    /// Set when the window was activated without receiving keyboard focus.
+    pub urgent: bool,
     pub focus_animation: FocusVisualAnimation,
     pub lifecycle_animation: WindowLifecycleAnimation,
     pub geometry_animation: WindowGeometryAnimation,
@@ -1481,6 +1483,7 @@ impl State {
             hold_floating_layout: false,
             resize_anchor: None,
             tiled_content_basis: None,
+            urgent: false,
             focus_animation: FocusVisualAnimation::settled(self.focus_visual_base(root)),
             lifecycle_animation: WindowLifecycleAnimation::idle(),
             geometry_animation: WindowGeometryAnimation::unarmed(),
@@ -1825,6 +1828,9 @@ impl State {
             tiling::mark_workspace_dirty(self, previous_workspace);
         }
         tiling::mark_workspace_dirty(self, workspace_id);
+        // Activation does not choose a focus target. The window that already owns
+        // keyboard focus is cleared here; a later focus change clears the window that receives it.
+        self.clear_focused_window_urgency_on(workspace_id);
         true
     }
 
@@ -2003,6 +2009,7 @@ impl State {
             }
             tiling::mark_workspace_dirty(self, previous_workspace_id);
         }
+        let destination_is_active = self.workspace_is_active(workspace_id);
         let Some(workspace) = self.workspaces.try_get_mut(workspace_id) else {
             self.root_surface_workspaces.remove(&surface);
             return false;
@@ -2013,6 +2020,9 @@ impl State {
             if self.managed_windows.contains_key(&window) {
                 let managed = self.managed_windows.get_mut(&window).unwrap();
                 managed.workspace_id = workspace_id;
+                if destination_is_active {
+                    managed.urgent = false;
+                }
                 managed.geometry_animation.prefer_relocation();
             } else {
                 let managed = self.fresh_managed_window(surface, workspace_id);
@@ -2116,6 +2126,48 @@ impl State {
             .and_then(|workspace| workspace.group)
             .and_then(|group_id| self.workspace_groups.try_get(group_id))
             .is_some_and(|group| group.active_workspace == Some(workspace_id))
+    }
+
+    /// Returns true when `window`'s urgency flag changed. A missing window returns false.
+    pub fn set_window_urgent(&mut self, window: WindowId, urgent: bool) -> bool {
+        let Some(managed) = self.managed_window_state_mut(window) else {
+            return false;
+        };
+        if managed.urgent == urgent {
+            return false;
+        }
+        managed.urgent = urgent;
+        true
+    }
+
+    pub fn workspace_is_urgent(&self, workspace_id: WorkspaceId) -> bool {
+        self.managed_windows
+            .values()
+            .any(|managed| managed.workspace_id == workspace_id && managed.urgent)
+    }
+
+    /// Clears urgency on the window that owns keyboard focus.
+    ///
+    /// Returns that window's workspace when the flag changed, so the caller can republish it.
+    pub fn clear_urgency_for_focused_window(&mut self) -> Option<WorkspaceId> {
+        let window = self.focused_window()?;
+        if !self.set_window_urgent(window, false) {
+            return None;
+        }
+        self.managed_window_state(window)
+            .map(|managed| managed.workspace_id)
+    }
+
+    fn clear_focused_window_urgency_on(&mut self, workspace_id: WorkspaceId) {
+        let Some(window) = self.focused_window() else {
+            return;
+        };
+        let on_workspace = self
+            .managed_window_state(window)
+            .is_some_and(|managed| managed.workspace_id == workspace_id);
+        if on_workspace {
+            let _ = self.set_window_urgent(window, false);
+        }
     }
 
     pub fn relayout_dirty_workspaces(&mut self) -> Vec<Resolved<WlSurfaceId>> {
@@ -6909,5 +6961,121 @@ mod tests {
         let workspace = state.workspaces.try_get(workspace_id).unwrap();
         assert_eq!(workspace.group, None);
         assert!(workspace.coordinates.is_empty());
+    }
+
+    fn urgent_workspaces(state: &mut State) -> (WorkspaceId, WorkspaceId, WorkspaceId) {
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let output_id = state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 100, 100));
+        let group_id = state.workspace_group_for_output(output_id).unwrap();
+        let workspaces = state.workspace_groups[group_id].workspaces.clone();
+        (workspaces[0], workspaces[1], workspaces[2])
+    }
+
+    fn urgent_window(state: &mut State, raw: u32) -> WindowId {
+        let (_, object_id) =
+            state.insert_object(WlSurface::new(WlSurfaceId::from(raw), ClientId::from_raw(1), 6));
+        let surface = root(state, object_id);
+        state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface)
+    }
+
+    #[test]
+    fn set_window_urgent_reports_whether_the_flag_changed() {
+        let mut state = state_for_tests();
+        let _ = urgent_workspaces(&mut state);
+        let window = urgent_window(&mut state, 40);
+
+        assert!(!state.set_window_urgent(WindowId::for_tests(999), true));
+        assert!(state.set_window_urgent(window, true));
+        assert!(!state.set_window_urgent(window, true));
+        assert!(state.set_window_urgent(window, false));
+        assert!(!state.set_window_urgent(window, false));
+        assert!(!state.managed_window_state(window).unwrap().urgent);
+    }
+
+    #[test]
+    fn workspace_is_urgent_when_any_of_its_windows_is() {
+        let mut state = state_for_tests();
+        let (active, _, _) = urgent_workspaces(&mut state);
+        let first = urgent_window(&mut state, 41);
+        let second = urgent_window(&mut state, 42);
+
+        assert!(!state.workspace_is_urgent(active));
+        assert!(state.set_window_urgent(first, true));
+        assert!(state.workspace_is_urgent(active));
+        assert!(state.set_window_urgent(second, true));
+        assert!(state.set_window_urgent(first, false));
+        assert!(state.workspace_is_urgent(active));
+        assert!(state.set_window_urgent(second, false));
+        assert!(!state.workspace_is_urgent(active));
+    }
+
+    #[test]
+    fn destroying_a_window_drops_its_urgency() {
+        let mut state = state_for_tests();
+        let (active, _, _) = urgent_workspaces(&mut state);
+        let window = urgent_window(&mut state, 43);
+        assert!(state.set_window_urgent(window, true));
+
+        state.destroy_window(window);
+
+        assert!(state.managed_window_state(window).is_none());
+        assert!(!state.workspace_is_urgent(active));
+    }
+
+    #[test]
+    fn moving_a_window_onto_the_active_workspace_clears_urgency() {
+        let mut state = state_for_tests();
+        let (active, inactive, other_inactive) = urgent_workspaces(&mut state);
+        let window = urgent_window(&mut state, 44);
+        assert!(state.assign_window_to_workspace(window, inactive));
+        assert!(state.set_window_urgent(window, true));
+
+        assert!(state.assign_window_to_workspace(window, other_inactive));
+        assert!(state.managed_window_state(window).unwrap().urgent);
+        assert!(state.workspace_is_urgent(other_inactive));
+
+        assert!(state.assign_window_to_workspace(window, active));
+        assert!(!state.managed_window_state(window).unwrap().urgent);
+        assert!(!state.workspace_is_urgent(active));
+        assert!(!state.workspace_is_urgent(other_inactive));
+    }
+
+    #[test]
+    fn activating_a_workspace_clears_only_its_focused_window() {
+        let mut state = state_for_tests();
+        let (_active, inactive, _) = urgent_workspaces(&mut state);
+        let focused = urgent_window(&mut state, 45);
+        let other = urgent_window(&mut state, 46);
+        let focused_surface = state.window_root_surface(focused).unwrap();
+        assert!(state.assign_window_to_workspace(focused, inactive));
+        assert!(state.assign_window_to_workspace(other, inactive));
+        assert!(state.set_window_urgent(focused, true));
+        assert!(state.set_window_urgent(other, true));
+        state.seat.keyboard_focus = Some(crate::input::SurfaceFocus::new(focused_surface));
+
+        assert!(state.activate_workspace(inactive));
+
+        assert!(!state.managed_window_state(focused).unwrap().urgent);
+        assert!(state.managed_window_state(other).unwrap().urgent);
+        assert!(state.workspace_is_urgent(inactive));
+    }
+
+    #[test]
+    fn activating_a_workspace_keeps_urgency_when_focus_is_elsewhere() {
+        let mut state = state_for_tests();
+        let (active, inactive, _) = urgent_workspaces(&mut state);
+        let stayed = urgent_window(&mut state, 47);
+        let away = urgent_window(&mut state, 48);
+        let away_surface = state.window_root_surface(away).unwrap();
+        assert!(state.assign_window_to_workspace(stayed, inactive));
+        assert!(state.set_window_urgent(stayed, true));
+        assert_eq!(state.managed_window_state(away).unwrap().workspace_id, active);
+        state.seat.keyboard_focus = Some(crate::input::SurfaceFocus::new(away_surface));
+
+        assert!(state.activate_workspace(inactive));
+
+        assert!(state.managed_window_state(stayed).unwrap().urgent);
+        assert!(state.workspace_is_urgent(inactive));
     }
 }
