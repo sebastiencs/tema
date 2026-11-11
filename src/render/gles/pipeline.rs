@@ -1086,6 +1086,10 @@ impl GlesDraw<'_> {
                                 *alpha,
                             );
                         }
+                        EffectElement::SurfaceBlurBackdrop { .. } => {
+                            // Wired in phase 6. The region is already in the frame plan.
+                            continue;
+                        }
                         EffectElement::DimOverlay { clip, alpha } => {
                             let Some(texture) = self.dim_texture() else {
                                 continue;

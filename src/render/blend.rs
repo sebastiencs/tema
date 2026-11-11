@@ -113,6 +113,20 @@ pub fn shadow_coverage(
     [color[0] * coverage, color[1] * coverage, color[2] * coverage, color[3] * coverage]
 }
 
+fn padded_blur_rect(bounds: RectI, style: crate::render::BlurVisualStyle) -> Option<RectI> {
+    let padding = style
+        .radius
+        .max(1)
+        .saturating_mul(i32::from(style.passes.max(1)))
+        .saturating_mul(4);
+    RectI::from_extents(
+        bounds.x.saturating_sub(padding),
+        bounds.y.saturating_sub(padding),
+        bounds.x2().saturating_add(padding),
+        bounds.y2().saturating_add(padding),
+    )
+}
+
 fn element_is_opaque(element: &FrameElement) -> bool {
     match element {
         FrameElement::Texture { element, .. } => {
@@ -136,17 +150,10 @@ fn element_rect(element: &FrameElement) -> Option<RectI> {
                 shadow_geometry(*clip, *style).map(|geometry| geometry.bounds)
             }
             EffectElement::WindowBlurBackdrop { ring, style, .. } => {
-                let padding = style
-                    .radius
-                    .max(1)
-                    .saturating_mul(i32::from(style.passes.max(1)))
-                    .saturating_mul(4);
-                RectI::from_extents(
-                    ring.outer.outer_rect.x.saturating_sub(padding),
-                    ring.outer.outer_rect.y.saturating_sub(padding),
-                    ring.outer.outer_rect.x2().saturating_add(padding),
-                    ring.outer.outer_rect.y2().saturating_add(padding),
-                )
+                padded_blur_rect(ring.outer.outer_rect, *style)
+            }
+            EffectElement::SurfaceBlurBackdrop { region, style, .. } => {
+                padded_blur_rect(region.bounds, *style)
             }
             EffectElement::DimOverlay { clip, .. } => Some(clip.outer_rect),
         },

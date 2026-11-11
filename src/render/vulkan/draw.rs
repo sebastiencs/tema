@@ -1034,18 +1034,22 @@ fn prepare_effect(
     element: &EffectElement,
     frame: &RenderFrame<'_>,
 ) -> Option<FrameOp> {
-    match *element {
+    match element {
         EffectElement::WindowBorder { ring, gradient, alpha } => {
-            prepare_border(device, draw, target, frame, ring, gradient, alpha).map(FrameOp::Quad)
+            prepare_border(device, draw, target, frame, *ring, *gradient, *alpha).map(FrameOp::Quad)
         }
         EffectElement::WindowShadow { clip, style, alpha } => {
-            prepare_shadow(device, draw, target, frame, clip, style, alpha).map(FrameOp::Quad)
+            prepare_shadow(device, draw, target, frame, *clip, *style, *alpha).map(FrameOp::Quad)
         }
         EffectElement::DimOverlay { clip, alpha } => {
-            prepare_dim(device, draw, target, frame, clip, alpha)
+            prepare_dim(device, draw, target, frame, *clip, *alpha)
         }
         EffectElement::WindowBlurBackdrop { ring, style, alpha } => {
-            prepare_blur(device, draw, target, frame, ring, style, alpha)
+            prepare_blur(device, draw, target, frame, *ring, *style, *alpha)
+        }
+        EffectElement::SurfaceBlurBackdrop { .. } => {
+            // Wired in phase 7. The region is already in the frame plan.
+            None
         }
     }
 }

@@ -14,9 +14,9 @@ use crate::{
         WlDataSourceId, WlSeatId, WlSurfaceId, ZwlrGammaControlV1Id, ZwlrLayerSurfaceV1Id,
         ZwpIdleInhibitorV1Id,
     },
-    region::RectI,
+    region::{DamageRegion, RectI},
     render::{
-        BlurVisualStyle, BorderGradient, BorderVisualStyle, RootSurfaceVisualState,
+        BlurRegion, BlurVisualStyle, BorderGradient, BorderVisualStyle, RootSurfaceVisualState,
         ShadowVisualStyle, SurfaceEffectStyle, WindowClip,
     },
     root_geometry::{self, CommittedRootGeometry, DecorationFrameLayout},
@@ -3481,6 +3481,71 @@ impl State {
 
     pub fn is_popup_root_surface(&self, surface: Resolved<WlSurfaceId>) -> bool {
         self.popup_parent_surface(surface).is_some()
+    }
+
+    /// Global blur for a layer surface, xdg toplevel, or xdg popup.
+    ///
+    /// `None` when blur is disabled, the role is not one of those, or the
+    /// committed region does not cover any of the root texture. The origin is
+    /// the one `render_state_at` uses: buffer offset for a composed root, and
+    /// `surface_scene_origin` plus that offset for a popup child.
+    pub fn root_surface_blur_region(&self, root: Resolved<WlSurfaceId>) -> Option<BlurRegion> {
+        if !self.config.effects.blur.enabled || !self.accepts_client_blur(root) {
+            return None;
+        }
+        let region = root.try_ref(self)?.committed_blur_region()?;
+        if region.is_empty() {
+            return None;
+        }
+        let surface_rect = self.root_texture_rect(root)?;
+        let mut blur = BlurRegion::from_surface_region(
+            &region,
+            surface_rect,
+            crate::render::visual::BLUR_REGION_RECT_CAP,
+        )?;
+        if let Some(clip) = self.root_surface_window_clip(root) {
+            let mut damage = DamageRegion::new();
+            for rect in blur.rects.iter().copied() {
+                damage.add_rect(rect);
+            }
+            crate::render::visual::clip_damage_to_window_clip(&mut damage, clip);
+            blur = BlurRegion::from_damage(&damage, crate::render::visual::BLUR_REGION_RECT_CAP)?;
+        }
+        Some(blur)
+    }
+
+    fn accepts_client_blur(&self, surface: Resolved<WlSurfaceId>) -> bool {
+        let Some(wl_surface) = surface.try_ref(self) else {
+            return false;
+        };
+        if !wl_surface.is_root() {
+            return false;
+        }
+        if wl_surface.layer_surface().is_some() {
+            return true;
+        }
+        let Some(xdg) = wl_surface.xdg_surface().and_then(|xdg| xdg.try_ref(self)) else {
+            return false;
+        };
+        xdg.toplevel_role().is_some() || xdg.popup_role().is_some()
+    }
+
+    /// Texture rectangle of a root, in the same coordinates as `SceneItemState.bounds`
+    /// before output translation. Popup children are positioned from
+    /// [`Self::surface_scene_origin`]; every other root is positioned from its
+    /// buffer offset, because the scene walks those with a zero base.
+    fn root_texture_rect(&self, surface: Resolved<WlSurfaceId>) -> Option<RectI> {
+        let wl_surface = surface.try_ref(self)?;
+        let base = if self
+            .popup_parent_surface_with_ref(surface, wl_surface)
+            .is_some()
+        {
+            self.surface_scene_origin_with_ref(surface, wl_surface)?
+        } else {
+            (0, 0)
+        };
+        let rendered = wl_surface.render_state_at(base.0, base.1)?;
+        RectI::new(rendered.x, rendered.y, rendered.width, rendered.height)
     }
 
     pub fn popup_child_surfaces(
@@ -7077,5 +7142,55 @@ mod tests {
 
         assert!(state.managed_window_state(stayed).unwrap().urgent);
         assert!(state.workspace_is_urgent(inactive));
+    }
+
+    #[test]
+    fn client_blur_follows_the_texture_only_while_blur_is_enabled() {
+        let mut state = state_for_tests();
+        let object_id = crate::test_support::insert_root_surface(&mut state, 70);
+        let surface = root(&state, object_id);
+        {
+            let mut wl = state.objects.grab_object::<WlSurface>(object_id);
+            wl.test_map(ObjectId::from(1usize), 8, 9, 20, 10);
+            wl.set_layer_surface_impl(Resolved::new(
+                ClientId::from_raw(1),
+                ZwlrLayerSurfaceV1Id::from(71),
+                ObjectId::from(71usize),
+            ));
+            let mut spec = crate::region::RegionSpec::default();
+            spec.add_rect(RectI::new(-4, -4, 100, 100).unwrap());
+            wl.test_set_committed_blur_region(Some(crate::region::RegionValue::from_spec(spec)));
+        }
+
+        assert!(state.root_surface_blur_region(surface).is_none());
+
+        state.config.effects.blur.enabled = true;
+        let blur = state.root_surface_blur_region(surface).unwrap();
+        assert_eq!(blur.rects.as_ref(), &[RectI::new(8, 9, 20, 10).unwrap()]);
+    }
+
+    #[test]
+    fn client_blur_ignores_a_subsurface() {
+        let mut state = state_for_tests();
+        state.config.effects.blur.enabled = true;
+        let parent_id = crate::test_support::insert_root_surface(&mut state, 72);
+        let (_, child_object) =
+            state.insert_object(WlSurface::new(WlSurfaceId::from(73), ClientId::from_raw(1), 6));
+        let child = root(&state, child_object);
+        let parent = root(&state, parent_id);
+        let subsurface = crate::test_support::insert_wl_subsurface_client1(
+            &mut state,
+            crate::protocol_generated::WlSubsurfaceId::from(74),
+            child_object,
+            parent_id,
+        );
+        {
+            let mut wl = state.objects.grab_object::<WlSurface>(child_object);
+            wl.assign_subsurface(subsurface, parent);
+            wl.test_map(ObjectId::from(1usize), 0, 0, 10, 10);
+            wl.test_set_committed_blur_region(Some(crate::region::RegionValue::infinite()));
+        }
+
+        assert!(state.root_surface_blur_region(child).is_none());
     }
 }

@@ -4,7 +4,7 @@ use crate::{color::ColorTransform, region::DamageRegion, state::RootSurfaceClip,
 
 use super::Texture;
 
-use super::visual::{BlurVisualStyle, BorderGradient, RoundedRing, ShadowVisualStyle};
+use super::visual::{BlurRegion, BlurVisualStyle, BorderGradient, RoundedRing, ShadowVisualStyle};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureSource {
@@ -55,12 +55,33 @@ pub enum FramePhase {
     Overlay,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EffectElement {
-    WindowBorder { ring: RoundedRing, gradient: BorderGradient, alpha: u8 },
-    WindowShadow { clip: RootSurfaceClip, style: ShadowVisualStyle, alpha: u8 },
-    WindowBlurBackdrop { ring: RoundedRing, style: BlurVisualStyle, alpha: u8 },
-    DimOverlay { clip: RootSurfaceClip, alpha: u8 },
+    WindowBorder {
+        ring: RoundedRing,
+        gradient: BorderGradient,
+        alpha: u8,
+    },
+    WindowShadow {
+        clip: RootSurfaceClip,
+        style: ShadowVisualStyle,
+        alpha: u8,
+    },
+    WindowBlurBackdrop {
+        ring: RoundedRing,
+        style: BlurVisualStyle,
+        alpha: u8,
+    },
+    /// Client-requested blur under one root surface. Drawn in a later phase.
+    SurfaceBlurBackdrop {
+        region: BlurRegion,
+        style: BlurVisualStyle,
+        alpha: u8,
+    },
+    DimOverlay {
+        clip: RootSurfaceClip,
+        alpha: u8,
+    },
 }
 
 #[derive(Clone, Debug)]

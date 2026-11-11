@@ -31,8 +31,8 @@ use crate::{
     object::Object,
     region::{DamageRegion, RectI},
     render::{
-        create_renderer, BorderGradient, EffectElement, FrameElement, FramePhase,
-        OutputFrameRecipe, RenderCompletion, RenderFrame, RenderTarget, Renderer,
+        create_renderer, BlurRegion, BlurVisualStyle, BorderGradient, EffectElement, FrameElement,
+        FramePhase, OutputFrameRecipe, RenderCompletion, RenderFrame, RenderTarget, Renderer,
         RendererCapabilities, RootSurfaceVisualState, RoundedRing, ShadowVisualStyle, ShmImage,
         Texture, TextureElement, TextureMask, TextureSource, WindowClip,
     },
@@ -1594,7 +1594,7 @@ fn note_tearing_submission(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RecordedFrameElement {
     Texture { phase: FramePhase, item_index: usize },
     Effect { phase: FramePhase, element: EffectElement },
@@ -8124,6 +8124,85 @@ fn push_root_surface_effect_elements(
     }
 }
 
+struct ClientBlur {
+    region: BlurRegion,
+    style: BlurVisualStyle,
+    alpha: u8,
+}
+
+fn client_blur_alpha(opacity: u8, alpha_multiplier: u32) -> u8 {
+    let factor = crate::render::effective_alpha(opacity, alpha_multiplier);
+    (factor * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn client_blur_for_snapshots(
+    state: &State,
+    snapshots: &[crate::wayland_objects::wl_surface::SurfaceRenderState],
+    visual_state: Option<RootSurfaceVisualState>,
+) -> BTreeMap<SurfaceKey, ClientBlur> {
+    let style = BlurVisualStyle {
+        radius: state.config.effects.blur.radius,
+        passes: state.config.effects.blur.passes,
+    };
+    let opacity = visual_state
+        .map(|visual| visual.effects.opacity_alpha)
+        .unwrap_or(u8::MAX);
+    let mut blur = BTreeMap::new();
+    for snapshot in snapshots {
+        let Some(surface) = snapshot.surface else {
+            continue;
+        };
+        let Some(region) = state.root_surface_blur_region(surface) else {
+            continue;
+        };
+        blur.insert(
+            surface,
+            ClientBlur {
+                region,
+                style,
+                alpha: client_blur_alpha(opacity, snapshot.alpha_multiplier),
+            },
+        );
+    }
+    blur
+}
+
+/// Record each root texture, with that root's client blur immediately before
+/// it. Subsurfaces and other roles are absent from `client_blur`.
+fn push_scene_items_with_client_blur(
+    frame_elements: &mut Vec<RecordedFrameElement>,
+    items: &[SceneItem],
+    item_indices: std::ops::Range<usize>,
+    client_blur: &BTreeMap<SurfaceKey, ClientBlur>,
+    content_mapping: Option<crate::render::RectMapping>,
+) {
+    for item_index in item_indices {
+        if let Some(surface) = items
+            .get(item_index)
+            .and_then(|item| item.state.surface_key)
+        {
+            if let Some(prepared) = client_blur.get(&surface) {
+                let region = match content_mapping {
+                    Some(mapping) => prepared.region.mapped(mapping),
+                    None => Some(prepared.region.clone()),
+                };
+                if let Some(region) = region {
+                    frame_elements.push(RecordedFrameElement::Effect {
+                        phase: FramePhase::UnderWindow,
+                        element: EffectElement::SurfaceBlurBackdrop {
+                            region,
+                            style: prepared.style,
+                            alpha: prepared.alpha,
+                        },
+                    });
+                }
+            }
+        }
+        frame_elements
+            .push(RecordedFrameElement::Texture { phase: FramePhase::Content, item_index });
+    }
+}
+
 fn push_scene_item_frame_elements(
     frame_elements: &mut Vec<RecordedFrameElement>,
     item_indices: std::ops::Range<usize>,
@@ -8794,6 +8873,11 @@ fn split_closing_effects(
             blur = Some(FrozenClosingBlur { ring, style, alpha });
             continue;
         }
+        // A closing window keeps its decoration blur. Client-requested blur
+        // samples the live backdrop, which this snapshot does not have.
+        if matches!(element, EffectElement::SurfaceBlurBackdrop { .. }) {
+            continue;
+        }
         effects.push(PlannedClosingEffect { phase, element });
     }
     (blur, effects)
@@ -8902,7 +8986,7 @@ fn closing_capture_elements(
 ) -> Vec<FrameElement> {
     let mut elements = Vec::new();
     let push_effect = |elements: &mut Vec<FrameElement>, effect: &PlannedClosingEffect| {
-        let mut element = effect.element;
+        let mut element = effect.element.clone();
         scale_effect_element(&mut element, scale);
         elements.push(FrameElement::Effect { phase: effect.phase, element });
     };
@@ -9487,7 +9571,7 @@ fn build_output_frame_recipe(
                 }
                 RecordedFrameElement::Effect { phase, element } => Some(FrameElement::Effect {
                     phase: *phase,
-                    element: map_effect_colors(*element, effect_color),
+                    element: map_effect_colors(element.clone(), effect_color),
                 }),
             })
             .collect(),
@@ -9604,6 +9688,7 @@ fn scale_effect_alpha(element: &mut EffectElement, factor: u8) {
         EffectElement::WindowBorder { alpha, .. }
         | EffectElement::WindowShadow { alpha, .. }
         | EffectElement::WindowBlurBackdrop { alpha, .. }
+        | EffectElement::SurfaceBlurBackdrop { alpha, .. }
         | EffectElement::DimOverlay { alpha, .. } => alpha,
     };
     *alpha = scale_u8(*alpha, factor);
@@ -9807,6 +9892,7 @@ fn render_composed_entry(
     }
     let mut snapshots = Vec::new();
     collect_surface_snapshots(state, root_surface, 0, 0, true, retired_candidates, &mut snapshots);
+    let client_blur = client_blur_for_snapshots(state, &snapshots, visual_state);
     let (objects, drm_map) = (&mut state.objects, &mut state.drm);
     let drm = drm_map.get_mut(drm_id);
     let drm_fd = drm.fd();
@@ -9828,7 +9914,13 @@ fn render_composed_entry(
         output_scale,
         Some(output_color),
     );
-    push_scene_item_frame_elements(frame_elements, item_start..items.len());
+    push_scene_items_with_client_blur(
+        frame_elements,
+        items,
+        item_start..items.len(),
+        &client_blur,
+        mapping.content,
+    );
     if effects_on_output {
         push_root_surface_effect_elements(frame_elements, visual_state, FramePhase::OverWindow);
         push_root_surface_effect_elements(frame_elements, visual_state, FramePhase::Overlay);
@@ -9873,6 +9965,9 @@ fn translate_effect_element(element: &mut EffectElement, dx: i32, dy: i32) {
         EffectElement::WindowShadow { clip, .. } | EffectElement::DimOverlay { clip, .. } => {
             clip.outer_rect = clip.outer_rect.translate(dx, dy);
         }
+        EffectElement::SurfaceBlurBackdrop { region, .. } => {
+            *region = region.translate(dx, dy);
+        }
     }
 }
 
@@ -9907,6 +10002,12 @@ fn scale_effect_element(element: &mut EffectElement, scale: crate::state::Fracti
         EffectElement::WindowBlurBackdrop { ring, style, .. } => {
             if let Some(scaled) = ring.scaled(scale) {
                 *ring = scaled;
+            }
+            *style = style.scaled(scale);
+        }
+        EffectElement::SurfaceBlurBackdrop { region, style, .. } => {
+            if let Some(scaled) = region.scaled(scale) {
+                *region = scaled;
             }
             *style = style.scaled(scale);
         }
@@ -11700,6 +11801,104 @@ mod render_recipe_tests {
                 element: EffectElement::DimOverlay { clip: overlay_clip, alpha }
             } if *overlay_clip == clip && *alpha == 44
         )));
+    }
+
+    #[test]
+    fn a_layer_surface_records_client_blur_under_its_texture() {
+        use crate::{
+            protocol_generated::ZwlrLayerSurfaceV1Id,
+            test_support::{resolved_wl_surface, state_for_tests},
+            wayland_objects::wl_surface::WlSurface,
+        };
+
+        let mut state = state_for_tests();
+        state.config.effects.blur.enabled = true;
+        let object_id = crate::test_support::insert_root_surface(&mut state, 80);
+        let surface = resolved_wl_surface(&state, object_id);
+        let snapshot = {
+            let mut wl = state.objects.grab_object::<WlSurface>(object_id);
+            wl.test_map(crate::state::ObjectId::from(1usize), 8, 9, 20, 10);
+            wl.set_layer_surface_impl(crate::clients::Resolved::new(
+                crate::clients::ClientId::from_raw(1),
+                ZwlrLayerSurfaceV1Id::from(81),
+                crate::state::ObjectId::from(81usize),
+            ));
+            let mut spec = crate::region::RegionSpec::default();
+            spec.add_rect(RectI::new(0, 0, 20, 10).unwrap());
+            wl.test_set_committed_blur_region(Some(crate::region::RegionValue::from_spec(spec)));
+            wl.take_render_state_at(surface, 0, 0).unwrap()
+        };
+        let client_blur =
+            super::client_blur_for_snapshots(&state, std::slice::from_ref(&snapshot), None);
+        let bounds = RectI::new(8, 9, 20, 10).unwrap();
+        let items = vec![SceneItem {
+            state: SceneItemState {
+                key: SceneItemKey::Surface(surface),
+                surface_key: Some(surface),
+                content_key: SceneItemContentKey::NamedCursor(
+                    crate::cursor::CursorImageContentKey { width: 1, height: 2, fingerprint: 3 },
+                ),
+                bounds,
+                tex_transform: transform::Mat3::identity(),
+                alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
+                mask: SceneItemMask::None,
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
+            },
+            mask: SceneItemMask::None,
+            texture: crate::render::inert_texture(),
+            damage: DamageRegion::from_rect(bounds),
+            sample_damage_padding: 0,
+            state_has_alpha: false,
+            alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
+            opaque_region: DamageRegion::new(),
+            opaque: false,
+            sync: crate::sync::SurfaceSyncState::default(),
+            direct_scanout: None,
+            color: None,
+            scanout_candidate: false,
+            presentation_feedbacks: Vec::new(),
+        }];
+        let mut frame_elements = Vec::new();
+        super::push_scene_items_with_client_blur(
+            &mut frame_elements,
+            &items,
+            0..items.len(),
+            &client_blur,
+            None,
+        );
+        let recipe = build_output_frame_recipe(&items, &frame_elements, None);
+        match &recipe.elements[0] {
+            crate::render::FrameElement::Effect {
+                phase: FramePhase::UnderWindow,
+                element: EffectElement::SurfaceBlurBackdrop { region, style, alpha },
+            } => {
+                assert_eq!(region.rects.as_ref(), &[bounds]);
+                assert_eq!(*style, BlurVisualStyle { radius: 12, passes: 2 });
+                assert_eq!(*alpha, 255);
+            }
+            other => panic!("blur should lead the recipe, got {other:?}"),
+        }
+        assert!(matches!(
+            recipe.elements[1],
+            crate::render::FrameElement::Texture { phase: FramePhase::Content, .. }
+        ));
+
+        state.config.effects.blur.enabled = false;
+        let disabled =
+            super::client_blur_for_snapshots(&state, std::slice::from_ref(&snapshot), None);
+        assert!(disabled.is_empty());
+        let mut bare = Vec::new();
+        super::push_scene_items_with_client_blur(&mut bare, &items, 0..1, &disabled, None);
+        let bare = build_output_frame_recipe(&items, &bare, None);
+        assert_eq!(bare.elements.len(), 1);
+        assert!(matches!(
+            bare.elements[0],
+            crate::render::FrameElement::Texture { phase: FramePhase::Content, .. }
+        ));
     }
 
     fn cursor_scene_item(bounds: RectI) -> SceneItem {

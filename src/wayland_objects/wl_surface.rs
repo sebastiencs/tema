@@ -1475,6 +1475,11 @@ impl WlSurface {
         self.on_screen.blur_region.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_set_committed_blur_region(&mut self, region: Option<RegionValue>) {
+        self.on_screen.blur_region = region;
+    }
+
     pub(crate) fn set_pending_alpha_multiplier(&mut self, factor: u32) {
         self.pending.alpha_multiplier = factor;
     }

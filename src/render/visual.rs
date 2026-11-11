@@ -1,8 +1,15 @@
+use std::rc::Rc;
+
 use crate::{
     config::{RgbaColor, RoundingPower, ShadowPower},
-    region::RectI,
-    state::RootSurfaceClip,
+    region::{DamageRegion, RectI, RegionValue},
+    state::{FractionalScale, RootSurfaceClip},
 };
+
+/// Rectangles kept for one client blur region. Waybar rasterises rounded
+/// corners as 1px spans, about two per radius pixel, so a bar stays well
+/// under this. Past it, rows collapse into bands.
+pub const BLUR_REGION_RECT_CAP: usize = 256;
 
 /// Rounded-rect clip applied to a window's root-surface tree.
 ///
@@ -66,6 +73,198 @@ pub struct ShadowVisualStyle {
 pub struct BlurVisualStyle {
     pub radius: i32,
     pub passes: u8,
+}
+
+/// Client blur in global compositor coordinates.
+///
+/// Rects are clipped to the surface, sorted by `(y, x)`, non-overlapping, and
+/// capped at [`BLUR_REGION_RECT_CAP`]. A rounded window clip is applied by the
+/// caller before the cap, so a corner that the window itself discards is not
+/// blurred.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlurRegion {
+    pub bounds: RectI,
+    pub rects: Rc<[RectI]>,
+}
+
+impl BlurRegion {
+    /// `region` is surface-local. `(0, 0)` maps to `surface_rect_global`'s
+    /// origin, which is the root texture's top-left. Anything outside that
+    /// rectangle is dropped.
+    pub fn from_surface_region(
+        region: &RegionValue,
+        surface_rect_global: RectI,
+        max_rects: usize,
+    ) -> Option<Self> {
+        let local = RectI::new(0, 0, surface_rect_global.width, surface_rect_global.height)?;
+        let mut damage = region.to_region_clipped(local);
+        damage.translate(surface_rect_global.x, surface_rect_global.y);
+        damage.intersect_rect(surface_rect_global);
+        Self::from_damage(&damage, max_rects)
+    }
+
+    pub fn from_damage(damage: &DamageRegion, max_rects: usize) -> Option<Self> {
+        blur_region_from_rects(damage.rects().iter().copied(), max_rects)
+    }
+
+    pub fn translate(&self, dx: i32, dy: i32) -> Self {
+        let rects = self
+            .rects
+            .iter()
+            .map(|rect| rect.translate(dx, dy))
+            .collect::<Vec<_>>();
+        Self {
+            bounds: self.bounds.translate(dx, dy),
+            rects: Rc::from(rects),
+        }
+    }
+
+    pub fn scaled(&self, scale: FractionalScale) -> Option<Self> {
+        if scale.is_one() {
+            return Some(self.clone());
+        }
+        let mut rects = Vec::with_capacity(self.rects.len());
+        for rect in self.rects.iter() {
+            rects.push(rect.scaled(scale)?);
+        }
+        blur_region_from_rects(rects, self.rects.len().max(1))
+    }
+
+    /// Same logical-to-visual map the scene applies to the root texture.
+    pub fn mapped(&self, mapping: RectMapping) -> Option<Self> {
+        blur_region_from_rects(
+            self.rects
+                .iter()
+                .copied()
+                .map(|rect| mapping.map_rect(rect)),
+            BLUR_REGION_RECT_CAP,
+        )
+    }
+}
+
+fn blur_region_from_rects(
+    rects: impl IntoIterator<Item = RectI>,
+    max_rects: usize,
+) -> Option<BlurRegion> {
+    if max_rects == 0 {
+        return None;
+    }
+    let mut damage = DamageRegion::new();
+    for rect in rects {
+        damage.add_rect(rect);
+    }
+    if damage.is_empty() {
+        return None;
+    }
+    let mut rects = damage.rects().to_vec();
+    rects.sort_by_key(|rect| (rect.y, rect.x, rect.x2()));
+    if rects.len() > max_rects {
+        // Smallest band that keeps the result within the cap. `N` is
+        // `ceil(span / max_rects)` rows. Each band becomes the bounding
+        // rectangle of the pieces that intersect it, so adjacent bands share
+        // an edge and do not overlap.
+        rects = collapse_row_bands(&rects, max_rects);
+    }
+    let bounds = union_blur_rects(&rects)?;
+    Some(BlurRegion { bounds, rects: Rc::from(rects) })
+}
+
+fn collapse_row_bands(rects: &[RectI], max_rects: usize) -> Vec<RectI> {
+    let y1 = rects.iter().map(|rect| rect.y).min().unwrap_or(0);
+    let y2 = rects.iter().map(|rect| rect.y2()).max().unwrap_or(y1);
+    let span = (y2.saturating_sub(y1)).max(1) as usize;
+    let band_rows = span.div_ceil(max_rects.max(1)).max(1) as i32;
+    let mut collapsed = Vec::new();
+    let mut y = y1;
+    while y < y2 {
+        let y_end = y.saturating_add(band_rows).min(y2);
+        let mut pieces = Vec::new();
+        for rect in rects {
+            let top = rect.y.max(y);
+            let bottom = rect.y2().min(y_end);
+            if bottom > top {
+                if let Some(piece) = RectI::new(rect.x, top, rect.width, bottom - top) {
+                    pieces.push(piece);
+                }
+            }
+        }
+        if let Some(bounds) = union_blur_rects(&pieces) {
+            collapsed.push(bounds);
+        }
+        y = y_end;
+    }
+    collapsed
+}
+
+fn union_blur_rects(rects: &[RectI]) -> Option<RectI> {
+    let mut iter = rects.iter().copied().filter(|rect| !rect.is_empty());
+    let first = iter.next()?;
+    let mut acc = first;
+    for rect in iter {
+        acc = RectI::from_extents(
+            acc.x.min(rect.x),
+            acc.y.min(rect.y),
+            acc.x2().max(rect.x2()),
+            acc.y2().max(rect.y2()),
+        )?;
+    }
+    Some(acc)
+}
+
+/// Drop the pixels a rounded window clip discards.
+///
+/// `Frame` hard-clips to the rounded box. `Corners` only removes the pixels
+/// inside the box that fall outside a rounded corner, leaving anything drawn
+/// outside the box (client shadows) in place.
+pub fn clip_damage_to_window_clip(damage: &mut DamageRegion, clip: WindowClip) {
+    let rounded = clip.clip();
+    if matches!(clip, WindowClip::Frame(_)) {
+        damage.intersect_rect(rounded.outer_rect);
+    }
+    subtract_rounded_corner_outsides(damage, rounded);
+}
+
+fn subtract_rounded_corner_outsides(damage: &mut DamageRegion, clip: RootSurfaceClip) {
+    let radius = clip.corner_radius;
+    if radius <= 0 || damage.is_empty() {
+        return;
+    }
+    let outer = clip.outer_rect;
+    let right = outer.x2().saturating_sub(radius);
+    let bottom = outer.y2().saturating_sub(radius);
+    let corners = [
+        (outer.x, outer.y, true),
+        (right, outer.y, false),
+        (outer.x, bottom, true),
+        (right, bottom, false),
+    ];
+    for (cx, cy, from_left) in corners {
+        let Some(corner) = RectI::new(cx, cy, radius, radius) else {
+            continue;
+        };
+        if !damage.intersects_rect(corner) {
+            continue;
+        }
+        let x_end = cx.saturating_add(radius);
+        for y in cy..cy.saturating_add(radius) {
+            let outside = if from_left {
+                let mut x = cx;
+                while x < x_end && !clip.contains_point(f64::from(x) + 0.5, f64::from(y) + 0.5) {
+                    x += 1;
+                }
+                RectI::new(cx, y, x.saturating_sub(cx), 1)
+            } else {
+                let mut x = x_end;
+                while x > cx && !clip.contains_point(f64::from(x - 1) + 0.5, f64::from(y) + 0.5) {
+                    x -= 1;
+                }
+                RectI::new(x, y, x_end.saturating_sub(x), 1)
+            };
+            if let Some(outside) = outside {
+                damage.subtract_rect(outside);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -570,5 +769,66 @@ mod tests {
             visual.frame_clip,
             RootSurfaceClip::new(RectI::new(10, 20, 40, 30).unwrap(), 12, RoundingPower::DEFAULT,)
         );
+    }
+
+    fn covers(rects: &[RectI], x: i32, y: i32) -> bool {
+        rects.iter().any(|rect| rect.contains(x, y))
+    }
+
+    #[test]
+    fn blur_region_clips_translates_and_scales() {
+        let surface = RectI::new(10, 20, 40, 30).unwrap();
+        let mut spec = crate::region::RegionSpec::default();
+        spec.add_rect(RectI::new(-5, -5, 100, 100).unwrap());
+        let region = crate::region::RegionValue::from_spec(spec);
+        let blur = super::BlurRegion::from_surface_region(&region, surface, 256).unwrap();
+        assert_eq!(blur.rects.as_ref(), &[surface]);
+        assert_eq!(blur.bounds, surface);
+
+        let moved = blur.translate(3, -4);
+        assert_eq!(moved.bounds, surface.translate(3, -4));
+        assert_eq!(moved.rects.as_ref(), &[surface.translate(3, -4)]);
+
+        let scaled = blur.scaled(crate::state::FractionalScale::TWO).unwrap();
+        assert_eq!(scaled.bounds, RectI::new(20, 40, 80, 60).unwrap());
+        assert_eq!(scaled.rects.as_ref(), &[RectI::new(20, 40, 80, 60).unwrap()]);
+    }
+
+    #[test]
+    fn blur_region_collapses_past_the_rect_cap() {
+        let mut spec = crate::region::RegionSpec::default();
+        for y in 0..300 {
+            spec.add_rect(RectI::new(0, y, 4, 1).unwrap());
+        }
+        let surface = RectI::new(0, 0, 4, 300).unwrap();
+        let blur = super::BlurRegion::from_surface_region(
+            &crate::region::RegionValue::from_spec(spec),
+            surface,
+            super::BLUR_REGION_RECT_CAP,
+        )
+        .unwrap();
+        assert_eq!(blur.rects.len(), 150);
+        assert!(blur.rects.len() <= super::BLUR_REGION_RECT_CAP);
+        assert_eq!(blur.rects[0], RectI::new(0, 0, 4, 2).unwrap());
+        assert_eq!(blur.rects[149], RectI::new(0, 298, 4, 2).unwrap());
+        assert_eq!(blur.bounds, surface);
+    }
+
+    #[test]
+    fn rounded_frame_clip_drops_the_corner_and_pixels_outside_the_box() {
+        let outer = RectI::new(0, 0, 20, 20).unwrap();
+        let clip = RootSurfaceClip::new(outer, 8, RoundingPower::DEFAULT);
+        let mut frame = crate::region::DamageRegion::from_rect(RectI::new(-2, -2, 24, 24).unwrap());
+        let mut corners = frame.clone();
+        super::clip_damage_to_window_clip(&mut frame, WindowClip::Frame(clip));
+        super::clip_damage_to_window_clip(&mut corners, WindowClip::Corners(clip));
+        let frame = super::BlurRegion::from_damage(&frame, 256).unwrap();
+        let corners = super::BlurRegion::from_damage(&corners, 256).unwrap();
+        assert!(!covers(&frame.rects, 0, 0));
+        assert!(!covers(&frame.rects, -1, 10));
+        assert!(covers(&frame.rects, 10, 10));
+        assert!(!covers(&corners.rects, 0, 0));
+        assert!(covers(&corners.rects, -1, 10));
+        assert!(covers(&corners.rects, 10, 10));
     }
 }
