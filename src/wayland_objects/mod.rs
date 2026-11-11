@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+pub mod color_management;
 pub mod ext_data_control_device_v1;
 pub mod ext_data_control_manager_v1;
 pub mod ext_data_control_offer_v1;
@@ -44,6 +45,10 @@ pub mod wl_subcompositor;
 pub mod wl_subsurface;
 pub mod wl_surface;
 pub mod wl_touch;
+pub mod wp_alpha_modifier_surface_v1;
+pub mod wp_alpha_modifier_v1;
+pub mod wp_color_representation_manager_v1;
+pub mod wp_color_representation_surface_v1;
 pub mod wp_cursor_shape_device_v1;
 pub mod wp_cursor_shape_manager_v1;
 pub mod wp_fractional_scale_manager_v1;
@@ -141,6 +146,31 @@ macro_rules! fake_obj {
 
 pub use xdg_surface::xdg_toplevel;
 
+pub mod wp_color_manager_v1 {
+    pub use super::color_management::wp_color_manager_v1::*;
+}
+pub mod wp_image_description_creator_params_v1 {
+    pub use super::color_management::wp_image_description_creator_params_v1::*;
+}
+pub mod wp_image_description_info_v1 {
+    pub use super::color_management::wp_image_description_info_v1::*;
+}
+pub mod wp_image_description_reference_v1 {
+    pub use super::color_management::wp_image_description_reference_v1::*;
+}
+pub mod wp_image_description_v1 {
+    pub use super::color_management::wp_image_description_v1::*;
+}
+pub mod wp_color_management_output_v1 {
+    pub use super::color_management::wp_color_management_output_v1::*;
+}
+pub mod wp_color_management_surface_v1 {
+    pub use super::color_management::wp_color_management_surface_v1::*;
+}
+pub mod wp_color_management_surface_feedback_v1 {
+    pub use super::color_management::wp_color_management_surface_feedback_v1::*;
+}
+
 /// Declaring objects, until we properly implement them
 /// So `protocol_generated.rs` doesn't contain non-declared types
 fake_obj! {
@@ -162,6 +192,7 @@ fake_obj! {
     // { xdg_popup, XdgPopup },
     { wp_content_type_manager_v1, WpContentTypeManagerV1 },
     { wp_content_type_v1, WpContentTypeV1 },
+    { wp_image_description_creator_icc_v1, WpImageDescriptionCreatorIccV1 },
     { wp_drm_lease_device_v1, WpDrmLeaseDeviceV1 },
     { wp_drm_lease_connector_v1, WpDrmLeaseConnectorV1 },
     { wp_drm_lease_request_v1, WpDrmLeaseRequestV1 },

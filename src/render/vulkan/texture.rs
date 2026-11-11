@@ -7,7 +7,7 @@ use {ash::vk, gpu_alloc::UsageFlags};
 
 use crate::{
     dmabuf::DmaBuf,
-    drm::{ARGB8888, XRGB8888},
+    drm::{client_format, FormatKind},
     render::{RenderDeviceId, RendererError, ShmImage, Texture},
 };
 
@@ -24,6 +24,10 @@ pub(super) struct VulkanTexture {
     device_id: RenderDeviceId,
     image: vk::Image,
     view: vk::ImageView,
+    /// Chroma plane of NV12 or P010. Null for a single RGBA texture.
+    uv_view: vk::ImageView,
+    yuv_mode: u32,
+    yuv_size: [f32; 2],
     memory: TextureMemory,
     /// One dup of each distinct dma-buf plane. Empty for uploaded textures.
     planes: Vec<OwnedFd>,
@@ -40,11 +44,22 @@ impl Debug for VulkanTexture {
     }
 }
 
-impl Texture for VulkanTexture {}
+impl Texture for VulkanTexture {
+    fn yuv_mode(&self) -> u32 {
+        self.yuv_mode
+    }
+
+    fn yuv_size(&self) -> [f32; 2] {
+        self.yuv_size
+    }
+}
 
 impl Drop for VulkanTexture {
     fn drop(&mut self) {
         unsafe {
+            if self.uv_view != vk::ImageView::null() {
+                self.device.device.destroy_image_view(self.uv_view, None);
+            }
             self.device.device.destroy_image_view(self.view, None);
             self.device.device.destroy_image(self.image, None);
             if let TextureMemory::Imported(memories) = &mut self.memory {
@@ -63,6 +78,10 @@ impl VulkanTexture {
 
     pub(super) fn view(&self) -> vk::ImageView {
         self.view
+    }
+
+    pub(super) fn uv_view(&self) -> vk::ImageView {
+        self.uv_view
     }
 
     pub(super) fn image(&self) -> vk::Image {
@@ -122,6 +141,7 @@ impl VulkanTexture {
         if format == vk::Format::UNDEFINED {
             return Err(RendererError::UnsupportedFormat);
         }
+        let yuv = super::format::yuv_view_formats(source.format.drm);
         let layouts: Vec<vk::SubresourceLayout> = source
             .planes
             .iter()
@@ -138,9 +158,16 @@ impl VulkanTexture {
             .plane_layouts(&layouts);
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let flags =
+        let mut flags =
             if disjoint { vk::ImageCreateFlags::DISJOINT } else { vk::ImageCreateFlags::empty() };
-        let image_info = vk::ImageCreateInfo::default()
+        let view_formats = yuv.map(|(image, luma, chroma)| [image, luma, chroma]);
+        let mut format_list = view_formats
+            .as_ref()
+            .map(|formats| vk::ImageFormatListCreateInfo::default().view_formats(formats));
+        if yuv.is_some() {
+            flags |= vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
+        }
+        let mut image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D {
@@ -158,6 +185,9 @@ impl VulkanTexture {
             .flags(flags)
             .push_next(&mut external)
             .push_next(&mut modifier_info);
+        if let Some(list) = format_list.as_mut() {
+            image_info = image_info.push_next(list);
+        }
         let image = unsafe { device.device.create_image(&image_info, None) }.map_err(|error| {
             log::error!("vulkan texture image creation failed: {error}");
             RendererError::ImportFailed
@@ -188,27 +218,45 @@ impl VulkanTexture {
             }
             return Err(error);
         }
-        let view = match create_view(
-            &device.device,
-            image,
-            format,
-            resources::component_mapping(!source.format.has_alpha),
-        ) {
-            Ok(view) => view,
-            Err(error) => {
-                unsafe {
-                    for memory in memories {
-                        device.device.free_memory(memory, None);
+        let (view, uv_view) = if let Some((_, luma, chroma)) = yuv {
+            match plane_views(&device.device, image, luma, chroma) {
+                Ok(views) => views,
+                Err(error) => {
+                    unsafe {
+                        for memory in memories {
+                            device.device.free_memory(memory, None);
+                        }
+                        device.device.destroy_image(image, None);
                     }
-                    device.device.destroy_image(image, None);
+                    return Err(error);
                 }
-                return Err(error);
+            }
+        } else {
+            match create_view(
+                &device.device,
+                image,
+                format,
+                resources::component_mapping(!source.format.has_alpha),
+            ) {
+                Ok(view) => (view, vk::ImageView::null()),
+                Err(error) => {
+                    unsafe {
+                        for memory in memories {
+                            device.device.free_memory(memory, None);
+                        }
+                        device.device.destroy_image(image, None);
+                    }
+                    return Err(error);
+                }
             }
         };
         let planes = match distinct_plane_fds(&source.planes) {
             Ok(planes) => planes,
             Err(error) => {
                 unsafe {
+                    if uv_view != vk::ImageView::null() {
+                        device.device.destroy_image_view(uv_view, None);
+                    }
                     device.device.destroy_image_view(view, None);
                     for memory in memories {
                         device.device.free_memory(memory, None);
@@ -218,11 +266,19 @@ impl VulkanTexture {
                 return Err(error);
             }
         };
+        let yuv_mode = match source.format.drm {
+            drm::buffer::DrmFourcc::P010 => crate::render::color_pipeline::YUV_BT709_LIMITED_10,
+            drm::buffer::DrmFourcc::Nv12 => crate::render::color_pipeline::YUV_BT709_LIMITED_8,
+            _ => 0,
+        };
         Ok(Self {
             device: device.clone(),
             device_id: device.device_id(),
             image,
             view,
+            uv_view,
+            yuv_mode,
+            yuv_size: [source.width as f32, source.height as f32],
             memory: TextureMemory::Imported(memories),
             planes,
         })
@@ -232,19 +288,30 @@ impl VulkanTexture {
         device: &Rc<VulkanDevice>,
         image: ShmImage<'_>,
     ) -> Result<Self, RendererError> {
-        if image.fourcc != ARGB8888.drm && image.fourcc != XRGB8888.drm {
+        let Some(described) = client_format(image.fourcc) else {
+            log::warn!("vulkan shared-memory import does not support {:?}", image.fourcc);
+            return Err(RendererError::UnsupportedFormat);
+        };
+        if !matches!(described.kind, FormatKind::Rgb8 | FormatKind::Rgb10 | FormatKind::Fp16) {
             log::warn!("vulkan shared-memory import does not support {:?}", image.fourcc);
             return Err(RendererError::UnsupportedFormat);
         }
-        checked_rows(image.bytes, image.width, image.height, image.stride)?;
+        let format = vk_format(image.fourcc);
+        if format == vk::Format::UNDEFINED {
+            log::warn!("vulkan shared-memory import does not support {:?}", image.fourcc);
+            return Err(RendererError::UnsupportedFormat);
+        }
+        let bpp = described.bpp as usize;
+        checked_rows(image.bytes, image.width, image.height, image.stride, bpp)?;
         upload_sampled(
             device,
             image.bytes,
             image.width,
             image.height,
             image.stride,
-            vk::Format::B8G8R8A8_UNORM,
-            resources::component_mapping(image.fourcc == XRGB8888.drm),
+            bpp,
+            format,
+            resources::component_mapping(!described.has_alpha),
             RendererError::ImportFailed,
         )
     }
@@ -262,13 +329,14 @@ impl VulkanTexture {
                 log::warn!("vulkan rgba upload has no positive size");
                 RendererError::UploadFailed
             })?;
-        checked_rows(pixels, width, height, row_bytes)?;
+        checked_rows(pixels, width, height, row_bytes, 4)?;
         upload_sampled(
             device,
             pixels,
             width,
             height,
             row_bytes,
+            4,
             vk::Format::R8G8B8A8_UNORM,
             resources::component_mapping(false),
             RendererError::UploadFailed,
@@ -291,18 +359,24 @@ pub(super) fn sampled_texture<'a>(
     Some(texture)
 }
 
-fn checked_rows(bytes: &[u8], width: i32, height: i32, stride: usize) -> Result<(), RendererError> {
-    if width <= 0 || height <= 0 {
+fn checked_rows(
+    bytes: &[u8],
+    width: i32,
+    height: i32,
+    stride: usize,
+    bytes_per_pixel: usize,
+) -> Result<(), RendererError> {
+    if width <= 0 || height <= 0 || bytes_per_pixel == 0 {
         log::warn!("vulkan texture upload has no positive size");
         return Err(RendererError::UploadFailed);
     }
     let row_bytes = usize::try_from(width)
         .ok()
-        .and_then(|width| width.checked_mul(4));
+        .and_then(|width| width.checked_mul(bytes_per_pixel));
     let Some(row_bytes) = row_bytes else {
         return Err(RendererError::UploadFailed);
     };
-    if stride < row_bytes || stride % 4 != 0 {
+    if stride < row_bytes || stride % bytes_per_pixel != 0 {
         log::warn!("vulkan texture stride {stride} does not cover {width} pixels");
         return Err(RendererError::UploadFailed);
     }
@@ -325,6 +399,7 @@ fn upload_sampled(
     width: i32,
     height: i32,
     stride: usize,
+    bytes_per_pixel: usize,
     format: vk::Format,
     components: vk::ComponentMapping,
     failed: RendererError,
@@ -394,7 +469,7 @@ fn upload_sampled(
         }
         return Err(failed);
     }
-    let row_texels = (stride / 4) as u32;
+    let row_texels = (stride / bytes_per_pixel) as u32;
     let copied = device.submit(failed, |device, command| {
         command::image_barrier(
             device,
@@ -447,6 +522,9 @@ fn upload_sampled(
         device_id: device.device_id(),
         image,
         view,
+        uv_view: vk::ImageView::null(),
+        yuv_mode: 0,
+        yuv_size: [0.0, 0.0],
         memory: TextureMemory::Gpu(allocation),
         planes: Vec::new(),
     })
@@ -626,9 +704,28 @@ impl VulkanTexture {
             device_id: device.device_id(),
             image,
             view,
+            uv_view: vk::ImageView::null(),
+            yuv_mode: 0,
+            yuv_size: [0.0, 0.0],
             memory: TextureMemory::Gpu(allocation),
             planes: Vec::new(),
         })
+    }
+}
+
+fn plane_views(
+    device: &ash::Device,
+    image: vk::Image,
+    luma: vk::Format,
+    chroma: vk::Format,
+) -> Result<(vk::ImageView, vk::ImageView), RendererError> {
+    let y = resources::create_plane_view(device, image, luma, vk::ImageAspectFlags::PLANE_0)?;
+    match resources::create_plane_view(device, image, chroma, vk::ImageAspectFlags::PLANE_1) {
+        Ok(uv) => Ok((y, uv)),
+        Err(error) => {
+            unsafe { device.destroy_image_view(y, None) };
+            Err(error)
+        }
     }
 }
 

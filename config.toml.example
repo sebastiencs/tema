@@ -27,6 +27,10 @@ allow_tearing = true
 outer_gap = 10
 inner_gap = 10
 
+# Advertise wp_color_manager_v1. Changing this requires a restart.
+[color_management]
+enabled = true
+
 # Xwayland starts lazily on the first X connection.
 # Changes apply on reload; disabling lets running X apps finish.
 [xwayland]
@@ -200,3 +204,18 @@ style = "fade"
 # [output.tearing]
 # "DP-1" = false
 # "eDP-1" = true
+
+# Optional: SDR image description per connector. Names match wl_output.name and are
+# case-sensitive. Omitted connectors use tf "gamma22", primaries "srgb", sdr_white 80,
+# and bitdepth 8. tf "srgb" is the IEC 61966-2-1 piecewise curve. primaries "edid" reads
+# the base-block chromaticities and falls back to sRGB when the EDID has none or they
+# are unusable. Luminance minimum stays 0.2; maximum and reference white are both
+# sdr_white. bitdepth 10 prefers an XRGB2101010 scanout buffer, then XBGR2101010, and
+# sets the connector max bpc to 10. Allocation or modeset failure falls back to 8-bit.
+# mode "hdr" asks for PQ with BT.2020 primaries. It stays SDR unless the EDID reports
+# PQ and BT.2020 RGB and the connector has Colorspace=BT2020_RGB and HDR_OUTPUT_METADATA.
+# An omitted sdr_white is 203 while that HDR mode is active. min_luminance, max_luminance,
+# and max_fall replace the EDID mastering range when set.
+# [output.color]
+# "DP-1" = { tf = "gamma22", primaries = "edid", sdr_white = 80, bitdepth = 8 }
+# "eDP-1" = { mode = "hdr", bitdepth = 10 }

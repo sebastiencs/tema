@@ -64,15 +64,16 @@ impl ZwlrScreencopyFrameV1 {
         self.send_event(zwlr_screencopy_frame_v1::Event::Failed, dispatcher);
     }
 
-    /// wlroots sends one preferred SHM format. Both formats this compositor can write are
-    /// advertised, ARGB8888 first, and `buffer_done` follows at version 3. DMA-BUF stays deferred.
+    /// wlroots sends one preferred SHM format. The 8-bit formats this compositor writes are
+    /// advertised, ARGB8888 first, and `buffer_done` follows at version 3. A 10-bit scanout is
+    /// converted to those pixels. DMA-BUF stays deferred.
     pub(crate) fn advertise(&mut self, width: i32, height: i32, dispatcher: &mut ClientDispatcher) {
         let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
             self.fail(dispatcher);
             return;
         };
         let stride = width.saturating_mul(4);
-        for format in [crate::drm::ARGB8888.wayland_id, crate::drm::XRGB8888.wayland_id] {
+        for format in crate::drm::shm_capture_formats().filter_map(|format| format.wayland_shm_id) {
             self.send_event(
                 zwlr_screencopy_frame_v1::Event::Buffer { format, width, height, stride },
                 dispatcher,

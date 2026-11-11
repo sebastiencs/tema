@@ -23,6 +23,8 @@ pub(super) struct OutputTarget {
     framebuffer: vk::Framebuffer,
     width: i32,
     height: i32,
+    format: vk::Format,
+    readback_opaque: bool,
     /// `UNDEFINED` before the first successful use. After each release to the
     /// foreign queue it is `GENERAL`.
     layout: Cell<vk::ImageLayout>,
@@ -162,6 +164,8 @@ impl OutputTarget {
             framebuffer,
             width: source.width,
             height: source.height,
+            format: vk_format,
+            readback_opaque: !source.format.has_alpha,
             layout: Cell::new(vk::ImageLayout::UNDEFINED),
         })
     }
@@ -272,6 +276,114 @@ impl OffscreenImage {
     }
 }
 
+pub(super) struct BlendImage {
+    device: Rc<VulkanDevice>,
+    image: vk::Image,
+    allocation: GpuAllocation,
+    view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
+    pub(super) width: i32,
+    pub(super) height: i32,
+    pub(super) layout: Cell<vk::ImageLayout>,
+}
+
+impl BlendImage {
+    pub(super) fn new(
+        device: &Rc<VulkanDevice>,
+        width: i32,
+        height: i32,
+        render_pass: vk::RenderPass,
+    ) -> Result<Self, String> {
+        let format = vk::Format::R16G16B16A16_SFLOAT;
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: width as u32, height: height as u32, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.device.create_image(&info, None) }
+            .map_err(|error| format!("vulkan blend image creation failed: {error}"))?;
+        let requirements = unsafe { device.device.get_image_memory_requirements(image) };
+        let allocation = match device.allocate(requirements, UsageFlags::FAST_DEVICE_ACCESS) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                unsafe { device.device.destroy_image(image, None) };
+                return Err(error);
+            }
+        };
+        if let Err(error) = unsafe {
+            device
+                .device
+                .bind_image_memory(image, allocation.memory(), allocation.offset())
+        } {
+            unsafe { device.device.destroy_image(image, None) };
+            return Err(format!("vulkan blend image bind failed: {error}"));
+        }
+        let view = match create_view(&device.device, image, format, component_mapping(false)) {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe { device.device.destroy_image(image, None) };
+                return Err(error.to_string());
+            }
+        };
+        let framebuffer = match create_framebuffer(
+            &device.device,
+            render_pass,
+            view,
+            width as u32,
+            height as u32,
+        ) {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                unsafe {
+                    device.device.destroy_image_view(view, None);
+                    device.device.destroy_image(image, None);
+                }
+                return Err(error.to_string());
+            }
+        };
+        Ok(Self {
+            device: device.clone(),
+            image,
+            allocation,
+            view,
+            framebuffer,
+            width,
+            height,
+            layout: Cell::new(vk::ImageLayout::UNDEFINED),
+        })
+    }
+
+    pub(super) fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub(super) fn view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    pub(super) fn framebuffer(&self) -> vk::Framebuffer {
+        self.framebuffer
+    }
+}
+
+impl Drop for BlendImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .device
+                .destroy_framebuffer(self.framebuffer, None);
+            self.device.device.destroy_image_view(self.view, None);
+            self.device.device.destroy_image(self.image, None);
+        }
+    }
+}
+
 pub(super) trait PaintedTarget {
     fn image(&self) -> vk::Image;
     fn framebuffer(&self) -> vk::Framebuffer;
@@ -284,6 +396,8 @@ pub(super) trait PaintedTarget {
     /// Imported dma-buf. Ownership moves to and from the foreign queue, and
     /// [`Self::layout`] is then `UNDEFINED` or `GENERAL`.
     fn external(&self) -> bool;
+    fn attachment_format(&self) -> vk::Format;
+    fn readback_opaque(&self) -> bool;
 }
 
 impl PaintedTarget for OutputTarget {
@@ -322,6 +436,14 @@ impl PaintedTarget for OutputTarget {
     fn external(&self) -> bool {
         true
     }
+
+    fn attachment_format(&self) -> vk::Format {
+        self.format
+    }
+
+    fn readback_opaque(&self) -> bool {
+        self.readback_opaque
+    }
 }
 
 impl PaintedTarget for OffscreenImage {
@@ -358,6 +480,14 @@ impl PaintedTarget for OffscreenImage {
     }
 
     fn external(&self) -> bool {
+        false
+    }
+
+    fn attachment_format(&self) -> vk::Format {
+        vk::Format::B8G8R8A8_UNORM
+    }
+
+    fn readback_opaque(&self) -> bool {
         false
     }
 }
@@ -557,6 +687,30 @@ pub(super) fn create_view(
         });
     unsafe { device.create_image_view(&info, None) }.map_err(|error| {
         log::error!("vulkan output image view failed: {error}");
+        RendererError::ImportFailed
+    })
+}
+
+pub(super) fn create_plane_view(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+    aspect: vk::ImageAspectFlags,
+) -> Result<vk::ImageView, RendererError> {
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(component_mapping(false))
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe { device.create_image_view(&info, None) }.map_err(|error| {
+        log::error!("vulkan plane image view failed: {error}");
         RendererError::ImportFailed
     })
 }

@@ -7,7 +7,7 @@ use khronos_types::{egl, gl};
 
 use {
     super::{
-        import::{gl_texture_name, GlTexture},
+        import::{gl_chroma_name, gl_texture_name, GlTexture},
         offscreen::TextureFrameBuffer,
         readback::read_flip_y_framebuffer,
         resources::{
@@ -33,6 +33,8 @@ pub(super) struct GlesDraw<'a> {
     pub(super) device_id: RenderDeviceId,
     pub(super) width: i32,
     pub(super) height: i32,
+    /// Decodes effect colors out of this output transfer while drawing into the linear buffer.
+    pub(super) linear_blend: Option<crate::color::TransferFunction>,
 }
 
 impl EglFrameBuffer {
@@ -42,6 +44,7 @@ impl EglFrameBuffer {
             device_id: self.device_id,
             width: self.width,
             height: self.height,
+            linear_blend: None,
         }
     }
 
@@ -165,11 +168,30 @@ impl EglFrameBuffer {
         preserve_contents: bool,
         output_transform: OutputPresentationTransform,
         clear_color: Option<[f32; 4]>,
+        linear_blend: Option<crate::color::TransferFunction>,
     ) -> RenderCompletion {
         self.clear_damage(damage, preserve_contents, output_transform, clear_color);
 
         if recipe.is_empty() {
             return self.finish_render(render_sync_mode);
+        }
+
+        if let Some(output_tf) = linear_blend {
+            if render_linear_blend(
+                &self.programs,
+                self.device_id,
+                &self.linear_blend,
+                self.framebuffer_object,
+                self.width,
+                self.height,
+                recipe,
+                projection,
+                damage,
+                output_transform,
+                output_tf,
+            ) {
+                return self.finish_render(render_sync_mode);
+            }
         }
 
         self.draw().render_frame_elements_to_target(
@@ -186,13 +208,140 @@ impl EglFrameBuffer {
     }
 }
 
+/// Draw translucent pixels into an FP16 linear buffer, then encode them onto
+/// `framebuffer`. Returns false when the intermediate is unused or cannot be
+/// created, so the caller draws the frame in the output encoding instead.
+pub(super) fn render_linear_blend(
+    programs: &GlesPrograms,
+    device_id: RenderDeviceId,
+    blend_slot: &std::cell::RefCell<Option<super::resources::LinearBlendTarget>>,
+    framebuffer: gl::GLuint,
+    width: i32,
+    height: i32,
+    recipe: &OutputFrameRecipe,
+    projection: Mat3,
+    damage: &DamageRegion,
+    output_transform: OutputPresentationTransform,
+    output_tf: crate::color::TransferFunction,
+) -> bool {
+    let Some(bounds) = RectI::new(0, 0, width, height) else {
+        return false;
+    };
+    let regions = crate::render::blend::create_regions(&recipe.elements, bounds, true);
+    let blend_damage = crate::render::blend::intersect_damage(&regions.blend, damage);
+    if blend_damage.is_empty() {
+        return false;
+    }
+    let Some((blend_fbo, blend_texture)) = linear_blend_target(blend_slot, width, height) else {
+        log::warn!("FP16 blend buffer is unavailable; blending in the output encoding");
+        return false;
+    };
+    let draw = |linear_blend| GlesDraw { programs, device_id, width, height, linear_blend };
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER as _, blend_fbo);
+        gl::Viewport(0, 0, width, height);
+        gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+        gl::Enable(gl::SCISSOR_TEST as _);
+        for rect in blend_damage.rects() {
+            gl::Scissor(
+                rect.x,
+                scissor_y(height, *rect, output_transform),
+                rect.width,
+                rect.height,
+            );
+            gl::Clear(gl::COLOR_BUFFER_BIT as _);
+        }
+        gl::Disable(gl::SCISSOR_TEST as _);
+    }
+    let elements = crate::render::blend::retarget_elements(&recipe.elements, output_tf);
+    draw(Some(output_tf)).render_frame_elements_to_target(
+        blend_fbo,
+        width,
+        height,
+        &elements,
+        projection,
+        &blend_damage,
+        output_transform,
+    );
+    let direct = crate::render::blend::intersect_damage(&regions.direct, damage);
+    draw(None).render_frame_elements_to_target(
+        framebuffer,
+        width,
+        height,
+        &recipe.elements,
+        projection,
+        &direct,
+        output_transform,
+    );
+    let copy_texture = draw(None).borrowed_texture(blend_texture);
+    let copy = RenderItem {
+        source: crate::render::TextureSource::Texture,
+        texture: copy_texture,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        tex_transform: Mat3::identity(),
+        damage: blend_damage.clone(),
+        blend: true,
+        alpha: u8::MAX,
+        alpha_multiplier: u32::MAX,
+        color: Some(std::rc::Rc::new(crate::render::blend::encode_from_linear(output_tf))),
+        alpha_mode: 0,
+        yuv: None,
+        mask: crate::render::TextureMask::None,
+    };
+    draw(None).render_texture_elements_to_target(
+        framebuffer,
+        width,
+        height,
+        std::slice::from_ref(&copy),
+        projection,
+        &blend_damage,
+        output_transform,
+    );
+    true
+}
+
+fn linear_blend_target(
+    blend_slot: &std::cell::RefCell<Option<super::resources::LinearBlendTarget>>,
+    width: i32,
+    height: i32,
+) -> Option<(gl::GLuint, gl::GLuint)> {
+    let mut slot = blend_slot.borrow_mut();
+    let fresh = match slot.as_ref() {
+        Some(target) if target.width == width && target.height == height => false,
+        _ => true,
+    };
+    if fresh {
+        *slot = crate::render::gles::resources::LinearBlendTarget::new(width, height);
+    }
+    slot.as_ref()
+        .map(|target| (target.framebuffer_object, target.texture))
+}
+
 impl GlesDraw<'_> {
-    fn texture_program(&self) -> Result<&TextureProgram, &str> {
+    fn texture_program(&self) -> Result<TextureProgram, String> {
+        self.texture_program_for(crate::render::color_pipeline::TexturePipelineKey::identity())
+    }
+
+    fn texture_program_for(
+        &self,
+        key: crate::render::color_pipeline::TexturePipelineKey,
+    ) -> Result<TextureProgram, String> {
+        if !key.is_admitted() {
+            return Err("texture pipeline key is outside the finite color space".to_string());
+        }
+        if let Some(cached) = self.programs.texture.borrow().get(&key) {
+            return cached.clone();
+        }
+        let compiled =
+            create_texture_program_from(&crate::render::color_pipeline::gles_fragment_source(key));
         self.programs
             .texture
-            .get_or_init(create_texture_program)
-            .as_ref()
-            .map_err(String::as_str)
+            .borrow_mut()
+            .insert(key, compiled.clone());
+        compiled
     }
 
     fn blur_program(&self) -> Result<&BlurProgram, &str> {
@@ -236,6 +385,10 @@ impl GlesDraw<'_> {
             texture: name,
             delete_on_drop: false,
             device_id: self.device_id,
+            samples_as_opaque: false,
+            chroma: None,
+            yuv_mode: 0,
+            yuv_size: [0.0, 0.0],
         })
     }
     fn render_texture_elements_to_target(
@@ -251,7 +404,7 @@ impl GlesDraw<'_> {
         if items.is_empty() {
             return;
         }
-        let program = match self.texture_program() {
+        let identity = match self.texture_program() {
             Ok(program) => program,
             Err(error) => {
                 log::error!("texture shader is unavailable: {error}");
@@ -266,15 +419,34 @@ impl GlesDraw<'_> {
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER as _, framebuffer_object);
             gl::Viewport(0, 0, target_width, target_height);
-            gl::UseProgram(program.program);
+            gl::UseProgram(identity.program);
             gl::BlendFunc(gl::ONE as _, gl::ONE_MINUS_SRC_ALPHA as _);
-            gl::Uniform1i(program.sampler_location, 0);
+            gl::Uniform1i(identity.sampler_location, 0);
             gl::ActiveTexture(gl::TEXTURE0 as _);
-            gl::EnableVertexAttribArray(program.position_location);
-            gl::EnableVertexAttribArray(program.texcoord_location);
+            gl::EnableVertexAttribArray(identity.position_location);
+            gl::EnableVertexAttribArray(identity.texcoord_location);
         }
 
         for item in items {
+            let mut key = crate::render::color_pipeline::TexturePipelineKey::from_color(
+                item.color.as_deref(),
+                true,
+            );
+            key.yuv_mode = item.texture.yuv_mode();
+            if !item.texture.samples_as_opaque() {
+                key.alpha_mode = item.alpha_mode;
+            }
+            let program = if key.selects_current_shader() {
+                identity
+            } else {
+                match self.texture_program_for(key) {
+                    Ok(program) => program,
+                    Err(error) => {
+                        log::error!("color texture shader is unavailable: {error}");
+                        continue;
+                    }
+                }
+            };
             let Some(item_bounds) = RectI::new(item.x, item.y, item.width, item.height) else {
                 continue;
             };
@@ -297,7 +469,7 @@ impl GlesDraw<'_> {
             .to_gl_array();
             let tex_transform = item.tex_transform.to_gl_array();
             unsafe {
-                if item.blend || item.alpha < u8::MAX {
+                if item.blend || item.alpha < u8::MAX || item.alpha_multiplier < u32::MAX {
                     gl::Enable(gl::BLEND as _);
                 } else {
                     gl::Disable(gl::BLEND as _);
@@ -307,10 +479,79 @@ impl GlesDraw<'_> {
                     continue;
                 };
                 gl::BindTexture(gl::TEXTURE_2D as _, texture_name);
+                if key.yuv_mode != 0 {
+                    let Some(chroma) = gl_chroma_name(item.texture.as_ref(), self.device_id) else {
+                        log::error!("yuv texture is missing its chroma plane");
+                        continue;
+                    };
+                    gl::ActiveTexture(gl::TEXTURE1 as _);
+                    gl::BindTexture(gl::TEXTURE_2D as _, chroma);
+                    gl::ActiveTexture(gl::TEXTURE0 as _);
+                }
+                if program.program != identity.program {
+                    gl::UseProgram(program.program);
+                    gl::Uniform1i(program.sampler_location, 0);
+                    gl::EnableVertexAttribArray(program.position_location);
+                    gl::EnableVertexAttribArray(program.texcoord_location);
+                    let color =
+                        crate::render::color_pipeline::color_uniforms(item.color.as_deref());
+                    gl::Uniform4fv(program.color_matrix_0, 1, color.matrix[0].as_ptr());
+                    gl::Uniform4fv(program.color_matrix_1, 1, color.matrix[1].as_ptr());
+                    gl::Uniform4fv(program.color_matrix_2, 1, color.matrix[2].as_ptr());
+                    gl::Uniform1f(program.src_bt1886_lb_over_lw, color.src_bt1886_lb_over_lw);
+                    gl::Uniform1f(program.dst_bt1886_lb_over_lw, color.dst_bt1886_lb_over_lw);
+                    gl::Uniform1f(program.src_power_exponent, color.src_power_exponent);
+                    gl::Uniform1f(program.dst_power_exponent, color.dst_power_exponent);
+                    if key.yuv_mode != 0 {
+                        let size = item.texture.yuv_size();
+                        let yuv = if let Some(yuv) = item.yuv {
+                            yuv
+                        } else {
+                            crate::color::ColorRepresentation::default().yuv_conversion(
+                                key.yuv_mode == crate::render::color_pipeline::YUV_BT709_LIMITED_10,
+                            )
+                        };
+                        gl::Uniform1i(program.uv_sampler_location, 1);
+                        gl::Uniform2f(program.yuv_size_location, size[0], size[1]);
+                        gl::Uniform2f(program.yuv_site_location, yuv.site[0], yuv.site[1]);
+                        gl::Uniform4fv(program.yuv_row0, 1, yuv.rows[0].as_ptr());
+                        gl::Uniform4fv(program.yuv_row1, 1, yuv.rows[1].as_ptr());
+                        gl::Uniform4fv(program.yuv_row2, 1, yuv.rows[2].as_ptr());
+                    }
+                    gl::Uniform1f(program.tonemap_max, color.tonemap_max);
+                    gl::Uniform1f(program.tonemap_dst_max, color.tonemap_dst_max);
+                    gl::Uniform1f(program.tonemap_dst_min, color.tonemap_dst_min);
+                    gl::Uniform1f(program.tonemap_dst_ref, color.tonemap_dst_ref);
+                    gl::Uniform4fv(program.tonemap_to_lms_0, 1, color.tonemap_to_lms[0].as_ptr());
+                    gl::Uniform4fv(program.tonemap_to_lms_1, 1, color.tonemap_to_lms[1].as_ptr());
+                    gl::Uniform4fv(program.tonemap_to_lms_2, 1, color.tonemap_to_lms[2].as_ptr());
+                    gl::Uniform4fv(
+                        program.tonemap_from_lms_0,
+                        1,
+                        color.tonemap_from_lms[0].as_ptr(),
+                    );
+                    gl::Uniform4fv(
+                        program.tonemap_from_lms_1,
+                        1,
+                        color.tonemap_from_lms[1].as_ptr(),
+                    );
+                    gl::Uniform4fv(
+                        program.tonemap_from_lms_2,
+                        1,
+                        color.tonemap_from_lms[2].as_ptr(),
+                    );
+                }
                 gl::UniformMatrix3fv(program.transform_location, 1, 0, transform.as_ptr());
                 gl::UniformMatrix3fv(program.tex_transform_location, 1, 0, tex_transform.as_ptr());
                 gl::Uniform2f(program.item_size_location, item.width as f32, item.height as f32);
-                gl::Uniform1f(program.alpha_location, f32::from(item.alpha) / 255.0);
+                gl::Uniform1f(
+                    program.alpha_location,
+                    crate::render::effective_alpha(item.alpha, item.alpha_multiplier),
+                );
+                gl::Uniform1i(
+                    program.opaque_sample_location,
+                    i32::from(item.texture.samples_as_opaque()),
+                );
                 match &item.mask {
                     RenderItemMask::None => {
                         gl::Uniform1i(program.clip_mode_location, 0);
@@ -420,14 +661,19 @@ impl GlesDraw<'_> {
                     gl::DrawArrays(gl::TRIANGLE_STRIP as _, 0, 4);
                 }
                 gl::Disable(gl::SCISSOR_TEST as _);
+                if program.program != identity.program {
+                    gl::DisableVertexAttribArray(program.position_location);
+                    gl::DisableVertexAttribArray(program.texcoord_location);
+                    gl::UseProgram(identity.program);
+                }
             }
         }
 
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D as _, 0);
             gl::Disable(gl::BLEND as _);
-            gl::DisableVertexAttribArray(program.position_location);
-            gl::DisableVertexAttribArray(program.texcoord_location);
+            gl::DisableVertexAttribArray(identity.position_location);
+            gl::DisableVertexAttribArray(identity.texcoord_location);
             gl::UseProgram(0);
         }
     }
@@ -779,6 +1025,10 @@ impl GlesDraw<'_> {
                                 damage: damage.clone(),
                                 blend: true,
                                 alpha: *alpha,
+                                alpha_multiplier: u32::MAX,
+                                color: None,
+                                alpha_mode: 0,
+                                yuv: None,
                                 mask: RenderItemMask::FrameRing {
                                     ring: crate::render::RoundedRing {
                                         outer: RootSurfaceClip::new(
@@ -851,6 +1101,10 @@ impl GlesDraw<'_> {
                                 damage: damage.clone(),
                                 blend: true,
                                 alpha: *alpha,
+                                alpha_multiplier: u32::MAX,
+                                color: None,
+                                alpha_mode: 0,
+                                yuv: None,
                                 mask: RenderItemMask::RoundedClip {
                                     clip: RootSurfaceClip::new(
                                         RectI::new(
@@ -921,8 +1175,8 @@ impl GlesDraw<'_> {
             projection,
         )
         .to_gl_array();
-        let start = gradient.start_color.to_premultiplied_rgba_bytes();
-        let end = gradient.end_color.to_premultiplied_rgba_bytes();
+        let start = crate::render::blend::premul_color(gradient.start_color, self.linear_blend);
+        let end = crate::render::blend::premul_color(gradient.end_color, self.linear_blend);
 
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER as _, framebuffer_object);
@@ -963,20 +1217,8 @@ impl GlesDraw<'_> {
                 program.inner_rounding_power_location,
                 ring.inner.rounding_power.get().max(0.0001),
             );
-            gl::Uniform4f(
-                program.start_color_location,
-                f32::from(start[0]) / 255.0,
-                f32::from(start[1]) / 255.0,
-                f32::from(start[2]) / 255.0,
-                f32::from(start[3]) / 255.0,
-            );
-            gl::Uniform4f(
-                program.end_color_location,
-                f32::from(end[0]) / 255.0,
-                f32::from(end[1]) / 255.0,
-                f32::from(end[2]) / 255.0,
-                f32::from(end[3]) / 255.0,
-            );
+            gl::Uniform4f(program.start_color_location, start[0], start[1], start[2], start[3]);
+            gl::Uniform4f(program.end_color_location, end[0], end[1], end[2], end[3]);
             gl::Uniform1f(program.angle_location, gradient.angle_degrees as f32);
             gl::Uniform1f(program.alpha_location, f32::from(alpha) / 255.0);
             gl::VertexAttribPointer(
@@ -1048,7 +1290,7 @@ impl GlesDraw<'_> {
             projection,
         )
         .to_gl_array();
-        let color = shadow_color_with_alpha(style.color, alpha);
+        let color = crate::render::blend::shadow_coverage(style.color, alpha, self.linear_blend);
 
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER as _, framebuffer_object);
@@ -1097,9 +1339,8 @@ impl GlesDraw<'_> {
     }
 }
 
-fn create_texture_program() -> Result<TextureProgram, String> {
+fn create_texture_program_from(fragment_source: &str) -> Result<TextureProgram, String> {
     let vertex_source = include_str!("../../shaders/texture_clip.vert");
-    let fragment_source = include_str!("../../shaders/texture_clip.frag");
     let vertex_shader = compile_shader(gl::VERTEX_SHADER as _, vertex_source)?;
     let fragment_shader = compile_shader(gl::FRAGMENT_SHADER as _, fragment_source)?;
     let program = link_program(vertex_shader, fragment_shader, "texture program")?;
@@ -1145,6 +1386,70 @@ fn create_texture_program() -> Result<TextureProgram, String> {
             gl::GetUniformLocation(program, b"u_clip_inner_rounding_power\0".as_ptr().cast())
         },
         alpha_location: unsafe { gl::GetUniformLocation(program, b"u_alpha\0".as_ptr().cast()) },
+        opaque_sample_location: unsafe {
+            gl::GetUniformLocation(program, b"u_opaque_sample\0".as_ptr().cast())
+        },
+        color_matrix_0: unsafe {
+            gl::GetUniformLocation(program, b"u_color_matrix_0\0".as_ptr().cast())
+        },
+        color_matrix_1: unsafe {
+            gl::GetUniformLocation(program, b"u_color_matrix_1\0".as_ptr().cast())
+        },
+        color_matrix_2: unsafe {
+            gl::GetUniformLocation(program, b"u_color_matrix_2\0".as_ptr().cast())
+        },
+        src_bt1886_lb_over_lw: unsafe {
+            gl::GetUniformLocation(program, b"u_src_bt1886_lb_over_lw\0".as_ptr().cast())
+        },
+        dst_bt1886_lb_over_lw: unsafe {
+            gl::GetUniformLocation(program, b"u_dst_bt1886_lb_over_lw\0".as_ptr().cast())
+        },
+        src_power_exponent: unsafe {
+            gl::GetUniformLocation(program, b"u_src_power_exponent\0".as_ptr().cast())
+        },
+        dst_power_exponent: unsafe {
+            gl::GetUniformLocation(program, b"u_dst_power_exponent\0".as_ptr().cast())
+        },
+        uv_sampler_location: unsafe {
+            gl::GetUniformLocation(program, b"u_texture_uv\0".as_ptr().cast())
+        },
+        yuv_size_location: unsafe {
+            gl::GetUniformLocation(program, b"u_yuv_size\0".as_ptr().cast())
+        },
+        yuv_site_location: unsafe {
+            gl::GetUniformLocation(program, b"u_yuv_site\0".as_ptr().cast())
+        },
+        yuv_row0: unsafe { gl::GetUniformLocation(program, b"u_yuv_row0\0".as_ptr().cast()) },
+        yuv_row1: unsafe { gl::GetUniformLocation(program, b"u_yuv_row1\0".as_ptr().cast()) },
+        yuv_row2: unsafe { gl::GetUniformLocation(program, b"u_yuv_row2\0".as_ptr().cast()) },
+        tonemap_max: unsafe { gl::GetUniformLocation(program, b"u_tonemap_max\0".as_ptr().cast()) },
+        tonemap_dst_max: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_dst_max\0".as_ptr().cast())
+        },
+        tonemap_dst_min: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_dst_min\0".as_ptr().cast())
+        },
+        tonemap_dst_ref: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_dst_ref\0".as_ptr().cast())
+        },
+        tonemap_to_lms_0: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_to_lms_0\0".as_ptr().cast())
+        },
+        tonemap_to_lms_1: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_to_lms_1\0".as_ptr().cast())
+        },
+        tonemap_to_lms_2: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_to_lms_2\0".as_ptr().cast())
+        },
+        tonemap_from_lms_0: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_from_lms_0\0".as_ptr().cast())
+        },
+        tonemap_from_lms_1: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_from_lms_1\0".as_ptr().cast())
+        },
+        tonemap_from_lms_2: unsafe {
+            gl::GetUniformLocation(program, b"u_tonemap_from_lms_2\0".as_ptr().cast())
+        },
     })
 }
 
@@ -1304,8 +1609,9 @@ fn compile_shader(kind: gl::Enum, source: &str) -> Result<gl::Uint, String> {
     let mut status = 0;
     unsafe { gl::GetShaderiv(shader, gl::COMPILE_STATUS as _, &mut status) };
     if status == 0 {
+        let log = shader_info_log(shader, true);
         unsafe { gl::DeleteShader(shader) };
-        return Err("could not compile shader".into());
+        return Err(format!("could not compile shader: {log}"));
     }
 
     Ok(shader)
@@ -1328,10 +1634,37 @@ fn link_program(
     let mut status = 0;
     unsafe { gl::GetProgramiv(program, gl::LINK_STATUS as _, &mut status) };
     if status == 0 {
+        let log = shader_info_log(program, false);
         unsafe { gl::DeleteProgram(program) };
-        return Err(format!("could not link {label}"));
+        return Err(format!("could not link {label}: {log}"));
     }
     Ok(program)
+}
+
+fn shader_info_log(object: gl::Uint, shader: bool) -> String {
+    let mut length = 0;
+    unsafe {
+        if shader {
+            gl::GetShaderiv(object, gl::INFO_LOG_LENGTH as _, &mut length);
+        } else {
+            gl::GetProgramiv(object, gl::INFO_LOG_LENGTH as _, &mut length);
+        }
+    }
+    if length <= 1 {
+        return String::new();
+    }
+    let mut bytes = vec![0_u8; length as usize];
+    unsafe {
+        if shader {
+            gl::GetShaderInfoLog(object, length, std::ptr::null_mut(), bytes.as_mut_ptr().cast());
+        } else {
+            gl::GetProgramInfoLog(object, length, std::ptr::null_mut(), bytes.as_mut_ptr().cast());
+        }
+    }
+    String::from_utf8_lossy(&bytes)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string()
 }
 
 fn scissor_y(
@@ -1455,6 +1788,10 @@ mod tests {
             texture: 7,
             delete_on_drop: false,
             device_id,
+            samples_as_opaque: false,
+            chroma: None,
+            yuv_mode: 0,
+            yuv_size: [0.0, 0.0],
         };
 
         assert_eq!(super::super::import::gl_texture_name(&texture, device_id), Some(7));

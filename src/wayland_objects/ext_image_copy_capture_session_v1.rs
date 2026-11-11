@@ -73,8 +73,9 @@ impl ExtImageCopyCaptureSessionV1 {
         self.advertised
     }
 
-    /// SHM formats this compositor can write, then the source size, then `done`.
-    /// DMA-BUF stays deferred. A cursor session with no cursor image waits for one.
+    /// 8-bit SHM formats this compositor writes, then the source size, then `done`.
+    /// A 10-bit scanout is converted to those pixels. DMA-BUF stays deferred. A cursor
+    /// session with no cursor image waits for one.
     pub(crate) fn send_constraints(
         &mut self,
         size: Option<(i32, i32)>,
@@ -93,7 +94,7 @@ impl ExtImageCopyCaptureSessionV1 {
         if self.stopped {
             return;
         }
-        for format in [crate::drm::ARGB8888.wayland_id, crate::drm::XRGB8888.wayland_id] {
+        for format in crate::drm::shm_capture_formats().filter_map(|format| format.wayland_shm_id) {
             self.send_event(
                 ext_image_copy_capture_session_v1::Event::ShmFormat { format },
                 dispatcher,

@@ -90,19 +90,53 @@ pub(super) fn record_barrier(
     image: vk::Image,
     spec: BarrierSpec,
 ) {
-    image_ownership_barrier(
-        device,
-        command,
-        image,
-        spec.old_layout,
-        spec.new_layout,
-        spec.src_stage,
-        spec.dst_stage,
-        spec.src_access,
-        spec.dst_access,
-        spec.src_family,
-        spec.dst_family,
-    );
+    record_barrier_aspect(device, command, image, spec, vk::ImageAspectFlags::COLOR);
+}
+
+/// NV12 and P010 keep a layout per plane. `COLOR` is not valid on a disjoint image.
+pub(super) fn record_plane_barriers(
+    device: &Device,
+    command: vk::CommandBuffer,
+    image: vk::Image,
+    spec: BarrierSpec,
+) {
+    record_barrier_aspect(device, command, image, spec, vk::ImageAspectFlags::PLANE_0);
+    record_barrier_aspect(device, command, image, spec, vk::ImageAspectFlags::PLANE_1);
+}
+
+fn record_barrier_aspect(
+    device: &Device,
+    command: vk::CommandBuffer,
+    image: vk::Image,
+    spec: BarrierSpec,
+    aspect: vk::ImageAspectFlags,
+) {
+    let barrier = vk::ImageMemoryBarrier::default()
+        .image(image)
+        .old_layout(spec.old_layout)
+        .new_layout(spec.new_layout)
+        .src_queue_family_index(spec.src_family)
+        .dst_queue_family_index(spec.dst_family)
+        .src_access_mask(spec.src_access)
+        .dst_access_mask(spec.dst_access)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command,
+            spec.src_stage,
+            spec.dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            std::slice::from_ref(&barrier),
+        );
+    }
 }
 
 pub(super) fn image_barrier(

@@ -392,7 +392,11 @@ pub(super) fn scene_change_damage(
             || current.state.content_key != previous.content_key
             || current.state.tex_transform != previous.tex_transform
             || current.state.alpha != previous.alpha
+            || current.state.alpha_multiplier != previous.alpha_multiplier
             || current.state.mask != previous.mask
+            || current.state.color_description_id != previous.color_description_id
+            || current.state.render_intent != previous.render_intent
+            || current.state.representation != previous.representation
         {
             base_damage.add_rect(previous.bounds);
             base_damage.add_rect(current.state.bounds);
@@ -471,7 +475,11 @@ mod tests {
                 bounds,
                 tex_transform: crate::transform::Mat3::identity(),
                 alpha,
+                alpha_multiplier: u32::MAX,
                 mask,
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask,
             texture: crate::render::inert_texture(),
@@ -479,10 +487,12 @@ mod tests {
             sample_damage_padding: 0,
             state_has_alpha: false,
             alpha,
+            alpha_multiplier: u32::MAX,
             opaque_region: DamageRegion::new(),
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }
@@ -508,6 +518,64 @@ mod tests {
         );
         let mut current = item(1, bounds, 128, super::super::SceneItemMask::None, bounds);
         current.damage = DamageRegion::new();
+        let damage = scene_change_damage(
+            output_bounds(),
+            &[current],
+            &[previous.state],
+            false,
+            false,
+            false,
+        );
+        assert!(damage.intersects_rect(bounds));
+        assert!(!covers_output(&damage));
+    }
+
+    #[test]
+    fn alpha_multiplier_only_change_damages_the_item_bounds() {
+        let bounds = RectI::new(10, 10, 40, 30).unwrap();
+        let previous = item(1, bounds, 255, super::super::SceneItemMask::None, bounds);
+        let mut current = item(1, bounds, 255, super::super::SceneItemMask::None, bounds);
+        current.damage = DamageRegion::new();
+        current.alpha_multiplier = 1;
+        current.state.alpha_multiplier = 1;
+        let damage = scene_change_damage(
+            output_bounds(),
+            &[current],
+            &[previous.state],
+            false,
+            false,
+            false,
+        );
+        assert!(damage.intersects_rect(bounds));
+        assert!(!covers_output(&damage));
+    }
+
+    #[test]
+    fn source_description_change_damages_the_item_bounds() {
+        let bounds = RectI::new(10, 10, 40, 30).unwrap();
+        let previous = item(1, bounds, 255, super::super::SceneItemMask::None, bounds);
+        let mut current = item(1, bounds, 255, super::super::SceneItemMask::None, bounds);
+        current.damage = DamageRegion::new();
+        current.state.color_description_id = 7;
+        let damage = scene_change_damage(
+            output_bounds(),
+            &[current],
+            &[previous.state],
+            false,
+            false,
+            false,
+        );
+        assert!(damage.intersects_rect(bounds));
+        assert!(!covers_output(&damage));
+    }
+
+    #[test]
+    fn render_intent_change_damages_the_item_bounds() {
+        let bounds = RectI::new(10, 10, 40, 30).unwrap();
+        let previous = item(1, bounds, 255, super::super::SceneItemMask::None, bounds);
+        let mut current = item(1, bounds, 255, super::super::SceneItemMask::None, bounds);
+        current.damage = DamageRegion::new();
+        current.state.render_intent = crate::color::RenderIntent::AbsoluteNoAdaptation;
         let damage = scene_change_damage(
             output_bounds(),
             &[current],
@@ -684,7 +752,7 @@ mod tests {
             })
             .count();
         assert_eq!(overlay_textures, 1);
-        let recipe = super::super::build_output_frame_recipe(&items, &frame_elements);
+        let recipe = super::super::build_output_frame_recipe(&items, &frame_elements, None);
         assert!(matches!(
             recipe.elements.last(),
             Some(crate::render::FrameElement::Texture {
@@ -719,7 +787,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(software_cursor_items.len(), 1);
         assert_eq!(frame_elements, original_elements);
-        let recipe = super::super::build_output_frame_recipe(&items, &frame_elements);
+        let recipe = super::super::build_output_frame_recipe(&items, &frame_elements, None);
         assert!(recipe.elements.iter().all(|element| {
             !matches!(
                 element,

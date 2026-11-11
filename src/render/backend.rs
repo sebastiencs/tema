@@ -112,6 +112,21 @@ pub trait Texture: Debug + Any {
     fn requires_device_context_on_drop(&self) -> bool {
         false
     }
+
+    /// The format has no alpha channel. GLES must sample alpha as 1. Vulkan already does.
+    fn samples_as_opaque(&self) -> bool {
+        false
+    }
+
+    /// `0` is one RGBA texture. `1` is NV12 and `2` is P010, both BT.709 limited.
+    fn yuv_mode(&self) -> u32 {
+        0
+    }
+
+    /// Luma size in pixels. Used to site the chroma sample.
+    fn yuv_size(&self) -> [f32; 2] {
+        [0.0, 0.0]
+    }
 }
 
 /// GPU-free texture for tests that build recipes without rendering.
@@ -164,6 +179,11 @@ pub struct RenderFrame<'a> {
     /// Output rendering leaves this empty and measures blur against the target.
     /// Window capture sets it to the output size.
     pub blur_reference: Option<(i32, i32)>,
+    /// Output transfer when translucent pixels composite in a linear FP16 buffer.
+    ///
+    /// `None` blends in the framebuffer encoding. A PQ output sets this to
+    /// [`crate::color::TransferFunction::St2084Pq`].
+    pub linear_blend: Option<crate::color::TransferFunction>,
 }
 
 /// One renderer for one DRM device.
@@ -171,6 +191,29 @@ pub trait Renderer: Debug {
     fn api(&self) -> GraphicsApi;
 
     fn capabilities(&self) -> &RendererCapabilities;
+
+    /// DRM formats this renderer can sample from a client buffer.
+    fn sampleable_formats(&self) -> &[FormatSupport] {
+        &self.capabilities().sample_formats
+    }
+
+    /// Shared-memory formats this renderer can copy into a texture.
+    ///
+    /// The 8-bit pair, the packed 10-bit RGB formats, and the FP16 pair are the
+    /// default. A GLES 2 context overrides this and drops 10-bit and FP16.
+    fn accepts_shm_format(&self, fourcc: DrmFourcc) -> bool {
+        matches!(
+            fourcc,
+            DrmFourcc::Argb8888
+                | DrmFourcc::Xrgb8888
+                | DrmFourcc::Argb2101010
+                | DrmFourcc::Xrgb2101010
+                | DrmFourcc::Abgr2101010
+                | DrmFourcc::Xbgr2101010
+                | DrmFourcc::Abgr16161616f
+                | DrmFourcc::Xbgr16161616f
+        )
+    }
 
     fn import_dmabuf(&mut self, source: &DmaBuf) -> Result<Rc<dyn Texture>, RendererError>;
 

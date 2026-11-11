@@ -9,6 +9,7 @@ use khronos_types::gl;
 
 use crate::{
     dmabuf::{DmaBuf, DmaBufId},
+    drm::{client_format, output_format, FormatKind},
     gbm::GbmDevice,
     region::RectI,
     render::{
@@ -24,7 +25,7 @@ use super::{
     resources::EglFrameBuffer,
 };
 
-/// GLES 2 renderer for one DRM device.
+/// GLES renderer for one DRM device. The context is ES 3 when the driver allows it.
 #[derive(Debug)]
 pub struct GlesRenderer {
     context: EglContext,
@@ -54,6 +55,7 @@ impl GlesRenderer {
             device_id: self.context.device_id(),
             width,
             height,
+            linear_blend: None,
         }
     }
 }
@@ -61,8 +63,12 @@ impl GlesRenderer {
 fn capabilities_from(context: &EglContext) -> RendererCapabilities {
     let mut fourccs: Vec<_> = context.opengl_formats.keys().copied().collect();
     fourccs.sort_by_key(|fourcc| format!("{fourcc:?}"));
-    let sample_formats = fourccs
+    let mut sample_formats: Vec<_> = fourccs
         .iter()
+        .filter(|&fourcc| {
+            client_format(*fourcc)
+                .is_some_and(|format| !matches!(format.kind, FormatKind::Yuv { .. }))
+        })
         .map(|fourcc| FormatSupport {
             fourcc: *fourcc,
             modifiers: context.opengl_formats[fourcc]
@@ -72,8 +78,10 @@ fn capabilities_from(context: &EglContext) -> RendererCapabilities {
                 .collect(),
         })
         .collect();
+    sample_formats.extend(yuv_sample_formats(context));
     let render_formats = fourccs
         .into_iter()
+        .filter(|fourcc| output_format(*fourcc).is_some())
         .map(|fourcc| FormatSupport {
             fourcc,
             modifiers: context.opengl_formats[&fourcc]
@@ -88,6 +96,30 @@ fn capabilities_from(context: &EglContext) -> RendererCapabilities {
         render_formats,
         explicit_sync: context.supports_native_render_fence(),
     }
+}
+
+/// NV12 and P010 are advertised when both planes import as `TEXTURE_2D`.
+/// `write_modifiers` is the non-external set. The driver's own NV12 entry is
+/// often external-only, which would hand the matrix to Mesa.
+fn yuv_sample_formats(context: &EglContext) -> Vec<FormatSupport> {
+    crate::drm::CLIENT_FORMATS
+        .iter()
+        .filter_map(|format| {
+            let (luma, chroma) = crate::drm::yuv_plane_fourccs(format)?;
+            let luma = context.opengl_formats.get(&luma)?;
+            let chroma = context.opengl_formats.get(&chroma)?;
+            let mut modifiers: Vec<u64> = luma
+                .write_modifiers
+                .intersection(&chroma.write_modifiers)
+                .map(|modifier| modifier.0)
+                .collect();
+            if modifiers.is_empty() {
+                return None;
+            }
+            modifiers.sort_unstable();
+            Some(FormatSupport { fourcc: format.drm, modifiers })
+        })
+        .collect()
 }
 
 impl RenderTarget for EglFrameBuffer {
@@ -137,6 +169,16 @@ impl Renderer for GlesRenderer {
         &self.capabilities
     }
 
+    fn accepts_shm_format(&self, fourcc: drm::buffer::DrmFourcc) -> bool {
+        match client_format(fourcc).map(|format| format.kind) {
+            Some(crate::drm::FormatKind::Rgb8) => true,
+            Some(crate::drm::FormatKind::Rgb10 | crate::drm::FormatKind::Fp16) => {
+                self.context.client_version >= 3
+            }
+            _ => false,
+        }
+    }
+
     fn import_dmabuf(&mut self, source: &DmaBuf) -> Result<Rc<dyn Texture>, RendererError> {
         self.dmabuf_textures
             .retain(|_, texture| texture.strong_count() > 0);
@@ -144,11 +186,29 @@ impl Renderer for GlesRenderer {
             return Ok(texture);
         }
         self.context.bind();
-        let image = self.context.import_dmabuf(source)?;
-        let texture = image
-            .into_texture(self.context.device_id())
+        let texture = if matches!(source.format.kind, FormatKind::Yuv { .. }) {
+            let (luma, chroma) = self.context.import_yuv_dmabuf(source)?;
+            let mode = match source.format.drm {
+                drm::buffer::DrmFourcc::P010 => crate::render::color_pipeline::YUV_BT709_LIMITED_10,
+                _ => crate::render::color_pipeline::YUV_BT709_LIMITED_8,
+            };
+            GlTexture::from_yuv_planes(
+                luma,
+                chroma,
+                mode,
+                source.width,
+                source.height,
+                self.context.device_id(),
+            )
             .map(|texture| Rc::new(texture) as Rc<dyn Texture>)
-            .map_err(|_| RendererError::ImportFailed)?;
+            .map_err(|_| RendererError::ImportFailed)?
+        } else {
+            let image = self.context.import_dmabuf(source)?;
+            image
+                .into_texture(self.context.device_id(), !source.format.has_alpha)
+                .map(|texture| Rc::new(texture) as Rc<dyn Texture>)
+                .map_err(|_| RendererError::ImportFailed)?
+        };
         self.dmabuf_textures
             .insert(source.id, Rc::downgrade(&texture));
         Ok(texture)
@@ -156,8 +216,13 @@ impl Renderer for GlesRenderer {
 
     fn test_import_dmabuf(&mut self, source: &DmaBuf) -> Result<(), RendererError> {
         self.context.bind();
-        let _image = self.context.import_dmabuf(source)?;
-        Ok(())
+        if matches!(source.format.kind, FormatKind::Yuv { .. }) {
+            let _planes = self.context.import_yuv_dmabuf(source)?;
+            Ok(())
+        } else {
+            let _image = self.context.import_dmabuf(source)?;
+            Ok(())
+        }
     }
 
     fn import_shm(&mut self, image: ShmImage<'_>) -> Result<Rc<dyn Texture>, RendererError> {
@@ -168,6 +233,7 @@ impl Renderer for GlesRenderer {
             image.height,
             image.stride,
             image.fourcc,
+            self.context.client_version >= 3,
             self.context.device_id(),
         )
         .map(|texture| Rc::new(texture) as Rc<dyn Texture>)
@@ -259,6 +325,7 @@ impl Renderer for GlesRenderer {
                 frame.preserve_contents,
                 frame.presentation_transform,
                 frame.clear_color,
+                frame.linear_blend,
             ));
         }
         let Some(offscreen) = target.as_any().downcast_ref::<OffscreenColorTarget>() else {
@@ -268,6 +335,35 @@ impl Renderer for GlesRenderer {
             .blur_reference
             .unwrap_or((offscreen.width(), offscreen.height()));
         let draw = self.draw(reference_width, reference_height);
+        if let Some(output_tf) = frame.linear_blend {
+            unsafe {
+                gl::BindFramebuffer(gl::FRAMEBUFFER as _, offscreen.framebuffer_object());
+                gl::Viewport(0, 0, offscreen.width(), offscreen.height());
+                gl::Disable(gl::SCISSOR_TEST as _);
+                gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                gl::Clear(gl::COLOR_BUFFER_BIT as _);
+            }
+            let projection = crate::transform::output_projection(
+                offscreen.width() as f32,
+                offscreen.height() as f32,
+                frame.presentation_transform,
+            );
+            if super::pipeline::render_linear_blend(
+                draw.programs,
+                draw.device_id,
+                offscreen.linear_blend(),
+                offscreen.framebuffer_object(),
+                offscreen.width(),
+                offscreen.height(),
+                frame.recipe,
+                projection,
+                frame.damage,
+                frame.presentation_transform,
+                output_tf,
+            ) {
+                return Ok(RenderCompletion::blocking_fallback());
+            }
+        }
         offscreen.render_elements(&draw, &frame.recipe.elements, frame.presentation_transform);
         Ok(RenderCompletion::blocking_fallback())
     }

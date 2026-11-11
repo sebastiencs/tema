@@ -117,6 +117,19 @@ wayland_id! {
   XdgSurfaceId,
   XdgToplevelId,
   XdgPopupId,
+  WpAlphaModifierV1Id,
+  WpAlphaModifierSurfaceV1Id,
+  WpColorManagerV1Id,
+  WpColorManagementOutputV1Id,
+  WpColorManagementSurfaceV1Id,
+  WpColorManagementSurfaceFeedbackV1Id,
+  WpImageDescriptionCreatorIccV1Id,
+  WpImageDescriptionCreatorParamsV1Id,
+  WpImageDescriptionV1Id,
+  WpImageDescriptionInfoV1Id,
+  WpImageDescriptionReferenceV1Id,
+  WpColorRepresentationManagerV1Id,
+  WpColorRepresentationSurfaceV1Id,
   WpContentTypeManagerV1Id,
   WpContentTypeV1Id,
   WpDrmLeaseDeviceV1Id,
@@ -9929,6 +9942,2646 @@ pub mod xdg_popup {
     pub enum Error {
         /// Tried to grab after being mapped,
         InvalidGrab = 0,
+    }
+}
+
+/// Surface alpha modifier manager
+///
+/// This interface allows a client to set a factor for the alpha values on a
+/// surface, which can be used to offload such operations to the compositor,
+/// which can in turn for example offload them to KMS.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod wp_alpha_modifier_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_alpha_modifier_v1::WpAlphaModifierV1 {
+        const INTERFACE_NAME: &'static str = "wp_alpha_modifier_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpAlphaModifierV1Id {
+        type Object = crate::wayland_objects::wp_alpha_modifier_v1::WpAlphaModifierV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_alpha_modifier_v1::WpAlphaModifierV1
+    {
+        type Id = WpAlphaModifierV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the alpha modifier manager object
+        ///
+        /// Destroy the alpha modifier manager. This doesn't destroy objects
+        /// created with the manager.
+        Destroy,
+        /// Create a new alpha modifier surface object
+        ///
+        /// Create a new alpha modifier surface object associated with the
+        /// given wl_surface. If there is already such an object associated with
+        /// the wl_surface, the already_constructed error will be raised.
+        GetSurface { id: WpAlphaModifierSurfaceV1Id, surface: WlSurfaceId },
+    }
+    impl Parser for crate::wayland_objects::wp_alpha_modifier_v1::WpAlphaModifierV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetSurface { id: req.id()?, surface: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Wl_surface already has a alpha modifier object,
+        AlreadyConstructed = 0,
+    }
+}
+
+/// Alpha modifier object for a surface
+///
+/// This interface allows the client to set a factor for the alpha values on
+/// a surface, which can be used to offload such operations to the compositor.
+/// The default factor is UINT32_MAX.
+///
+/// This object has to be destroyed before the associated wl_surface. Once the
+/// wl_surface is destroyed, all request on this object will raise the
+/// no_surface error.
+pub mod wp_alpha_modifier_surface_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1 {
+        const INTERFACE_NAME: &'static str = "wp_alpha_modifier_surface_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpAlphaModifierSurfaceV1Id {
+        type Object =
+            crate::wayland_objects::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1
+    {
+        type Id = WpAlphaModifierSurfaceV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the alpha modifier object
+        ///
+        /// This destroys the object, and is equivalent to set_multiplier with
+        /// a value of UINT32_MAX, with the same double-buffered semantics as
+        /// set_multiplier.
+        Destroy,
+        /// Specify the alpha multiplier
+        ///
+        /// Sets the alpha multiplier for the surface. The alpha multiplier is
+        /// double-buffered state, see wl_surface.commit for details.
+        ///
+        /// This factor is applied in the compositor's blending space, as an
+        /// additional step after the processing of per-pixel alpha values for the
+        /// wl_surface. The exact meaning of the factor is thus undefined, unless
+        /// the blending space is specified in a different extension.
+        ///
+        /// This multiplier is applied even if the buffer attached to the
+        /// wl_surface doesn't have an alpha channel; in that case an alpha value
+        /// of one is used instead.
+        ///
+        /// Zero means completely transparent, UINT32_MAX means completely opaque.
+        SetMultiplier { factor: u32 },
+    }
+    impl Parser for crate::wayland_objects::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => SetMultiplier { factor: req.uint()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Wl_surface was destroyed,
+        NoSurface = 0,
+    }
+}
+
+/// Color manager singleton
+///
+/// A singleton global interface used for getting color management extensions
+/// for wl_surface and wl_output objects, and for creating client defined
+/// image description objects. The extension interfaces allow
+/// getting the image description of outputs and setting the image
+/// description of surfaces.
+///
+/// Compositors should never remove this global.
+pub mod wp_color_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_color_manager_v1::WpColorManagerV1 {
+        const INTERFACE_NAME: &'static str = "wp_color_manager_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for WpColorManagerV1Id {
+        type Object = crate::wayland_objects::wp_color_manager_v1::WpColorManagerV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_color_manager_v1::WpColorManagerV1 {
+        type Id = WpColorManagerV1Id;
+    }
+    /// Minimum interface version for the `get_image_description` message (XML `since` / `version`).
+    pub const GET_IMAGE_DESCRIPTION_SINCE: u32 = 2;
+    /// Minimum interface version for the `create_windows_bt2100` message (XML `since` / `version`).
+    pub const CREATE_WINDOWS_BT2100_SINCE: u32 = 3;
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the color manager
+        ///
+        /// Destroy the wp_color_manager_v1 object. This does not affect any other
+        /// objects in any way.
+        Destroy,
+        /// Create a color management interface for a wl_output
+        ///
+        /// This creates a new wp_color_management_output_v1 object for the
+        /// given wl_output.
+        ///
+        /// See the wp_color_management_output_v1 interface for more details.
+        GetOutput { id: WpColorManagementOutputV1Id, output: WlOutputId },
+        /// Create a color management interface for a wl_surface
+        ///
+        /// If a wp_color_management_surface_v1 object already exists for the given
+        /// wl_surface, the protocol error surface_exists is raised.
+        ///
+        /// This creates a new color wp_color_management_surface_v1 object for the
+        /// given wl_surface.
+        ///
+        /// See the wp_color_management_surface_v1 interface for more details.
+        GetSurface { id: WpColorManagementSurfaceV1Id, surface: WlSurfaceId },
+        /// Create a color management feedback interface
+        ///
+        /// This creates a new color wp_color_management_surface_feedback_v1 object
+        /// for the given wl_surface.
+        ///
+        /// See the wp_color_management_surface_feedback_v1 interface for more
+        /// details.
+        GetSurfaceFeedback { id: WpColorManagementSurfaceFeedbackV1Id, surface: WlSurfaceId },
+        /// Make a new ICC-based image description creator object
+        ///
+        /// Makes a new ICC-based image description creator object with all
+        /// properties initially unset. The client can then use the object's
+        /// interface to define all the required properties for an image description
+        /// and finally create a wp_image_description_v1 object.
+        ///
+        /// This request can be used when the compositor advertises
+        /// wp_color_manager_v1.feature.icc_v2_v4.
+        /// Otherwise this request raises the protocol error unsupported_feature.
+        CreateIccCreator {
+            /// The new creator object,
+            obj: WpImageDescriptionCreatorIccV1Id,
+        },
+        /// Make a new parametric image description creator object
+        ///
+        /// Makes a new parametric image description creator object with all
+        /// properties initially unset. The client can then use the object's
+        /// interface to define all the required properties for an image description
+        /// and finally create a wp_image_description_v1 object.
+        ///
+        /// This request can be used when the compositor advertises
+        /// wp_color_manager_v1.feature.parametric.
+        /// Otherwise this request raises the protocol error unsupported_feature.
+        CreateParametricCreator {
+            /// The new creator object,
+            obj: WpImageDescriptionCreatorParamsV1Id,
+        },
+        /// Create Windows-scRGB image description object
+        ///
+        /// This creates a pre-defined image description for the so-called
+        /// Windows-scRGB stimulus encoding. This comes from the Windows 10 handling
+        /// of its own definition of an scRGB color space for an HDR screen
+        /// driven in BT.2100/PQ signalling mode.
+        ///
+        /// Windows-scRGB uses sRGB (BT.709) color primaries and white point.
+        /// The transfer characteristic is extended linear.
+        ///
+        /// The nominal color channel value range is extended, meaning it includes
+        /// negative and greater than 1.0 values. Negative values are used to
+        /// escape the sRGB color gamut boundaries. To make use of the extended
+        /// range, the client needs to use a pixel format that can represent those
+        /// values, e.g. floating-point 16 bits per channel.
+        ///
+        /// Nominal color value R=G=B=0.0 corresponds to BT.2100/PQ system
+        /// 0 cd/m², and R=G=B=1.0 corresponds to BT.2100/PQ system 80 cd/m².
+        /// The maximum is R=G=B=125.0 corresponding to 10k cd/m².
+        ///
+        /// Windows-scRGB is displayed by Windows 10 by converting it to
+        /// BT.2100/PQ, maintaining the CIE 1931 chromaticity and mapping the
+        /// luminance as above. No adjustment is made to the signal to account
+        /// for the viewing conditions.
+        ///
+        /// The reference white level of Windows-scRGB is unknown. If a
+        /// reference white level must be assumed for compositor processing, it
+        /// should be R=G=B=2.5375 corresponding to 203 cd/m² of Report ITU-R
+        /// BT.2408-7.
+        ///
+        /// The target color volume of Windows-scRGB is unknown. The color gamut
+        /// may be anything between sRGB and BT.2100.
+        ///
+        /// Note: EGL_EXT_gl_colorspace_scrgb_linear definition differs from
+        /// Windows-scRGB by using R=G=B=1.0 as the reference white level, while
+        /// Windows-scRGB reference white level is unknown or varies. However,
+        /// it seems probable that Windows implements both
+        /// EGL_EXT_gl_colorspace_scrgb_linear and Vulkan
+        /// VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT as Windows-scRGB.
+        ///
+        /// This request can be used when the compositor advertises
+        /// wp_color_manager_v1.feature.windows_scrgb.
+        /// Otherwise this request raises the protocol error unsupported_feature.
+        ///
+        /// The resulting image description object does not allow get_information
+        /// request. The wp_image_description_v1.ready event shall be sent.
+        CreateWindowsScrgb { image_description: WpImageDescriptionV1Id },
+        /// Create an image description from a reference
+        ///
+        /// This request retrieves the image description backing a reference.
+        ///
+        /// The get_information request can be used if and only if the request that
+        /// creates the reference allows it.
+        GetImageDescription {
+            image_description: WpImageDescriptionV1Id,
+            reference: WpImageDescriptionReferenceV1Id,
+        },
+        /// Create Windows-BT.2100 image description object
+        ///
+        /// This creates a pre-defined image description for the so-called
+        /// Windows-BT.2100 stimulus encoding. This comes from the Windows 10
+        /// handling of its own definition of a BT.2100 color space for an HDR
+        /// screen driven in BT.2100/PQ signalling mode.
+        ///
+        /// Windows-BT.2100 uses BT.2020 color primaries and white point.
+        /// The transfer characteristic is st2084_pq.
+        ///
+        /// Windows-BT.2100 is generally displayed by Windows 10 without any
+        /// adjustments to the signal to account for viewing conditions.
+        ///
+        /// The reference white level of Windows-BT.2100 is unknown. If a
+        /// reference white level must be assumed for compositor processing, it
+        /// should be 203 cd/m² of Report ITU-R BT.2408-7.
+        ///
+        /// The target color volume of Windows-BT.2100 is unknown. The color gamut
+        /// may be anything up to BT.2100.
+        ///
+        /// This request can be used when the compositor advertises
+        /// wp_color_manager_v1.feature.windows_bt2100.
+        /// Otherwise this request raises the protocol error unsupported_feature.
+        ///
+        /// The resulting image description object does not allow get_information
+        /// request. The wp_image_description_v1.ready event shall be sent.
+        CreateWindowsBt2100 { image_description: WpImageDescriptionV1Id },
+    }
+    impl Parser for crate::wayland_objects::wp_color_manager_v1::WpColorManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetOutput { id: req.id()?, output: req.id()? },
+                2 => GetSurface { id: req.id()?, surface: req.id()? },
+                3 => GetSurfaceFeedback { id: req.id()?, surface: req.id()? },
+                4 => CreateIccCreator { obj: req.id()? },
+                5 => CreateParametricCreator { obj: req.id()? },
+                6 => CreateWindowsScrgb { image_description: req.id()? },
+                7 => GetImageDescription { image_description: req.id()?, reference: req.id()? },
+                8 => CreateWindowsBt2100 { image_description: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Supported rendering intent
+        ///
+        /// When this object is created, it shall immediately send this event once
+        /// for each rendering intent the compositor supports.
+        ///
+        /// A compositor must not advertise intents that are deprecated in the
+        /// bound version of the interface.
+        SupportedIntent {
+            /// Rendering intent,
+            render_intent: u32,
+        },
+        /// Supported features
+        ///
+        /// When this object is created, it shall immediately send this event once
+        /// for each compositor supported feature listed in the enumeration.
+        ///
+        /// A compositor must not advertise features that are deprecated in the
+        /// bound version of the interface.
+        SupportedFeature {
+            /// Supported feature,
+            feature: u32,
+        },
+        /// Supported named transfer characteristic
+        ///
+        /// When this object is created, it shall immediately send this event once
+        /// for each named transfer function the compositor supports with the
+        /// parametric image description creator.
+        ///
+        /// A compositor must not advertise transfer functions that are deprecated
+        /// in the bound version of the interface.
+        SupportedTfNamed {
+            /// Named transfer function,
+            tf: u32,
+        },
+        /// Supported named primaries
+        ///
+        /// When this object is created, it shall immediately send this event once
+        /// for each named set of primaries the compositor supports with the
+        /// parametric image description creator.
+        ///
+        /// A compositor must not advertise names that are deprecated in the
+        /// bound version of the interface.
+        SupportedPrimariesNamed {
+            /// Named color primaries,
+            primaries: u32,
+        },
+        /// All features have been sent
+        ///
+        /// This event is sent when all supported rendering intents, features,
+        /// transfer functions and named primaries have been sent.
+        Done,
+    }
+    impl EventWriter for crate::wayland_objects::wp_color_manager_v1::WpColorManagerV1 {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                SupportedIntent { render_intent } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 1);
+                    raw.uint(render_intent);
+                    raw
+                }
+                SupportedFeature { feature } => {
+                    let mut raw = RawEvent::new(self.id(), 1, 1);
+                    raw.uint(feature);
+                    raw
+                }
+                SupportedTfNamed { tf } => {
+                    let mut raw = RawEvent::new(self.id(), 2, 1);
+                    raw.uint(tf);
+                    raw
+                }
+                SupportedPrimariesNamed { primaries } => {
+                    let mut raw = RawEvent::new(self.id(), 3, 1);
+                    raw.uint(primaries);
+                    raw
+                }
+                Done {} => {
+                    let mut raw = RawEvent::new(self.id(), 4, 0);
+                    raw
+                }
+            }
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Request not supported,
+        UnsupportedFeature = 0,
+        /// Color management surface exists already,
+        SurfaceExists = 1,
+    }
+    /// Rendering intents
+    ///
+    /// See the ICC.1:2022 specification from the International Color Consortium
+    /// for more details about rendering intents.
+    ///
+    /// The principles of ICC defined rendering intents apply with all types of
+    /// image descriptions, not only those with ICC file profiles.
+    ///
+    /// Compositors must support the perceptual rendering intent. Other
+    /// rendering intents are optional.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum RenderIntent {
+        /// Perceptual,
+        Perceptual = 0,
+        /// Media-relative colorimetric,
+        Relative = 1,
+        /// Saturation,
+        Saturation = 2,
+        /// ICC-absolute colorimetric,
+        Absolute = 3,
+        /// Media-relative colorimetric + black point compensation,
+        RelativeBpc = 4,
+        /// ICC-absolute colorimetric without adaptation
+        ///
+        /// This rendering intent is a modified absolute rendering intent that
+        /// assumes the viewer is not adapted to the display white point, so no
+        /// chromatic adaptation between surface and display is done.
+        /// This can be useful for color proofing applications.
+        AbsoluteNoAdaptation = 5,
+    }
+    /// Compositor supported features
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Feature {
+        /// Create_icc_creator request,
+        IccV2V4 = 0,
+        /// Create_parametric_creator request,
+        Parametric = 1,
+        /// Parametric set_primaries request,
+        SetPrimaries = 2,
+        /// Parametric set_tf_power request,
+        SetTfPower = 3,
+        /// Parametric set_luminances request,
+        SetLuminances = 4,
+        /// Parametric set_mastering_display_primaries request
+        ///
+        /// The compositor supports set_mastering_display_primaries request with a
+        /// target color volume fully contained inside the primary color volume.
+        SetMasteringDisplayPrimaries = 5,
+        /// Parametric target exceeds primary color volume
+        ///
+        /// The compositor additionally supports target color volumes that
+        /// extend outside of the primary color volume.
+        ///
+        /// This can only be advertised if feature set_mastering_display_primaries
+        /// is supported as well.
+        ExtendedTargetVolume = 6,
+        /// Create_windows_scrgb request,
+        WindowsScrgb = 7,
+        /// Create_windows_bt2100 request,
+        WindowsBt2100 = 8,
+    }
+    /// Named color primaries
+    ///
+    /// Named color primaries used to encode well-known sets of primaries.
+    ///
+    /// A value of 0 is invalid and will never be present in the list of enums.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Primaries {
+        /// Color primaries for the sRGB color space as defined by the BT.709 standard
+        ///
+        /// Color primaries as defined by
+        /// - Rec. ITU-R BT.709-6
+        /// - Rec. ITU-R BT.1361-0 conventional colour gamut system and extended
+        /// colour gamut system (historical)
+        /// - IEC 61966-2-1 sRGB or sYCC
+        /// - IEC 61966-2-4
+        /// - Society of Motion Picture and Television Engineers (SMPTE) RP 177
+        /// (1993) Annex B
+        Srgb = 1,
+        /// Color primaries for PAL-M as defined by the BT.470 standard
+        ///
+        /// Color primaries as defined by
+        /// - Rec. ITU-R BT.470-6 System M (historical)
+        /// - United States National Television System Committee 1953
+        /// Recommendation for transmission standards for color television
+        /// - United States Federal Communications Commission (2003) Title 47 Code
+        /// of Federal Regulations 73.682 (a)(20)
+        PalM = 2,
+        /// Color primaries for PAL as defined by the BT.601 standard
+        ///
+        /// Color primaries as defined by
+        /// - Rec. ITU-R BT.470-6 System B, G (historical)
+        /// - Rec. ITU-R BT.601-7 625
+        /// - Rec. ITU-R BT.1358-0 625 (historical)
+        /// - Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM
+        Pal = 3,
+        /// Color primaries for NTSC as defined by the BT.601 standard
+        ///
+        /// Color primaries as defined by
+        /// - Rec. ITU-R BT.601-7 525
+        /// - Rec. ITU-R BT.1358-1 525 or 625 (historical)
+        /// - Rec. ITU-R BT.1700-0 NTSC
+        /// - SMPTE 170M (2004)
+        /// - SMPTE 240M (1999) (historical)
+        Ntsc = 4,
+        /// Generic film with colour filters using Illuminant C
+        ///
+        /// Color primaries as defined by Recommendation ITU-T H.273
+        /// "Coding-independent code points for video signal type identification"
+        /// for "generic film".
+        GenericFilm = 5,
+        /// Color primaries as defined by the BT.2020 and BT.2100 standard
+        ///
+        /// Color primaries as defined by
+        /// - Rec. ITU-R BT.2020-2
+        /// - Rec. ITU-R BT.2100-0
+        Bt2020 = 6,
+        /// Color primaries of the full CIE 1931 XYZ color space
+        ///
+        /// Color primaries as defined as the maximum of the CIE 1931 XYZ color
+        /// space by
+        /// - SMPTE ST 428-1
+        /// - (CIE 1931 XYZ as in ISO 11664-1)
+        Cie1931Xyz = 7,
+        /// Color primaries of the DCI P3 color space as defined by the SMPTE RP 431 standard
+        ///
+        /// Color primaries as defined by Digital Cinema System and published in
+        /// SMPTE RP 431-2 (2011).
+        DciP3 = 8,
+        /// Color primaries of Display P3 variant of the DCI-P3 color space as defined by the SMPTE EG 432 standard
+        ///
+        /// Color primaries as defined by Digital Cinema System and published in
+        /// SMPTE EG 432-1 (2010).
+        DisplayP3 = 9,
+        /// Color primaries of the Adobe RGB color space as defined by the ISO 12640 standard
+        ///
+        /// Color primaries as defined by Adobe as "Adobe RGB" and later published
+        /// by ISO 12640-4 (2011).
+        AdobeRgb = 10,
+    }
+    /// Named transfer functions
+    ///
+    /// Named transfer functions used to represent well-known transfer
+    /// characteristics of displays.
+    ///
+    /// A value of 0 is invalid and will never be present in the list of enums.
+    ///
+    /// See appendix.md for the formulae.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum TransferFunction {
+        /// BT.1886 display transfer characteristic
+        ///
+        /// Rec. ITU-R BT.1886 is the display transfer characteristic assumed by
+        /// - Rec. ITU-R BT.601-7 525 and 625
+        /// - Rec. ITU-R BT.709-6
+        /// - Rec. ITU-R BT.2020-2
+        ///
+        /// This TF implies these default luminances from Rec. ITU-R BT.2035:
+        /// - primary color volume minimum: 0.01 cd/m²
+        /// - primary color volume maximum: 100 cd/m²
+        /// - reference white: 100 cd/m²
+        Bt1886 = 1,
+        /// Assumed display gamma 2.2 transfer function
+        ///
+        /// Transfer characteristics as defined by
+        /// - Rec. ITU-R BT.470-6 System M (historical)
+        /// - United States National Television System Committee 1953
+        /// Recommendation for transmission standards for color television
+        /// - United States Federal Communications Commission (2003) Title 47 Code
+        /// of Federal Regulations 73.682 (a) (20)
+        /// - Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM
+        /// - IEC 61966-2-1 (reference display)
+        Gamma22 = 2,
+        /// Assumed display gamma 2.8 transfer function
+        ///
+        /// Transfer characteristics as defined by
+        /// - Rec. ITU-R BT.470-6 System B, G (historical)
+        Gamma28 = 3,
+        /// SMPTE ST 240 transfer function
+        ///
+        /// Transfer characteristics as defined by
+        /// - SMPTE ST 240 (1999)
+        St240 = 4,
+        /// Extended linear transfer function
+        ///
+        /// Linear transfer function defined over all real numbers.
+        /// Normalised electrical values are equal the normalised optical values.
+        ExtLinear = 5,
+        /// Logarithmic 100:1 transfer function
+        ///
+        /// Logarithmic transfer characteristic (100:1 range).
+        Log100 = 6,
+        /// Logarithmic (100*Sqrt(10) : 1) transfer function
+        ///
+        /// Logarithmic transfer characteristic (100 * Sqrt(10) : 1 range).
+        Log316 = 7,
+        /// IEC 61966-2-4 transfer function
+        ///
+        /// Transfer characteristics as defined by
+        /// - IEC 61966-2-4
+        Xvycc = 8,
+        /// Deprecated (ambiguous sRGB transfer function)
+        ///
+        /// Transfer characteristics as defined by
+        /// - IEC 61966-2-1 sRGB
+        ///
+        /// As a rule of thumb, use gamma22 for video, motion picture and
+        /// computer graphics, or compound_power_2_4 for ICC calibrated print
+        /// workflows.
+        Srgb = 9,
+        /// Deprecated (Extended sRGB piece-wise transfer function)
+        ///
+        /// Transfer characteristics as defined by
+        /// - IEC 61966-2-1 sYCC
+        ExtSrgb = 10,
+        /// Perceptual quantizer transfer function
+        ///
+        /// Transfer characteristics as defined by
+        /// - SMPTE ST 2084 (2014) for 10-, 12-, 14- and 16-bit systems
+        /// - Rec. ITU-R BT.2100-2 perceptual quantization (PQ) system
+        ///
+        /// This TF implies these default luminances
+        /// - primary color volume minimum: 0.005 cd/m²
+        /// - primary color volume maximum: 10000 cd/m²
+        /// - reference white: 203 cd/m²
+        ///
+        /// The difference between the primary color volume minimum and maximum
+        /// must be approximately 10000 cd/m² as that is the swing of the EOTF
+        /// defined by ST 2084 and BT.2100. The default value for the
+        /// reference white is a protocol addition: it is suggested by
+        /// Report ITU-R BT.2408-7 and is not part of ST 2084 or BT.2100.
+        St2084Pq = 11,
+        /// SMPTE ST 428 transfer function
+        ///
+        /// Transfer characteristics as defined by
+        /// - SMPTE ST 428-1 (2019)
+        St428 = 12,
+        /// Hybrid log-gamma transfer function
+        ///
+        /// Transfer characteristics as defined by
+        /// - ARIB STD-B67 (2015)
+        /// - Rec. ITU-R BT.2100-2 hybrid log-gamma (HLG) system
+        ///
+        /// This TF implies these default luminances
+        /// - primary color volume minimum: 0.005 cd/m²
+        /// - primary color volume maximum: 1000 cd/m²
+        /// - reference white: 203 cd/m²
+        ///
+        /// HLG is a relative display-referred signal with a specified
+        /// non-linear mapping to the display peak luminance (the HLG OOTF).
+        /// All absolute luminance values used here for HLG assume a 1000 cd/m²
+        /// peak display.
+        ///
+        /// The default value for the reference white is a protocol addition:
+        /// it is suggested by Report ITU-R BT.2408-7 and is not part of
+        /// ARIB STD-B67 or BT.2100.
+        Hlg = 13,
+        /// IEC 61966-2-1 encoding function
+        ///
+        /// Encoding characteristics as defined by IEC 61966-2-1, for displays
+        /// that invert the encoding function.
+        CompoundPower24 = 14,
+    }
+}
+
+/// Output color properties
+///
+/// A wp_color_management_output_v1 describes the color properties of an
+/// output.
+///
+/// The wp_color_management_output_v1 is associated with the wl_output global
+/// underlying the wl_output object. Therefore the client destroying the
+/// wl_output object has no impact, but the compositor removing the output
+/// global makes the wp_color_management_output_v1 object inert.
+pub mod wp_color_management_output_v1 {
+    use super::*;
+    impl Constants
+        for crate::wayland_objects::wp_color_management_output_v1::WpColorManagementOutputV1
+    {
+        const INTERFACE_NAME: &'static str = "wp_color_management_output_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for WpColorManagementOutputV1Id {
+        type Object =
+            crate::wayland_objects::wp_color_management_output_v1::WpColorManagementOutputV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_color_management_output_v1::WpColorManagementOutputV1
+    {
+        type Id = WpColorManagementOutputV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the color management output
+        ///
+        /// Destroy the color wp_color_management_output_v1 object. This does not
+        /// affect any remaining protocol objects.
+        Destroy,
+        /// Get the image description of the output
+        ///
+        /// This creates a new wp_image_description_v1 object for the current image
+        /// description of the output. There always is exactly one image description
+        /// active for an output so the client should destroy the image description
+        /// created by earlier invocations of this request. This request is usually
+        /// sent as a reaction to the image_description_changed event or when
+        /// creating a wp_color_management_output_v1 object.
+        ///
+        /// The image description of an output represents the color encoding the
+        /// output expects. There might be performance and power advantages, as well
+        /// as improved color reproduction, if a content update matches the image
+        /// description of the output it is being shown on. If a content update is
+        /// shown on any other output than the one it matches the image description
+        /// of, then the color reproduction on those outputs might be considerably
+        /// worse.
+        ///
+        /// The created wp_image_description_v1 object preserves the image
+        /// description of the output from the time the object was created.
+        ///
+        /// The resulting image description object allows get_information request.
+        ///
+        /// If this protocol object is inert, the resulting image description object
+        /// shall immediately deliver the wp_image_description_v1.failed event with
+        /// the no_output cause.
+        ///
+        /// If the interface version is inadequate for the output's image
+        /// description, meaning that the client does not support all the events
+        /// needed to deliver the crucial information, the resulting image
+        /// description object shall immediately deliver the
+        /// wp_image_description_v1.failed event with the low_version cause.
+        ///
+        /// Otherwise the object shall immediately deliver the ready event.
+        GetImageDescription { image_description: WpImageDescriptionV1Id },
+    }
+    impl Parser for crate::wayland_objects::wp_color_management_output_v1::WpColorManagementOutputV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetImageDescription { image_description: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Image description changed
+        ///
+        /// This event is sent whenever the image description of the output changed,
+        /// followed by one wl_output.done event common to output events across all
+        /// extensions.
+        ///
+        /// If the client wants to use the updated image description, it needs to do
+        /// get_image_description again, because image description objects are
+        /// immutable.
+        ImageDescriptionChanged,
+    }
+    impl EventWriter
+        for crate::wayland_objects::wp_color_management_output_v1::WpColorManagementOutputV1
+    {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                ImageDescriptionChanged {} => {
+                    let mut raw = RawEvent::new(self.id(), 0, 0);
+                    raw
+                }
+            }
+        }
+    }
+}
+
+/// Color management extension to a surface
+///
+/// A wp_color_management_surface_v1 allows the client to set the color
+/// space and HDR properties of a surface.
+///
+/// If the wl_surface associated with the wp_color_management_surface_v1 is
+/// destroyed, the wp_color_management_surface_v1 object becomes inert.
+pub mod wp_color_management_surface_v1 {
+    use super::*;
+    impl Constants
+        for crate::wayland_objects::wp_color_management_surface_v1::WpColorManagementSurfaceV1
+    {
+        const INTERFACE_NAME: &'static str = "wp_color_management_surface_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for WpColorManagementSurfaceV1Id {
+        type Object =
+            crate::wayland_objects::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_color_management_surface_v1::WpColorManagementSurfaceV1
+    {
+        type Id = WpColorManagementSurfaceV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the color management interface for a surface
+        ///
+        /// Destroy the wp_color_management_surface_v1 object and do the same as
+        /// unset_image_description.
+        Destroy,
+        /// Set the surface image description
+        ///
+        /// If this protocol object is inert, the protocol error inert is raised.
+        ///
+        /// Set the image description of the underlying surface. The image
+        /// description and rendering intent are double-buffered state, see
+        /// wl_surface.commit.
+        ///
+        /// It is the client's responsibility to understand the image description
+        /// it sets on a surface, and to provide content that matches that image
+        /// description. Compositors might convert images to match their own or any
+        /// other image descriptions.
+        ///
+        /// Image descriptions which are not ready (see wp_image_description_v1)
+        /// are forbidden in this request, and in such case the protocol error
+        /// image_description is raised.
+        ///
+        /// All image descriptions which are ready (see wp_image_description_v1)
+        /// are allowed and must always be accepted by the compositor.
+        ///
+        /// When an image description is set on a surface, it establishes an
+        /// explicit link between surface pixel values and surface colorimetry.
+        /// This link may be undefined for some pixel values, see the image
+        /// description creator interfaces for the conditions. Non-finite
+        /// floating-point values (NaN, Inf) always have an undefined colorimetry.
+        ///
+        /// A rendering intent provides the client's preference on how surface
+        /// colorimetry should be mapped to each output. The render_intent value
+        /// must be one advertised by the compositor with
+        /// wp_color_manager_v1.render_intent event, otherwise the protocol error
+        /// render_intent is raised.
+        ///
+        /// By default, a surface does not have an associated image description
+        /// nor a rendering intent. The handling of color on such surfaces is
+        /// compositor implementation defined. Compositors should handle such
+        /// surfaces as sRGB, but may handle them differently if they have specific
+        /// requirements.
+        ///
+        /// Setting the image description has copy semantics; after this request,
+        /// the image description can be immediately destroyed without affecting
+        /// the pending state of the surface.
+        SetImageDescription {
+            image_description: WpImageDescriptionV1Id,
+            /// Rendering intent,
+            render_intent: u32,
+        },
+        /// Remove the surface image description
+        ///
+        /// If this protocol object is inert, the protocol error inert is raised.
+        ///
+        /// This request removes any image description from the surface. See
+        /// set_image_description for how a compositor handles a surface without
+        /// an image description. This is double-buffered state, see
+        /// wl_surface.commit.
+        UnsetImageDescription,
+    }
+    impl Parser for crate::wayland_objects::wp_color_management_surface_v1::WpColorManagementSurfaceV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => {
+                    SetImageDescription { image_description: req.id()?, render_intent: req.uint()? }
+                }
+                2 => UnsetImageDescription,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    /// Protocol errors
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Unsupported rendering intent,
+        RenderIntent = 0,
+        /// Invalid image description,
+        ImageDescription = 1,
+        /// Forbidden request on inert object,
+        Inert = 2,
+    }
+}
+
+/// Color management extension to a surface
+///
+/// A wp_color_management_surface_feedback_v1 allows the client to get the
+/// preferred image description of a surface.
+///
+/// If the wl_surface associated with this object is destroyed, the
+/// wp_color_management_surface_feedback_v1 object becomes inert.
+pub mod wp_color_management_surface_feedback_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1 {
+    const INTERFACE_NAME: &'static str = "wp_color_management_surface_feedback_v1";
+    const INTERFACE_VERSION: u32 = 3;
+  }
+    impl crate::object::IdToObject for WpColorManagementSurfaceFeedbackV1Id {
+        type Object = crate::wayland_objects::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1 {
+    type Id = WpColorManagementSurfaceFeedbackV1Id;
+  }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the color management interface for a surface
+        ///
+        /// Destroy the wp_color_management_surface_feedback_v1 object.
+        Destroy,
+        /// Get the preferred image description
+        ///
+        /// If this protocol object is inert, the protocol error inert is raised.
+        ///
+        /// The preferred image description represents the compositor's preferred
+        /// color encoding for this wl_surface at the current time. There might be
+        /// performance and power advantages, as well as improved color
+        /// reproduction, if the image description of a content update matches the
+        /// preferred image description.
+        ///
+        /// This creates a new wp_image_description_v1 object for the currently
+        /// preferred image description for the wl_surface. The client should
+        /// stop using and destroy the image descriptions created by earlier
+        /// invocations of this request for the associated wl_surface.
+        /// This request is usually sent as a reaction to the preferred_changed
+        /// event or when creating a wp_color_management_surface_feedback_v1 object
+        /// if the client is capable of adapting to image descriptions.
+        ///
+        /// The created wp_image_description_v1 object preserves the preferred image
+        /// description of the wl_surface from the time the object was created.
+        ///
+        /// The resulting image description object allows get_information request.
+        ///
+        /// If the image description is parametric, the client should set it on its
+        /// wl_surface only if the image description is an exact match with the
+        /// client content. Particularly if everything else matches, but the target
+        /// color volume is greater than what the client needs, the client should
+        /// create its own parameric image description with its exact parameters.
+        ///
+        /// If the interface version is inadequate for the preferred image
+        /// description, meaning that the client does not support all the
+        /// events needed to deliver the crucial information, the resulting image
+        /// description object shall immediately deliver the
+        /// wp_image_description_v1.failed event with the low_version cause,
+        /// otherwise the object shall immediately deliver the ready event.
+        GetPreferred { image_description: WpImageDescriptionV1Id },
+        /// Get the preferred image description
+        ///
+        /// The same description as for get_preferred applies, except the returned
+        /// image description is guaranteed to be parametric. This is meant for
+        /// clients that can only deal with parametric image descriptions.
+        ///
+        /// If the compositor doesn't support parametric image descriptions, the
+        /// unsupported_feature error is emitted.
+        GetPreferredParametric { image_description: WpImageDescriptionV1Id },
+    }
+    impl Parser for crate::wayland_objects::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1 {
+    type Request = Request;
+    fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+      use Request::*;
+      let request = match req.request_id {
+        0 => Destroy,
+        1 => GetPreferred {
+          image_description: req.id()?,
+        },
+        2 => GetPreferredParametric {
+          image_description: req.id()?,
+        },
+        _ => return Err(ParserError::InvalidRequest),
+      };
+      Ok(request)
+    }
+  }
+    /// Minimum interface version for the `preferred_changed2` message (XML `since` / `version`).
+    pub const PREFERRED_CHANGED2_SINCE: u32 = 2;
+    #[derive(Debug)]
+    pub enum Event {
+        /// The preferred image description changed (32-bit)
+        ///
+        /// Starting from interface version 2, 'preferred_changed2' is sent instead
+        /// of this event. See the 'preferred_changed2' event for the definition.
+        PreferredChanged {
+            /// The 32-bit image description id number,
+            identity: u32,
+        },
+        /// The preferred image description changed
+        ///
+        /// The preferred image description is the one which likely has the most
+        /// performance and/or quality benefits for the compositor if used by the
+        /// client for its wl_surface contents. This event is sent whenever the
+        /// compositor changes the wl_surface's preferred image description.
+        ///
+        /// This event sends the identity of the new preferred state as the argument,
+        /// so clients who are aware of the image description already can reuse it.
+        /// Otherwise, if the client client wants to know what the preferred image
+        /// description is, it shall use the get_preferred request.
+        ///
+        /// The preferred image description is not automatically used for anything.
+        /// It is only a hint, and clients may set any valid image description with
+        /// set_image_description, but there might be performance and color accuracy
+        /// improvements by providing the wl_surface contents in the preferred
+        /// image description. Therefore clients that can, should render according
+        /// to the preferred image description
+        PreferredChanged2 {
+            /// High 32 bits of the 64-bit image description id number,
+            identity_hi: u32,
+            /// Low 32 bits of the 64-bit image description id number,
+            identity_lo: u32,
+        },
+    }
+    impl EventWriter for crate::wayland_objects::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1 {
+    type Event = Event;
+    fn object_id(&self) -> WaylandId {
+      use crate::object::Object;
+      self.id()
+    }
+    fn to_raw_event(&self, event: Event) -> RawEvent {
+      use Event::*;
+      use crate::object::Object;
+      match event {
+        PreferredChanged { identity } => {
+          let mut raw = RawEvent::new(self.id(), 0, 1);
+          raw.uint(identity);
+        raw
+        },
+        PreferredChanged2 { identity_hi,identity_lo } => {
+          let mut raw = RawEvent::new(self.id(), 1, 2);
+          raw.uint(identity_hi);
+          raw.uint(identity_lo);
+        raw
+        },
+      }
+    }
+  }
+    /// Protocol errors
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Forbidden request on inert object,
+        Inert = 0,
+        /// Attempted to use an unsupported feature,
+        UnsupportedFeature = 1,
+    }
+}
+
+/// Holder of image description ICC information
+///
+/// This type of object is used for collecting all the information required
+/// to create a wp_image_description_v1 object from an ICC file. A complete
+/// set of required parameters consists of these properties:
+/// - ICC file
+///
+/// Each required property must be set exactly once if the client is to create
+/// an image description. The set requests verify that a property was not
+/// already set. The create request verifies that all required properties are
+/// set. There may be several alternative requests for setting each property,
+/// and in that case the client must choose one of them.
+///
+/// Once all properties have been set, the create request must be used to
+/// create the image description object, destroying the creator in the
+/// process.
+///
+/// The link between a pixel value (a device value in ICC) and its respective
+/// colorimetry is defined by the details of the particular ICC profile.
+/// Those details also determine when colorimetry becomes undefined.
+pub mod wp_image_description_creator_icc_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1 {
+    const INTERFACE_NAME: &'static str = "wp_image_description_creator_icc_v1";
+    const INTERFACE_VERSION: u32 = 3;
+  }
+    impl crate::object::IdToObject for WpImageDescriptionCreatorIccV1Id {
+        type Object = crate::wayland_objects::wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1 {
+    type Id = WpImageDescriptionCreatorIccV1Id;
+  }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Create the image description object from ICC data
+        ///
+        /// Create an image description object based on the ICC information
+        /// previously set on this object. A compositor must parse the ICC data in
+        /// some undefined but finite amount of time.
+        ///
+        /// The completeness of the parameter set is verified. If the set is not
+        /// complete, the protocol error incomplete_set is raised. For the
+        /// definition of a complete set, see the description of this interface.
+        ///
+        /// If the particular combination of the information is not supported
+        /// by the compositor, the resulting image description object shall
+        /// immediately deliver the wp_image_description_v1.failed event with the
+        /// 'unsupported' cause. If a valid image description was created from the
+        /// information, the wp_image_description_v1.ready event will eventually
+        /// be sent instead.
+        ///
+        /// This request destroys the wp_image_description_creator_icc_v1 object.
+        ///
+        /// The resulting image description object does not allow get_information
+        /// request.
+        Create { image_description: WpImageDescriptionV1Id },
+        /// Set the ICC profile file
+        ///
+        /// Sets the ICC profile file to be used as the basis of the image
+        /// description.
+        ///
+        /// The data shall be found through the given fd at the given offset, having
+        /// the given length. The fd must be seekable and readable. Violating these
+        /// requirements raises the bad_fd protocol error.
+        ///
+        /// If reading the data fails due to an error independent of the client, the
+        /// compositor shall send the wp_image_description_v1.failed event on the
+        /// created wp_image_description_v1 with the 'operating_system' cause.
+        ///
+        /// The maximum size of the ICC profile is 32 MB. If length is greater than
+        /// that or zero, the protocol error bad_size is raised. If offset + length
+        /// exceeds the file size, the protocol error out_of_file is raised.
+        ///
+        /// A compositor may read the file at any time starting from this request
+        /// and only until whichever happens first:
+        /// - If create request was issued, the wp_image_description_v1 object
+        /// delivers either failed or ready event; or
+        /// - if create request was not issued, this
+        /// wp_image_description_creator_icc_v1 object is destroyed.
+        ///
+        /// A compositor shall not modify the contents of the file, and the fd may
+        /// be sealed for writes and size changes. The client must ensure to its
+        /// best ability that the data does not change while the compositor is
+        /// reading it.
+        ///
+        /// The data must represent a valid ICC profile. The ICC profile version
+        /// must be 2 or 4, it must be a 3 channel profile and the class must be
+        /// Display or ColorSpace. Violating these requirements will not result in a
+        /// protocol error, but will eventually send the
+        /// wp_image_description_v1.failed event on the created
+        /// wp_image_description_v1 with the 'unsupported' cause.
+        ///
+        /// See the International Color Consortium specification ICC.1:2022 for more
+        /// details about ICC profiles.
+        ///
+        /// If ICC file has already been set on this object, the protocol error
+        /// already_set is raised.
+        SetIccFile {
+            /// ICC profile,
+            icc_profile: Rc<OwnedFd>,
+            /// Byte offset in fd to start of ICC data,
+            offset: u32,
+            /// Length of ICC data in bytes,
+            length: u32,
+        },
+    }
+    impl Parser for crate::wayland_objects::wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1 {
+    type Request = Request;
+    fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+      use Request::*;
+      let request = match req.request_id {
+        0 => Create {
+          image_description: req.id()?,
+        },
+        1 => SetIccFile {
+          icc_profile: req.fd()?,
+          offset: req.uint()?,
+          length: req.uint()?,
+        },
+        _ => return Err(ParserError::InvalidRequest),
+      };
+      Ok(request)
+    }
+  }
+    /// Protocol errors
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Incomplete parameter set,
+        IncompleteSet = 0,
+        /// Property already set,
+        AlreadySet = 1,
+        /// Fd not seekable and readable,
+        BadFd = 2,
+        /// No or too much data,
+        BadSize = 3,
+        /// Offset + length exceeds file size,
+        OutOfFile = 4,
+    }
+}
+
+/// Holder of image description parameters
+///
+/// This type of object is used for collecting all the parameters required
+/// to create a wp_image_description_v1 object. A complete set of required
+/// parameters consists of these properties:
+/// - transfer characteristic function (tf)
+/// - chromaticities of primaries and white point (primary color volume)
+///
+/// The following properties are optional and have a well-defined default
+/// if not explicitly set:
+/// - primary color volume luminance range
+/// - reference white luminance level
+/// - mastering display primaries and white point (target color volume)
+/// - mastering luminance range
+///
+/// The following properties are optional and will be ignored
+/// if not explicitly set:
+/// - maximum content light level
+/// - maximum frame-average light level
+///
+/// Each required property must be set exactly once if the client is to create
+/// an image description. The set requests verify that a property was not
+/// already set. The create request verifies that all required properties are
+/// set. There may be several alternative requests for setting each property,
+/// and in that case the client must choose one of them.
+///
+/// Once all properties have been set, the create request must be used to
+/// create the image description object, destroying the creator in the
+/// process.
+///
+/// A viewer, who is viewing the display defined by the resulting image
+/// description (the viewing environment included), is assumed to be fully
+/// adapted to the primary color volume's white point.
+///
+/// Any of the following conditions will cause the colorimetry of a pixel
+/// to become undefined:
+/// - Values outside of the defined range of the transfer characteristic.
+/// - Tristimulus that exceeds the target color volume.
+/// - If extended_target_volume is not supported: tristimulus that exceeds
+/// the primary color volume.
+///
+/// The closest correspondence to an image description created through this
+/// interface is the Display class of profiles in ICC.
+pub mod wp_image_description_creator_params_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1 {
+    const INTERFACE_NAME: &'static str = "wp_image_description_creator_params_v1";
+    const INTERFACE_VERSION: u32 = 3;
+  }
+    impl crate::object::IdToObject for WpImageDescriptionCreatorParamsV1Id {
+        type Object = crate::wayland_objects::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1 {
+    type Id = WpImageDescriptionCreatorParamsV1Id;
+  }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Create the image description object using params
+        ///
+        /// Create an image description object based on the parameters previously
+        /// set on this object.
+        ///
+        /// The completeness of the parameter set is verified. If the set is not
+        /// complete, the protocol error incomplete_set is raised. For the
+        /// definition of a complete set, see the description of this interface.
+        ///
+        /// When both max_cll and max_fall are set, max_fall must be less or equal
+        /// to max_cll otherwise the invalid_luminance protocol error is raised.
+        ///
+        /// In version 1, these following conditions also result in the
+        /// invalid_luminance protocol error. Version 2 and later do not have this
+        /// requirement.
+        /// - When max_cll is set, it must be greater than min L and less or equal
+        /// to max L of the mastering luminance range.
+        /// - When max_fall is set, it must be greater than min L and less or equal
+        /// to max L of the mastering luminance range.
+        ///
+        /// If the particular combination of the parameter set is not supported
+        /// by the compositor, the resulting image description object shall
+        /// immediately deliver the wp_image_description_v1.failed event with the
+        /// 'unsupported' cause. If a valid image description was created from the
+        /// parameter set, the wp_image_description_v1.ready event will eventually
+        /// be sent instead.
+        ///
+        /// This request destroys the wp_image_description_creator_params_v1
+        /// object.
+        ///
+        /// The resulting image description object does not allow get_information
+        /// request.
+        Create { image_description: WpImageDescriptionV1Id },
+        /// Named transfer characteristic
+        ///
+        /// Sets the transfer characteristic using explicitly enumerated named
+        /// functions.
+        ///
+        /// When the resulting image description is attached to an image, the
+        /// content should be decoded according to the industry standard
+        /// practices for the transfer characteristic.
+        ///
+        /// Only names advertised with wp_color_manager_v1 event supported_tf_named
+        /// are allowed. Other values shall raise the protocol error invalid_tf.
+        ///
+        /// If transfer characteristic has already been set on this object, the
+        /// protocol error already_set is raised.
+        SetTfNamed {
+            /// Named transfer function,
+            tf: u32,
+        },
+        /// Transfer characteristic as a power curve
+        ///
+        /// Sets the color component transfer characteristic to a power curve with
+        /// the given exponent. Negative values are handled by mirroring the
+        /// positive half of the curve through the origin. The valid domain and
+        /// range of the curve are all finite real numbers. This curve represents
+        /// the conversion from electrical to optical color channel values.
+        ///
+        /// The curve exponent shall be multiplied by 10000 to get the argument eexp
+        /// value to carry the precision of 4 decimals.
+        ///
+        /// The curve exponent must be at least 1.0 and at most 10.0. Otherwise the
+        /// protocol error invalid_tf is raised.
+        ///
+        /// If transfer characteristic has already been set on this object, the
+        /// protocol error already_set is raised.
+        ///
+        /// This request can be used when the compositor advertises
+        /// wp_color_manager_v1.feature.set_tf_power. Otherwise this request raises
+        /// the protocol error unsupported_feature.
+        SetTfPower {
+            /// The exponent * 10000,
+            eexp: u32,
+        },
+        /// Named primaries
+        ///
+        /// Sets the color primaries and white point using explicitly named sets.
+        /// This describes the primary color volume which is the basis for color
+        /// value encoding.
+        ///
+        /// Only names advertised with wp_color_manager_v1 event
+        /// supported_primaries_named are allowed. Other values shall raise the
+        /// protocol error invalid_primaries_named.
+        ///
+        /// If primaries have already been set on this object, the protocol error
+        /// already_set is raised.
+        SetPrimariesNamed {
+            /// Named primaries,
+            primaries: u32,
+        },
+        /// Primaries as chromaticity coordinates
+        ///
+        /// Sets the color primaries and white point using CIE 1931 xy chromaticity
+        /// coordinates. This describes the primary color volume which is the basis
+        /// for color value encoding.
+        ///
+        /// Each coordinate value is multiplied by 1 million to get the argument
+        /// value to carry precision of 6 decimals.
+        ///
+        /// If primaries have already been set on this object, the protocol error
+        /// already_set is raised.
+        ///
+        /// This request can be used if the compositor advertises
+        /// wp_color_manager_v1.feature.set_primaries. Otherwise this request raises
+        /// the protocol error unsupported_feature.
+        SetPrimaries {
+            /// Red x * 1M,
+            r_x: i32,
+            /// Red y * 1M,
+            r_y: i32,
+            /// Green x * 1M,
+            g_x: i32,
+            /// Green y * 1M,
+            g_y: i32,
+            /// Blue x * 1M,
+            b_x: i32,
+            /// Blue y * 1M,
+            b_y: i32,
+            /// White x * 1M,
+            w_x: i32,
+            /// White y * 1M,
+            w_y: i32,
+        },
+        /// Primary color volume luminance range and reference white
+        ///
+        /// Sets the primary color volume luminance range and the reference white
+        /// luminance level. These values include the minimum display emission, but
+        /// not external flare. The minimum display emission is assumed to have
+        /// the chromaticity of the primary color volume white point.
+        ///
+        /// The default luminances from
+        /// https://www.color.org/chardata/rgb/srgb.xalter are
+        /// - primary color volume minimum: 0.2 cd/m²
+        /// - primary color volume maximum: 80 cd/m²
+        /// - reference white: 80 cd/m²
+        ///
+        /// Setting a named transfer characteristic can imply other default
+        /// luminances.
+        ///
+        /// The default luminances get overwritten when this request is used.
+        /// With transfer_function.st2084_pq the given 'max_lum' value is ignored,
+        /// and 'max_lum' is taken as 'min_lum' + 10000 cd/m².
+        ///
+        /// 'min_lum' and 'max_lum' specify the minimum and maximum luminances of
+        /// the primary color volume as reproduced by the targeted display.
+        ///
+        /// 'reference_lum' specifies the luminance of the reference white as
+        /// reproduced by the targeted display, and reflects the targeted viewing
+        /// environment.
+        ///
+        /// Compositors should make sure that all content is anchored, meaning that
+        /// an input signal level of 'reference_lum' on one image description and
+        /// another input signal level of 'reference_lum' on another image
+        /// description should produce the same output level, even though the
+        /// 'reference_lum' on both image representations can be different.
+        ///
+        /// 'reference_lum' may be higher than 'max_lum'. In that case reaching
+        /// the reference white output level in image content requires the
+        /// 'extended_target_volume' feature support.
+        ///
+        /// If 'max_lum' or 'reference_lum' are less than or equal to 'min_lum',
+        /// the protocol error invalid_luminance is raised.
+        ///
+        /// The minimum luminance is multiplied by 10000 to get the argument
+        /// 'min_lum' value and carries precision of 4 decimals. The maximum
+        /// luminance and reference white luminance values are unscaled.
+        ///
+        /// If the primary color volume luminance range and the reference white
+        /// luminance level have already been set on this object, the protocol error
+        /// already_set is raised.
+        ///
+        /// This request can be used if the compositor advertises
+        /// wp_color_manager_v1.feature.set_luminances. Otherwise this request
+        /// raises the protocol error unsupported_feature.
+        SetLuminances {
+            /// Minimum luminance (cd/m²) * 10000,
+            min_lum: u32,
+            /// Maximum luminance (cd/m²),
+            max_lum: u32,
+            /// Reference white luminance (cd/m²),
+            reference_lum: u32,
+        },
+        /// Mastering display primaries as chromaticity coordinates
+        ///
+        /// Provides the color primaries and white point of the mastering display
+        /// using CIE 1931 xy chromaticity coordinates. This is compatible with the
+        /// SMPTE ST 2086 definition of HDR static metadata.
+        ///
+        /// The mastering display primaries and mastering display luminances define
+        /// the target color volume.
+        ///
+        /// If mastering display primaries are not explicitly set, the target color
+        /// volume is assumed to have the same primaries as the primary color volume.
+        ///
+        /// The target color volume is defined by all tristimulus values between 0.0
+        /// and 1.0 (inclusive) of the color space defined by the given mastering
+        /// display primaries and white point. The colorimetry is identical between
+        /// the container color space and the mastering display color space,
+        /// including that no chromatic adaptation is applied even if the white
+        /// points differ.
+        ///
+        /// The target color volume can exceed the primary color volume to allow for
+        /// a greater color volume with an existing color space definition (for
+        /// example scRGB). It can be smaller than the primary color volume to
+        /// minimize gamut and tone mapping distances for big color spaces (HDR
+        /// metadata).
+        ///
+        /// To make use of the entire target color volume a suitable pixel format
+        /// has to be chosen (e.g. floating point to exceed the primary color
+        /// volume, or abusing limited quantization range as with xvYCC).
+        ///
+        /// Each coordinate value is multiplied by 1 million to get the argument
+        /// value to carry precision of 6 decimals.
+        ///
+        /// If mastering display primaries have already been set on this object, the
+        /// protocol error already_set is raised.
+        ///
+        /// This request can be used if the compositor advertises
+        /// wp_color_manager_v1.feature.set_mastering_display_primaries. Otherwise
+        /// this request raises the protocol error unsupported_feature. The
+        /// advertisement implies support only for target color volumes fully
+        /// contained within the primary color volume.
+        ///
+        /// If a compositor additionally supports target color volume exceeding the
+        /// primary color volume, it must advertise
+        /// wp_color_manager_v1.feature.extended_target_volume. If a client uses
+        /// target color volume exceeding the primary color volume and the
+        /// compositor does not support it, the result is implementation defined.
+        /// Compositors are recommended to detect this case and fail the image
+        /// description gracefully, but it may as well result in color artifacts.
+        SetMasteringDisplayPrimaries {
+            /// Red x * 1M,
+            r_x: i32,
+            /// Red y * 1M,
+            r_y: i32,
+            /// Green x * 1M,
+            g_x: i32,
+            /// Green y * 1M,
+            g_y: i32,
+            /// Blue x * 1M,
+            b_x: i32,
+            /// Blue y * 1M,
+            b_y: i32,
+            /// White x * 1M,
+            w_x: i32,
+            /// White y * 1M,
+            w_y: i32,
+        },
+        /// Display mastering luminance range
+        ///
+        /// Sets the luminance range that was used during the content mastering
+        /// process as the minimum and maximum absolute luminance L. These values
+        /// include the minimum display emission and ambient flare luminances,
+        /// assumed to be optically additive and have the chromaticity of the
+        /// primary color volume white point. This should be
+        /// compatible with the SMPTE ST 2086 definition of HDR static metadata.
+        ///
+        /// The mastering display primaries and mastering display luminances define
+        /// the target color volume.
+        ///
+        /// If mastering luminances are not explicitly set, the target color volume
+        /// is assumed to have the same min and max luminances as the primary color
+        /// volume.
+        ///
+        /// If max L is less than or equal to min L, the protocol error
+        /// invalid_luminance is raised.
+        ///
+        /// Min L value is multiplied by 10000 to get the argument min_lum value
+        /// and carry precision of 4 decimals. Max L value is unscaled for max_lum.
+        ///
+        /// This request can be used if the compositor advertises
+        /// wp_color_manager_v1.feature.set_mastering_display_primaries. Otherwise
+        /// this request raises the protocol error unsupported_feature. The
+        /// advertisement implies support only for target color volumes fully
+        /// contained within the primary color volume.
+        ///
+        /// If a compositor additionally supports target color volume exceeding the
+        /// primary color volume, it must advertise
+        /// wp_color_manager_v1.feature.extended_target_volume. If a client uses
+        /// target color volume exceeding the primary color volume and the
+        /// compositor does not support it, the result is implementation defined.
+        /// Compositors are recommended to detect this case and fail the image
+        /// description gracefully, but it may as well result in color artifacts.
+        SetMasteringLuminance {
+            /// Min L (cd/m²) * 10000,
+            min_lum: u32,
+            /// Max L (cd/m²),
+            max_lum: u32,
+        },
+        /// Maximum content light level
+        ///
+        /// Sets the maximum content light level (max_cll) as defined by CTA-861-H.
+        ///
+        /// max_cll is undefined by default.
+        SetMaxCll {
+            /// Maximum content light level (cd/m²),
+            max_cll: u32,
+        },
+        /// Maximum frame-average light level
+        ///
+        /// Sets the maximum frame-average light level (max_fall) as defined by
+        /// CTA-861-H.
+        ///
+        /// max_fall is undefined by default.
+        SetMaxFall {
+            /// Maximum frame-average light level (cd/m²),
+            max_fall: u32,
+        },
+    }
+    impl Parser for crate::wayland_objects::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1 {
+    type Request = Request;
+    fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+      use Request::*;
+      let request = match req.request_id {
+        0 => Create {
+          image_description: req.id()?,
+        },
+        1 => SetTfNamed {
+          tf: req.uint()?,
+        },
+        2 => SetTfPower {
+          eexp: req.uint()?,
+        },
+        3 => SetPrimariesNamed {
+          primaries: req.uint()?,
+        },
+        4 => SetPrimaries {
+          r_x: req.int()?,
+          r_y: req.int()?,
+          g_x: req.int()?,
+          g_y: req.int()?,
+          b_x: req.int()?,
+          b_y: req.int()?,
+          w_x: req.int()?,
+          w_y: req.int()?,
+        },
+        5 => SetLuminances {
+          min_lum: req.uint()?,
+          max_lum: req.uint()?,
+          reference_lum: req.uint()?,
+        },
+        6 => SetMasteringDisplayPrimaries {
+          r_x: req.int()?,
+          r_y: req.int()?,
+          g_x: req.int()?,
+          g_y: req.int()?,
+          b_x: req.int()?,
+          b_y: req.int()?,
+          w_x: req.int()?,
+          w_y: req.int()?,
+        },
+        7 => SetMasteringLuminance {
+          min_lum: req.uint()?,
+          max_lum: req.uint()?,
+        },
+        8 => SetMaxCll {
+          max_cll: req.uint()?,
+        },
+        9 => SetMaxFall {
+          max_fall: req.uint()?,
+        },
+        _ => return Err(ParserError::InvalidRequest),
+      };
+      Ok(request)
+    }
+  }
+    /// Protocol errors
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Incomplete parameter set,
+        IncompleteSet = 0,
+        /// Property already set,
+        AlreadySet = 1,
+        /// Request not supported,
+        UnsupportedFeature = 2,
+        /// Invalid transfer characteristic,
+        InvalidTf = 3,
+        /// Invalid primaries named,
+        InvalidPrimariesNamed = 4,
+        /// Invalid luminance value or range,
+        InvalidLuminance = 5,
+    }
+}
+
+/// Colorimetric image description
+///
+/// An image description carries information about the pixel color encoding
+/// and its intended display and viewing environment. The image description is
+/// attached to a wl_surface via
+/// wp_color_management_surface_v1.set_image_description. A compositor can use
+/// this information to decode pixel values into colorimetrically meaningful
+/// quantities, which allows the compositor to transform the surface contents
+/// to become suitable for various displays and viewing environments.
+///
+/// Note, that the wp_image_description_v1 object is not ready to be used
+/// immediately after creation. The object eventually delivers either the
+/// 'ready' or the 'failed' event, specified in all requests creating it. The
+/// object is deemed "ready" after receiving the 'ready' event.
+///
+/// An object which is not ready is illegal to use, it can only be destroyed.
+/// Any other request in this interface shall result in the 'not_ready'
+/// protocol error. Attempts to use an object which is not ready through other
+/// interfaces shall raise protocol errors defined there.
+///
+/// Once created and regardless of how it was created, a
+/// wp_image_description_v1 object always refers to one fixed image
+/// description. It cannot change after creation.
+pub mod wp_image_description_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_image_description_v1::WpImageDescriptionV1 {
+        const INTERFACE_NAME: &'static str = "wp_image_description_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for WpImageDescriptionV1Id {
+        type Object = crate::wayland_objects::wp_image_description_v1::WpImageDescriptionV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_image_description_v1::WpImageDescriptionV1
+    {
+        type Id = WpImageDescriptionV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the image description
+        ///
+        /// Destroy this object. It is safe to destroy an object which is not ready.
+        ///
+        /// Destroying a wp_image_description_v1 object has no side-effects, not
+        /// even if a wp_color_management_surface_v1.set_image_description has not
+        /// yet been followed by a wl_surface.commit.
+        Destroy,
+        /// Get information about the image description
+        ///
+        /// Creates a wp_image_description_info_v1 object which delivers the
+        /// information that makes up the image description.
+        ///
+        /// Not all image description protocol objects allow get_information
+        /// request. Whether it is allowed or not is defined by the request that
+        /// created the object. If get_information is not allowed, the protocol
+        /// error no_information is raised.
+        GetInformation { information: WpImageDescriptionInfoV1Id },
+    }
+    impl Parser for crate::wayland_objects::wp_image_description_v1::WpImageDescriptionV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetInformation { information: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    /// Minimum interface version for the `ready2` message (XML `since` / `version`).
+    pub const READY2_SINCE: u32 = 2;
+    #[derive(Debug)]
+    pub enum Event {
+        /// Graceful error on creating the image description
+        ///
+        /// If creating a wp_image_description_v1 object fails for a reason that is
+        /// not defined as a protocol error, this event is sent.
+        ///
+        /// The requests that create image description objects define whether and
+        /// when this can occur. Only such creation requests can trigger this event.
+        /// This event cannot be triggered after the image description was
+        /// successfully formed.
+        ///
+        /// Once this event has been sent, the wp_image_description_v1 object will
+        /// never become ready and it can only be destroyed.
+        Failed {
+            /// Generic reason,
+            cause: u32,
+            /// Ad hoc human-readable explanation,
+            msg: String,
+        },
+        /// The object is ready to be used (32-bit)
+        ///
+        /// Starting from interface version 2, the 'ready2' event is sent instead
+        /// of this event.
+        ///
+        /// For the definition of this event, see the 'ready2' event. The
+        /// difference to this event is as follows.
+        ///
+        /// The id number is valid only as long as the protocol object is alive. If
+        /// all protocol objects referring to the same image description record are
+        /// destroyed, the id number may be recycled for a different image
+        /// description record.
+        Ready {
+            /// The 32-bit image description id number,
+            identity: u32,
+        },
+        /// The object is ready to be used
+        ///
+        /// Once this event has been sent, the wp_image_description_v1 object is
+        /// deemed "ready". Ready objects can be used to send requests and can be
+        /// used through other interfaces.
+        ///
+        /// Every ready wp_image_description_v1 protocol object refers to an
+        /// underlying image description record in the compositor. Multiple protocol
+        /// objects may end up referring to the same record. Clients may identify
+        /// these "copies" by comparing their id numbers: if the numbers from two
+        /// protocol objects are identical, the protocol objects refer to the same
+        /// image description record. Two different image description records
+        /// cannot have the same id number simultaneously. The id number does not
+        /// change during the lifetime of the image description record.
+        ///
+        /// Image description id number is not a protocol object id. Zero is
+        /// reserved as an invalid id number. It shall not be possible for a client
+        /// to refer to an image description by its id number in protocol. The id
+        /// numbers might not be portable between Wayland connections. A compositor
+        /// shall not send an invalid id number.
+        ///
+        /// Compositors must not recycle image description id numbers.
+        ///
+        /// This identity allows clients to de-duplicate image description records
+        /// and avoid get_information request if they already have the image
+        /// description information.
+        Ready2 {
+            /// High 32 bits of the 64-bit image description id number,
+            identity_hi: u32,
+            /// Low 32 bits of the 64-bit image description id number,
+            identity_lo: u32,
+        },
+    }
+    impl EventWriter for crate::wayland_objects::wp_image_description_v1::WpImageDescriptionV1 {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Failed { cause, msg } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 2);
+                    raw.uint(cause);
+                    raw.string(msg);
+                    raw
+                }
+                Ready { identity } => {
+                    let mut raw = RawEvent::new(self.id(), 1, 1);
+                    raw.uint(identity);
+                    raw
+                }
+                Ready2 { identity_hi, identity_lo } => {
+                    let mut raw = RawEvent::new(self.id(), 2, 2);
+                    raw.uint(identity_hi);
+                    raw.uint(identity_lo);
+                    raw
+                }
+            }
+        }
+    }
+    /// Protocol errors
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Attempted to use an object which is not ready,
+        NotReady = 0,
+        /// Get_information not allowed,
+        NoInformation = 1,
+    }
+    /// Generic reason for failure
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Cause {
+        /// Interface version too low,
+        LowVersion = 0,
+        /// Unsupported image description data,
+        Unsupported = 1,
+        /// Error independent of the client,
+        OperatingSystem = 2,
+        /// The relevant output no longer exists,
+        NoOutput = 3,
+    }
+}
+
+/// Colorimetric image description information
+///
+/// Sends all matching events describing an image description object exactly
+/// once and finally sends the 'done' event.
+///
+/// This means
+/// - if the image description is parametric, it must send
+/// - primaries
+/// - named_primaries, if applicable
+/// - at least one of tf_power and tf_named, as applicable
+/// - luminances
+/// - target_primaries
+/// - target_luminance
+/// - if the image description is parametric, it may send, if applicable,
+/// - target_max_cll
+/// - target_max_fall
+/// - if the image description contains an ICC profile, it must send the
+/// icc_file event
+///
+/// Once a wp_image_description_info_v1 object has delivered a 'done' event it
+/// is automatically destroyed.
+///
+/// Every wp_image_description_info_v1 created from the same
+/// wp_image_description_v1 shall always return the exact same data.
+pub mod wp_image_description_info_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_image_description_info_v1::WpImageDescriptionInfoV1 {
+        const INTERFACE_NAME: &'static str = "wp_image_description_info_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for WpImageDescriptionInfoV1Id {
+        type Object =
+            crate::wayland_objects::wp_image_description_info_v1::WpImageDescriptionInfoV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_image_description_info_v1::WpImageDescriptionInfoV1
+    {
+        type Id = WpImageDescriptionInfoV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// End of information
+        ///
+        /// Signals the end of information events and destroys the object.
+        Done,
+        /// ICC profile matching the image description
+        ///
+        /// The icc argument provides a file descriptor to the client which may be
+        /// memory-mapped to provide the ICC profile matching the image description.
+        /// The fd is read-only, and if mapped then it must be mapped with
+        /// MAP_PRIVATE by the client.
+        ///
+        /// The ICC profile version and other details are determined by the
+        /// compositor. There is no provision for a client to ask for a specific
+        /// kind of a profile.
+        IccFile {
+            /// ICC profile file descriptor,
+            icc: Rc<OwnedFd>,
+            /// ICC profile size, in bytes,
+            icc_size: u32,
+        },
+        /// Primaries as chromaticity coordinates
+        ///
+        /// Delivers the primary color volume primaries and white point using CIE
+        /// 1931 xy chromaticity coordinates.
+        ///
+        /// Each coordinate value is multiplied by 1 million to get the argument
+        /// value to carry precision of 6 decimals.
+        Primaries {
+            /// Red x * 1M,
+            r_x: i32,
+            /// Red y * 1M,
+            r_y: i32,
+            /// Green x * 1M,
+            g_x: i32,
+            /// Green y * 1M,
+            g_y: i32,
+            /// Blue x * 1M,
+            b_x: i32,
+            /// Blue y * 1M,
+            b_y: i32,
+            /// White x * 1M,
+            w_x: i32,
+            /// White y * 1M,
+            w_y: i32,
+        },
+        /// Named primaries
+        ///
+        /// Delivers the primary color volume primaries and white point using an
+        /// explicitly enumerated named set.
+        PrimariesNamed {
+            /// Named primaries,
+            primaries: u32,
+        },
+        /// Transfer characteristic as a power curve
+        ///
+        /// The color component transfer characteristic of this image description is
+        /// a pure power curve. This event provides the exponent of the power
+        /// function. This curve represents the conversion from electrical to
+        /// optical pixel or color values.
+        ///
+        /// The curve exponent has been multiplied by 10000 to get the argument eexp
+        /// value to carry the precision of 4 decimals.
+        TfPower {
+            /// The exponent * 10000,
+            eexp: u32,
+        },
+        /// Named transfer characteristic
+        ///
+        /// Delivers the transfer characteristic using an explicitly enumerated
+        /// named function.
+        TfNamed {
+            /// Named transfer function,
+            tf: u32,
+        },
+        /// Primary color volume luminance range and reference white
+        ///
+        /// Delivers the primary color volume luminance range and the reference
+        /// white luminance level. These values include the minimum display emission
+        /// and ambient flare luminances, assumed to be optically additive and have
+        /// the chromaticity of the primary color volume white point.
+        ///
+        /// The minimum luminance is multiplied by 10000 to get the argument
+        /// 'min_lum' value and carries precision of 4 decimals. The maximum
+        /// luminance and reference white luminance values are unscaled.
+        Luminances {
+            /// Minimum luminance (cd/m²) * 10000,
+            min_lum: u32,
+            /// Maximum luminance (cd/m²),
+            max_lum: u32,
+            /// Reference white luminance (cd/m²),
+            reference_lum: u32,
+        },
+        /// Target primaries as chromaticity coordinates
+        ///
+        /// Provides the color primaries and white point of the target color volume
+        /// using CIE 1931 xy chromaticity coordinates. This is compatible with the
+        /// SMPTE ST 2086 definition of HDR static metadata for mastering displays.
+        ///
+        /// While primary color volume is about how color is encoded, the target
+        /// color volume is the actually displayable color volume.
+        ///
+        /// Each coordinate value is multiplied by 1 million to get the argument
+        /// value to carry precision of 6 decimals.
+        TargetPrimaries {
+            /// Red x * 1M,
+            r_x: i32,
+            /// Red y * 1M,
+            r_y: i32,
+            /// Green x * 1M,
+            g_x: i32,
+            /// Green y * 1M,
+            g_y: i32,
+            /// Blue x * 1M,
+            b_x: i32,
+            /// Blue y * 1M,
+            b_y: i32,
+            /// White x * 1M,
+            w_x: i32,
+            /// White y * 1M,
+            w_y: i32,
+        },
+        /// Target luminance range
+        ///
+        /// Provides the luminance range that the image description is targeting as
+        /// the minimum and maximum absolute luminance L. These values include the
+        /// minimum display emission and ambient flare luminances, assumed to be
+        /// optically additive and have the chromaticity of the primary color
+        /// volume white point. This should be compatible with the SMPTE ST 2086
+        /// definition of HDR static metadata.
+        ///
+        /// This luminance range is only theoretical and may not correspond to the
+        /// luminance of light emitted on an actual display.
+        ///
+        /// Min L value is multiplied by 10000 to get the argument min_lum value and
+        /// carry precision of 4 decimals. Max L value is unscaled for max_lum.
+        TargetLuminance {
+            /// Min L (cd/m²) * 10000,
+            min_lum: u32,
+            /// Max L (cd/m²),
+            max_lum: u32,
+        },
+        /// Target maximum content light level
+        ///
+        /// Provides the targeted max_cll of the image description. max_cll is
+        /// defined by CTA-861-H.
+        ///
+        /// This luminance is only theoretical and may not correspond to the
+        /// luminance of light emitted on an actual display.
+        TargetMaxCll {
+            /// Maximum content light-level (cd/m²),
+            max_cll: u32,
+        },
+        /// Target maximum frame-average light level
+        ///
+        /// Provides the targeted max_fall of the image description. max_fall is
+        /// defined by CTA-861-H.
+        ///
+        /// This luminance is only theoretical and may not correspond to the
+        /// luminance of light emitted on an actual display.
+        TargetMaxFall {
+            /// Maximum frame-average light level (cd/m²),
+            max_fall: u32,
+        },
+    }
+    impl EventWriter
+        for crate::wayland_objects::wp_image_description_info_v1::WpImageDescriptionInfoV1
+    {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Done {} => {
+                    let mut raw = RawEvent::new(self.id(), 0, 0);
+                    raw
+                }
+                IccFile { icc, icc_size } => {
+                    let mut raw = RawEvent::new(self.id(), 1, 2);
+                    raw.fd(icc);
+                    raw.uint(icc_size);
+                    raw
+                }
+                Primaries { r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y } => {
+                    let mut raw = RawEvent::new(self.id(), 2, 8);
+                    raw.int(r_x);
+                    raw.int(r_y);
+                    raw.int(g_x);
+                    raw.int(g_y);
+                    raw.int(b_x);
+                    raw.int(b_y);
+                    raw.int(w_x);
+                    raw.int(w_y);
+                    raw
+                }
+                PrimariesNamed { primaries } => {
+                    let mut raw = RawEvent::new(self.id(), 3, 1);
+                    raw.uint(primaries);
+                    raw
+                }
+                TfPower { eexp } => {
+                    let mut raw = RawEvent::new(self.id(), 4, 1);
+                    raw.uint(eexp);
+                    raw
+                }
+                TfNamed { tf } => {
+                    let mut raw = RawEvent::new(self.id(), 5, 1);
+                    raw.uint(tf);
+                    raw
+                }
+                Luminances { min_lum, max_lum, reference_lum } => {
+                    let mut raw = RawEvent::new(self.id(), 6, 3);
+                    raw.uint(min_lum);
+                    raw.uint(max_lum);
+                    raw.uint(reference_lum);
+                    raw
+                }
+                TargetPrimaries { r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y } => {
+                    let mut raw = RawEvent::new(self.id(), 7, 8);
+                    raw.int(r_x);
+                    raw.int(r_y);
+                    raw.int(g_x);
+                    raw.int(g_y);
+                    raw.int(b_x);
+                    raw.int(b_y);
+                    raw.int(w_x);
+                    raw.int(w_y);
+                    raw
+                }
+                TargetLuminance { min_lum, max_lum } => {
+                    let mut raw = RawEvent::new(self.id(), 8, 2);
+                    raw.uint(min_lum);
+                    raw.uint(max_lum);
+                    raw
+                }
+                TargetMaxCll { max_cll } => {
+                    let mut raw = RawEvent::new(self.id(), 9, 1);
+                    raw.uint(max_cll);
+                    raw
+                }
+                TargetMaxFall { max_fall } => {
+                    let mut raw = RawEvent::new(self.id(), 10, 1);
+                    raw.uint(max_fall);
+                    raw
+                }
+            }
+        }
+    }
+}
+
+/// Reference to an image description
+///
+/// This object is a reference to an image description. This interface is
+/// frozen at version 1 to allow other protocols to create
+/// wp_image_description_v1 objects.
+///
+/// The wp_color_manager_v1.get_image_description request can be used to
+/// retrieve the underlying image description.
+pub mod wp_image_description_reference_v1 {
+    use super::*;
+    impl Constants
+        for crate::wayland_objects::wp_image_description_reference_v1::WpImageDescriptionReferenceV1
+    {
+        const INTERFACE_NAME: &'static str = "wp_image_description_reference_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpImageDescriptionReferenceV1Id {
+        type Object = crate::wayland_objects::wp_image_description_reference_v1::WpImageDescriptionReferenceV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_image_description_reference_v1::WpImageDescriptionReferenceV1
+    {
+        type Id = WpImageDescriptionReferenceV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the reference
+        ///
+        /// Destroy this object. This has no effect on the referenced image
+        /// description.
+        Destroy,
+    }
+    impl Parser
+        for crate::wayland_objects::wp_image_description_reference_v1::WpImageDescriptionReferenceV1
+    {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+}
+
+/// Color representation manager singleton
+///
+/// A singleton global interface used for getting color representation
+/// extensions for wl_surface. The extension interfaces allow setting the
+/// color representation of surfaces.
+///
+/// Compositors should never remove this global.
+pub mod wp_color_representation_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_color_representation_manager_v1::WpColorRepresentationManagerV1 {
+    const INTERFACE_NAME: &'static str = "wp_color_representation_manager_v1";
+    const INTERFACE_VERSION: u32 = 1;
+  }
+    impl crate::object::IdToObject for WpColorRepresentationManagerV1Id {
+        type Object = crate::wayland_objects::wp_color_representation_manager_v1::WpColorRepresentationManagerV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_color_representation_manager_v1::WpColorRepresentationManagerV1 {
+    type Id = WpColorRepresentationManagerV1Id;
+  }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the manager
+        ///
+        /// Destroy the wp_color_representation_manager_v1 object. This does not
+        /// affect any other objects in any way.
+        Destroy,
+        /// Create a color representation interface for a wl_surface
+        ///
+        /// If a wp_color_representation_surface_v1 object already exists for the
+        /// given wl_surface, the protocol error surface_exists is raised.
+        ///
+        /// This creates a new color wp_color_representation_surface_v1 object for
+        /// the given wl_surface.
+        ///
+        /// See the wp_color_representation_surface_v1 interface for more details.
+        GetSurface { id: WpColorRepresentationSurfaceV1Id, surface: WlSurfaceId },
+    }
+    impl Parser for crate::wayland_objects::wp_color_representation_manager_v1::WpColorRepresentationManagerV1 {
+    type Request = Request;
+    fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+      use Request::*;
+      let request = match req.request_id {
+        0 => Destroy,
+        1 => GetSurface {
+          id: req.id()?,
+          surface: req.id()?,
+        },
+        _ => return Err(ParserError::InvalidRequest),
+      };
+      Ok(request)
+    }
+  }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Supported alpha modes
+        ///
+        /// When this object is created, it shall immediately send this event once
+        /// for each alpha mode the compositor supports.
+        ///
+        /// For the definition of the supported values, see the
+        /// wp_color_representation_surface_v1::alpha_mode enum.
+        SupportedAlphaMode {
+            /// Supported alpha mode,
+            alpha_mode: u32,
+        },
+        /// Supported matrix coefficients and ranges
+        ///
+        /// When this object is created, it shall immediately send this event once
+        /// for each matrix coefficient and color range combination the compositor
+        /// supports.
+        ///
+        /// For the definition of the supported values, see the
+        /// wp_color_representation_surface_v1::coefficients and
+        /// wp_color_representation_surface_v1::range enums.
+        SupportedCoefficientsAndRanges {
+            /// Supported matrix coefficients,
+            coefficients: u32,
+            /// Full range flag,
+            range: u32,
+        },
+        /// All features have been sent
+        ///
+        /// This event is sent when all supported features have been sent.
+        Done,
+    }
+    impl EventWriter for crate::wayland_objects::wp_color_representation_manager_v1::WpColorRepresentationManagerV1 {
+    type Event = Event;
+    fn object_id(&self) -> WaylandId {
+      use crate::object::Object;
+      self.id()
+    }
+    fn to_raw_event(&self, event: Event) -> RawEvent {
+      use Event::*;
+      use crate::object::Object;
+      match event {
+        SupportedAlphaMode { alpha_mode } => {
+          let mut raw = RawEvent::new(self.id(), 0, 1);
+          raw.uint(alpha_mode);
+        raw
+        },
+        SupportedCoefficientsAndRanges { coefficients,range } => {
+          let mut raw = RawEvent::new(self.id(), 1, 2);
+          raw.uint(coefficients);
+          raw.uint(range);
+        raw
+        },
+        Done {  } => {
+          let mut raw = RawEvent::new(self.id(), 2, 0);
+        raw
+        },
+      }
+    }
+  }
+    /// Protocol errors
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Color representation surface exists already,
+        SurfaceExists = 1,
+    }
+}
+
+/// Color representation extension to a surface
+///
+/// A wp_color_representation_surface_v1 allows the client to set the color
+/// representation metadata of a surface.
+///
+/// By default, a surface does not have any color representation metadata set.
+/// The reconstruction of R, G, B signals on such surfaces is compositor
+/// implementation defined. The alpha mode is assumed to be
+/// premultiplied_electrical when the alpha mode is unset.
+///
+/// If the wl_surface associated with the wp_color_representation_surface_v1
+/// is destroyed, the wp_color_representation_surface_v1 object becomes inert.
+pub mod wp_color_representation_surface_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1 {
+    const INTERFACE_NAME: &'static str = "wp_color_representation_surface_v1";
+    const INTERFACE_VERSION: u32 = 1;
+  }
+    impl crate::object::IdToObject for WpColorRepresentationSurfaceV1Id {
+        type Object = crate::wayland_objects::wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1 {
+    type Id = WpColorRepresentationSurfaceV1Id;
+  }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the color representation
+        ///
+        /// Destroy the wp_color_representation_surface_v1 object.
+        ///
+        /// Destroying this object unsets all the color representation metadata from
+        /// the surface. See the wp_color_representation_surface_v1 interface
+        /// description for how a compositor handles a surface without color
+        /// representation metadata. Unsetting is double-buffered state, see
+        /// wl_surface.commit.
+        Destroy,
+        /// Set the surface alpha mode
+        ///
+        /// If this protocol object is inert, the protocol error inert is raised.
+        ///
+        /// Assuming an alpha channel exists, it is always linear. The alpha mode
+        /// determines whether and how the color channels include pre-multiplied
+        /// alpha. Using straight alpha might have performance benefits.
+        ///
+        /// Only alpha modes advertised by the compositor are allowed to be used as
+        /// argument for this request. The "alpha_mode" protocol error is raised
+        /// otherwise.
+        ///
+        /// Alpha mode is double buffered, see wl_surface.commit.
+        SetAlphaMode {
+            /// Alpha mode,
+            alpha_mode: u32,
+        },
+        /// Set the matrix coefficients and range
+        ///
+        /// If this protocol object is inert, the protocol error inert is raised.
+        ///
+        /// Set the matrix coefficients and video range which defines the formula
+        /// and the related constants used to derive red, green and blue signals.
+        /// Usually coefficients correspond to MatrixCoefficients code points in
+        /// H.273.
+        ///
+        /// Only combinations advertised by the compositor are allowed to be used as
+        /// argument for this request. The "coefficients" protocol error is raised
+        /// otherwise.
+        ///
+        /// A call to wl_surface.commit verifies that the pixel format and the
+        /// coefficients-range combination in the committed surface contents are
+        /// compatible, if contents exist. The "pixel_format" protocol error is
+        /// raised otherwise.
+        ///
+        /// A pixel format is compatible with the coefficients-range combination if
+        /// the related equations and conventions as defined in H.273 can produce
+        /// the color channels (RGB or YCbCr) of the pixel format.
+        ///
+        /// For the definition of the supported combination, see the
+        /// wp_color_representation_surface_v1::coefficients and
+        /// wp_color_representation_surface_v1::range enums.
+        ///
+        /// The coefficients-range combination is double-buffered, see
+        /// wl_surface.commit.
+        SetCoefficientsAndRange {
+            /// Matrix coefficients,
+            coefficients: u32,
+            /// Range,
+            range: u32,
+        },
+        /// Set the chroma location
+        ///
+        /// If this protocol object is inert, the protocol error inert is raised.
+        ///
+        /// Set the chroma location type which defines the position of downsampled
+        /// chroma samples, corresponding to Chroma420SampleLocType code points in
+        /// H.273.
+        ///
+        /// An invalid chroma location enum value raises the "chroma_location"
+        /// protocol error.
+        ///
+        /// A call to wl_surface.commit verifies that the pixel format and chroma
+        /// location type in the committed surface contents are compatible, if
+        /// contents exist. The "pixel_format" protocol error is raised otherwise.
+        ///
+        /// For the definition of the supported chroma location types, see the
+        /// wp_color_representation_surface_v1::chroma_location enum.
+        ///
+        /// The chroma location type is double-buffered, see wl_surface.commit.
+        SetChromaLocation {
+            /// Chroma sample location,
+            chroma_location: u32,
+        },
+    }
+    impl Parser for crate::wayland_objects::wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1 {
+    type Request = Request;
+    fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+      use Request::*;
+      let request = match req.request_id {
+        0 => Destroy,
+        1 => SetAlphaMode {
+          alpha_mode: req.uint()?,
+        },
+        2 => SetCoefficientsAndRange {
+          coefficients: req.uint()?,
+          range: req.uint()?,
+        },
+        3 => SetChromaLocation {
+          chroma_location: req.uint()?,
+        },
+        _ => return Err(ParserError::InvalidRequest),
+      };
+      Ok(request)
+    }
+  }
+    /// Protocol errors
+    ///
+    ///
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Unsupported alpha mode,
+        AlphaMode = 1,
+        /// Unsupported coefficients,
+        Coefficients = 2,
+        /// The pixel format and a set value are incompatible,
+        PixelFormat = 3,
+        /// Forbidden request on inert object,
+        Inert = 4,
+        /// Invalid chroma location,
+        ChromaLocation = 5,
+    }
+    /// Alpha mode
+    ///
+    /// Specifies how the alpha channel affects the color channels.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum AlphaMode {
+        /// Premultiplied alpha in electrical values
+        ///
+        /// Electrical color channel values (after transfer function encoding)
+        /// are already multiplied with the alpha channel value.
+        PremultipliedElectrical = 0,
+        /// Premultiplied alpha in optical values
+        ///
+        /// Optical color channel values (before transfer function encoding)
+        /// are already multiplied with the alpha channel value.
+        PremultipliedOptical = 1,
+        /// Straight alpha
+        ///
+        /// Alpha channel has not been pre-multiplied into color channels.
+        Straight = 2,
+    }
+    /// Named coefficients
+    ///
+    /// Named matrix coefficients used to encode well-known sets of
+    /// coefficients. H.273 is the authority, when it comes to the exact values
+    /// of coefficients and authoritative specifications, where an equivalent
+    /// code point exists.
+    ///
+    /// A value of 0 is invalid and will never be present in the list of enums.
+    ///
+    /// Descriptions do list the specifications for convenience.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Coefficients {
+        /// The identity matrix
+        ///
+        /// Coefficients as defined by
+        /// - IEC 61966-2-1 sRGB
+        /// - SMPTE ST 428-1 (2019)
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 0.
+        /// Compatible with pixel formats of the RGB family.
+        Identity = 1,
+        /// BT.709 matrix coefficients
+        ///
+        /// Coefficients as defined by
+        /// - Rec. ITU-R BT.709-6
+        /// - Rec. ITU-R BT.1361-0 conventional colour gamut system (historical)
+        /// - Rec. ITU-R BT.1361-0 conventional colour gamut system and extended
+        /// colour gamut system (historical)
+        /// - IEC 61966-2-4 xvYCC709
+        /// - SMPTE RP 177 (1993) Annex B
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 1.
+        /// Compatible with pixel formats of the YCbCr family.
+        Bt709 = 2,
+        /// FCC matrix coefficients
+        ///
+        /// Coefficients as defined by
+        /// - United States Federal Communications Commission (2003) Title 47
+        /// Code of Federal Regulations 73.682 (a) (20)
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 4.
+        /// Compatible with pixel formats of the YCbCr family.
+        Fcc = 3,
+        /// BT.601-7 matrix coefficients
+        ///
+        /// Coefficients as defined by
+        /// - Rec. ITU-R BT.470-6 System B, G (historical)
+        /// - Rec. ITU-R BT.601-7 625
+        /// - Rec. ITU-R BT.601-7 525
+        /// - Rec. ITU-R BT.1358-0 625 (historical)
+        /// - Rec. ITU-R BT.1358-1 525 or 625 (historical)
+        /// - Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM
+        /// - Rec. ITU-R BT.1700-0 NTSC
+        /// - IEC 61966-2-1 sYCC
+        /// - IEC 61966-2-4 xvYCC601
+        /// - SMPTE ST 170 (2004)
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 5, 6.
+        /// Compatible with pixel formats of the YCbCr family.
+        Bt601 = 4,
+        /// SMPTE ST 240 matrix coefficients
+        ///
+        /// Coefficients as defined by
+        /// - SMPTE ST 240 (1999)
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 7.
+        /// Compatible with pixel formats of the YCbCr family.
+        Smpte240 = 5,
+        /// BT.2020 and BT.2100 YCbCr matrix coefficients
+        ///
+        /// Coefficients as defined by
+        /// - Rec. ITU-R BT.2020-2 (non-constant luminance)
+        /// - Rec. ITU-R BT.2100-2 Y′CbCr
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 9.
+        /// Compatible with pixel formats of the YCbCr family.
+        Bt2020 = 6,
+        /// BT.2020 matrix coefficients for constant luminance
+        ///
+        /// Coefficients as defined by
+        /// - Rec. ITU-R BT.2020-2 (constant luminance)
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 10.
+        /// Compatible with pixel formats of the YCbCr family.
+        Bt2020Cl = 7,
+        /// BT.2100 ICtCp matrix coefficients
+        ///
+        /// Coefficients as defined by
+        /// - Rec. ITU-R BT.2100-2 ICTCP
+        ///
+        /// Equivalent to H.273 MatrixCoefficients code point 14.
+        /// Compatible with pixel formats of the YCbCr family.
+        Ictcp = 8,
+    }
+    /// Color range values
+    ///
+    /// Possible color range values.
+    ///
+    /// A value of 0 is invalid and will never be present in the list of enums.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Range {
+        /// Full color range,
+        Full = 1,
+        /// Limited color range,
+        Limited = 2,
+    }
+    /// Chroma sample location for 4:2:0 YCbCr
+    ///
+    /// Chroma sample location as defined by H.273 Chroma420SampleLocType.
+    ///
+    /// A value of 0 is invalid and will never be present in the list of enums.
+    ///
+    /// The descriptions list the matching Vulkan VkChromaLocation combinations
+    /// for convenience.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum ChromaLocation {
+        /// Horizontal offset of 0, vertical offset of 0.5
+        ///
+        /// Corresponding to VkChromaLocations:
+        /// - xChromaOffset: VK_CHROMA_LOCATION_COSITED_EVEN
+        /// - yChromaOffset: VK_CHROMA_LOCATION_MIDPOINT
+        ///
+        /// Equivalent to H.273 Chroma420SampleLocType 0.
+        Type0 = 1,
+        /// Horizontal offset of 0.5, vertical offset of 0.5
+        ///
+        /// Corresponding to VkChromaLocations:
+        /// - xChromaOffset: VK_CHROMA_LOCATION_MIDPOINT
+        /// - yChromaOffset: VK_CHROMA_LOCATION_MIDPOINT
+        ///
+        /// Equivalent to H.273 Chroma420SampleLocType 1.
+        Type1 = 2,
+        /// Horizontal offset of 0, vertical offset of 0
+        ///
+        /// Corresponding to VkChromaLocations:
+        /// - xChromaOffset: VK_CHROMA_LOCATION_COSITED_EVEN
+        /// - yChromaOffset: VK_CHROMA_LOCATION_COSITED_EVEN
+        ///
+        /// Equivalent to H.273 Chroma420SampleLocType 2.
+        Type2 = 3,
+        /// Horizontal offset of 0.5, vertical offset of 0
+        ///
+        /// Corresponding to VkChromaLocations:
+        /// - xChromaOffset: VK_CHROMA_LOCATION_MIDPOINT
+        /// - yChromaOffset: VK_CHROMA_LOCATION_COSITED_EVEN
+        ///
+        /// Equivalent to H.273 Chroma420SampleLocType 3.
+        Type3 = 4,
+        /// Horizontal offset of 0, vertical offset of 1
+        ///
+        /// Equivalent to H.273 Chroma420SampleLocType 4.
+        Type4 = 5,
+        /// Horizontal offset of 0.5, vertical offset of 1
+        ///
+        /// Equivalent to H.273 Chroma420SampleLocType 5.
+        Type5 = 6,
     }
 }
 

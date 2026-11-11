@@ -171,6 +171,7 @@ mod animation_config;
 mod buffer_content;
 mod capture;
 mod clients;
+mod color;
 mod config;
 mod cursor;
 mod dbus;
@@ -331,6 +332,9 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
 
     let mut globals = Globals::new();
     globals.initialize();
+    if !config.color_management.enabled {
+        globals.remove_interface("wp_color_manager_v1");
+    }
 
     let mut state = State::new(globals, config, keyboard, xkb);
     let mut startup_dispatcher = Dispatcher::default();

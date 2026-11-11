@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::{region::DamageRegion, state::RootSurfaceClip, transform::Mat3};
+use crate::{color::ColorTransform, region::DamageRegion, state::RootSurfaceClip, transform::Mat3};
 
 use super::Texture;
 
@@ -31,7 +31,20 @@ pub struct TextureElement {
     pub damage: DamageRegion,
     pub blend: bool,
     pub alpha: u8,
+    /// Raw `wp_alpha_modifier_surface_v1` factor. `u32::MAX` is 1.0.
+    pub alpha_multiplier: u32,
+    /// `None` is the identity color path and selects the current shader.
+    pub color: Option<Rc<ColorTransform>>,
+    /// Shader alpha mode. Opaque textures ignore it and stay premultiplied electrical.
+    pub alpha_mode: u32,
+    /// `None` uses BT.709 limited, chroma type 0, when the texture is YUV.
+    pub yuv: Option<crate::color::YuvConversion>,
     pub mask: TextureMask,
+}
+
+/// Window opacity times the client alpha factor. `u32::MAX` is 1.0.
+pub fn effective_alpha(alpha: u8, alpha_multiplier: u32) -> f32 {
+    (f32::from(alpha) / 255.0) * (f64::from(alpha_multiplier) / f64::from(u32::MAX)) as f32
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

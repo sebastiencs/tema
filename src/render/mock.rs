@@ -304,6 +304,10 @@ fn composite_imported_frame(renderer: &mut dyn Renderer) {
                 damage: DamageRegion::from_rect(rect),
                 blend: false,
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
+                color: None,
+                alpha_mode: 0,
+                yuv: None,
                 mask: TextureMask::None,
             },
         }],
@@ -320,6 +324,7 @@ fn composite_imported_frame(renderer: &mut dyn Renderer) {
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: None,
+                linear_blend: None,
             },
         )
         .expect("render");

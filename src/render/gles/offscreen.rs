@@ -78,7 +78,16 @@ impl TextureFrameBuffer {
                 gl::DeleteFramebuffers(1, &framebuffer_object);
             }
         }
-        GlTexture { image: None, texture, delete_on_drop: true, device_id }
+        GlTexture {
+            image: None,
+            texture,
+            delete_on_drop: true,
+            device_id,
+            samples_as_opaque: false,
+            chroma: None,
+            yuv_mode: 0,
+            yuv_size: [0.0, 0.0],
+        }
     }
 }
 
@@ -87,11 +96,24 @@ impl TextureFrameBuffer {
 #[derive(Debug)]
 pub(crate) struct OffscreenColorTarget {
     framebuffer: TextureFrameBuffer,
+    /// FP16 intermediate for translucent HDR pixels. Reused while the size matches.
+    linear_blend: std::cell::RefCell<Option<super::resources::LinearBlendTarget>>,
 }
 
 impl OffscreenColorTarget {
     pub(crate) fn new(width: i32, height: i32) -> Option<Self> {
-        TextureFrameBuffer::new(width, height).map(|framebuffer| Self { framebuffer })
+        TextureFrameBuffer::new(width, height)
+            .map(|framebuffer| Self { framebuffer, linear_blend: std::cell::RefCell::new(None) })
+    }
+
+    pub(super) fn framebuffer_object(&self) -> gl::GLuint {
+        self.framebuffer.framebuffer_object
+    }
+
+    pub(super) fn linear_blend(
+        &self,
+    ) -> &std::cell::RefCell<Option<super::resources::LinearBlendTarget>> {
+        &self.linear_blend
     }
 
     pub(super) fn render_elements(

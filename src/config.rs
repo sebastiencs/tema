@@ -46,6 +46,102 @@ pub enum OutputScaleSetting {
     Fixed(FractionalScale),
 }
 
+/// `srgb` is the IEC 61966-2-1 piecewise transfer, `compound_power_2_4`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputColorTransfer {
+    Gamma22,
+    Srgb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputColorPrimaries {
+    Srgb,
+    Edid,
+}
+
+/// Per-connector color description. SDR minimum luminance stays 0.2 cd/m².
+#[derive(Clone, Copy, Debug)]
+pub struct OutputColorConfig {
+    pub tf: OutputColorTransfer,
+    pub primaries: OutputColorPrimaries,
+    /// `hdr` asks for a PQ BT.2020 output. It stays SDR unless the EDID and the
+    /// connector both allow it.
+    pub mode: OutputColorMode,
+    /// Reference white, in cd/m². An omitted value is 203 while HDR is active
+    /// and 80 otherwise.
+    pub sdr_white: f64,
+    /// `false` when the file omitted `sdr_white`, so a rejected HDR request
+    /// keeps the SDR default of 80.
+    pub sdr_white_explicit: bool,
+    /// `8` keeps `XRGB8888`. `10` prefers `XRGB2101010`, then `XBGR2101010`.
+    /// An active HDR mode prefers those 10-bit formats too.
+    pub bitdepth: u8,
+    /// Replaces the EDID minimum luminance when set.
+    pub min_luminance: Option<f64>,
+    /// Replaces the EDID maximum luminance when set.
+    pub max_luminance: Option<f64>,
+    /// Replaces the EDID maximum frame-average luminance when set.
+    pub max_fall: Option<f64>,
+}
+
+/// `mode` in `[output.color]`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OutputColorMode {
+    Sdr,
+    Hdr,
+}
+
+impl OutputColorConfig {
+    pub const DEFAULT: Self = Self {
+        tf: OutputColorTransfer::Gamma22,
+        primaries: OutputColorPrimaries::Srgb,
+        mode: OutputColorMode::Sdr,
+        sdr_white: 80.0,
+        sdr_white_explicit: false,
+        bitdepth: 8,
+        min_luminance: None,
+        max_luminance: None,
+        max_fall: None,
+    };
+
+    /// Reference white actually used. A rejected HDR request does not inherit
+    /// the implicit 203 cd/m² default.
+    pub fn reference_white(self, hdr_active: bool) -> f64 {
+        if hdr_active || self.mode == OutputColorMode::Sdr || self.sdr_white_explicit {
+            self.sdr_white
+        } else {
+            80.0
+        }
+    }
+}
+
+/// A 10-bit scanout buffer is requested by `bitdepth = 10` or by an active HDR mode.
+///
+/// `hdr_active` is true only after the EDID and connector checks pass.
+pub fn ten_bit_scanout(color: &OutputColorConfig, hdr_active: bool) -> bool {
+    hdr_active || color.bitdepth == 10
+}
+
+impl PartialEq for OutputColorConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.tf == other.tf
+            && self.primaries == other.primaries
+            && self.mode == other.mode
+            && self.sdr_white.to_bits() == other.sdr_white.to_bits()
+            && self.sdr_white_explicit == other.sdr_white_explicit
+            && self.bitdepth == other.bitdepth
+            && optional_bits(self.min_luminance) == optional_bits(other.min_luminance)
+            && optional_bits(self.max_luminance) == optional_bits(other.max_luminance)
+            && optional_bits(self.max_fall) == optional_bits(other.max_fall)
+    }
+}
+
+impl Eq for OutputColorConfig {}
+
+fn optional_bits(value: Option<f64>) -> Option<u64> {
+    value.map(f64::to_bits)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     path: PathBuf,
@@ -60,6 +156,20 @@ pub struct RuntimeConfig {
     pub mouse_bindings: Vec<MouseBinding>,
     output_scales: BTreeMap<String, OutputScaleSetting>,
     output_tearing: BTreeMap<String, bool>,
+    output_color: BTreeMap<String, OutputColorConfig>,
+    pub color_management: ColorManagementConfig,
+}
+
+/// `wp_color_manager_v1` is advertised when `enabled` is true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorManagementConfig {
+    pub enabled: bool,
+}
+
+impl Default for ColorManagementConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -442,6 +552,19 @@ struct ConfigFile {
     bindings: BTreeMap<String, ActionFile>,
     mouse_bindings: BTreeMap<String, MouseBindingAction>,
     output: OutputConfigFile,
+    color_management: ColorManagementConfigFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ColorManagementConfigFile {
+    enabled: bool,
+}
+
+impl Default for ColorManagementConfigFile {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -519,6 +642,41 @@ struct OutputConfigFile {
     scales: BTreeMap<String, OutputScaleSettingFile>,
     #[serde(default)]
     tearing: BTreeMap<String, bool>,
+    #[serde(default)]
+    color: BTreeMap<String, OutputColorFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OutputColorFile {
+    tf: String,
+    primaries: String,
+    mode: String,
+    sdr_white: Option<f64>,
+    #[serde(default = "default_output_bitdepth")]
+    bitdepth: u8,
+    min_luminance: Option<f64>,
+    max_luminance: Option<f64>,
+    max_fall: Option<f64>,
+}
+
+fn default_output_bitdepth() -> u8 {
+    8
+}
+
+impl Default for OutputColorFile {
+    fn default() -> Self {
+        Self {
+            tf: "gamma22".to_string(),
+            primaries: "srgb".to_string(),
+            mode: "sdr".to_string(),
+            sdr_white: None,
+            bitdepth: default_output_bitdepth(),
+            min_luminance: None,
+            max_luminance: None,
+            max_fall: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -526,6 +684,93 @@ struct OutputConfigFile {
 enum OutputScaleSettingFile {
     Text(String),
     Number(f64),
+}
+
+fn validate_luminance_override(
+    name: &str,
+    key: &str,
+    value: Option<f64>,
+    allow_zero: bool,
+) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let ok = value.is_finite() && if allow_zero { value >= 0.0 } else { value > 0.0 };
+    if ok {
+        Ok(())
+    } else {
+        bail!("invalid output color {key} for `{name}`")
+    }
+}
+
+fn output_colors_from_file(
+    parsed: BTreeMap<String, OutputColorFile>,
+) -> anyhow::Result<BTreeMap<String, OutputColorConfig>> {
+    let mut output_color = BTreeMap::new();
+    for (name, value) in parsed {
+        let tf = match value.tf.as_str() {
+            "gamma22" => OutputColorTransfer::Gamma22,
+            "srgb" => OutputColorTransfer::Srgb,
+            _ => bail!("invalid output color tf for `{name}`; expected \"gamma22\" or \"srgb\""),
+        };
+        let primaries = match value.primaries.as_str() {
+            "srgb" => OutputColorPrimaries::Srgb,
+            "edid" => OutputColorPrimaries::Edid,
+            _ => {
+                bail!("invalid output color primaries for `{name}`; expected \"srgb\" or \"edid\"")
+            }
+        };
+        let mode = match value.mode.as_str() {
+            "sdr" => OutputColorMode::Sdr,
+            "hdr" => OutputColorMode::Hdr,
+            _ => bail!("invalid output color mode for `{name}`; expected \"sdr\" or \"hdr\""),
+        };
+        let (sdr_white, sdr_white_explicit) = match value.sdr_white {
+            Some(white) => {
+                if !white.is_finite() || white <= 0.2 {
+                    bail!(
+                        "invalid output color sdr_white for `{name}`; expected a value greater than 0.2"
+                    );
+                }
+                (white, true)
+            }
+            None if mode == OutputColorMode::Hdr => (crate::color::hdr::REFERENCE_WHITE, false),
+            None => (80.0, false),
+        };
+        if value.bitdepth != 8 && value.bitdepth != 10 {
+            bail!("invalid output color bitdepth for `{name}`; expected 8 or 10");
+        }
+        validate_luminance_override(&name, "min_luminance", value.min_luminance, true)?;
+        validate_luminance_override(&name, "max_luminance", value.max_luminance, false)?;
+        validate_luminance_override(&name, "max_fall", value.max_fall, false)?;
+        if let (Some(min), Some(max)) = (value.min_luminance, value.max_luminance) {
+            if max <= min {
+                bail!("invalid output color luminance for `{name}`; max_luminance must exceed min_luminance");
+            }
+        }
+        if let (Some(max), Some(fall)) = (value.max_luminance, value.max_fall) {
+            if fall > max {
+                bail!(
+                    "invalid output color max_fall for `{name}`; it must not exceed max_luminance"
+                );
+            }
+        }
+        output_color.insert(
+            name,
+            OutputColorConfig {
+                tf,
+                primaries,
+                mode,
+                sdr_white,
+                sdr_white_explicit,
+                bitdepth: value.bitdepth,
+                min_luminance: value.min_luminance,
+                max_luminance: value.max_luminance,
+                max_fall: value.max_fall,
+            },
+        );
+    }
+    Ok(output_color)
 }
 
 fn output_scale_setting_from_file(
@@ -717,6 +962,8 @@ impl RuntimeConfig {
             mouse_bindings,
             output_scales,
             output_tearing: parsed.output.tearing,
+            output_color: output_colors_from_file(parsed.output.color)?,
+            color_management: ColorManagementConfig { enabled: parsed.color_management.enabled },
         })
     }
 
@@ -742,6 +989,8 @@ impl RuntimeConfig {
             mouse_bindings: Vec::new(),
             output_scales: BTreeMap::new(),
             output_tearing: BTreeMap::new(),
+            output_color: BTreeMap::new(),
+            color_management: ColorManagementConfig::default(),
         }
     }
 
@@ -760,6 +1009,15 @@ impl RuntimeConfig {
             .get(output_name)
             .copied()
             .unwrap_or(self.general.allow_tearing)
+    }
+
+    /// Per-connector SDR description. A missing connector uses [`OutputColorConfig::DEFAULT`].
+    /// Connector names are case-sensitive.
+    pub fn output_color(&self, output_name: &str) -> OutputColorConfig {
+        self.output_color
+            .get(output_name)
+            .copied()
+            .unwrap_or(OutputColorConfig::DEFAULT)
     }
 
     pub fn binding_for_key(&self, keyboard: &KeyboardState, key: u32) -> Option<CompositorAction> {
@@ -1293,6 +1551,14 @@ pub fn reload_from_disk(
         );
         next.general.renderer = state.config.general.renderer;
     }
+    if next.color_management.enabled != state.config.color_management.enabled {
+        log::warn!(
+            "color_management.enabled is {requested} in {path}; restart the compositor to change it",
+            requested = next.color_management.enabled,
+            path = path.display(),
+        );
+        next.color_management.enabled = state.config.color_management.enabled;
+    }
     let enabled_changed = next.xwayland.enabled != state.config.xwayland.enabled;
     let scaling_mode_changed = next.xwayland.scaling_mode != state.config.xwayland.scaling_mode;
     let import_changed = next.general.import_environment != state.config.general.import_environment;
@@ -1348,6 +1614,8 @@ pub fn apply_general_settings(state: &mut State, dispatcher: &mut Dispatcher) {
 }
 
 pub fn apply_output_settings(state: &mut State, dispatcher: &mut Dispatcher) {
+    state.refresh_output_colors();
+    crate::drm::request_output_color_redraws(state, dispatcher);
     let changed_outputs = state.apply_output_scales_from_config();
     if changed_outputs.is_empty() {
         return;
@@ -3051,6 +3319,7 @@ mod tests {
         let defaults = RuntimeConfig::parse_for_test("", &xkb).unwrap();
         assert!(defaults.general.allow_tearing);
         assert!(defaults.output_allows_tearing("DP-1"));
+        assert_eq!(defaults.output_color("DP-1"), OutputColorConfig::DEFAULT);
 
         let config = RuntimeConfig::parse_for_test(
             r#"
@@ -3067,6 +3336,157 @@ mod tests {
         assert!(config.output_allows_tearing("DP-1"));
         assert!(!config.output_allows_tearing("eDP-1"));
         assert!(!config.output_allows_tearing("dp-1"));
+    }
+
+    #[test]
+    fn output_color_defaults_and_a_per_connector_value_wins() {
+        let xkb = Xkb::new();
+        let defaults = RuntimeConfig::parse_for_test("", &xkb).unwrap();
+        assert_eq!(defaults.output_color("DP-1"), OutputColorConfig::DEFAULT);
+        assert_eq!(defaults.output_color("DP-1").tf, OutputColorTransfer::Gamma22);
+        assert_eq!(defaults.output_color("DP-1").primaries, OutputColorPrimaries::Srgb);
+        assert_eq!(defaults.output_color("DP-1").sdr_white, 80.0);
+        assert_eq!(defaults.output_color("DP-1").bitdepth, 8);
+        assert!(!ten_bit_scanout(&defaults.output_color("DP-1"), false));
+        assert!(ten_bit_scanout(&defaults.output_color("DP-1"), true));
+
+        let config = RuntimeConfig::parse_for_test(
+            r#"
+            [output.color]
+            "DP-1" = { tf = "srgb", primaries = "edid", sdr_white = 100 }
+            "DP-2" = { tf = "gamma22" }
+            "#,
+            &xkb,
+        )
+        .unwrap();
+        assert_eq!(
+            config.output_color("DP-1"),
+            OutputColorConfig {
+                tf: OutputColorTransfer::Srgb,
+                primaries: OutputColorPrimaries::Edid,
+                mode: OutputColorMode::Sdr,
+                sdr_white: 100.0,
+                sdr_white_explicit: true,
+                bitdepth: 8,
+                min_luminance: None,
+                max_luminance: None,
+                max_fall: None,
+            }
+        );
+        assert_eq!(
+            config.output_color("DP-2"),
+            OutputColorConfig {
+                tf: OutputColorTransfer::Gamma22,
+                primaries: OutputColorPrimaries::Srgb,
+                mode: OutputColorMode::Sdr,
+                sdr_white: 80.0,
+                sdr_white_explicit: false,
+                bitdepth: 8,
+                min_luminance: None,
+                max_luminance: None,
+                max_fall: None,
+            }
+        );
+        assert_eq!(config.output_color("dp-1"), OutputColorConfig::DEFAULT);
+        assert_eq!(config.output_color("eDP-1"), OutputColorConfig::DEFAULT);
+
+        let ten_bit = RuntimeConfig::parse_for_test(
+            r#"
+            [output.color]
+            "DP-1" = { bitdepth = 10 }
+            "#,
+            &xkb,
+        )
+        .unwrap();
+        assert_eq!(ten_bit.output_color("DP-1").bitdepth, 10);
+        assert_eq!(ten_bit.output_color("DP-1").tf, OutputColorTransfer::Gamma22);
+        assert!(ten_bit_scanout(&ten_bit.output_color("DP-1"), false));
+        assert!(!ten_bit_scanout(&ten_bit.output_color("DP-2"), false));
+
+        let hdr = RuntimeConfig::parse_for_test(
+            r#"
+            [output.color]
+            "DP-1" = { mode = "hdr" }
+            "DP-2" = { mode = "hdr", sdr_white = 120, min_luminance = 0.01, max_luminance = 600, max_fall = 200 }
+            "#,
+            &xkb,
+        )
+        .unwrap();
+        let requested = hdr.output_color("DP-1");
+        assert_eq!(requested.mode, OutputColorMode::Hdr);
+        assert_eq!(requested.sdr_white, 203.0);
+        assert!(!requested.sdr_white_explicit);
+        assert_eq!(requested.reference_white(false), 80.0);
+        assert_eq!(requested.reference_white(true), 203.0);
+        let overridden = hdr.output_color("DP-2");
+        assert!(overridden.sdr_white_explicit);
+        assert_eq!(overridden.sdr_white, 120.0);
+        assert_eq!(overridden.min_luminance, Some(0.01));
+        assert_eq!(overridden.max_luminance, Some(600.0));
+        assert_eq!(overridden.max_fall, Some(200.0));
+
+        let xkb = Xkb::new();
+        for source in [
+            r#"[output.color]
+            "DP-1" = { tf = "pq" }"#,
+            r#"[output.color]
+            "DP-1" = { primaries = "bt2020" }"#,
+            r#"[output.color]
+            "DP-1" = { sdr_white = 0.2 }"#,
+            r#"[output.color]
+            "DP-1" = { hdr = true }"#,
+            r#"[output.color]
+            "DP-1" = { mode = "pq" }"#,
+            r#"[output.color]
+            "DP-1" = { bitdepth = 12 }"#,
+            r#"[output.color]
+            "DP-1" = { mode = "hdr", max_luminance = 10, max_fall = 20 }"#,
+        ] {
+            assert!(RuntimeConfig::parse_for_test(source, &xkb).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn color_management_defaults_to_enabled_and_rejects_an_unknown_key() {
+        let xkb = Xkb::new();
+        let defaults = RuntimeConfig::parse_for_test("", &xkb).unwrap();
+        assert!(defaults.color_management.enabled);
+
+        let disabled =
+            RuntimeConfig::parse_for_test("[color_management]\nenabled = false\n", &xkb).unwrap();
+        assert!(!disabled.color_management.enabled);
+
+        let error =
+            RuntimeConfig::parse_for_test("[color_management]\nicc = true\n", &xkb).unwrap_err();
+        assert!(error.to_string().contains("icc"), "{error}");
+    }
+
+    #[test]
+    fn reload_keeps_the_running_color_management_switch() {
+        let temp_dir = mktemp::Temp::new_dir().unwrap();
+        let path = temp_dir.to_path_buf().join("config.toml");
+        fs::write(&path, "[color_management]\nenabled = true\n[general]\nouter_gap = 4\n").unwrap();
+
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let mut state = state_for_tests_with_config(config);
+        state.config.path = path.clone();
+        let mut dispatcher = Dispatcher::default();
+
+        fs::write(&path, "[color_management]\nenabled = false\n[general]\nouter_gap = 4\n")
+            .unwrap();
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+        assert!(!changed);
+        assert!(state.config.color_management.enabled);
+
+        fs::write(&path, "[color_management]\nenabled = false\n[general]\nouter_gap = 12\n")
+            .unwrap();
+        let changed =
+            reload_from_disk(&mut state, &mut dispatcher, ReloadTrigger::ManualBinding).unwrap();
+        assert!(changed);
+        assert!(state.config.color_management.enabled);
+        assert_eq!(state.config.general.outer_gap, 12);
     }
 
     #[test]

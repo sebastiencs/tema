@@ -94,6 +94,10 @@ fn texture_element(texture: Rc<dyn Texture>, width: i32, height: i32) -> FrameEl
             damage: DamageRegion::from_rect(rect),
             blend: false,
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
+            color: None,
+            alpha_mode: 0,
+            yuv: None,
             mask: TextureMask::None,
         },
     }
@@ -121,6 +125,7 @@ fn render_solid(
                 sync_mode,
                 blur_reference,
                 clear_color: None,
+                linear_blend: None,
             },
         )
         .expect("render")
@@ -280,6 +285,7 @@ fn effects_darken_and_damage_keeps_untouched_pixels() {
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: Some((8, 8)),
                 clear_color: None,
+                linear_blend: None,
             },
         )
         .expect("effect render");
@@ -337,6 +343,7 @@ fn effects_darken_and_damage_keeps_untouched_pixels() {
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: None,
+                linear_blend: None,
             },
         )
         .expect("damage clear");
@@ -542,6 +549,10 @@ fn render_cursor_image(
                 damage: DamageRegion::from_rect(image),
                 blend: true,
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
+                color: None,
+                alpha_mode: 0,
+                yuv: None,
                 mask: TextureMask::None,
             },
         }],
@@ -558,6 +569,7 @@ fn render_cursor_image(
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: Some([0.0, 0.0, 0.0, 0.0]),
+                linear_blend: None,
             },
         )
         .expect("cursor render");

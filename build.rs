@@ -1,11 +1,14 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 fn main() {
     let shader_dir = Path::new("src/render/vulkan/shaders");
     println!("cargo:rerun-if-changed=src/render/vulkan/shaders");
+    println!("cargo:rerun-if-changed=src/render/shaders_common/color.glsl");
+    println!("cargo:rerun-if-changed=src/shaders/texture_clip.frag");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let shaders = shader_sources(shader_dir);
     let generated =
@@ -54,6 +57,13 @@ fn compile_shaders(shaders: &[(PathBuf, shaderc_dyn::ShaderKind)], out_dir: &Pat
     options
         .set_target_env(shaderc_dyn::TargetEnv::Vulkan, shaderc_dyn::EnvVersion::Vulkan1_2 as u32);
     options.set_target_spirv(shaderc_dyn::SpirvVersion::V1_5);
+    options.set_include_callback(|name, _, _, _| {
+        let path = Path::new("src/render/shaders_common").join(name);
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("include {}: {error}", path.display()))?;
+        Ok(shaderc_dyn::ResolvedInclude { resolved_name: name.to_string(), content })
+    });
+    verify_color_snippet(&compiler);
     let mut generated = String::new();
     for (path, kind) in shaders {
         let source = fs::read_to_string(path).unwrap_or_else(|error| {
@@ -75,6 +85,95 @@ fn compile_shaders(shaders: &[(PathBuf, shaderc_dyn::ShaderKind)], out_dir: &Pat
         ));
     }
     generated
+}
+
+/// Compiles the shared snippet as Vulkan GLSL 450 and as GLSL ES 1.00.
+/// The live texture shaders do not include it; identity draws stay on them.
+fn verify_color_snippet(compiler: &shaderc_dyn::Compiler) {
+    let vulkan = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform ColorParams {
+    vec4 u_color_matrix_0;
+    vec4 u_color_matrix_1;
+    vec4 u_color_matrix_2;
+    float u_src_bt1886_lb_over_lw;
+    float u_dst_bt1886_lb_over_lw;
+    float u_src_power_exponent;
+    float u_dst_power_exponent;
+    float u_tonemap_max;
+    float u_tonemap_dst_max;
+    float u_tonemap_dst_min;
+    float u_tonemap_dst_ref;
+    vec4 u_tonemap_to_lms_0;
+    vec4 u_tonemap_to_lms_1;
+    vec4 u_tonemap_to_lms_2;
+    vec4 u_tonemap_from_lms_0;
+    vec4 u_tonemap_from_lms_1;
+    vec4 u_tonemap_from_lms_2;
+};
+#include \"color.glsl\"
+layout(location = 0) out vec4 out_color;
+void main() {
+    vec3 color = decode_tf(2, vec3(0.5));
+    color = encode_tf(2, color);
+    out_color = apply_color(vec4(color, 1.0), 1, 2, 2, 0, 0, 1, 0);
+}
+";
+    compile_checked(
+        compiler,
+        vulkan,
+        shaderc_dyn::TargetEnv::Vulkan,
+        shaderc_dyn::EnvVersion::Vulkan1_2 as u32,
+        "color.vulkan.frag",
+    );
+    verify_es_snippet();
+}
+
+/// shaderc emits SPIR-V, which cannot represent `#version 100`.
+/// glslangValidator checks the concatenated GLES source as ES 1.00.
+fn verify_es_snippet() {
+    let snippet =
+        fs::read_to_string("src/render/shaders_common/color.glsl").expect("read color.glsl");
+    let source = format!(
+        "#version 100\nprecision highp float;\n#define COLOR_LOOSE_UNIFORMS 1\n{snippet}\nvoid main() {{\n    vec3 color = decode_tf(2, vec3(0.5));\n    color = encode_tf(2, color);\n    gl_FragColor = apply_color(vec4(color, 1.0), 1, 2, 2, 0, 0, 1, 0);\n}}\n"
+    );
+    let path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("color.es.frag");
+    fs::write(&path, source).expect("write ES color shader");
+    let output = Command::new("glslangValidator")
+        .args(["-S", "frag", "--glsl-version", "100"])
+        .arg(&path)
+        .output()
+        .expect("run glslangValidator for the ES 1.00 color snippet");
+    if !output.status.success() {
+        panic!(
+            "compile color.es.frag:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn compile_checked(
+    compiler: &shaderc_dyn::Compiler,
+    source: &str,
+    env: shaderc_dyn::TargetEnv,
+    version: u32,
+    name: &str,
+) {
+    let mut options = shaderc_dyn::CompileOptions::new().expect("shaderc options");
+    options.set_target_env(env, version);
+    if env == shaderc_dyn::TargetEnv::Vulkan {
+        options.set_target_spirv(shaderc_dyn::SpirvVersion::V1_5);
+    }
+    options.set_include_callback(|included, _, _, _| {
+        let path = Path::new("src/render/shaders_common").join(included);
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("include {}: {error}", path.display()))?;
+        Ok(shaderc_dyn::ResolvedInclude { resolved_name: included.to_string(), content })
+    });
+    compiler
+        .compile_into_spirv(source, shaderc_dyn::ShaderKind::Fragment, name, "main", Some(&options))
+        .unwrap_or_else(|error| panic!("compile {name}: {error}"));
 }
 
 fn spirv_ident(file_name: &str) -> String {

@@ -1,5 +1,9 @@
 use crate::{
     clients::{ClientId, ProcessInfo, Resolved},
+    color::{
+        ColorManager, ImageDescription, ImageDescriptionParams, Luminances, NamedPrimaries,
+        Primaries, TransferFunction,
+    },
     config::{DecorationInsets, OutputScaleSetting, RoundingPower, RuntimeConfig},
     drm::Drm,
     globals::{Global, GlobalName, Globals},
@@ -317,6 +321,8 @@ pub struct Output {
     pub enabled: bool,
     pub current_mode: OutputMode,
     pub preferred_mode: Option<OutputMode>,
+    /// SDR image description for this connector. Untagged surfaces stay passthrough.
+    pub color_description: Rc<ImageDescription>,
 }
 
 /// Fields advertised to clients or used to place the output. Identity and
@@ -345,7 +351,12 @@ struct PublishedOutputState {
 }
 
 impl Output {
-    pub fn new(backend: BackendOutputRef, drm_crtc_id: u32, drm: &Drm) -> Self {
+    pub fn new(
+        backend: BackendOutputRef,
+        drm_crtc_id: u32,
+        drm: &Drm,
+        color_manager: &ColorManager,
+    ) -> Self {
         let mut output = Self {
             backend,
             drm_crtc_id,
@@ -371,6 +382,7 @@ impl Output {
             enabled: false,
             current_mode: OutputMode { width: 0, height: 0, refresh_millihz: 0 },
             preferred_mode: None,
+            color_description: color_manager.srgb_gamma22(),
         };
         output.refresh_from_backend(drm);
         output
@@ -1149,6 +1161,15 @@ pub struct State {
     pub(crate) session_manager_global: Option<GlobalName>,
     /// Sessions a client currently holds. The key is the session id.
     pub(crate) live_sessions: BTreeMap<String, crate::session::LiveSession>,
+    pub color_manager: ColorManager,
+    /// Image-description id changes. `request_output_color_redraws` drains this
+    /// and sends `image_description_changed` plus feedback updates.
+    output_description_changes: Vec<OutputId>,
+    /// Same changes, waiting for a full-output frame.
+    output_color_redraws: Vec<OutputId>,
+    /// Connectors that already logged an EDID chromaticity fallback.
+    edid_fallback_logged: BTreeSet<String>,
+    hdr_rejected_logged: BTreeSet<String>,
 }
 
 const INITIAL_WORKSPACES_PER_OUTPUT: usize = 4;
@@ -1281,6 +1302,11 @@ impl State {
             session_store: None,
             session_manager_global: None,
             live_sessions: BTreeMap::new(),
+            color_manager: ColorManager::new(),
+            output_description_changes: Vec::new(),
+            output_color_redraws: Vec::new(),
+            edid_fallback_logged: BTreeSet::new(),
+            hdr_rejected_logged: BTreeSet::new(),
         }
     }
 
@@ -4686,7 +4712,7 @@ impl State {
     pub fn refresh_outputs_for_backend(&mut self, backend: BackendOutputRef) -> Vec<OutputId> {
         let mut changed = Vec::new();
         let mut scale_changed = Vec::new();
-        {
+        let output_ids = {
             let Some(drm) = self.drm.try_get(backend.drm_id) else {
                 return Vec::new();
             };
@@ -4696,8 +4722,8 @@ impl State {
                 .filter_map(|(output_id, output)| (output.backend == backend).then_some(output_id))
                 .collect::<Vec<_>>();
 
-            for output_id in output_ids {
-                let Some(output) = self.outputs.try_get_mut(output_id) else {
+            for output_id in &output_ids {
+                let Some(output) = self.outputs.try_get_mut(*output_id) else {
                     continue;
                 };
                 let before = output.published_state();
@@ -4705,17 +4731,134 @@ impl State {
                 output.refresh_from_backend(drm);
                 output.scale = output.configured_scale(&self.config);
                 if output.scale != previous_scale {
-                    scale_changed.push(output_id);
+                    scale_changed.push(*output_id);
                 }
                 if output.published_state() != before {
-                    changed.push(output_id);
+                    changed.push(*output_id);
                 }
             }
+            output_ids
+        };
+        for output_id in output_ids {
+            self.refresh_output_color(output_id);
         }
         for output_id in scale_changed {
             self.force_output_redraw(output_id);
         }
         changed
+    }
+
+    /// Rebuilds every output description from config and connector EDID.
+    pub fn refresh_output_colors(&mut self) -> Vec<OutputId> {
+        let output_ids = self
+            .outputs
+            .iter()
+            .map(|(output_id, _)| output_id)
+            .collect::<Vec<_>>();
+        output_ids
+            .into_iter()
+            .filter(|output_id| self.refresh_output_color(*output_id))
+            .collect()
+    }
+
+    /// Replaces the output description when config or EDID produce a new id.
+    /// A new id damages the output and records [`Self::note_output_description_changed`].
+    pub fn refresh_output_color(&mut self, output_id: OutputId) -> bool {
+        let Some(output) = self.outputs.try_get(output_id) else {
+            return false;
+        };
+        let name = output.name.clone();
+        let drm_id = output.backend.drm_id;
+        let crtc_id = output.drm_crtc_id;
+        let previous = Rc::clone(&output.color_description);
+        let setting = self.config.output_color(&name);
+        let edid = self.connector_chromaticities(drm_id, crtc_id);
+        let display = self
+            .drm
+            .try_get(drm_id)
+            .and_then(|drm| drm.output_connector_in_use(crtc_id))
+            .map(|in_use| in_use.connector.display_hdr())
+            .unwrap_or_else(crate::color::hdr::DisplayHdr::unsupported);
+        let kms_ok = self
+            .drm
+            .try_get(drm_id)
+            .is_none_or(|drm| drm.hdr_kms_available(crtc_id));
+        let hdr = (setting.mode == crate::config::OutputColorMode::Hdr && kms_ok)
+            .then(|| {
+                crate::color::hdr::prepare(
+                    crate::color::hdr::HdrRequest {
+                        white: setting.reference_white(true),
+                        min_luminance: setting.min_luminance,
+                        max_luminance: setting.max_luminance,
+                        max_fall: setting.max_fall,
+                    },
+                    display,
+                )
+            })
+            .flatten();
+        if setting.mode == crate::config::OutputColorMode::Hdr
+            && hdr.is_none()
+            && self.hdr_rejected_logged.insert(name.clone())
+        {
+            if kms_ok {
+                log::warn!(
+                    "output {name}: HDR needs PQ, BT.2020 RGB, Colorspace=BT2020_RGB, and HDR_OUTPUT_METADATA; staying in SDR"
+                );
+            } else {
+                log::warn!("output {name}: HDR modeset was rejected; staying in SDR");
+            }
+        }
+        let metadata = hdr.as_ref().map(crate::color::hdr::metadata_bytes);
+        let kms_changed = self
+            .drm
+            .try_get_mut(drm_id)
+            .is_some_and(|drm| drm.set_output_hdr(crtc_id, metadata));
+        let (next, fell_back) =
+            output_image_description(&self.color_manager, setting, edid, hdr.as_ref());
+        if fell_back && self.edid_fallback_logged.insert(name.clone()) {
+            log::warn!("output {name}: EDID chromaticities are unusable; using sRGB primaries");
+        }
+        if next.id() == previous.id() {
+            if kms_changed {
+                self.force_output_redraw(output_id);
+            }
+            return false;
+        }
+        if let Some(output) = self.outputs.try_get_mut(output_id) {
+            output.color_description = next;
+        }
+        self.note_output_description_changed(output_id);
+        true
+    }
+
+    /// Records an image-description id change and damages the whole output.
+    ///
+    /// `request_output_color_redraws` drains [`Self::take_output_description_changes`]
+    /// and tells clients. The queue stays intact until that drain so a caller can
+    /// observe the change itself.
+    pub fn note_output_description_changed(&mut self, output_id: OutputId) {
+        self.output_description_changes.push(output_id);
+        self.output_color_redraws.push(output_id);
+        self.force_output_redraw(output_id);
+    }
+
+    pub fn take_output_description_changes(&mut self) -> Vec<OutputId> {
+        std::mem::take(&mut self.output_description_changes)
+    }
+
+    pub(crate) fn take_output_color_redraws(&mut self) -> Vec<OutputId> {
+        std::mem::take(&mut self.output_color_redraws)
+    }
+
+    fn connector_chromaticities(&self, drm_id: DrmId, crtc_id: u32) -> Option<EdidChromaticities> {
+        let edid = self
+            .drm
+            .try_get(drm_id)?
+            .output_connector_in_use(crtc_id)?
+            .connector
+            .edid
+            .as_ref()?;
+        Some(EdidChromaticities::from_edid(&edid.color))
     }
 
     fn force_output_redraw(&mut self, output_id: OutputId) {
@@ -4737,6 +4880,94 @@ impl State {
     }
 }
 
+/// Base-block EDID chromaticities. CTA-861 HDR metadata stays on the connector.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EdidChromaticities {
+    pub red: (f64, f64),
+    pub green: (f64, f64),
+    pub blue: (f64, f64),
+    pub white: (f64, f64),
+}
+
+impl EdidChromaticities {
+    fn from_edid(color: &edid_rs::ColorCharacteristics) -> Self {
+        fn xy((x, y): (f32, f32)) -> (f64, f64) {
+            (f64::from(x), f64::from(y))
+        }
+        Self {
+            red: xy(color.red),
+            green: xy(color.green),
+            blue: xy(color.blue),
+            white: xy(color.white),
+        }
+    }
+}
+
+/// Output description for `setting`. The second value is true when `primaries = "edid"`
+/// was requested and the chromaticities were missing or unusable.
+///
+/// `hdr` replaces the SDR transfer and primaries with PQ and BT.2020. The
+/// encoding maximum is the PQ swing (`min + 10000`). The display range is the
+/// target luminance, `max_cll`, and `max_fall`.
+pub(crate) fn output_image_description(
+    manager: &ColorManager,
+    setting: crate::config::OutputColorConfig,
+    edid: Option<EdidChromaticities>,
+    hdr: Option<&crate::color::hdr::HdrVolume>,
+) -> (Rc<ImageDescription>, bool) {
+    if let Some(hdr) = hdr {
+        let description = manager.intern(ImageDescriptionParams {
+            tf: TransferFunction::St2084Pq,
+            primaries: Primaries::BT2020,
+            named_primaries: Some(NamedPrimaries::Bt2020),
+            luminances: Luminances {
+                min: hdr.encoding_min,
+                max: hdr.encoding_min + 10_000.0,
+                white: hdr.white,
+            },
+            target_primaries: hdr.target,
+            target_luminances: (hdr.mastering_min, hdr.mastering_max),
+            max_cll: Some(hdr.mastering_max),
+            max_fall: Some(hdr.max_fall),
+        });
+        return (description, false);
+    }
+    let white = setting.reference_white(false);
+    let tf = match setting.tf {
+        crate::config::OutputColorTransfer::Gamma22 => TransferFunction::Gamma22,
+        crate::config::OutputColorTransfer::Srgb => TransferFunction::CompoundPower24,
+    };
+    let (primaries, named, fell_back) = match setting.primaries {
+        crate::config::OutputColorPrimaries::Srgb => {
+            (Primaries::SRGB, Some(NamedPrimaries::Srgb), false)
+        }
+        crate::config::OutputColorPrimaries::Edid => match edid.and_then(|color| {
+            Primaries::from_chromaticities(color.red, color.green, color.blue, color.white)
+        }) {
+            Some(primaries) => (primaries, None, false),
+            None => (Primaries::SRGB, Some(NamedPrimaries::Srgb), true),
+        },
+    };
+    if tf == TransferFunction::Gamma22
+        && named == Some(NamedPrimaries::Srgb)
+        && white.to_bits() == 80.0_f64.to_bits()
+    {
+        return (manager.srgb_gamma22(), fell_back);
+    }
+    let luminances = Luminances { min: 0.2, max: white, white };
+    let description = manager.intern(ImageDescriptionParams {
+        tf,
+        primaries,
+        named_primaries: named,
+        luminances,
+        target_primaries: primaries,
+        target_luminances: (0.2, white),
+        max_cll: None,
+        max_fall: None,
+    });
+    (description, fell_back)
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -4754,6 +4985,173 @@ mod tests {
         },
         std::time::Duration,
     };
+
+    fn stock_output_color() -> std::rc::Rc<crate::color::ImageDescription> {
+        crate::color::ColorManager::new().srgb_gamma22()
+    }
+
+    #[test]
+    fn output_description_follows_config_and_notifies_when_the_id_changes() {
+        use crate::{
+            color::{ColorManager, ColorTransform, Primaries, RenderIntent, TransferFunction},
+            config::{OutputColorConfig, OutputColorPrimaries, OutputColorTransfer, RuntimeConfig},
+        };
+
+        let mut state = state_for_tests();
+        let output_id = state.outputs.insert(test_output(
+            BackendOutputRef::new(DrmId::from(0usize)),
+            1,
+            0,
+            0,
+            100,
+            100,
+            "DP-1",
+        ));
+        assert!(!state.refresh_output_color(output_id));
+        assert!(state.take_output_description_changes().is_empty());
+
+        state.config = RuntimeConfig::parse_for_test(
+            r#"
+            [output.color]
+            "DP-1" = { tf = "srgb", primaries = "srgb", sdr_white = 100 }
+            "#,
+            &state.xkb,
+        )
+        .unwrap();
+        assert!(state.refresh_output_color(output_id));
+        assert_eq!(state.take_output_description_changes(), vec![output_id]);
+        assert_eq!(state.take_output_color_redraws(), vec![output_id]);
+        let description = &state.outputs[output_id].color_description;
+        assert_eq!(description.transfer_function(), TransferFunction::CompoundPower24);
+        assert_eq!(description.luminances().max, 100.0);
+        assert_eq!(description.luminances().white, 100.0);
+        assert!(ColorTransform::between(
+            &state.color_manager.srgb_gamma22(),
+            description,
+            RenderIntent::Perceptual,
+        )
+        .is_some());
+        assert!(!state.refresh_output_color(output_id));
+
+        let manager = ColorManager::new();
+        let p3 = EdidChromaticities {
+            red: Primaries::DISPLAY_P3.r,
+            green: Primaries::DISPLAY_P3.g,
+            blue: Primaries::DISPLAY_P3.b,
+            white: Primaries::DISPLAY_P3.w,
+        };
+        let (wide, fell_back) = output_image_description(
+            &manager,
+            OutputColorConfig {
+                tf: OutputColorTransfer::Gamma22,
+                primaries: OutputColorPrimaries::Edid,
+                ..OutputColorConfig::DEFAULT
+            },
+            Some(p3),
+            None,
+        );
+        assert!(!fell_back);
+        assert_ne!(wide.id(), manager.srgb_gamma22().id());
+        assert!(wide.named_primaries().is_none());
+        let (fallback, fell_back) = output_image_description(
+            &manager,
+            OutputColorConfig {
+                tf: OutputColorTransfer::Gamma22,
+                primaries: OutputColorPrimaries::Edid,
+                ..OutputColorConfig::DEFAULT
+            },
+            Some(EdidChromaticities {
+                red: (0.0, 0.0),
+                green: (0.0, 0.0),
+                blue: (0.0, 0.0),
+                white: (0.3127, 0.0),
+            }),
+            None,
+        );
+        assert!(fell_back);
+        assert_eq!(fallback.id(), manager.srgb_gamma22().id());
+        let (missing, fell_back) = output_image_description(
+            &manager,
+            OutputColorConfig {
+                tf: OutputColorTransfer::Gamma22,
+                primaries: OutputColorPrimaries::Edid,
+                ..OutputColorConfig::DEFAULT
+            },
+            None,
+            None,
+        );
+        assert!(fell_back);
+        assert_eq!(missing.id(), manager.srgb_gamma22().id());
+        assert!(ColorTransform::between(&manager.srgb_gamma22(), &wide, RenderIntent::Perceptual)
+            .is_some());
+        assert!(ColorTransform::between(
+            &manager.srgb_gamma22(),
+            &manager.srgb_gamma22(),
+            RenderIntent::Perceptual,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn hdr_output_uses_pq_bt2020_and_maps_sdr_white_to_203() {
+        use crate::{
+            color::{
+                hdr::{prepare, DisplayHdr, HdrRequest, ENCODING_MIN, REFERENCE_WHITE},
+                ColorManager, ColorTransform, NamedPrimaries, Primaries, RenderIntent,
+                TransferFunction,
+            },
+            config::{OutputColorConfig, OutputColorMode},
+        };
+
+        let manager = ColorManager::new();
+        let mut display = DisplayHdr::unsupported();
+        display.pq = true;
+        display.bt2020_rgb = true;
+        display.has_kms_properties = true;
+        display.max_luminance = Some(800.0);
+        display.max_fall = Some(400.0);
+        display.primaries = Some(Primaries::DISPLAY_P3);
+        let volume = prepare(
+            HdrRequest {
+                white: REFERENCE_WHITE,
+                min_luminance: None,
+                max_luminance: None,
+                max_fall: None,
+            },
+            display,
+        )
+        .unwrap();
+        let mut setting = OutputColorConfig::DEFAULT;
+        setting.mode = OutputColorMode::Hdr;
+        let (description, fell_back) =
+            output_image_description(&manager, setting, None, Some(&volume));
+        assert!(!fell_back);
+        assert_eq!(description.transfer_function(), TransferFunction::St2084Pq);
+        assert_eq!(description.named_primaries(), Some(NamedPrimaries::Bt2020));
+        assert_eq!(description.luminances().min, ENCODING_MIN);
+        assert_eq!(description.luminances().white, REFERENCE_WHITE);
+        assert_eq!(description.luminances().max, ENCODING_MIN + 10_000.0);
+        assert_eq!(description.target_luminances(), (0.0, 800.0));
+        assert_eq!(description.max_cll(), Some(800.0));
+        let mapped = ColorTransform::between(
+            &manager.srgb_gamma22(),
+            &description,
+            RenderIntent::Perceptual,
+        )
+        .unwrap()
+        .map_rgb([1.0, 1.0, 1.0]);
+        let nits = TransferFunction::St2084Pq.decode(mapped[0]) * description.luminances().max;
+        assert!((nits - REFERENCE_WHITE).abs() < 1.0, "sdr white maps to {nits} nits");
+        assert!(ColorTransform::between(
+            &manager.windows_bt2100(),
+            &description,
+            RenderIntent::Perceptual,
+        )
+        .is_some());
+
+        let (rejected, _) = output_image_description(&manager, setting, None, None);
+        assert_eq!(rejected.id(), manager.srgb_gamma22().id());
+    }
 
     #[test]
     fn root_surface_clip_clamps_radius_and_excludes_outer_corner_points() {
@@ -5610,6 +6008,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 100, height: 50, refresh_millihz: 60_000 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let right_id = outputs.insert(Output {
             backend: BackendOutputRef::new(DrmId::from(2usize)),
@@ -5636,6 +6035,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 120, height: 80, refresh_millihz: 60_000 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let layout = OutputLayout::from_outputs(&outputs);
         assert_eq!(layout.extents(), RectI::from_extents(-100, 0, 120, 80));
@@ -5672,6 +6072,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 100, height: 100, refresh_millihz: 60_000 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let second_id = outputs.insert(Output {
             backend: BackendOutputRef::new(DrmId::from(2usize)),
@@ -5698,6 +6099,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 100, height: 100, refresh_millihz: 60_000 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let layout = OutputLayout::from_outputs(&outputs);
         let even_split = RectI::new(50, 0, 100, 100).unwrap();
@@ -5734,6 +6136,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 100, height: 100, refresh_millihz: 60_000 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let right_id = outputs.insert(Output {
             backend: BackendOutputRef::new(DrmId::from(2usize)),
@@ -5760,6 +6163,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 100, height: 100, refresh_millihz: 60_000 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let layout = OutputLayout::from_outputs(&outputs);
         assert_eq!(layout.nearest_point(150, 10), Some((right_id, (200, 10))));
@@ -5810,6 +6214,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 0, height: 0, refresh_millihz: 0 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let real_id = outputs.insert(Output {
             backend: BackendOutputRef::new(DrmId::from(1usize)),
@@ -5836,6 +6241,7 @@ mod tests {
             enabled: true,
             current_mode: OutputMode { width: 100, height: 80, refresh_millihz: 60_000 },
             preferred_mode: None,
+            color_description: stock_output_color(),
         });
         let layout = OutputLayout::from_outputs(&outputs);
         assert_eq!(layout.entries().len(), 1);

@@ -9,12 +9,13 @@ use {ash::vk, gpu_alloc::UsageFlags};
 use std::{os::fd::AsRawFd, rc::Rc};
 
 use crate::{
-    config::RgbaColor,
+    color::ColorTransform,
     region::{DamageRegion, RectI},
     render::{
+        color_pipeline::{color_uniforms, TexturePipelineKey},
         shadow_geometry, BlurVisualStyle, BorderGradient, EffectElement, FrameElement,
-        RenderCompletion, RenderFrame, RenderSyncMode, RendererError, RoundedRing,
-        ShadowVisualStyle, TextureElement, TextureMask, TextureSource,
+        OutputFrameRecipe, RenderCompletion, RenderFrame, RenderSyncMode, RendererError,
+        RoundedRing, ShadowVisualStyle, Texture, TextureElement, TextureMask, TextureSource,
     },
     state::RootSurfaceClip,
     transform::{self, Mat3, OutputPresentationTransform},
@@ -48,11 +49,41 @@ struct DrawUniforms {
     outer_power: f32,
     inner_radius: f32,
     inner_power: f32,
+    // Tail of the Draw block. std140: three matrix rows, then the source and
+    // destination BT.1886 ratios and power exponents.
+    color_matrix_0: [f32; 4],
+    color_matrix_1: [f32; 4],
+    color_matrix_2: [f32; 4],
+    src_bt1886_lb_over_lw: f32,
+    dst_bt1886_lb_over_lw: f32,
+    src_power_exponent: f32,
+    dst_power_exponent: f32,
+    yuv_size: [f32; 2],
+    yuv_site: [f32; 2],
+    yuv_row0: [f32; 4],
+    yuv_row1: [f32; 4],
+    yuv_row2: [f32; 4],
+    tonemap_max: f32,
+    tonemap_dst_max: f32,
+    tonemap_dst_min: f32,
+    tonemap_dst_ref: f32,
+    tonemap_to_lms_0: [f32; 4],
+    tonemap_to_lms_1: [f32; 4],
+    tonemap_to_lms_2: [f32; 4],
+    tonemap_from_lms_0: [f32; 4],
+    tonemap_from_lms_1: [f32; 4],
+    tonemap_from_lms_2: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<DrawUniforms>() == 160);
+const _: () = assert!(std::mem::size_of::<DrawUniforms>() == 400);
 const _: () = assert!(std::mem::offset_of!(DrawUniforms, item_size) == 96);
 const _: () = assert!(std::mem::offset_of!(DrawUniforms, outer_rect) == 112);
+const _: () = assert!(std::mem::offset_of!(DrawUniforms, color_matrix_0) == 160);
+const _: () = assert!(std::mem::offset_of!(DrawUniforms, src_bt1886_lb_over_lw) == 208);
+const _: () = assert!(std::mem::offset_of!(DrawUniforms, dst_power_exponent) == 220);
+const _: () = assert!(std::mem::offset_of!(DrawUniforms, yuv_size) == 224);
+const _: () = assert!(std::mem::offset_of!(DrawUniforms, tonemap_max) == 288);
+const _: () = assert!(std::mem::offset_of!(DrawUniforms, tonemap_to_lms_0) == 304);
 
 struct QuadDraw {
     pipeline: vk::Pipeline,
@@ -108,6 +139,310 @@ const _: () = assert!(std::mem::size_of::<ShadowUniforms>() == 112);
 const _: () = assert!(std::mem::offset_of!(ShadowUniforms, shadow_color) == 80);
 const _: () = assert!(std::mem::offset_of!(ShadowUniforms, inner_rect) == 96);
 
+struct BlendPass {
+    image: vk::Image,
+    view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
+    render_pass: vk::RenderPass,
+    ops: Vec<FrameOp>,
+    clears: Vec<vk::Rect2D>,
+    output_tf: crate::color::TransferFunction,
+}
+
+fn prepare_linear_pass(
+    device: &Rc<VulkanDevice>,
+    draw: &mut DrawState,
+    target: &dyn PaintedTarget,
+    frame: &RenderFrame<'_>,
+    ops: &mut Vec<FrameOp>,
+    kept_textures: &mut Vec<Rc<dyn Texture>>,
+    foreign_images: &mut Vec<(vk::Image, bool)>,
+    foreign_textures: &mut Vec<Rc<dyn Texture>>,
+) -> Result<Option<BlendPass>, RendererError> {
+    let Some(output_tf) = frame.linear_blend else {
+        return Ok(None);
+    };
+    if output_tf == crate::color::TransferFunction::ExtLinear {
+        return Ok(None);
+    }
+    let Some(bounds) = RectI::new(0, 0, target.width(), target.height()) else {
+        return Ok(None);
+    };
+    let regions = crate::render::blend::create_regions(&frame.recipe.elements, bounds, true);
+    let blend_damage = crate::render::blend::intersect_damage(&regions.blend, frame.damage);
+    if blend_damage.is_empty() {
+        return Ok(None);
+    }
+    let output_format = target.attachment_format();
+    if let Err(error) = draw.use_attachment(vk::Format::R16G16B16A16_SFLOAT) {
+        log::warn!("FP16 blend buffer is unavailable ({error}); blending in the output encoding");
+        let _ = draw.use_attachment(output_format);
+        return Ok(None);
+    }
+    let (image, view, framebuffer) = match draw.ensure_blend_image(target.width(), target.height())
+    {
+        Ok(handles) => handles,
+        Err(error) => {
+            log::warn!(
+                "FP16 blend buffer is unavailable ({error}); blending in the output encoding"
+            );
+            let _ = draw.use_attachment(output_format);
+            return Ok(None);
+        }
+    };
+    let render_pass = draw.active_render_pass();
+    let elements = crate::render::blend::retarget_elements(&frame.recipe.elements, output_tf);
+    let recipe = OutputFrameRecipe { elements };
+    let blend_frame = RenderFrame {
+        recipe: &recipe,
+        damage: &blend_damage,
+        preserve_contents: true,
+        presentation_transform: frame.presentation_transform,
+        sync_mode: frame.sync_mode,
+        clear_color: Some([0.0, 0.0, 0.0, 0.0]),
+        blur_reference: frame.blur_reference,
+        linear_blend: Some(output_tf),
+    };
+    let mut blend_ops = Vec::new();
+    append_elements(
+        device,
+        draw,
+        target,
+        &blend_frame,
+        &mut blend_ops,
+        kept_textures,
+        foreign_images,
+        foreign_textures,
+    )?;
+    draw.use_attachment(output_format).map_err(|error| {
+        log::error!("{error}");
+        RendererError::RenderFailed
+    })?;
+    let direct = crate::render::blend::intersect_damage(&regions.direct, frame.damage);
+    let direct_frame = RenderFrame {
+        recipe: frame.recipe,
+        damage: &direct,
+        preserve_contents: frame.preserve_contents,
+        presentation_transform: frame.presentation_transform,
+        sync_mode: frame.sync_mode,
+        clear_color: frame.clear_color,
+        blur_reference: frame.blur_reference,
+        linear_blend: None,
+    };
+    append_elements(
+        device,
+        draw,
+        target,
+        &direct_frame,
+        ops,
+        kept_textures,
+        foreign_images,
+        foreign_textures,
+    )?;
+    let pass = BlendPass {
+        image,
+        view,
+        framebuffer,
+        render_pass,
+        ops: blend_ops,
+        clears: region_clears(target.height(), &blend_damage, frame.presentation_transform),
+        output_tf,
+    };
+    if let Some(copy) = prepare_blend_copy(
+        device,
+        draw,
+        target,
+        &pass,
+        &blend_damage,
+        frame.presentation_transform,
+    )? {
+        ops.push(FrameOp::Quad(copy));
+    }
+    Ok(Some(pass))
+}
+
+fn prepare_blend_copy(
+    device: &Rc<VulkanDevice>,
+    draw: &mut DrawState,
+    target: &dyn PaintedTarget,
+    pass: &BlendPass,
+    damage: &DamageRegion,
+    presentation: OutputPresentationTransform,
+) -> Result<Option<QuadDraw>, RendererError> {
+    let color = crate::render::blend::encode_from_linear(pass.output_tf);
+    let mut key = TexturePipelineKey::from_color(Some(&color), true);
+    key.alpha_mode = 0;
+    let pipeline = draw.pipeline_for(key).map_err(|error| {
+        log::error!("{error}");
+        RendererError::RenderFailed
+    })?;
+    let frame = RenderFrame {
+        recipe: &OutputFrameRecipe { elements: Vec::new() },
+        damage,
+        preserve_contents: true,
+        presentation_transform: presentation,
+        sync_mode: RenderSyncMode::BlockingFinishFallback,
+        clear_color: None,
+        blur_reference: None,
+        linear_blend: None,
+    };
+    prepare_sampled(
+        device,
+        draw,
+        target,
+        &frame,
+        pipeline,
+        pass.view,
+        pass.view,
+        [target.width() as f32, target.height() as f32],
+        crate::color::ColorRepresentation::default().yuv_conversion(false),
+        0,
+        0,
+        target.width(),
+        target.height(),
+        Mat3::identity(),
+        1.0,
+        &TextureMask::None,
+        damage,
+        Some(&color),
+    )
+}
+
+fn append_elements(
+    device: &Rc<VulkanDevice>,
+    draw: &mut DrawState,
+    target: &dyn PaintedTarget,
+    frame: &RenderFrame<'_>,
+    ops: &mut Vec<FrameOp>,
+    kept_textures: &mut Vec<Rc<dyn Texture>>,
+    foreign_images: &mut Vec<(vk::Image, bool)>,
+    foreign_textures: &mut Vec<Rc<dyn Texture>>,
+) -> Result<(), RendererError> {
+    for element in &frame.recipe.elements {
+        match element {
+            FrameElement::Texture { element, .. } => {
+                if let Some(quad) = prepare_texture(device, draw, target, element, frame)? {
+                    if let Some(texture) =
+                        texture::sampled_texture(element.texture.as_ref(), device.device_id())
+                    {
+                        if texture.foreign()
+                            && !foreign_images
+                                .iter()
+                                .any(|(image, _)| *image == texture.image())
+                        {
+                            foreign_images.push((texture.image(), texture.yuv_mode() != 0));
+                            foreign_textures.push(Rc::clone(&element.texture));
+                        }
+                    }
+                    kept_textures.push(Rc::clone(&element.texture));
+                    ops.push(FrameOp::Quad(quad));
+                }
+            }
+            FrameElement::Effect { element, .. } => {
+                if let Some(op) = prepare_effect(device, draw, target, element, frame) {
+                    ops.push(op);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_blend_pass(
+    vulkan: &ash::Device,
+    command: vk::CommandBuffer,
+    draw: &DrawState,
+    target: &dyn PaintedTarget,
+    pass: &BlendPass,
+) {
+    let old = draw
+        .blend_layout()
+        .map(|layout| layout.get())
+        .unwrap_or(vk::ImageLayout::UNDEFINED);
+    let (src_stage, src_access) = if old == vk::ImageLayout::UNDEFINED {
+        (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty())
+    } else {
+        (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::AccessFlags::SHADER_READ)
+    };
+    command::image_barrier(
+        vulkan,
+        command,
+        pass.image,
+        old,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        src_stage,
+        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access,
+        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+    );
+    let mut cleared = false;
+    begin_pass(
+        vulkan,
+        command,
+        draw,
+        pass.render_pass,
+        pass.framebuffer,
+        target.width(),
+        target.height(),
+        &pass.clears,
+        [0.0, 0.0, 0.0, 0.0],
+        &mut cleared,
+    );
+    for op in &pass.ops {
+        match op {
+            FrameOp::Quad(quad) => draw_quad(vulkan, command, quad),
+            FrameOp::Blur { job, result } => {
+                unsafe { vulkan.cmd_end_render_pass(command) };
+                let mut layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                job.record(vulkan, command, draw, pass.image, &mut layout);
+                cleared = true;
+                begin_pass(
+                    vulkan,
+                    command,
+                    draw,
+                    pass.render_pass,
+                    pass.framebuffer,
+                    target.width(),
+                    target.height(),
+                    &pass.clears,
+                    [0.0, 0.0, 0.0, 0.0],
+                    &mut cleared,
+                );
+                draw_quad(vulkan, command, result);
+            }
+        }
+    }
+    unsafe { vulkan.cmd_end_render_pass(command) };
+    command::image_barrier(
+        vulkan,
+        command,
+        pass.image,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        vk::PipelineStageFlags::FRAGMENT_SHADER,
+        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        vk::AccessFlags::SHADER_READ,
+    );
+    if let Some(layout) = draw.blend_layout() {
+        layout.set(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+}
+
+fn region_clears(
+    height: i32,
+    damage: &DamageRegion,
+    presentation: OutputPresentationTransform,
+) -> Vec<vk::Rect2D> {
+    damage
+        .rects()
+        .iter()
+        .copied()
+        .filter_map(|rect| framebuffer_rect(height, rect, presentation))
+        .filter_map(vulkan_scissor)
+        .collect()
+}
+
 pub(super) fn paint(
     device: &Rc<VulkanDevice>,
     draw: &mut DrawState,
@@ -124,34 +459,36 @@ pub(super) fn paint(
         log::error!("{error}");
         RendererError::RenderFailed
     })?;
+    draw.use_attachment(target.attachment_format())
+        .map_err(|error| {
+            log::error!("{error}");
+            RendererError::RenderFailed
+        })?;
     let mut ops = Vec::new();
     let mut kept_textures = Vec::new();
-    let mut foreign_images = Vec::new();
+    let mut foreign_images: Vec<(vk::Image, bool)> = Vec::new();
     let mut foreign_textures = Vec::new();
-    for element in &frame.recipe.elements {
-        match element {
-            FrameElement::Texture { element, .. } => {
-                if let Some(quad) = prepare_texture(device, draw, target, element, &frame)? {
-                    if let Some(texture) =
-                        texture::sampled_texture(element.texture.as_ref(), device.device_id())
-                    {
-                        // Jay and wlroots acquire every sampled dma-buf from
-                        // GENERAL. UNDEFINED would discard the client's contents.
-                        if texture.foreign() && !foreign_images.contains(&texture.image()) {
-                            foreign_images.push(texture.image());
-                            foreign_textures.push(Rc::clone(&element.texture));
-                        }
-                    }
-                    kept_textures.push(Rc::clone(&element.texture));
-                    ops.push(FrameOp::Quad(quad));
-                }
-            }
-            FrameElement::Effect { element, .. } => {
-                if let Some(op) = prepare_effect(device, draw, target, element, &frame) {
-                    ops.push(op);
-                }
-            }
-        }
+    let blend_pass = prepare_linear_pass(
+        device,
+        draw,
+        target,
+        &frame,
+        &mut ops,
+        &mut kept_textures,
+        &mut foreign_images,
+        &mut foreign_textures,
+    )?;
+    if blend_pass.is_none() {
+        append_elements(
+            device,
+            draw,
+            target,
+            &frame,
+            &mut ops,
+            &mut kept_textures,
+            &mut foreign_images,
+            &mut foreign_textures,
+        )?;
     }
     let clear_rects =
         clear_rects(target, frame.damage, frame.preserve_contents, frame.presentation_transform);
@@ -201,19 +538,22 @@ pub(super) fn paint(
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             );
         }
-        for image in &foreign_images {
-            command::record_barrier(
-                vulkan,
-                command,
-                *image,
-                command::foreign_acquire(
-                    false,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::AccessFlags::SHADER_READ,
-                    graphics_family,
-                ),
+        for (image, yuv) in &foreign_images {
+            let spec = command::foreign_acquire(
+                false,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+                graphics_family,
             );
+            if *yuv {
+                command::record_plane_barriers(vulkan, command, *image, spec);
+            } else {
+                command::record_barrier(vulkan, command, *image, spec);
+            }
+        }
+        if let Some(pass) = &blend_pass {
+            record_blend_pass(vulkan, command, draw, target, pass);
         }
         let mut layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         let mut pass_open = false;
@@ -275,18 +615,18 @@ pub(super) fn paint(
             );
         }
         unsafe { vulkan.cmd_end_render_pass(command) };
-        for image in &foreign_images {
-            command::record_barrier(
-                vulkan,
-                command,
-                *image,
-                command::foreign_release(
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::AccessFlags::SHADER_READ,
-                    graphics_family,
-                ),
+        for (image, yuv) in &foreign_images {
+            let spec = command::foreign_release(
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ,
+                graphics_family,
             );
+            if *yuv {
+                command::record_plane_barriers(vulkan, command, *image, spec);
+            } else {
+                command::record_barrier(vulkan, command, *image, spec);
+            }
         }
         if external {
             // Jay's final_barriers releases a direct framebuffer from
@@ -341,6 +681,14 @@ fn foreign_plane_fds(
         .collect()
 }
 
+fn yuv_draw(element: &TextureElement, yuv_mode: u32) -> crate::color::YuvConversion {
+    if let Some(yuv) = element.yuv {
+        return yuv;
+    }
+    crate::color::ColorRepresentation::default()
+        .yuv_conversion(yuv_mode == crate::render::color_pipeline::YUV_BT709_LIMITED_10)
+}
+
 fn prepare_texture(
     device: &Rc<VulkanDevice>,
     draw: &mut DrawState,
@@ -352,20 +700,37 @@ fn prepare_texture(
     else {
         return Ok(None);
     };
+    let mut key = TexturePipelineKey::from_color(element.color.as_deref(), true);
+    key.yuv_mode = texture.yuv_mode();
+    if !texture.samples_as_opaque() {
+        key.alpha_mode = element.alpha_mode;
+    }
+    let pipeline = draw.pipeline_for(key).map_err(|error| {
+        log::error!("{error}");
+        RendererError::RenderFailed
+    })?;
+    let chroma =
+        if texture.uv_view() == vk::ImageView::null() { texture.view() } else { texture.uv_view() };
+    let yuv = yuv_draw(element, texture.yuv_mode());
     prepare_sampled(
         device,
         draw,
         target,
         frame,
+        pipeline,
         texture.view(),
+        chroma,
+        texture.yuv_size(),
+        yuv,
         element.x,
         element.y,
         element.width,
         element.height,
         element.tex_transform,
-        element.alpha,
+        crate::render::effective_alpha(element.alpha, element.alpha_multiplier),
         &element.mask,
         &element.damage,
+        element.color.as_deref(),
     )
 }
 
@@ -374,15 +739,20 @@ fn prepare_sampled(
     draw: &mut DrawState,
     target: &dyn PaintedTarget,
     frame: &RenderFrame<'_>,
+    pipeline: vk::Pipeline,
     view: vk::ImageView,
+    chroma: vk::ImageView,
+    yuv_size: [f32; 2],
+    yuv: crate::color::YuvConversion,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     tex_transform: Mat3,
-    alpha: u8,
+    alpha: f32,
     mask: &TextureMask,
     damage: &DamageRegion,
+    color: Option<&ColorTransform>,
 ) -> Result<Option<QuadDraw>, RendererError> {
     let Some(item_bounds) = RectI::new(x, y, width, height) else {
         return Ok(None);
@@ -420,6 +790,7 @@ fn prepare_sampled(
     ));
     let tex = columns(tex_transform);
     let clip = clip_uniforms(mask);
+    let color = color_uniforms(color);
     let uniforms = DrawUniforms {
         transform_c0: transform[0],
         transform_c1: transform[1],
@@ -428,7 +799,7 @@ fn prepare_sampled(
         tex_c1: tex[1],
         tex_c2: tex[2],
         item_size: [width as f32, height as f32],
-        alpha: f32::from(alpha) / 255.0,
+        alpha,
         clip_mode: clip.mode,
         outer_rect: clip.outer,
         inner_rect: clip.inner,
@@ -436,6 +807,28 @@ fn prepare_sampled(
         outer_power: clip.outer_power,
         inner_radius: clip.inner_radius,
         inner_power: clip.inner_power,
+        color_matrix_0: color.matrix[0],
+        color_matrix_1: color.matrix[1],
+        color_matrix_2: color.matrix[2],
+        src_bt1886_lb_over_lw: color.src_bt1886_lb_over_lw,
+        dst_bt1886_lb_over_lw: color.dst_bt1886_lb_over_lw,
+        src_power_exponent: color.src_power_exponent,
+        dst_power_exponent: color.dst_power_exponent,
+        yuv_size,
+        yuv_site: yuv.site,
+        yuv_row0: yuv.rows[0],
+        yuv_row1: yuv.rows[1],
+        yuv_row2: yuv.rows[2],
+        tonemap_max: color.tonemap_max,
+        tonemap_dst_max: color.tonemap_dst_max,
+        tonemap_dst_min: color.tonemap_dst_min,
+        tonemap_dst_ref: color.tonemap_dst_ref,
+        tonemap_to_lms_0: color.tonemap_to_lms[0],
+        tonemap_to_lms_1: color.tonemap_to_lms[1],
+        tonemap_to_lms_2: color.tonemap_to_lms[2],
+        tonemap_from_lms_0: color.tonemap_from_lms[0],
+        tonemap_from_lms_1: color.tonemap_from_lms[1],
+        tonemap_from_lms_2: color.tonemap_from_lms[2],
     };
     let uniform = uniform_buffer(device, &uniforms).map_err(|error| {
         log::error!("{error}");
@@ -450,11 +843,12 @@ fn prepare_sampled(
         set,
         draw.sampler(),
         view,
+        chroma,
         uniform.buffer(),
         std::mem::size_of::<DrawUniforms>() as u64,
     );
     Ok(Some(QuadDraw {
-        pipeline: draw.pipeline(),
+        pipeline,
         layout: draw.pipeline_layout(),
         set,
         _uniform: uniform,
@@ -467,12 +861,18 @@ fn write_set(
     set: vk::DescriptorSet,
     sampler: vk::Sampler,
     view: vk::ImageView,
+    chroma: vk::ImageView,
     buffer: vk::Buffer,
     range: u64,
 ) {
     let image = vk::DescriptorImageInfo {
         sampler,
         image_view: view,
+        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    };
+    let chroma_image = vk::DescriptorImageInfo {
+        sampler,
+        image_view: chroma,
         image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     };
     let uniform = vk::DescriptorBufferInfo { buffer, offset: 0, range };
@@ -487,6 +887,11 @@ fn write_set(
             .dst_binding(1)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(std::slice::from_ref(&uniform)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&chroma_image)),
     ];
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
@@ -686,8 +1091,11 @@ fn prepare_border(
             ring.inner.outer_rect.width as f32,
             ring.inner.outer_rect.height as f32,
         ],
-        gradient_start: color_vec(gradient.start_color),
-        gradient_end: color_vec(gradient.end_color),
+        gradient_start: crate::render::blend::premul_color(
+            gradient.start_color,
+            frame.linear_blend,
+        ),
+        gradient_end: crate::render::blend::premul_color(gradient.end_color, frame.linear_blend),
     };
     solid_quad(
         device,
@@ -735,7 +1143,7 @@ fn prepare_shadow(
         shadow_range: geometry.shadow_range as f32,
         shadow_power: style.power.get(),
         _pad: [0.0; 2],
-        shadow_color: shadow_color(style.color, alpha),
+        shadow_color: crate::render::blend::shadow_coverage(style.color, alpha, frame.linear_blend),
         inner_rect: [
             geometry.inner_rect.x as f32,
             geometry.inner_rect.y as f32,
@@ -778,6 +1186,10 @@ fn prepare_dim(
         damage: frame.damage.clone(),
         blend: true,
         alpha,
+        alpha_multiplier: u32::MAX,
+        color: None,
+        alpha_mode: 0,
+        yuv: None,
         mask: TextureMask::RoundedClip {
             clip: RootSurfaceClip::new(local, clip.corner_radius, clip.rounding_power),
         },
@@ -837,15 +1249,20 @@ fn prepare_blur(
         draw,
         target,
         frame,
+        draw.pipeline(),
         job.result_view(),
+        job.result_view(),
+        [0.0, 0.0],
+        crate::color::ColorRepresentation::default().yuv_conversion(false),
         bounds.x,
         bounds.y,
         bounds.width,
         bounds.height,
         Mat3::identity(),
-        alpha,
+        f32::from(alpha) / 255.0,
         &mask,
         frame.damage,
+        None,
     ) {
         Ok(Some(quad)) => quad,
         Ok(None) => return None,
@@ -949,27 +1366,6 @@ fn solid_quad<T>(
     Some(QuadDraw { pipeline, layout, set, _uniform: uniform, scissors })
 }
 
-fn color_vec(color: RgbaColor) -> [f32; 4] {
-    let bytes = color.to_premultiplied_rgba_bytes();
-    [
-        f32::from(bytes[0]) / 255.0,
-        f32::from(bytes[1]) / 255.0,
-        f32::from(bytes[2]) / 255.0,
-        f32::from(bytes[3]) / 255.0,
-    ]
-}
-
-fn shadow_color(color: RgbaColor, alpha: u8) -> [f32; 4] {
-    let premultiplied = color_vec(color);
-    let global_alpha = f32::from(alpha) / 255.0;
-    [
-        premultiplied[0] * global_alpha,
-        premultiplied[1] * global_alpha,
-        premultiplied[2] * global_alpha,
-        premultiplied[3] * global_alpha,
-    ]
-}
-
 fn begin_output_pass(
     vulkan: &ash::Device,
     command: vk::CommandBuffer,
@@ -979,12 +1375,38 @@ fn begin_output_pass(
     clear_color: [f32; 4],
     cleared: &mut bool,
 ) {
+    begin_pass(
+        vulkan,
+        command,
+        draw,
+        target.render_pass(),
+        target.framebuffer(),
+        target.width(),
+        target.height(),
+        clear_rects,
+        clear_color,
+        cleared,
+    );
+}
+
+fn begin_pass(
+    vulkan: &ash::Device,
+    command: vk::CommandBuffer,
+    draw: &DrawState,
+    render_pass: vk::RenderPass,
+    framebuffer: vk::Framebuffer,
+    width: i32,
+    height: i32,
+    clear_rects: &[vk::Rect2D],
+    clear_color: [f32; 4],
+    cleared: &mut bool,
+) {
     let begin = vk::RenderPassBeginInfo::default()
-        .render_pass(target.render_pass())
-        .framebuffer(target.framebuffer())
+        .render_pass(render_pass)
+        .framebuffer(framebuffer)
         .render_area(vk::Rect2D {
             offset: vk::Offset2D::default(),
-            extent: vk::Extent2D { width: target.width() as u32, height: target.height() as u32 },
+            extent: vk::Extent2D { width: width as u32, height: height as u32 },
         });
     unsafe {
         vulkan.cmd_begin_render_pass(command, &begin, vk::SubpassContents::INLINE);
@@ -1008,8 +1430,8 @@ fn begin_output_pass(
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
-            width: target.width() as f32,
-            height: target.height() as f32,
+            width: width as f32,
+            height: height as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         };

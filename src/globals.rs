@@ -13,6 +13,8 @@ use crate::{
         ext_workspace_manager_v1::ExtWorkspaceManagerV1Global, wl_compositor::WlCompositorGlobal,
         wl_data_device_manager::WlDataDeviceManagerGlobal, wl_fixes::WlFixesGlobal,
         wl_seat::WlSeatGlobal, wl_shm::WlShmGlobal, wl_subcompositor::WlSubcompositorGlobal,
+        wp_alpha_modifier_v1::WpAlphaModifierV1Global, wp_color_manager_v1::WpColorManagerV1Global,
+        wp_color_representation_manager_v1::WpColorRepresentationManagerV1Global,
         wp_cursor_shape_manager_v1::WpCursorShapeManagerV1Global,
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1Global,
         wp_presentation::WpPresentationGlobal,
@@ -121,6 +123,9 @@ impl Globals {
             WlSeatGlobal::new, // TODO: `WlSeatGlobal` should be added dynamically
             WpPresentationGlobal::new,
             WpFractionalScaleManagerV1Global::new,
+            WpAlphaModifierV1Global::new,
+            WpColorManagerV1Global::new,
+            WpColorRepresentationManagerV1Global::new,
             WpTearingControlManagerV1Global::new,
             WpViewporterGlobal::new,
             ZwpLinuxDmabufV1Global::new,
@@ -190,6 +195,15 @@ impl Globals {
         assert!(self.names_by_slot.insert(slot_id, name).is_none());
         assert!(self.slots_by_name.insert(name, slot_id).is_none());
         name
+    }
+
+    /// Remove the live global for `interface`. Used before any client connects.
+    pub fn remove_interface(&mut self, interface: &str) -> bool {
+        let name = self
+            .iter()
+            .find(|(_, global)| global.interface().0 == interface)
+            .map(|(name, _)| name);
+        name.is_some_and(|name| self.remove(name).is_some())
     }
 
     pub fn remove(&mut self, name: GlobalName) -> Option<Box<dyn Global>> {

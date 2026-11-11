@@ -817,9 +817,22 @@ fn create_device(
         .iter()
         .map(|name| name.as_ptr())
         .collect();
-    let create_info = vk::DeviceCreateInfo::default()
+    let mut supported = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+    let mut queried = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported);
+    unsafe {
+        instance
+            .instance
+            .get_physical_device_features2(physical, &mut queried);
+    }
+    let ycbcr_conversion = supported.sampler_ycbcr_conversion != 0;
+    let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+        .sampler_ycbcr_conversion(ycbcr_conversion);
+    let mut create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(std::slice::from_ref(&queue_info))
         .enabled_extension_names(&extensions);
+    if ycbcr_conversion {
+        create_info = create_info.push_next(&mut ycbcr);
+    }
     unsafe {
         instance
             .instance

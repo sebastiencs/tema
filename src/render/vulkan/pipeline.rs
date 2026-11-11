@@ -1,10 +1,10 @@
 //! Textured-quad, border, shadow, and blur pipelines.
 
-use std::{ffi::CString, rc::Rc};
+use std::{collections::HashMap, ffi::CString, rc::Rc};
 
 use {ash::vk, gpu_alloc::UsageFlags};
 
-use crate::render::Texture;
+use crate::render::{color_pipeline::TexturePipelineKey, Texture};
 
 use super::{
     allocator::AllocatedBuffer, compiled_shaders, device::VulkanDevice, resources, texture,
@@ -20,6 +20,14 @@ pub(super) struct DrawState {
     sampler: vk::Sampler,
     vertices: AllocatedBuffer,
     effects: EffectGpu,
+    /// Pipelines other than the identity blend-on program. Created on first use.
+    texture_pipelines: HashMap<TexturePipelineKey, vk::Pipeline>,
+    /// FP16 linear intermediate. Created on the first HDR frame that needs it.
+    blend_image: Option<resources::BlendImage>,
+    /// Attachment format selected for the frame being recorded.
+    active: vk::Format,
+    /// Render passes other than `B8G8R8A8`. A 10-bit target needs its own pipelines.
+    extra: HashMap<vk::Format, ExtraPass>,
 }
 
 impl DrawState {
@@ -92,6 +100,7 @@ impl DrawState {
             compiled_shaders::TEXTURE_FRAG,
             false,
             true,
+            &[],
         ) {
             Ok(pipeline) => pipeline,
             Err(error) => {
@@ -149,11 +158,119 @@ impl DrawState {
             sampler,
             vertices,
             effects,
+            texture_pipelines: HashMap::new(),
+            blend_image: None,
+            active: vk::Format::B8G8R8A8_UNORM,
+            extra: HashMap::new(),
         })
     }
 
+    /// Select pipelines whose render pass matches the target. The 8-bit pass is the one
+    /// built in [`Self::new`]. A 10-bit attachment builds its pass on first use.
+    pub(super) fn use_attachment(&mut self, format: vk::Format) -> Result<(), String> {
+        if format == vk::Format::B8G8R8A8_UNORM || format == vk::Format::UNDEFINED {
+            self.active = vk::Format::B8G8R8A8_UNORM;
+            return Ok(());
+        }
+        if !self.extra.contains_key(&format) {
+            let pass = ExtraPass::new(&self.device, self.pipeline_layout, format)?;
+            self.extra.insert(format, pass);
+        }
+        self.active = format;
+        Ok(())
+    }
+
+    pub(super) fn active_render_pass(&self) -> vk::RenderPass {
+        if self.active == vk::Format::B8G8R8A8_UNORM {
+            self.render_pass
+        } else {
+            self.extra[&self.active].render_pass
+        }
+    }
+
+    /// RGBA16F target for the linear blend pass. The active render pass must be that format.
+    pub(super) fn ensure_blend_image(
+        &mut self,
+        width: i32,
+        height: i32,
+    ) -> Result<(vk::Image, vk::ImageView, vk::Framebuffer), String> {
+        let stale = self
+            .blend_image
+            .as_ref()
+            .is_none_or(|image| image.width != width || image.height != height);
+        if stale {
+            self.blend_image = Some(resources::BlendImage::new(
+                &self.device,
+                width,
+                height,
+                self.active_render_pass(),
+            )?);
+        }
+        let image = self.blend_image.as_ref().unwrap();
+        Ok((image.image(), image.view(), image.framebuffer()))
+    }
+
+    pub(super) fn blend_layout(&self) -> Option<&std::cell::Cell<vk::ImageLayout>> {
+        self.blend_image.as_ref().map(|image| &image.layout)
+    }
+
     pub(super) fn pipeline(&self) -> vk::Pipeline {
-        self.pipeline
+        if self.active == vk::Format::B8G8R8A8_UNORM {
+            self.pipeline
+        } else {
+            self.extra[&self.active].identity
+        }
+    }
+
+    /// Identity uses the pipeline built for the active attachment. Other keys, including
+    /// color transforms, are created on first use from the same shader.
+    pub(super) fn pipeline_for(&mut self, key: TexturePipelineKey) -> Result<vk::Pipeline, String> {
+        if !key.is_admitted() {
+            return Err("texture pipeline key is outside the finite color space".to_string());
+        }
+        if self.active == vk::Format::B8G8R8A8_UNORM {
+            if key == TexturePipelineKey::identity() {
+                return Ok(self.pipeline);
+            }
+            if let Some(pipeline) = self.texture_pipelines.get(&key).copied() {
+                return Ok(pipeline);
+            }
+            let pipeline = graphics_pipeline(
+                &self.device.device,
+                self.pipeline_layout,
+                self.render_pass,
+                compiled_shaders::TEXTURE_VERT,
+                compiled_shaders::TEXTURE_FRAG,
+                false,
+                key.blend,
+                &key.specialization_constants(),
+            )?;
+            self.texture_pipelines.insert(key, pipeline);
+            return Ok(pipeline);
+        }
+        if key == TexturePipelineKey::identity() {
+            return Ok(self.extra[&self.active].identity);
+        }
+        if let Some(pipeline) = self.extra[&self.active].textures.get(&key).copied() {
+            return Ok(pipeline);
+        }
+        let render_pass = self.extra[&self.active].render_pass;
+        let pipeline = graphics_pipeline(
+            &self.device.device,
+            self.pipeline_layout,
+            render_pass,
+            compiled_shaders::TEXTURE_VERT,
+            compiled_shaders::TEXTURE_FRAG,
+            false,
+            key.blend,
+            &key.specialization_constants(),
+        )?;
+        self.extra
+            .get_mut(&self.active)
+            .unwrap()
+            .textures
+            .insert(key, pipeline);
+        Ok(pipeline)
     }
 
     pub(super) fn pipeline_layout(&self) -> vk::PipelineLayout {
@@ -191,36 +308,44 @@ impl DrawState {
             .ok_or_else(|| "vulkan allocated no descriptor set".to_string())
     }
 
+    fn active_effects(&self) -> &EffectGpu {
+        if self.active == vk::Format::B8G8R8A8_UNORM {
+            &self.effects
+        } else {
+            &self.extra[&self.active].effects
+        }
+    }
+
     pub(super) fn border_pipeline(&self) -> vk::Pipeline {
-        self.effects.border_pipeline
+        self.active_effects().border_pipeline
     }
 
     pub(super) fn border_layout(&self) -> vk::PipelineLayout {
-        self.effects.border_layout
+        self.active_effects().border_layout
     }
 
     pub(super) fn border_set_layout(&self) -> vk::DescriptorSetLayout {
-        self.effects.border_set_layout
+        self.active_effects().border_set_layout
     }
 
     pub(super) fn shadow_pipeline(&self) -> vk::Pipeline {
-        self.effects.shadow_pipeline
+        self.active_effects().shadow_pipeline
     }
 
     pub(super) fn shadow_layout(&self) -> vk::PipelineLayout {
-        self.effects.shadow_layout
+        self.active_effects().shadow_layout
     }
 
     pub(super) fn shadow_set_layout(&self) -> vk::DescriptorSetLayout {
-        self.effects.shadow_set_layout
+        self.active_effects().shadow_set_layout
     }
 
     pub(super) fn blur_pipeline(&self) -> vk::Pipeline {
-        self.effects.blur_pipeline
+        self.active_effects().blur_pipeline
     }
 
     pub(super) fn dim_texture(&self) -> Rc<dyn Texture> {
-        self.effects.dim.clone()
+        self.active_effects().dim.clone()
     }
 
     pub(super) fn reset_descriptors(&mut self) -> Result<(), String> {
@@ -250,6 +375,10 @@ impl Drop for DrawState {
             if let Err(error) = self.device.device.device_wait_idle() {
                 log::error!("vulkan wait before destroying the pipeline failed: {error}");
             }
+            for pipeline in self.texture_pipelines.values().copied() {
+                self.device.device.destroy_pipeline(pipeline, None);
+            }
+            self.texture_pipelines.clear();
             self.effects.destroy();
             self.device.device.destroy_pipeline(self.pipeline, None);
             self.device
@@ -284,7 +413,13 @@ fn set_layout(
         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
-    let bindings = [sampler_binding, uniform_binding];
+    let chroma_binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(2)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .immutable_samplers(std::slice::from_ref(&sampler));
+    let bindings = [sampler_binding, uniform_binding, chroma_binding];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     unsafe { device.create_descriptor_set_layout(&info, None) }
         .map_err(|error| format!("vulkan descriptor layout failed: {error}"))
@@ -294,7 +429,7 @@ fn descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, String> {
     let sizes = [
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 1024,
+            descriptor_count: 2048,
         },
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -326,6 +461,7 @@ fn graphics_pipeline(
     fragment_spirv: &[u8],
     position_only: bool,
     blend: bool,
+    specialization: &[(u32, u32)],
 ) -> Result<vk::Pipeline, String> {
     let vertex = shader_module(device, vertex_spirv)?;
     let fragment = match shader_module(device, fragment_spirv) {
@@ -336,15 +472,35 @@ fn graphics_pipeline(
         }
     };
     let entry = CString::new("main").expect("shader entry point");
+    let spec_bytes: Vec<u8> = specialization
+        .iter()
+        .flat_map(|(_, value)| value.to_le_bytes())
+        .collect();
+    let spec_entries: Vec<vk::SpecializationMapEntry> = specialization
+        .iter()
+        .enumerate()
+        .map(|(index, (constant_id, _))| vk::SpecializationMapEntry {
+            constant_id: *constant_id,
+            offset: (index * 4) as u32,
+            size: 4,
+        })
+        .collect();
+    let spec = vk::SpecializationInfo::default()
+        .map_entries(&spec_entries)
+        .data(&spec_bytes);
+    let mut fragment_stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::FRAGMENT)
+        .module(fragment)
+        .name(&entry);
+    if !specialization.is_empty() {
+        fragment_stage = fragment_stage.specialization_info(&spec);
+    }
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vertex)
             .name(&entry),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(fragment)
-            .name(&entry),
+        fragment_stage,
     ];
     let binding = vk::VertexInputBindingDescription {
         binding: 0,
@@ -460,6 +616,77 @@ fn quad_vertices(device: &Rc<VulkanDevice>) -> Result<AllocatedBuffer, String> {
     Ok(buffer)
 }
 
+struct ExtraPass {
+    device: Rc<VulkanDevice>,
+    render_pass: vk::RenderPass,
+    identity: vk::Pipeline,
+    textures: HashMap<TexturePipelineKey, vk::Pipeline>,
+    effects: EffectGpu,
+}
+
+impl ExtraPass {
+    fn new(
+        device: &Rc<VulkanDevice>,
+        pipeline_layout: vk::PipelineLayout,
+        format: vk::Format,
+    ) -> Result<Self, String> {
+        let render_pass = resources::color_render_pass(&device.device, format)?;
+        let identity = match graphics_pipeline(
+            &device.device,
+            pipeline_layout,
+            render_pass,
+            compiled_shaders::TEXTURE_VERT,
+            compiled_shaders::TEXTURE_FRAG,
+            false,
+            true,
+            &[],
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                unsafe { device.device.destroy_render_pass(render_pass, None) };
+                return Err(error);
+            }
+        };
+        let effects = match EffectGpu::new(device, render_pass, pipeline_layout) {
+            Ok(effects) => effects,
+            Err(error) => {
+                unsafe {
+                    device.device.destroy_pipeline(identity, None);
+                    device.device.destroy_render_pass(render_pass, None);
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            device: device.clone(),
+            render_pass,
+            identity,
+            textures: HashMap::new(),
+            effects,
+        })
+    }
+}
+
+impl Drop for ExtraPass {
+    fn drop(&mut self) {
+        unsafe {
+            for pipeline in self.textures.values().copied() {
+                self.device.device.destroy_pipeline(pipeline, None);
+            }
+            self.textures.clear();
+            self.effects.destroy();
+            if self.identity != vk::Pipeline::null() {
+                self.device.device.destroy_pipeline(self.identity, None);
+            }
+            if self.render_pass != vk::RenderPass::null() {
+                self.device
+                    .device
+                    .destroy_render_pass(self.render_pass, None);
+            }
+        }
+    }
+}
+
 struct EffectGpu {
     device: Rc<VulkanDevice>,
     border_pipeline: vk::Pipeline,
@@ -504,6 +731,7 @@ impl EffectGpu {
             compiled_shaders::BLUR_FRAG,
             false,
             false,
+            &[],
         ) {
             Ok(pipeline) => pipeline,
             Err(error) => {
@@ -587,7 +815,16 @@ fn uniform_pipeline(
             return Err(error);
         }
     };
-    match graphics_pipeline(device, layout, render_pass, vertex_spirv, fragment_spirv, true, true) {
+    match graphics_pipeline(
+        device,
+        layout,
+        render_pass,
+        vertex_spirv,
+        fragment_spirv,
+        true,
+        true,
+        &[],
+    ) {
         Ok(pipeline) => Ok((pipeline, layout, set_layout)),
         Err(error) => {
             unsafe {

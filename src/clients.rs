@@ -214,6 +214,9 @@ pub enum ClientManagerAction {
     OutputRemoved {
         output_id: OutputId,
     },
+    OutputColorDescriptionChanged {
+        output_id: OutputId,
+    },
     GammaControlFailed {
         output_id: OutputId,
     },
@@ -476,6 +479,14 @@ impl Model for ClientManager {
                     dispatcher.dispatch_to(client_id, ClientAction::OutputRemoved { output_id });
                 }
             }
+            OutputColorDescriptionChanged { output_id } => {
+                for client_id in self.set.iter().copied() {
+                    dispatcher.dispatch_to(
+                        client_id,
+                        ClientAction::OutputColorDescriptionChanged { output_id },
+                    );
+                }
+            }
             GammaControlFailed { output_id } => {
                 for client_id in self.set.iter().copied() {
                     dispatcher
@@ -693,6 +704,9 @@ pub enum ClientAction {
         output_id: OutputId,
     },
     OutputRemoved {
+        output_id: OutputId,
+    },
+    OutputColorDescriptionChanged {
         output_id: OutputId,
     },
     GammaControlFailed {
@@ -2781,6 +2795,45 @@ impl Client {
         self.flush_deferred_resize_configure(state, dispatcher, xdg_toplevel);
     }
 
+    pub(crate) fn notify_output_color_description(
+        &mut self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        output_id: OutputId,
+    ) {
+        let color_outputs = self
+            .iter_resolved_of::<crate::protocol_generated::WpColorManagementOutputV1Id>(state)
+            .collect::<Vec<_>>();
+        let mut sent_changed = false;
+        for color_output in color_outputs {
+            let matches = color_output
+                .try_ref(state)
+                .is_some_and(|object| object.output_id() == Some(output_id));
+            if matches {
+                color_output
+                    .rref(state)
+                    .send_image_description_changed(dispatcher);
+                sent_changed = true;
+            }
+        }
+        if sent_changed {
+            for wl_output in self.output_object_ids_for_output(state, output_id) {
+                wl_output.rref(state).send_done(dispatcher);
+            }
+        }
+        let surfaces = self
+            .iter_resolved_of::<WlSurfaceId>(state)
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            let Some(mut surface) = surface.try_grab(state) else {
+                continue;
+            };
+            if surface.active_output_id() == Some(output_id) {
+                surface.send_preferred_color_description(state, dispatcher);
+            }
+        }
+    }
+
     fn handle_output_removed(
         &mut self,
         state: &mut State,
@@ -2966,6 +3019,9 @@ fn refresh_surface_tree_outputs(
         };
         surface_obj.send_preferred_fractional_scale_for_output(fractional_scale, state, dispatcher);
         surface_obj.send_preferred_buffer_state_for_output(scale, transform, dispatcher);
+        surface_obj.send_preferred_color_description(state, dispatcher);
+    } else if let Some(mut surface_obj) = surface.try_grab(state) {
+        surface_obj.send_preferred_color_description(state, dispatcher);
     }
     crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::refresh_surface_feedback(
         state, dispatcher, surface,
@@ -3012,6 +3068,9 @@ fn clear_surface_tree_outputs(
         for output in client.output_object_ids_for_output(state, output_id) {
             client.send_surface_output_membership_event(state, dispatcher, surface, output, false);
         }
+    }
+    if let Some(mut surface_obj) = surface.try_grab(state) {
+        surface_obj.send_preferred_color_description(state, dispatcher);
     }
 
     for entry in stack {
@@ -3338,6 +3397,9 @@ impl Model for Client {
             OutputRemoved { output_id } => {
                 self.handle_output_removed(state, &mut dispatcher, output_id);
                 self.refresh_workspace_protocols(state, &mut dispatcher);
+            }
+            OutputColorDescriptionChanged { output_id } => {
+                self.notify_output_color_description(state, &mut dispatcher, output_id);
             }
             GammaControlFailed { output_id } => {
                 if self.invalidate_gamma_control_for_output(state, &mut dispatcher, output_id)
