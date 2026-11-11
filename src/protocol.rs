@@ -407,7 +407,7 @@ pub fn gen() -> std::io::Result<()> {
         // "/usr/share/wayland-protocols/staging/commit-timing/commit-timing-v1.xml",
         "/usr/share/wayland-protocols/staging/content-type/content-type-v1.xml",
         "/usr/share/wayland-protocols/staging/drm-lease/drm-lease-v1.xml",
-        // "/usr/share/wayland-protocols/staging/ext-background-effect/ext-background-effect-v1.xml",
+        "/usr/share/wayland-protocols/staging/ext-background-effect/ext-background-effect-v1.xml",
         "/usr/share/wayland-protocols/staging/ext-data-control/ext-data-control-v1.xml",
         "/usr/share/wayland-protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml",
         "/usr/share/wayland-protocols/staging/ext-idle-notify/ext-idle-notify-v1.xml",

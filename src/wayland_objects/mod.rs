@@ -1,6 +1,8 @@
 #![allow(unused)]
 
 pub mod color_management;
+pub mod ext_background_effect_manager_v1;
+pub mod ext_background_effect_surface_v1;
 pub mod ext_data_control_device_v1;
 pub mod ext_data_control_manager_v1;
 pub mod ext_data_control_offer_v1;

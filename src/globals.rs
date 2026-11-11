@@ -3,6 +3,7 @@ use crate::{
     protocol_generated::{NewId, WlRegistryId},
     state::{Grab, IndexMap, State},
     wayland_objects::{
+        ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1Global,
         ext_data_control_manager_v1::ExtDataControlManagerV1Global,
         ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1Global,
         ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1Global,
@@ -153,6 +154,7 @@ impl Globals {
             ZxdgDecorationManagerV1Global::new,
             ZwlrLayerShellV1Global::new,
             ZxdgOutputManagerV1Global::new,
+            ExtBackgroundEffectManagerV1Global::new,
             ExtWorkspaceManagerV1Global::new,
             XwaylandShellV1Global::new,
         ] {

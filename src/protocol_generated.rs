@@ -136,6 +136,8 @@ wayland_id! {
   WpDrmLeaseConnectorV1Id,
   WpDrmLeaseRequestV1Id,
   WpDrmLeaseV1Id,
+  ExtBackgroundEffectManagerV1Id,
+  ExtBackgroundEffectSurfaceV1Id,
   ExtDataControlManagerV1Id,
   ExtDataControlDeviceV1Id,
   ExtDataControlSourceV1Id,
@@ -13189,6 +13191,187 @@ pub mod wp_drm_lease_v1 {
                 }
             }
         }
+    }
+}
+
+/// Background effect factory
+///
+/// This protocol provides a way to improve visuals of translucent surfaces
+/// by applying effects like blur to the background behind them.
+///
+/// The capabilities are send when the global is bound, and every time they
+/// change. Note that when the capability goes away, the corresponding effect
+/// is no longer applied by the compositor, even if it was set before.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod ext_background_effect_manager_v1 {
+    use super::*;
+    impl Constants
+        for crate::wayland_objects::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1
+    {
+        const INTERFACE_NAME: &'static str = "ext_background_effect_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for ExtBackgroundEffectManagerV1Id {
+        type Object =
+            crate::wayland_objects::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1
+    {
+        type Id = ExtBackgroundEffectManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the background effect manager
+        ///
+        /// Informs the server that the client will no longer be using this
+        /// protocol object. Existing objects created by this object are not
+        /// affected.
+        Destroy,
+        /// Get a background effects object
+        ///
+        /// Instantiate an interface extension for the given wl_surface to add
+        /// effects like blur for the background behind it.
+        ///
+        /// If the given wl_surface already has a ext_background_effect_surface_v1
+        /// object associated, the background_effect_exists protocol error will be
+        /// raised.
+        GetBackgroundEffect {
+            /// The new ext_background_effect_surface_v1 object,
+            id: ExtBackgroundEffectSurfaceV1Id,
+            /// The surface,
+            surface: WlSurfaceId,
+        },
+    }
+    impl Parser
+        for crate::wayland_objects::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1
+    {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetBackgroundEffect { id: req.id()?, surface: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Capabilities of the compositor
+        ///
+        ///
+        Capabilities { flags: u32 },
+    }
+    impl EventWriter
+        for crate::wayland_objects::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1
+    {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Capabilities { flags } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 1);
+                    raw.uint(flags);
+                    raw
+                }
+            }
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// The surface already has a background effect object,
+        BackgroundEffectExists = 0,
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Capability {
+        /// The compositor supports applying blur,
+        Blur = 1,
+    }
+}
+
+/// Background effects for a surface
+///
+/// The background effect object provides a way to specify a region behind
+/// a surface that should have background effects like blur applied.
+///
+/// If the wl_surface associated with the ext_background_effect_surface_v1
+/// object has been destroyed, this object becomes inert.
+pub mod ext_background_effect_surface_v1 {
+    use super::*;
+    impl Constants
+        for crate::wayland_objects::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1
+    {
+        const INTERFACE_NAME: &'static str = "ext_background_effect_surface_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for ExtBackgroundEffectSurfaceV1Id {
+        type Object =
+            crate::wayland_objects::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1
+    {
+        type Id = ExtBackgroundEffectSurfaceV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Release the blur object
+        ///
+        /// Informs the server that the client will no longer be using this protocol
+        /// object. The effect regions will be removed on the next commit.
+        Destroy,
+        /// Set blur region
+        ///
+        /// This request sets the region of the surface that will have its
+        /// background blurred.
+        ///
+        /// The blur region is specified in the surface-local coordinates, and
+        /// clipped by the compositor to the surface size.
+        ///
+        /// The initial value for the blur region is empty. Setting the pending
+        /// blur region has copy semantics, and the wl_region object can be
+        /// destroyed immediately. A NULL wl_region removes the effect.
+        ///
+        /// The blur region is double-buffered state, and will be applied on
+        /// the next wl_surface.commit.
+        ///
+        /// The blur algorithm is subject to compositor policies.
+        ///
+        /// If the associated surface has been destroyed, the surface_destroyed
+        /// error will be raised.
+        SetBlurRegion {
+            /// Blur region of the surface,
+            region: WlRegionId,
+        },
+    }
+    impl Parser
+        for crate::wayland_objects::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1
+    {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => SetBlurRegion { region: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// The associated surface has been destroyed,
+        SurfaceDestroyed = 0,
     }
 }
 

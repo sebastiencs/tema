@@ -16,12 +16,13 @@ use crate::{
     object::{Object, Parser, PostAction, RequestResult},
     protocol_generated::{
         wl_pointer, wl_surface, wp_fractional_scale_v1, wp_linux_drm_syncobj_surface_v1,
-        wp_viewport, xdg_wm_base, ExtSessionLockSurfaceV1Id, WaylandId, WlBufferId, WlCallbackId,
-        WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId, WpAlphaModifierSurfaceV1Id,
-        WpColorManagementSurfaceFeedbackV1Id, WpColorManagementSurfaceV1Id,
-        WpColorRepresentationSurfaceV1Id, WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id,
-        WpPresentationFeedbackId, WpTearingControlV1Id, WpViewportId, XdgSurfaceId,
-        XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id, ZwpInputPopupSurfaceV2Id,
+        wp_viewport, xdg_wm_base, ExtBackgroundEffectSurfaceV1Id, ExtSessionLockSurfaceV1Id,
+        WaylandId, WlBufferId, WlCallbackId, WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId,
+        WpAlphaModifierSurfaceV1Id, WpColorManagementSurfaceFeedbackV1Id,
+        WpColorManagementSurfaceV1Id, WpColorRepresentationSurfaceV1Id, WpFractionalScaleV1Id,
+        WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpTearingControlV1Id, WpViewportId,
+        XdgSurfaceId, XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
+        ZwpInputPopupSurfaceV2Id,
     },
     region::{DamageRegion, RectI, RegionValue},
     scene::visibility::root_participates_in_input,
@@ -244,6 +245,7 @@ pub struct WlSurface {
     fractional_scale_object: Option<Resolved<WpFractionalScaleV1Id>>,
     tearing_control_object: Option<Resolved<WpTearingControlV1Id>>,
     alpha_modifier_object: Option<Resolved<WpAlphaModifierSurfaceV1Id>>,
+    background_effect_object: Option<Resolved<ExtBackgroundEffectSurfaceV1Id>>,
     color_management_surface: Option<Resolved<WpColorManagementSurfaceV1Id>>,
     color_representation_object: Option<Resolved<WpColorRepresentationSurfaceV1Id>>,
     color_feedback: Vec<Resolved<WpColorManagementSurfaceFeedbackV1Id>>,
@@ -336,6 +338,9 @@ struct Pending {
     opaque_region: Option<RegionValue>,
     /// `None` means `set_region` was not called. `Some(None)` is a null region.
     pointer_constraint_region: Option<Option<RegionValue>>,
+    /// `None` means this commit does not change the blur region.
+    /// `Some(None)` removes it. `Some(Some(_))` sets the copied region.
+    blur_region: Option<Option<RegionValue>>,
     pointer_constraint_hint: Option<(f32, f32)>,
     xwayland_serial: Option<u64>,
 }
@@ -359,6 +364,7 @@ impl Default for Pending {
             opaque_region: None,
             pointer_constraint_region: None,
             pointer_constraint_hint: None,
+            blur_region: None,
             xwayland_serial: None,
         }
     }
@@ -374,6 +380,8 @@ struct SurfaceCommitPayload {
     viewport: SurfaceViewport,
     presentation_hint: PresentationHint,
     alpha_multiplier: u32,
+    /// Resolved blur region for this commit. `None` removes the effect.
+    blur_region: Option<RegionValue>,
     /// `None` means this commit does not change the description.
     /// `Some(None)` returns the surface to untagged. `Some(Some(_))` sets it.
     color: Option<Option<SurfaceColor>>,
@@ -416,6 +424,8 @@ struct OnScreen {
     viewport: SurfaceViewport,
     presentation_hint: PresentationHint,
     alpha_multiplier: u32,
+    /// `None` means the client has not asked for blur.
+    blur_region: Option<RegionValue>,
     /// `None` is an untagged surface.
     color: Option<SurfaceColor>,
     representation: ColorRepresentation,
@@ -444,6 +454,7 @@ impl Default for OnScreen {
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
             alpha_multiplier: u32::MAX,
+            blur_region: None,
             color: None,
             representation: ColorRepresentation::default(),
             logical_size: None,
@@ -499,6 +510,7 @@ struct BlockedSurfaceState {
     viewport: SurfaceViewport,
     presentation_hint: PresentationHint,
     alpha_multiplier: u32,
+    blur_region: Option<RegionValue>,
     color: Option<SurfaceColor>,
     representation: ColorRepresentation,
     input_region: RegionValue,
@@ -657,6 +669,7 @@ impl WlSurface {
             fractional_scale_object: None,
             tearing_control_object: None,
             alpha_modifier_object: None,
+            background_effect_object: None,
             color_management_surface: None,
             color_representation_object: None,
             color_feedback: Vec::new(),
@@ -790,6 +803,10 @@ impl WlSurface {
 
         if self.alpha_modifier_object.take().is_some() {
             self.pending.alpha_multiplier = u32::MAX;
+        }
+
+        if self.background_effect_object.take().is_some() {
+            self.pending.blur_region = Some(None);
         }
 
         self.color_management_surface = None;
@@ -1425,6 +1442,39 @@ impl WlSurface {
         self.alpha_modifier_object.is_some()
     }
 
+    pub fn set_background_effect_object(
+        &mut self,
+        object: Resolved<ExtBackgroundEffectSurfaceV1Id>,
+    ) -> Result<(), ()> {
+        if self.background_effect_object.is_some() {
+            return Err(());
+        }
+        self.background_effect_object = Some(object);
+        Ok(())
+    }
+
+    pub fn clear_background_effect_object(
+        &mut self,
+        object: Resolved<ExtBackgroundEffectSurfaceV1Id>,
+    ) {
+        if self.background_effect_object == Some(object) {
+            self.background_effect_object = None;
+            self.pending.blur_region = Some(None);
+        }
+    }
+
+    pub fn has_background_effect_object(&self) -> bool {
+        self.background_effect_object.is_some()
+    }
+
+    pub(crate) fn set_pending_blur_region(&mut self, region: Option<RegionValue>) {
+        self.pending.blur_region = Some(region);
+    }
+
+    pub(crate) fn committed_blur_region(&self) -> Option<RegionValue> {
+        self.on_screen.blur_region.clone()
+    }
+
     pub(crate) fn set_pending_alpha_multiplier(&mut self, factor: u32) {
         self.pending.alpha_multiplier = factor;
     }
@@ -1673,7 +1723,7 @@ impl WlSurface {
         Ok(())
     }
 
-    fn snapshot_region_request(
+    pub(crate) fn snapshot_region_request(
         client: &mut Client,
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
@@ -1779,6 +1829,7 @@ impl WlSurface {
             viewport: self.on_screen.viewport,
             presentation_hint: self.on_screen.presentation_hint,
             alpha_multiplier: self.on_screen.alpha_multiplier,
+            blur_region: self.on_screen.blur_region.clone(),
             color: self.on_screen.color.clone(),
             representation: self.on_screen.representation,
             logical_size: None,
@@ -1816,6 +1867,10 @@ impl WlSurface {
             .take()
             .or_else(|| raw_regions.map(|raw| raw.opaque_region.clone()))
             .unwrap_or_else(|| self.on_screen.opaque_region.clone());
+        let blur_region = match self.pending.blur_region.take() {
+            None => self.on_screen.blur_region.clone(),
+            Some(next) => next,
+        };
         SurfaceCommitPayload {
             buffer: self.pending.buffer.take(),
             offset: std::mem::take(&mut self.pending.offset),
@@ -1825,6 +1880,7 @@ impl WlSurface {
             viewport: self.pending.viewport,
             presentation_hint: self.pending.presentation_hint,
             alpha_multiplier: self.pending.alpha_multiplier,
+            blur_region,
             color: self.pending.color.take(),
             representation: std::mem::take(&mut self.pending.representation),
             damage_surface: std::mem::take(&mut self.pending.damage_surface),
@@ -1976,6 +2032,7 @@ impl WlSurface {
                 cached.payload.viewport = payload.viewport;
                 cached.payload.presentation_hint = payload.presentation_hint;
                 cached.payload.alpha_multiplier = payload.alpha_multiplier;
+                cached.payload.blur_region = payload.blur_region.clone();
                 if payload.color.is_some() {
                     cached.payload.color = payload.color;
                 }
@@ -2267,6 +2324,7 @@ impl WlSurface {
             viewport: payload.viewport,
             presentation_hint: payload.presentation_hint,
             alpha_multiplier: payload.alpha_multiplier,
+            blur_region: payload.blur_region.clone(),
             color: committed_surface_color(&self.on_screen.color, &payload.color),
             representation: payload.representation.apply(self.on_screen.representation),
             input_region: payload.input_region.clone(),
@@ -2505,6 +2563,7 @@ impl WlSurface {
                     viewport: payload.viewport,
                     presentation_hint: payload.presentation_hint,
                     alpha_multiplier: payload.alpha_multiplier,
+                    blur_region: payload.blur_region.clone(),
                     color,
                     representation,
                     logical_size: None,
@@ -2587,6 +2646,7 @@ impl WlSurface {
                     viewport: payload.viewport,
                     presentation_hint: payload.presentation_hint,
                     alpha_multiplier: payload.alpha_multiplier,
+                    blur_region: payload.blur_region.clone(),
                     color: None,
                     representation: RepresentationUpdate::default(),
                     damage_surface: Vec::new(),
@@ -2611,6 +2671,7 @@ impl WlSurface {
         if !commit_blocked {
             self.on_screen.presentation_hint = payload.presentation_hint;
             self.on_screen.alpha_multiplier = payload.alpha_multiplier;
+            self.on_screen.blur_region = payload.blur_region.clone();
             if let Some(color) = payload.color.clone() {
                 self.on_screen.color = color;
             }
@@ -3632,6 +3693,7 @@ impl WlSurface {
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
             alpha_multiplier: u32::MAX,
+            blur_region: None,
             color: None,
             representation: ColorRepresentation::default(),
             logical_size: Some(SizeI { width, height }),
@@ -3716,6 +3778,7 @@ impl WlSurface {
             viewport: next.viewport,
             presentation_hint: next.presentation_hint,
             alpha_multiplier: next.alpha_multiplier,
+            blur_region: next.blur_region,
             color: next.color,
             representation: next.representation,
             logical_size: Some(SizeI { width: next.width, height: next.height }),
@@ -4197,6 +4260,7 @@ mod tests {
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
             alpha_multiplier: u32::MAX,
+            blur_region: None,
             color: None,
             representation: crate::color::ColorRepresentation::default(),
             logical_size: Some(SizeI { width: 100, height: 80 }),
@@ -7942,6 +8006,7 @@ mod tests {
                 viewport: SurfaceViewport::default(),
                 presentation_hint: PresentationHint::Vsync,
                 alpha_multiplier: u32::MAX,
+                blur_region: None,
                 color: Some(Some((
                     crate::color::ColorManager::untagged_srgb_gamma22(),
                     crate::color::RenderIntent::Relative,
@@ -7968,6 +8033,7 @@ mod tests {
                 viewport: SurfaceViewport::default(),
                 presentation_hint: PresentationHint::Async,
                 alpha_multiplier: 42,
+                blur_region: None,
                 color: None,
                 representation: crate::color::RepresentationUpdate::default(),
                 damage_surface: vec![DamageRect { x: 5, y: 6, width: 7, height: 8 }],
@@ -8243,6 +8309,7 @@ mod tests {
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
             alpha_multiplier: 9,
+            blur_region: None,
             color: Some(Some((
                 std::rc::Rc::clone(&description),
                 crate::color::RenderIntent::RelativeBpc,
