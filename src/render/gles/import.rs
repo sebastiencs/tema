@@ -216,7 +216,7 @@ fn bind_texture_2d(image: *mut std::ffi::c_void) -> Result<gl::Uint, ()> {
         gl::EGLImageTargetTexture2DOES(gl::TEXTURE_2D as _, image);
         let error = gl::GetError();
         gl::BindTexture(gl::TEXTURE_2D as _, 0);
-        if error != gl::NO_ERROR as _ {
+        if error != gl::NO_ERROR as gl::GLenum {
             gl::DeleteTextures(1, &texture);
             return Err(());
         }

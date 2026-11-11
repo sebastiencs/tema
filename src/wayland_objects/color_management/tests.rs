@@ -716,7 +716,6 @@ fn insert_buffer(session: &mut Session, id: u32, size: i32) {
         &mut session.state,
         WlBuffer::new(NewWlBufferParams {
             id: WlBufferId::from(id),
-            owner_client_id: session.client.client_id(),
             offset: 0,
             width: size,
             height: size,

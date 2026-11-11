@@ -2127,18 +2127,15 @@ impl WlSurface {
         if next.coefficients.is_none() && next.chroma.is_none() {
             return true;
         }
-        let buffer_id = match self.pending.buffer {
+        let attached = match &self.pending.buffer {
             Some(None) => return true,
             Some(Some(buffer)) => buffer,
-            None => match self.on_screen.buffer_object_id {
+            None => match &self.on_screen.buffer {
                 Some(buffer) => buffer,
                 None => return true,
             },
         };
-        let Some(buffer) = buffer_id.try_ref(state) else {
-            return true;
-        };
-        let yuv = matches!(buffer.format().kind, crate::drm::FormatKind::Yuv { .. });
+        let yuv = matches!(attached.content.format().kind, crate::drm::FormatKind::Yuv { .. });
         let Some(object) = self.color_representation_object else {
             return true;
         };
@@ -8224,6 +8221,8 @@ mod tests {
         let buffer_object_id =
             insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(90), 2, 2);
         let buffer = Resolved::new(client.client_id(), WlBufferId::from(90), buffer_object_id);
+        let buffer = crate::buffer_content::AttachedBuffer::resolve(&state, buffer)
+            .expect("test buffer is live");
         let mut surface = make_surface();
         let description = state.color_manager.windows_scrgb();
         let coefficients = crate::color::Coefficients {
@@ -8236,7 +8235,7 @@ mod tests {
             chroma: None,
         };
         let payload = SurfaceCommitPayload {
-            buffer: Some(Some(buffer)),
+            buffer: Some(Some(buffer.clone())),
             offset: (0, 0),
             sync: SurfaceSyncState::default(),
             buffer_transform: BufferTransform::Normal,

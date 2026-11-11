@@ -12915,7 +12915,6 @@ mod presentation_timing_tests {
         let buffer_object_id = state
             .insert_object(WlBuffer::test_argb8888_shm(
                 WlBufferId::from(1),
-                ClientId::from_raw(1),
                 16,
                 12,
                 vec![0x80; 16 * 12 * 4],
@@ -14126,7 +14125,11 @@ mod overlay_tests {
                 bounds,
                 tex_transform: transform::Mat3::identity(),
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
                 mask: SceneItemMask::None,
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask: SceneItemMask::None,
             texture: crate::render::inert_texture(),
@@ -14134,10 +14137,12 @@ mod overlay_tests {
             sample_damage_padding: 0,
             state_has_alpha: true,
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             opaque_region: DamageRegion::new(),
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }
@@ -14167,7 +14172,7 @@ mod overlay_tests {
         items: &[SceneItem],
         frame_elements: &[RecordedFrameElement],
     ) -> Vec<SceneItemKey> {
-        let recipe = super::build_output_frame_recipe(items, frame_elements);
+        let recipe = super::build_output_frame_recipe(items, frame_elements, None);
         let textures: Vec<_> = recipe
             .elements
             .iter()
@@ -14329,7 +14334,7 @@ mod overlay_tests {
         let items = vec![scene_item(1), scene_item(2)];
         let frame_elements =
             vec![RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 }];
-        let _ = super::build_output_frame_recipe(&items, &frame_elements);
+        let _ = super::build_output_frame_recipe(&items, &frame_elements, None);
     }
 
     #[test]
@@ -14339,7 +14344,7 @@ mod overlay_tests {
             RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 },
             RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 1 },
         ];
-        let recipe = super::build_output_frame_recipe(&items, &frame_elements);
+        let recipe = super::build_output_frame_recipe(&items, &frame_elements, None);
         assert_eq!(recipe.elements.len(), 2);
     }
 }

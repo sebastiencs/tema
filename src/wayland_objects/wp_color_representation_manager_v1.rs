@@ -241,7 +241,6 @@ mod tests {
             state,
             WlBuffer::new(NewWlBufferParams {
                 id: WlBufferId::from(buffer),
-                owner_client_id: client.client_id(),
                 offset: 0,
                 width: 4,
                 height: 4,

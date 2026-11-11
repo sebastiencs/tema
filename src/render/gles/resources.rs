@@ -139,7 +139,7 @@ impl LinearBlendTarget {
             );
             let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER as _);
             gl::BindFramebuffer(gl::FRAMEBUFFER as _, 0);
-            if status != gl::FRAMEBUFFER_COMPLETE as _ {
+            if status != gl::FRAMEBUFFER_COMPLETE as gl::GLenum {
                 gl::DeleteFramebuffers(1, &framebuffer_object);
                 gl::DeleteTextures(1, &texture);
                 return None;
