@@ -55,9 +55,13 @@ split_ratio = 1.0
 
 # Corner radius of the window content, in logical pixels. This is independent of
 # who draws the decorations. 0 disables rounding.
+# resize_grab_extent is the extra logical pixels outside a floating frame where a
+# resize can start. Tiled windows resize through the borders and gap of a split;
+# edges with no neighbour do not. 0 disables that extra extent.
 [decorations]
 rounding = 20
 rounding_power = 2.0
+resize_grab_extent = 10
 
 # Width of the compositor frame on every edge, in logical pixels. This is also
 # the drawn border width. Every non-fullscreen window gets this frame, including

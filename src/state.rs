@@ -22,7 +22,7 @@ use crate::{
         presentation::PresentationSubsystem,
     },
     seat::SeatState,
-    tiling::{self, TiledResizeState, WorkspaceLayout},
+    tiling::{self, SplitDragPair, SplitPair, WorkspaceLayout},
     visual_animation::{
         lifecycle_pose, resolve_window_visual, FocusVisualAnimation, GeometryTiming,
         OpeningIntroduction, RetainedClosingSnapshot, WindowGeometryAnimation,
@@ -3618,19 +3618,38 @@ impl State {
         changed
     }
 
-    pub fn begin_tiled_window_resize(
+    pub fn begin_split_drags(
+        &mut self,
+        workspace_id: WorkspaceId,
+        splits: SplitPair,
+    ) -> Option<SplitDragPair> {
+        self.relayout_dirty_workspaces();
+        let drags = self
+            .workspaces
+            .try_get(workspace_id)?
+            .layout
+            .begin_split_drags(splits);
+        (!drags.is_empty()).then_some(drags)
+    }
+
+    /// Ancestor walk for a window's edges. Relayouts first so split spans exist.
+    pub fn begin_window_edge_drags(
         &mut self,
         window: WindowId,
         edges: u32,
-    ) -> Option<TiledResizeState> {
-        self.relayout_dirty_workspaces();
+    ) -> Option<(WorkspaceId, SplitDragPair)> {
         let root = self.window_root_surface(window)?;
         let workspace_id = self.root_surface_workspace(root)?;
-        let workspace = self.workspaces.try_get(workspace_id)?;
-        workspace.layout.begin_tiled_resize(window, edges)
+        let splits = self
+            .workspaces
+            .try_get(workspace_id)?
+            .layout
+            .splits_for_window_edges(window, edges);
+        let drags = self.begin_split_drags(workspace_id, splits)?;
+        Some((workspace_id, drags))
     }
 
-    /// Apply one pointer step of a tiled resize.
+    /// Apply one pointer step of a tiled split resize.
     ///
     /// When [`tiling::SNAP_TILED_RESIZE`] is set, the tiles that change jump
     /// to the new rectangle. Relayout keeps that snap while the grab is active,
@@ -3638,35 +3657,23 @@ impl State {
     /// `windows` animation. Hyprland's `warpPositionSize()` does the same
     /// during a mouse resize. Keyboard resizes stay on [`Self::resize_tiled_window`]
     /// and keep the `windows` animation.
-    pub fn resize_tiled_window_from_state(
+    pub fn apply_split_drags(
         &mut self,
-        window: WindowId,
-        resize_state: TiledResizeState,
+        workspace_id: WorkspaceId,
+        drags: &SplitDragPair,
         dx: i32,
         dy: i32,
     ) -> bool {
-        let Some(root) = self.window_root_surface(window) else {
-            return false;
-        };
-        let Some(workspace_id) = self.root_surface_workspace(root) else {
-            return false;
-        };
         let Some(workspace) = self.workspaces.try_get_mut(workspace_id) else {
             return false;
         };
-        let changed = workspace
-            .layout
-            .resize_tiled_window_from_state(window, resize_state, dx, dy);
+        let changed = workspace.layout.apply_split_drags(drags, dx, dy);
         if changed {
             self.relayout_dirty_workspaces();
             let affected = self
                 .workspaces
                 .try_get(workspace_id)
-                .and_then(|workspace| {
-                    workspace
-                        .layout
-                        .resize_affected_windows(window, resize_state)
-                })
+                .map(|workspace| workspace.layout.split_drags_affected_windows(drags))
                 .unwrap_or_default();
             for window in affected {
                 self.sync_window_geometry_goal(window, WindowGeometryMotion::Warp);

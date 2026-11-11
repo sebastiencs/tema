@@ -178,10 +178,16 @@ impl PartialEq for SplitRatio {
 
 impl Eq for SplitRatio {}
 
+/// Default `decorations.resize_grab_extent`, in logical pixels.
+pub const RESIZE_GRAB_EXTENT_DEFAULT: i32 = 10;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecorationsConfig {
     pub rounding: i32,
     pub rounding_power: RoundingPower,
+    /// Logical pixels of resize grab outside a floating frame. Tiled handles use it as
+    /// their minimum span. Read at use time so a reload applies on the next pick.
+    pub resize_grab_extent: i32,
     pub border: BorderDecorationConfig,
     pub shadow: ShadowDecorationConfig,
 }
@@ -457,6 +463,7 @@ struct TilingDragConfigFile {
 struct DecorationsConfigFile {
     rounding: i32,
     rounding_power: f32,
+    resize_grab_extent: i32,
     border: BorderDecorationConfigFile,
     shadow: ShadowDecorationConfigFile,
 }
@@ -698,6 +705,9 @@ impl RuntimeConfig {
             decorations: DecorationsConfig {
                 rounding: sanitize_non_negative_i32(parsed.decorations.rounding),
                 rounding_power: RoundingPower::sanitize(parsed.decorations.rounding_power),
+                resize_grab_extent: sanitize_non_negative_i32(
+                    parsed.decorations.resize_grab_extent,
+                ),
                 border,
                 shadow,
             },
@@ -847,6 +857,7 @@ impl Default for DecorationsConfig {
         Self {
             rounding: 0,
             rounding_power: RoundingPower::DEFAULT,
+            resize_grab_extent: RESIZE_GRAB_EXTENT_DEFAULT,
             border: BorderDecorationConfig::default(),
             shadow: ShadowDecorationConfig::default(),
         }
@@ -981,6 +992,7 @@ impl Default for DecorationsConfigFile {
         Self {
             rounding: defaults.rounding,
             rounding_power: defaults.rounding_power.get(),
+            resize_grab_extent: defaults.resize_grab_extent,
             border: BorderDecorationConfigFile::default(),
             shadow: ShadowDecorationConfigFile::default(),
         }
@@ -2184,6 +2196,7 @@ mod tests {
             [decorations]
             rounding = -5
             rounding_power = 0.0
+            resize_grab_extent = -4
 
             [decorations.border]
             size = -9
@@ -2196,6 +2209,7 @@ mod tests {
         assert_eq!(config.general.inner_gap, 0);
         assert_eq!(config.decorations.border.size, 0);
         assert_eq!(config.decorations.rounding, 0);
+        assert_eq!(config.decorations.resize_grab_extent, 0);
         assert_eq!(config.decorations.rounding_power, RoundingPower::DEFAULT);
         assert_eq!(config.decorations.shadow.power, ShadowPower::DEFAULT);
     }
@@ -2216,6 +2230,8 @@ mod tests {
             RgbaColor::new(0x33, 0x38, 0x44, 0xff)
         );
         assert_eq!(config.decorations.rounding, 0);
+        assert_eq!(config.decorations.resize_grab_extent, RESIZE_GRAB_EXTENT_DEFAULT);
+        assert_eq!(parsed.decorations.resize_grab_extent, RESIZE_GRAB_EXTENT_DEFAULT);
         assert_eq!(config.decorations.rounding_power, RoundingPower::DEFAULT);
     }
 

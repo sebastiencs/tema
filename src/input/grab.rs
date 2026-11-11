@@ -9,8 +9,8 @@ use crate::{
     root_geometry::{CommittedRootGeometry, WindowTargetGeometry},
     runner::Dispatcher,
     seat::{dispatch_client_action, dispatch_client_event, refresh_pointer_focus, SeatClientEvent},
-    state::State,
-    tiling::ExtractedTiledLeaf,
+    state::{State, WorkspaceId},
+    tiling::{ExtractedTiledLeaf, SplitDragPair, SplitPair},
     wayland_objects::xdg_surface::xdg_toplevel::{
         InteractiveSizeConstraints, ToplevelDecorationMode,
     },
@@ -99,6 +99,21 @@ pub(crate) fn apply_interaction_intent(
             let target = anchored_grab_target(state, dispatcher, target);
             start_window_grab(state, dispatcher, &target, intent)
         }
+        InteractionIntent::StartSplitResize { workspace, splits, cursor_edges, origin } => {
+            if options.prepare_window {
+                if let Some(target) = origin {
+                    prepare_window_for_pointer_grab(state, dispatcher, &target);
+                }
+            }
+            start_interactive_split_resize(
+                state,
+                dispatcher,
+                workspace,
+                splits,
+                cursor_edges,
+                origin.and_then(toplevel_window_id),
+            )
+        }
         InteractionIntent::DismissPopupGrab | InteractionIntent::None => false,
     }
 }
@@ -110,15 +125,33 @@ pub(crate) fn apply_pointer_interactive_grab(
     let Some(grab) = state.seat.pointer_interactive_grab else {
         return false;
     };
-    let window = match grab {
-        ActiveGrabState::Move { window, .. }
-        | ActiveGrabState::Resize { window, .. }
-        | ActiveGrabState::ResizeTiled { window, .. } => window,
-        ActiveGrabState::MoveTiled(session) => session.window,
-    };
-    if state.window_root_surface(window).is_none() {
-        abort_pointer_interactive_grab(state, dispatcher, 0);
-        return true;
+    match grab {
+        ActiveGrabState::ResizeSplit { workspace, drags, .. } => {
+            let live = state
+                .workspaces
+                .try_get(workspace)
+                .is_some_and(|workspace| {
+                    drags
+                        .iter()
+                        .any(|drag| workspace.layout.split_drag_resolves(&drag))
+                });
+            if !live {
+                abort_pointer_interactive_grab(state, dispatcher, 0);
+                return true;
+            }
+        }
+        ActiveGrabState::Move { window, .. } | ActiveGrabState::Resize { window, .. } => {
+            if state.window_root_surface(window).is_none() {
+                abort_pointer_interactive_grab(state, dispatcher, 0);
+                return true;
+            }
+        }
+        ActiveGrabState::MoveTiled(session) => {
+            if state.window_root_surface(session.window).is_none() {
+                abort_pointer_interactive_grab(state, dispatcher, 0);
+                return true;
+            }
+        }
     }
     match grab {
         ActiveGrabState::Move { root_surface, initial_pointer_pos, initial_geometry, .. } => {
@@ -194,22 +227,22 @@ pub(crate) fn apply_pointer_interactive_grab(
                 last_size,
             });
         }
-        ActiveGrabState::ResizeTiled {
-            window,
-            root_surface,
-            edges,
+        ActiveGrabState::ResizeSplit {
+            workspace,
+            drags,
+            cursor_edges,
             initial_pointer_pos,
-            resize_state,
+            origin_window,
         } => {
             let dx = (state.seat.pointer_pos.0 - initial_pointer_pos.0).round() as i32;
             let dy = (state.seat.pointer_pos.1 - initial_pointer_pos.1).round() as i32;
-            let changed = state.resize_tiled_window_from_state(window, resize_state, dx, dy);
-            state.seat.pointer_interactive_grab = Some(ActiveGrabState::ResizeTiled {
-                window,
-                root_surface,
-                edges,
+            let changed = state.apply_split_drags(workspace, &drags, dx, dy);
+            state.seat.pointer_interactive_grab = Some(ActiveGrabState::ResizeSplit {
+                workspace,
+                drags,
+                cursor_edges,
                 initial_pointer_pos,
-                resize_state,
+                origin_window,
             });
             if changed {
                 let roots = tiled_resize_active_root_surfaces(state)
@@ -256,17 +289,14 @@ fn settle_pointer_interactive_grab(
         }
     }
     let origin = state.seat.tiled_drag_origin.take();
-    let was_tiled_resize = matches!(grab, ActiveGrabState::ResizeTiled { .. });
+    let was_tiled_resize = matches!(grab, ActiveGrabState::ResizeSplit { .. });
     if cancel {
         if let ActiveGrabState::Resize { window, .. } = grab {
             state.clear_resize_anchor(window);
         }
     }
     if was_tiled_resize && crate::tiling::SNAP_TILED_RESIZE {
-        if let ActiveGrabState::ResizeTiled { window, resize_state, .. } = grab {
-            let windows = crate::tiling::affected_tiled_resize_windows(state, window, resize_state);
-            state.seat.tiled_resize_snap_windows = windows;
-        }
+        state.seat.tiled_resize_snap_windows = crate::tiling::active_split_resize_windows(state);
     }
     state.seat.clear_pointer_interactive_grab();
     crate::session::note_window_changed(state, dispatcher);
@@ -380,24 +410,7 @@ pub(crate) fn tiled_drag_tracks_surface(state: &State, surface: Resolved<WlSurfa
 }
 
 pub(crate) fn tiled_resize_active_root_surfaces(state: &State) -> BTreeSet<Resolved<WlSurfaceId>> {
-    let Some(ActiveGrabState::ResizeTiled { root_surface, resize_state, .. }) =
-        state.seat.pointer_interactive_grab
-    else {
-        return BTreeSet::new();
-    };
-    let Some(window) = state.window_for_root(root_surface) else {
-        return BTreeSet::new();
-    };
-    let Some(workspace_id) = state.root_surface_workspace(root_surface) else {
-        return BTreeSet::new();
-    };
-    let Some(workspace) = state.workspaces.try_get(workspace_id) else {
-        return BTreeSet::new();
-    };
-    workspace
-        .layout
-        .resize_affected_windows(window, resize_state)
-        .unwrap_or_default()
+    crate::tiling::active_split_resize_windows(state)
         .into_iter()
         .filter_map(|window| state.window_root_surface(window))
         .collect()
@@ -498,7 +511,15 @@ fn prepare_window_for_pointer_grab(
             .unwrap_or(target.geometry.target_rect)],
         dispatcher,
     );
-    set_keyboard_focus(state, dispatcher, Some(SurfaceFocus::new(target.root_surface)));
+    let accepts_focus = match target.role {
+        WindowRoleSnapshot::Toplevel { window, .. } => state
+            .toplevel(window)
+            .is_none_or(|toplevel| toplevel.accepts_keyboard_focus()),
+        WindowRoleSnapshot::Unsupported => true,
+    };
+    if accepts_focus {
+        set_keyboard_focus(state, dispatcher, Some(SurfaceFocus::new(target.root_surface)));
+    }
     target
 }
 
@@ -521,14 +542,7 @@ fn start_window_grab(
             WindowRoleSnapshot::Toplevel { window, size_constraints, .. },
         ) => {
             if state.window_is_tiled(window) {
-                start_interactive_tiled_resize(
-                    state,
-                    dispatcher,
-                    target.client_id(),
-                    window,
-                    target.root_surface,
-                    edges,
-                )
+                start_interactive_tiled_resize(state, dispatcher, window, edges)
             } else {
                 start_interactive_resize(
                     state,
@@ -895,21 +909,58 @@ fn start_interactive_resize(
     true
 }
 
+fn resolved_resize_edges(requested: u32, drags: &SplitDragPair) -> u32 {
+    let horizontal = ResizeEdge::Left as u32 | ResizeEdge::Right as u32;
+    let vertical = ResizeEdge::Top as u32 | ResizeEdge::Bottom as u32;
+    let mut edges = 0;
+    if drags.horizontal.is_some() {
+        edges |= requested & horizontal;
+    }
+    if drags.vertical.is_some() {
+        edges |= requested & vertical;
+    }
+    edges
+}
+
+fn toplevel_window_id(target: WindowTarget) -> Option<WindowId> {
+    match target.role {
+        WindowRoleSnapshot::Toplevel { window, .. } => Some(window),
+        WindowRoleSnapshot::Unsupported => None,
+    }
+}
+
+fn start_interactive_split_resize(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    workspace: WorkspaceId,
+    splits: SplitPair,
+    cursor_edges: u32,
+    origin: Option<WindowId>,
+) -> bool {
+    let Some(drags) = state.begin_split_drags(workspace, splits) else {
+        return false;
+    };
+    begin_compositor_pointer_grab(state, dispatcher, resize_cursor_icon_names(cursor_edges));
+    state
+        .seat
+        .start_toplevel_tiled_resize(workspace, drags, cursor_edges, origin);
+    true
+}
+
 fn start_interactive_tiled_resize(
     state: &mut State,
     dispatcher: &mut Dispatcher,
-    client_id: ClientId,
     window: WindowId,
-    root_surface: Resolved<WlSurfaceId>,
     edges: u32,
 ) -> bool {
-    let Some(resize_state) = state.begin_tiled_window_resize(window, edges) else {
+    let Some((workspace, drags)) = state.begin_window_edge_drags(window, edges) else {
         return false;
     };
-    begin_compositor_pointer_grab(state, dispatcher, resize_cursor_icon_names(edges));
+    let cursor_edges = resolved_resize_edges(edges, &drags);
+    begin_compositor_pointer_grab(state, dispatcher, resize_cursor_icon_names(cursor_edges));
     state
         .seat
-        .start_toplevel_tiled_resize(client_id, window, root_surface, edges, resize_state);
+        .start_toplevel_tiled_resize(workspace, drags, cursor_edges, Some(window));
     true
 }
 

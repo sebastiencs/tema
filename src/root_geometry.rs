@@ -25,8 +25,6 @@ pub struct DecorationFrameLayout {
     pub frame_rect: RectI,
     /// Client-declared window rectangle inside the compositor frame.
     pub client_window_rect: RectI,
-    /// Optional titlebar area inside the compositor-owned decoration frame.
-    pub titlebar_rect: Option<RectI>,
 }
 
 /// Final committed geometry snapshot for one root surface.
@@ -104,7 +102,6 @@ impl CommittedRootGeometry {
         compositor_decoration_layout(
             self.frame_rect_global(),
             self.content_rect_global(),
-            self.decoration_insets,
             self.fullscreen,
         )
     }
@@ -558,26 +555,12 @@ fn compositor_decorations_enabled(fullscreen: bool) -> bool {
 fn compositor_decoration_layout(
     frame_rect: RectI,
     client_window_rect: RectI,
-    decoration_insets: DecorationInsets,
     fullscreen: bool,
 ) -> Option<DecorationFrameLayout> {
     if !compositor_decorations_enabled(fullscreen) || frame_rect == client_window_rect {
         return None;
     }
-    Some(DecorationFrameLayout {
-        frame_rect,
-        client_window_rect,
-        titlebar_rect: (decoration_insets.top > 0)
-            .then(|| {
-                RectI::new(
-                    client_window_rect.x,
-                    frame_rect.y,
-                    client_window_rect.width,
-                    decoration_insets.top,
-                )
-            })
-            .flatten(),
-    })
+    Some(DecorationFrameLayout { frame_rect, client_window_rect })
 }
 
 /// Translate committed root-local surface bounds into global compositor space.

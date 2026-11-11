@@ -5305,15 +5305,14 @@ mod tests {
         let second_root = root(&state, second_surface);
         let first_window = state.window_for_root(first_root).expect("first window");
         state.seat.pointer_pos = (100.0, 50.0);
-        let resize_state = state
-            .begin_tiled_window_resize(first_window, crate::tiling::EDGE_RIGHT)
+        let (workspace, drags) = state
+            .begin_window_edge_drags(first_window, crate::tiling::EDGE_RIGHT)
             .expect("left leaf should support right-edge resize");
         state.seat.start_toplevel_tiled_resize(
-            client.client_id(),
-            first_window,
-            first_root,
+            workspace,
+            drags,
             crate::tiling::EDGE_RIGHT,
-            resize_state,
+            Some(first_window),
         );
         let _ = dispatcher.test_take_queued_actions::<ClientManagerAction>();
 

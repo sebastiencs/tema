@@ -914,11 +914,15 @@ mod tests {
     fn raise_resize_and_workspace_move_ignore_a_destroyed_window() {
         let mut state = state_for_tests();
         let (window, _, workspace) = destroyed_window(&mut state);
-        let resize_state = crate::tiling::test_tiled_resize_state();
         assert!(!state.raise_window(window));
         assert!(!state.resize_tiled_window(window, 0, 1, 0));
-        assert!(state.begin_tiled_window_resize(window, 0).is_none());
-        assert!(!state.resize_tiled_window_from_state(window, resize_state, 1, 0));
+        assert!(state.begin_window_edge_drags(window, 0).is_none());
+        assert!(!state.apply_split_drags(
+            workspace,
+            &crate::tiling::SplitDragPair::default(),
+            1,
+            0
+        ));
         assert!(!state.assign_window_to_workspace(window, workspace));
         assert!(!crate::tiling::window_is_tiled(&state, window));
         assert!(!crate::tiling::focus_window(&mut state, window));

@@ -5,6 +5,7 @@ pub(crate) mod interaction;
 pub(crate) mod pick;
 pub(crate) mod pointer_confine;
 pub(crate) mod pointer_lock;
+pub(crate) mod resize_zone;
 pub(crate) mod toplevel_drag;
 pub(crate) mod types;
 
@@ -35,7 +36,7 @@ pub(crate) use {
         surface_focus_pick_at_excluding,
     },
     types::{
-        ActiveGrabState, HitSemantics, InteractionIntent, InteractionStartOptions,
+        ActiveGrabState, CompositorZone, InteractionIntent, InteractionStartOptions,
         PointerInteractiveGrab, ScenePick, SurfaceFocusPick, SurfaceRect, WindowHit,
         WindowRoleSnapshot, WindowSnapshot, WindowTarget, POINTER_INTERACTION_START_OPTIONS,
         PROTOCOL_INTERACTION_START_OPTIONS,

@@ -28,9 +28,9 @@ use crate::{
     runner::Dispatcher,
     state::{
         DragNegotiationState, DragPhase, DragState, DragTargetState, OutputId,
-        PrimarySelectionSourceState, SelectionSourceState, State,
+        PrimarySelectionSourceState, SelectionSourceState, State, WorkspaceId,
     },
-    tiling::TiledResizeState,
+    tiling::SplitDragPair,
     wayland_objects::{
         xdg_surface::xdg_toplevel::{InteractiveSizeConstraints, ToplevelDecorationMode},
         zwlr_layer_surface_v1::LayerLayoutObjectSnapshot,
@@ -41,7 +41,7 @@ use crate::{
 pub use crate::input::SurfaceFocus;
 #[cfg(test)]
 pub(crate) use crate::input::{
-    surface_focus_pick_at, types::PointerFocus, HitSemantics, SurfaceRect,
+    surface_focus_pick_at, types::PointerFocus, CompositorZone, SurfaceRect,
 };
 
 const POINTER_MOVE_CURSOR_ICON_NAMES: &[&str] = &["grab", "grabbing", "move"];
@@ -1124,11 +1124,13 @@ impl SeatState {
             self.popup_grab = None;
         }
         if self.pointer_interactive_grab.is_some_and(|grab| {
+            // A split resize is not tied to one client. It ends on the next
+            // motion when every drag fails to resolve.
             let root_surface = match grab {
                 PointerInteractiveGrab::Move { root_surface, .. }
-                | PointerInteractiveGrab::Resize { root_surface, .. }
-                | PointerInteractiveGrab::ResizeTiled { root_surface, .. } => root_surface,
+                | PointerInteractiveGrab::Resize { root_surface, .. } => root_surface,
                 PointerInteractiveGrab::MoveTiled(session) => session.root_surface,
+                PointerInteractiveGrab::ResizeSplit { .. } => return false,
             };
             root_surface.client_id() == client_id
         }) {
@@ -1519,18 +1521,17 @@ impl SeatState {
 
     pub(crate) fn start_toplevel_tiled_resize(
         &mut self,
-        _client_id: ClientId,
-        window: crate::window::WindowId,
-        root_surface: Resolved<WlSurfaceId>,
-        edges: u32,
-        resize_state: TiledResizeState,
+        workspace: WorkspaceId,
+        drags: SplitDragPair,
+        cursor_edges: u32,
+        origin_window: Option<crate::window::WindowId>,
     ) {
-        self.pointer_interactive_grab = Some(PointerInteractiveGrab::ResizeTiled {
-            window,
-            root_surface,
-            edges,
+        self.pointer_interactive_grab = Some(PointerInteractiveGrab::ResizeSplit {
+            workspace,
+            drags,
+            cursor_edges,
             initial_pointer_pos: self.pointer_pos,
-            resize_state,
+            origin_window,
         });
     }
 
@@ -1540,12 +1541,10 @@ impl SeatState {
         self.intercepted_pointer_buttons.clear();
     }
 
-    pub(crate) fn active_tiled_resize(
-        &self,
-    ) -> Option<(crate::window::WindowId, TiledResizeState)> {
+    pub(crate) fn active_tiled_resize(&self) -> Option<(WorkspaceId, SplitDragPair)> {
         match self.pointer_interactive_grab {
-            Some(PointerInteractiveGrab::ResizeTiled { window, resize_state, .. }) => {
-                Some((window, resize_state))
+            Some(PointerInteractiveGrab::ResizeSplit { workspace, drags, .. }) => {
+                Some((workspace, drags))
             }
             _ => None,
         }
@@ -2752,8 +2751,8 @@ mod xdg_seat_tests {
             pointer_scroll_protocol_events, quiesce_for_session_pause,
             recover_pointer_after_interactive_grab_loss, refresh_visible_cursor_surface_outputs,
             refresh_visible_dnd_icon_surface_outputs, remove_popup_grab, scene_pick_at,
-            set_keyboard_focus, window_hit_at, HitSemantics, PointerAxisChange, PointerScrollAxis,
-            PointerScrollDirection, PointerScrollFrame, PointerScrollSource,
+            set_keyboard_focus, window_hit_at, CompositorZone, PointerAxisChange,
+            PointerScrollAxis, PointerScrollDirection, PointerScrollFrame, PointerScrollSource,
             PointerScrollWireEvent, SeatClientEvent, SeatState,
         },
         crate::{
@@ -4239,7 +4238,7 @@ mod xdg_seat_tests {
 
         let hit = window_hit_at(&state, (80.0, 90.0)).expect("content hit");
         assert_eq!(hit.target.root_surface.object_id(), wl_surface_object_id);
-        assert_eq!(hit.semantics, HitSemantics::SurfaceContent);
+        assert!(hit.zone.is_none());
     }
 
     #[test]
@@ -4274,7 +4273,7 @@ mod xdg_seat_tests {
         ensure_test_root_geometry(&mut state, wl_surface_object_id);
 
         let hit = window_hit_at(&state, (85.0, 50.0)).expect("content hit");
-        assert_eq!(hit.semantics, HitSemantics::SurfaceContent);
+        assert!(hit.zone.is_none());
         assert_eq!(hit.binding_resize_edges, xdg_toplevel::ResizeEdge::Right as u32);
     }
 
@@ -4320,19 +4319,25 @@ mod xdg_seat_tests {
 
         let top_border_hit = window_hit_at(&state, (80.0, 44.0)).expect("top border hit");
         assert_eq!(
-            top_border_hit.semantics,
-            HitSemantics::CompositorResize(xdg_toplevel::ResizeEdge::Top as u32)
+            top_border_hit.zone,
+            Some(CompositorZone::WindowResize {
+                target: top_border_hit.target,
+                edges: xdg_toplevel::ResizeEdge::Top as u32,
+            })
         );
 
         let resize_hit = window_hit_at(&state, (35.0, 90.0)).expect("resize hit");
         assert_eq!(
-            resize_hit.semantics,
-            HitSemantics::CompositorResize(xdg_toplevel::ResizeEdge::Left as u32)
+            resize_hit.zone,
+            Some(CompositorZone::WindowResize {
+                target: resize_hit.target,
+                edges: xdg_toplevel::ResizeEdge::Left as u32,
+            })
         );
     }
 
     #[test]
-    fn client_side_border_resizes_and_the_outer_radius_drops_the_corner() {
+    fn client_side_border_and_rounded_corner_resize() {
         let mut state = state_for_tests();
         state.config.decorations.border.size = 12;
         state.config.decorations.rounding = 18;
@@ -4360,19 +4365,27 @@ mod xdg_seat_tests {
                 .get_mut(wl_surface_object_id)
                 .downcast_mut::<WlSurface>()
                 .unwrap();
-            surface.test_map(ObjectId::from(959usize), 40, 50, 120, 80);
+            surface.test_map(ObjectId::from(959usize), 40, 50, 120, 200);
         }
         ensure_test_root_geometry(&mut state, wl_surface_object_id);
 
         let border_hit = window_hit_at(&state, (34.0, 90.0)).expect("client-side border hit");
         assert_eq!(
-            border_hit.semantics,
-            HitSemantics::CompositorResize(xdg_toplevel::ResizeEdge::Left as u32)
+            border_hit.zone,
+            Some(CompositorZone::WindowResize {
+                target: border_hit.target,
+                edges: xdg_toplevel::ResizeEdge::Left as u32,
+            })
         );
 
-        // Inside the old content radius, outside `rounding + border.size`.
         let corner_hit = window_hit_at(&state, (34.0, 44.0)).expect("outer-corner hit");
-        assert_eq!(corner_hit.semantics, HitSemantics::SurfaceContent);
+        assert_eq!(
+            corner_hit.zone,
+            Some(CompositorZone::WindowResize {
+                target: corner_hit.target,
+                edges: xdg_toplevel::ResizeEdge::TopLeft as u32,
+            })
+        );
 
         state.seat.pointer_pos = (34.0, 90.0);
         handle_pointer_button(&mut state, &mut dispatcher, 0x110, 1, 100);
@@ -4384,7 +4397,7 @@ mod xdg_seat_tests {
     }
 
     #[test]
-    fn window_pointer_hit_treats_rounded_decoration_corner_as_non_border() {
+    fn rounded_decoration_corner_resizes() {
         let mut state = state_for_tests();
         state.config.decorations.border.size = 12;
         state.config.decorations.rounding = 18;
@@ -4425,7 +4438,637 @@ mod xdg_seat_tests {
         ensure_test_root_geometry(&mut state, wl_surface_object_id);
 
         let corner_hit = window_hit_at(&state, (34.0, 38.0)).expect("corner hit");
-        assert_eq!(corner_hit.semantics, HitSemantics::SurfaceContent);
+        assert_eq!(
+            corner_hit.zone,
+            Some(CompositorZone::WindowResize {
+                target: corner_hit.target,
+                edges: xdg_toplevel::ResizeEdge::TopLeft as u32,
+            })
+        );
+
+        let curved = window_hit_at(&state, (41.0, 51.0)).expect("curved content corner");
+        assert_eq!(
+            curved.zone,
+            Some(CompositorZone::WindowResize {
+                target: curved.target,
+                edges: xdg_toplevel::ResizeEdge::TopLeft as u32,
+            })
+        );
+        assert!(scene_pick_at(&state, (41.0, 51.0)).surface_focus.is_none());
+    }
+
+    #[test]
+    fn floating_corner_zone_uses_rounding_and_border() {
+        let mut state = state_for_tests();
+        state.config.decorations.rounding = 20;
+        state.config.decorations.border.size = 10;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let (wl_surface_object_id, xdg_surface_object_id) = insert_xdg_surface(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(261),
+            XdgSurfaceId::from(271),
+        );
+        let toplevel_object_id = assign_toplevel_role(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            xdg_surface_object_id,
+            XdgSurfaceId::from(271),
+            XdgToplevelId::from(281),
+        );
+        {
+            let toplevel = state
+                .objects
+                .get_mut(toplevel_object_id)
+                .downcast_mut::<XdgToplevel>()
+                .unwrap();
+            toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
+        }
+        {
+            let surface = state
+                .objects
+                .get_mut(wl_surface_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            surface.test_map(ObjectId::from(961usize), 40, 50, 200, 160);
+        }
+        ensure_test_root_geometry(&mut state, wl_surface_object_id);
+
+        let layout = state
+            .root_surface_decoration_layout(root(&state, wl_surface_object_id))
+            .unwrap();
+        let corner = (f64::from(layout.frame_rect.x) + 1.0, f64::from(layout.frame_rect.y) + 1.0);
+        let hit = window_hit_at(&state, corner).expect("corner");
+        assert!(matches!(
+            hit.zone,
+            Some(CompositorZone::WindowResize { edges, .. })
+                if edges == xdg_toplevel::ResizeEdge::TopLeft as u32
+        ));
+
+        let interior = (
+            f64::from(layout.client_window_rect.x) + 80.0,
+            f64::from(layout.client_window_rect.y) + 60.0,
+        );
+        assert!(window_hit_at(&state, interior).unwrap().zone.is_none());
+
+        {
+            let toplevel = state
+                .objects
+                .get_mut(toplevel_object_id)
+                .downcast_mut::<XdgToplevel>()
+                .unwrap();
+            toplevel.test_set_maximized(true);
+        }
+        assert!(window_hit_at(&state, corner).unwrap().zone.is_none());
+    }
+
+    #[test]
+    fn hover_cursor_matches_the_press_zone() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 12;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let (wl_surface_object_id, xdg_surface_object_id) = insert_xdg_surface(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(262),
+            XdgSurfaceId::from(272),
+        );
+        let toplevel_object_id = assign_toplevel_role(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            xdg_surface_object_id,
+            XdgSurfaceId::from(272),
+            XdgToplevelId::from(282),
+        );
+        {
+            let toplevel = state
+                .objects
+                .get_mut(toplevel_object_id)
+                .downcast_mut::<XdgToplevel>()
+                .unwrap();
+            toplevel.test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
+        }
+        {
+            let surface = state
+                .objects
+                .get_mut(wl_surface_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            surface.test_map(ObjectId::from(963usize), 40, 50, 120, 80);
+        }
+        ensure_test_root_geometry(&mut state, wl_surface_object_id);
+        let frame = state
+            .root_surface_decoration_layout(root(&state, wl_surface_object_id))
+            .unwrap()
+            .frame_rect;
+
+        let mut y = f64::from(frame.y) + 0.5;
+        while y < f64::from(frame.y2()) {
+            let mut x = f64::from(frame.x) + 0.5;
+            while x < f64::from(frame.x2()) {
+                state.seat.pointer_pos = (x, y);
+                let hover = super::decoration_hover_cursor_icon_names(&state);
+                let zone = window_hit_at(&state, (x, y)).and_then(|hit| hit.zone);
+                let started = super::begin_decoration_pointer_action(&mut state, &mut dispatcher);
+                match zone {
+                    None => {
+                        assert!(hover.is_none());
+                        assert!(!started);
+                    }
+                    Some(CompositorZone::WindowResize { edges, .. }) => {
+                        assert_eq!(hover, Some(crate::input::resize_cursor_icon_names(edges)));
+                        assert!(started);
+                        assert!(matches!(
+                            state.seat.pointer_interactive_grab,
+                            Some(super::PointerInteractiveGrab::Resize { edges: grab_edges, .. })
+                                if grab_edges == edges
+                        ));
+                        crate::input::abort_pointer_interactive_grab(
+                            &mut state,
+                            &mut dispatcher,
+                            0,
+                        );
+                    }
+                    Some(CompositorZone::SplitResize { .. }) => {
+                        panic!("floating window produced a split zone")
+                    }
+                }
+                x += 24.0;
+            }
+            y += 24.0;
+        }
+    }
+
+    #[test]
+    fn tiled_outer_border_is_not_a_zone_and_a_shared_border_is() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 8;
+        state.config.general.inner_gap = 0;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let left = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(263),
+            XdgSurfaceId::from(273),
+            XdgToplevelId::from(283),
+            964,
+            0,
+            0,
+            200,
+            200,
+        );
+        let _right = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(264),
+            XdgSurfaceId::from(274),
+            XdgToplevelId::from(284),
+            965,
+            0,
+            0,
+            200,
+            200,
+        );
+        let layout = state
+            .root_surface_decoration_layout(root(&state, left))
+            .unwrap();
+        let mid_y = f64::from(layout.frame_rect.y) + f64::from(layout.frame_rect.height) / 2.0;
+        let outer = (f64::from(layout.frame_rect.x) + 1.0, mid_y);
+        let outer_hit = window_hit_at(&state, outer).expect("outer border");
+        assert!(outer_hit.zone.is_none());
+        state.seat.pointer_pos = outer;
+        assert!(!super::begin_decoration_pointer_action(&mut state, &mut dispatcher));
+
+        let content = (
+            f64::from(layout.client_window_rect.x) + 4.0,
+            f64::from(layout.client_window_rect.y) + 4.0,
+        );
+        let content_pick = scene_pick_at(&state, content);
+        assert!(content_pick.zone.is_none());
+        assert!(content_pick.surface_focus.is_some());
+
+        let shared = (f64::from(layout.frame_rect.x2()) - 1.0, mid_y);
+        assert!(matches!(
+            window_hit_at(&state, shared).and_then(|hit| hit.zone),
+            Some(CompositorZone::SplitResize { .. })
+        ));
+    }
+
+    #[test]
+    fn floating_extent_over_a_tiled_window_is_a_resize_zone() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 10;
+        state.config.decorations.resize_grab_extent = 10;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let _left = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(301),
+            XdgSurfaceId::from(311),
+            XdgToplevelId::from(321),
+            1001,
+            0,
+            0,
+            200,
+            200,
+        );
+        let _right = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(302),
+            XdgSurfaceId::from(312),
+            XdgToplevelId::from(322),
+            1002,
+            0,
+            0,
+            200,
+            200,
+        );
+        let floating = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(303),
+            XdgSurfaceId::from(313),
+            XdgToplevelId::from(323),
+            1003,
+            0,
+            0,
+            200,
+            200,
+        );
+        let floating_root = root(&state, floating);
+        let floating_window = state.window_for_root(floating_root).unwrap();
+        assert!(state.set_window_floating(floating_window, true));
+        state
+            .objects
+            .get_mut(floating)
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .set_root_position(400, 200);
+        ensure_test_root_geometry(&mut state, floating);
+        let frame = state
+            .committed_root_geometry(floating_root)
+            .unwrap()
+            .frame_rect_global();
+        let outside =
+            (f64::from(frame.x) - 5.0, f64::from(frame.y) + f64::from(frame.height) / 2.0);
+        let pick = scene_pick_at(&state, outside);
+        assert!(pick.surface_focus.is_none());
+        assert!(matches!(
+            pick.zone,
+            Some(CompositorZone::WindowResize { target, edges })
+                if target.root_surface == floating_root
+                    && edges == xdg_toplevel::ResizeEdge::Left as u32
+        ));
+    }
+
+    #[test]
+    fn popup_inside_a_floating_extent_keeps_focus_and_has_no_zone() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 10;
+        state.config.decorations.resize_grab_extent = 10;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let _tiled = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(304),
+            XdgSurfaceId::from(314),
+            XdgToplevelId::from(324),
+            1004,
+            0,
+            0,
+            200,
+            200,
+        );
+        let floating = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(305),
+            XdgSurfaceId::from(315),
+            XdgToplevelId::from(325),
+            1005,
+            0,
+            0,
+            200,
+            200,
+        );
+        let floating_root = root(&state, floating);
+        assert!(state.set_window_floating(state.window_for_root(floating_root).unwrap(), true));
+        state
+            .objects
+            .get_mut(floating)
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .set_root_position(400, 200);
+        ensure_test_root_geometry(&mut state, floating);
+        let frame = state
+            .committed_root_geometry(floating_root)
+            .unwrap()
+            .frame_rect_global();
+        let parent_origin = state
+            .objects
+            .get(floating)
+            .downcast_ref::<WlSurface>()
+            .unwrap()
+            .root_position();
+        let popup_origin = (frame.x - 8, frame.y + frame.height / 2);
+        let (popup_wl, popup_xdg) = insert_xdg_surface(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(306),
+            XdgSurfaceId::from(316),
+        );
+        state
+            .objects
+            .get_mut(popup_wl)
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .test_map(ObjectId::from(1006usize), 0, 0, 6, 6);
+        let parent_xdg = floating_root
+            .try_ref(&state)
+            .unwrap()
+            .xdg_surface()
+            .unwrap();
+        let popup_xdg_resolved =
+            Resolved::new(client.client_id(), XdgSurfaceId::from(316), popup_xdg);
+        let (_, popup_object_id) = state.insert_object(XdgPopup::new(
+            XdgPopupId::from(326),
+            popup_xdg_resolved,
+            Some(parent_xdg),
+            PositionerState::default(),
+            7,
+        ));
+        let popup = Resolved::new(client.client_id(), XdgPopupId::from(326), popup_object_id);
+        state
+            .objects
+            .get_mut(popup_object_id)
+            .downcast_mut::<XdgPopup>()
+            .unwrap()
+            .apply_acked_configure(RectI {
+                x: popup_origin.0 - parent_origin.0,
+                y: popup_origin.1 - parent_origin.1,
+                width: 6,
+                height: 6,
+            });
+        state
+            .objects
+            .get_mut(popup_xdg)
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .test_set_current_window_geometry(Some(RectI { x: 0, y: 0, width: 6, height: 6 }));
+        state
+            .objects
+            .get_mut(popup_xdg)
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .test_set_popup_role(popup);
+        state
+            .objects
+            .get_mut(parent_xdg.object_id())
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .add_popup_child(popup);
+
+        let pick = scene_pick_at(
+            &state,
+            (f64::from(popup_origin.0) + 2.0, f64::from(popup_origin.1) + 2.0),
+        );
+        assert!(pick.zone.is_none());
+        assert_eq!(
+            pick.surface_focus
+                .map(|focus| focus.target.surface.object_id()),
+            Some(popup_wl)
+        );
+    }
+
+    #[test]
+    fn gap_between_tiles_resizes_until_a_floating_window_covers_it() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 8;
+        state.config.general.inner_gap = 10;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let left = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(307),
+            XdgSurfaceId::from(317),
+            XdgToplevelId::from(327),
+            1007,
+            0,
+            0,
+            200,
+            200,
+        );
+        let right = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(308),
+            XdgSurfaceId::from(318),
+            XdgToplevelId::from(328),
+            1008,
+            0,
+            0,
+            200,
+            200,
+        );
+        let left_frame = state
+            .committed_root_geometry(root(&state, left))
+            .unwrap()
+            .frame_rect_global();
+        let right_frame = state
+            .committed_root_geometry(root(&state, right))
+            .unwrap()
+            .frame_rect_global();
+        let gap = gap_midpoint(left_frame, right_frame);
+        let pick = scene_pick_at(&state, gap);
+        assert!(pick.surface_focus.is_none());
+        assert!(pick.window_target.is_none());
+        assert!(matches!(pick.zone, Some(CompositorZone::SplitResize { .. })));
+        state.seat.pointer_pos = gap;
+        assert!(super::decoration_hover_cursor_icon_names(&state).is_some());
+        drop(client_dispatcher);
+        assert!(super::begin_decoration_pointer_action(&mut state, &mut dispatcher));
+        assert!(matches!(
+            state.seat.pointer_interactive_grab,
+            Some(super::PointerInteractiveGrab::ResizeSplit { origin_window: None, .. })
+        ));
+        crate::input::abort_pointer_interactive_grab(&mut state, &mut dispatcher, 0);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+
+        let floating = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(309),
+            XdgSurfaceId::from(319),
+            XdgToplevelId::from(329),
+            1009,
+            0,
+            0,
+            200,
+            200,
+        );
+        let floating_root = root(&state, floating);
+        assert!(state.set_window_floating(state.window_for_root(floating_root).unwrap(), true));
+        let left_frame = state
+            .committed_root_geometry(root(&state, left))
+            .unwrap()
+            .frame_rect_global();
+        let right_frame = state
+            .committed_root_geometry(root(&state, right))
+            .unwrap()
+            .frame_rect_global();
+        let gap = gap_midpoint(left_frame, right_frame);
+        state
+            .objects
+            .get_mut(floating)
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .set_root_position(gap.0.round() as i32 - 40, gap.1.round() as i32 - 40);
+        ensure_test_root_geometry(&mut state, floating);
+        let covered = scene_pick_at(&state, gap);
+        assert!(covered.zone.is_none());
+        assert_eq!(covered.surface_focus.map(|focus| focus.target.surface), Some(floating_root));
+    }
+
+    #[test]
+    fn top_layer_over_a_gap_wins() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 8;
+        state.config.general.inner_gap = 10;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let left = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(331),
+            XdgSurfaceId::from(341),
+            XdgToplevelId::from(351),
+            1011,
+            0,
+            0,
+            200,
+            200,
+        );
+        let right = map_toplevel_on_active_output(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(332),
+            XdgSurfaceId::from(342),
+            XdgToplevelId::from(352),
+            1012,
+            0,
+            0,
+            200,
+            200,
+        );
+        let left_frame = state
+            .committed_root_geometry(root(&state, left))
+            .unwrap()
+            .frame_rect_global();
+        let right_frame = state
+            .committed_root_geometry(root(&state, right))
+            .unwrap()
+            .frame_rect_global();
+        let gap = gap_midpoint(left_frame, right_frame);
+        let output_id = state.outputs.iter().next().unwrap().0;
+        let layer_object = insert_surface(&mut state, &mut client, WlSurfaceId::from(333));
+        let layer_root = root(&state, layer_object);
+        layer_root.ref_mut(&mut state).test_map(
+            ObjectId::from(1013usize),
+            gap.0.round() as i32 - 20,
+            gap.1.round() as i32 - 20,
+            40,
+            40,
+        );
+        let mut layer = ZwlrLayerSurfaceV1::new(
+            ZwlrLayerSurfaceV1Id::from(334),
+            Resolved::new(client.client_id(), ZwlrLayerShellV1Id::from(6), ObjectId::from(6usize)),
+            4,
+            layer_root,
+            Some(output_id),
+            LayerShellLayer::Top,
+            "bar".to_string(),
+        );
+        layer.test_set_mapped(true);
+        let (layer_resolved, _) = client.insert_object(&mut state, layer);
+        state.register_layer_surface_object(layer_resolved);
+        layer_root
+            .ref_mut(&mut state)
+            .set_layer_surface_impl(layer_resolved);
+
+        let pick = scene_pick_at(&state, gap);
+        assert!(pick.zone.is_none());
+        assert_eq!(pick.surface_focus.map(|focus| focus.target.surface), Some(layer_root));
+    }
+
+    #[test]
+    fn zero_border_floating_extent_is_outside_the_content() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 0;
+        state.config.decorations.resize_grab_extent = 10;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let (wl_surface_object_id, xdg_surface_object_id) = insert_xdg_surface(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            WlSurfaceId::from(335),
+            XdgSurfaceId::from(345),
+        );
+        assign_toplevel_role(
+            &mut state,
+            &mut client,
+            &mut client_dispatcher,
+            xdg_surface_object_id,
+            XdgSurfaceId::from(345),
+            XdgToplevelId::from(355),
+        );
+        state
+            .objects
+            .get_mut(wl_surface_object_id)
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .test_map(ObjectId::from(1014usize), 40, 50, 200, 160);
+        ensure_test_root_geometry(&mut state, wl_surface_object_id);
+        let content = state
+            .committed_root_geometry(root(&state, wl_surface_object_id))
+            .unwrap()
+            .content_rect_global();
+        let inside_extent =
+            (f64::from(content.x) - 5.0, f64::from(content.y) + f64::from(content.height) / 2.0);
+        let pick = scene_pick_at(&state, inside_extent);
+        assert!(pick.surface_focus.is_none());
+        assert!(matches!(
+            pick.zone,
+            Some(CompositorZone::WindowResize { edges, .. })
+                if edges == xdg_toplevel::ResizeEdge::Left as u32
+        ));
+        let outside_extent =
+            (f64::from(content.x) - 11.0, f64::from(content.y) + f64::from(content.height) / 2.0);
+        assert!(scene_pick_at(&state, outside_extent).zone.is_none());
     }
 
     #[test]
@@ -4842,6 +5485,30 @@ mod xdg_seat_tests {
             (pointer.0 - size.0 as f64 / 2.0).round() as i32,
             (pointer.1 - size.1 as f64 / 2.0).round() as i32,
         )
+    }
+
+    fn gap_midpoint(first: RectI, second: RectI) -> (f64, f64) {
+        if first.x2() <= second.x {
+            (
+                f64::from(first.x2() + second.x) / 2.0,
+                f64::from(first.y) + f64::from(first.height) / 2.0,
+            )
+        } else if second.x2() <= first.x {
+            (
+                f64::from(second.x2() + first.x) / 2.0,
+                f64::from(second.y) + f64::from(second.height) / 2.0,
+            )
+        } else if first.y2() <= second.y {
+            (
+                f64::from(first.x) + f64::from(first.width) / 2.0,
+                f64::from(first.y2() + second.y) / 2.0,
+            )
+        } else {
+            (
+                f64::from(second.x) + f64::from(second.width) / 2.0,
+                f64::from(second.y2() + first.y) / 2.0,
+            )
+        }
     }
 
     fn layout_rect(state: &State, object_id: ObjectId) -> RectI {
@@ -6190,45 +6857,37 @@ mod xdg_seat_tests {
     }
 
     #[test]
-    fn tiled_resize_grab_is_cleared_on_client_removal() {
+    fn split_resize_grab_survives_client_removal() {
         let mut state = state_for_tests();
         let (client, _dispatcher) = test_client_and_dispatcher(7);
 
-        state.seat.pointer_interactive_grab = Some(super::PointerInteractiveGrab::ResizeTiled {
-            window: crate::window::WindowId::for_tests(1),
-            root_surface: crate::clients::Resolved::new(
-                client.client_id(),
-                WlSurfaceId::from(999u32),
-                ObjectId::from(999usize),
-            ),
-            edges: xdg_toplevel::ResizeEdge::Right as u32,
+        state.seat.pointer_interactive_grab = Some(super::PointerInteractiveGrab::ResizeSplit {
+            workspace: crate::state::WorkspaceId::from_parts(0, 1),
+            drags: crate::tiling::SplitDragPair::default(),
+            cursor_edges: xdg_toplevel::ResizeEdge::Right as u32,
             initial_pointer_pos: (10.0, 20.0),
-            resize_state: crate::tiling::test_tiled_resize_state(),
+            origin_window: Some(crate::window::WindowId::for_tests(1)),
         });
         state.seat.intercepted_pointer_buttons.insert(0x111);
 
         let removal = state.seat.remove_client(client.client_id());
 
-        assert!(removal.interactive_grab_cleared);
-        assert!(state.seat.pointer_interactive_grab.is_none());
-        assert!(state.seat.intercepted_pointer_buttons.is_empty());
+        assert!(!removal.interactive_grab_cleared);
+        assert!(state.seat.pointer_interactive_grab.is_some());
+        assert!(state.seat.intercepted_pointer_buttons.contains(&0x111));
     }
 
     #[test]
     fn tiled_resize_release_dispatches_workspace_state_changed() {
         let mut state = state_for_tests();
-        let (client, mut dispatcher) = test_client_and_dispatcher(7);
+        let (_client, mut dispatcher) = test_client_and_dispatcher(7);
 
-        state.seat.pointer_interactive_grab = Some(super::PointerInteractiveGrab::ResizeTiled {
-            window: crate::window::WindowId::for_tests(1),
-            root_surface: crate::clients::Resolved::new(
-                client.client_id(),
-                WlSurfaceId::from(999u32),
-                ObjectId::from(999usize),
-            ),
-            edges: xdg_toplevel::ResizeEdge::Right as u32,
+        state.seat.pointer_interactive_grab = Some(super::PointerInteractiveGrab::ResizeSplit {
+            workspace: crate::state::WorkspaceId::from_parts(0, 1),
+            drags: crate::tiling::SplitDragPair::default(),
+            cursor_edges: xdg_toplevel::ResizeEdge::Right as u32,
             initial_pointer_pos: (10.0, 20.0),
-            resize_state: crate::tiling::test_tiled_resize_state(),
+            origin_window: Some(crate::window::WindowId::for_tests(1)),
         });
 
         finish_pointer_interactive_grab(&mut state, &mut dispatcher, 0);

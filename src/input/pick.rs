@@ -2,7 +2,7 @@ use crate::{
     clients::Resolved,
     protocol_generated::{xdg_toplevel::ResizeEdge, WlSurfaceId, XdgSurfaceId},
     region::RectI,
-    scene::{compose_global_root_order, compose_output},
+    scene::{compose_global_root_order, compose_output, CompositionTier},
     state::State,
     wayland_objects::{
         wl_surface::{Role, StackEntry, WlSurface},
@@ -11,8 +11,10 @@ use crate::{
 };
 
 use super::{
-    ScenePick, SurfaceFocus, SurfaceFocusPick, SurfaceRect, WindowRoleSnapshot, WindowSnapshot,
-    WindowTarget,
+    interaction::window_allows_compositor_interaction,
+    resize_zone::{corner_len, floating_resize_edges, FrameZoneParams},
+    CompositorZone, ScenePick, SurfaceFocus, SurfaceFocusPick, SurfaceRect, WindowRoleSnapshot,
+    WindowSnapshot, WindowTarget,
 };
 
 pub(crate) fn scene_pick_at(state: &State, pointer_pos: (f64, f64)) -> ScenePick {
@@ -33,33 +35,37 @@ pub(crate) fn scene_pick_at_excluding(
     // come only from that output's interactive participants.
     if state.outputs.iter().next().is_none() {
         let ordered_roots = compose_global_root_order(state, &scene, None);
-        return pick_roots(
-            state,
-            pointer_pos,
-            ordered_roots
-                .into_iter()
-                .rev()
-                .filter(move |root| Some(*root) != excluded),
-        );
+        let roots = ordered_roots
+            .into_iter()
+            .rev()
+            .filter(move |root| Some(*root) != excluded)
+            .map(|root| PickRoot { root, tier: None })
+            .collect::<Vec<_>>();
+        return pick_roots(state, pointer_pos, &roots, None);
     }
     let Some(output_id) = pointer_output(state, pointer_pos) else {
-        return ScenePick { surface_focus: None, window_target: None };
+        return ScenePick { surface_focus: None, window_target: None, zone: None };
     };
     let view = compose_output(state, &scene, output_id, None);
-    pick_roots(
-        state,
-        pointer_pos,
-        view.entries
-            .iter()
-            .rev()
-            .filter(|entry| {
-                entry.participates_in_input
-                    || (entry.participates_in_render
-                        && state.root_surface_is_mapped(entry.root_surface))
-            })
-            .map(|entry| entry.root_surface)
-            .filter(move |root| Some(*root) != excluded),
-    )
+    let roots = view
+        .entries
+        .iter()
+        .rev()
+        .filter(|entry| {
+            entry.participates_in_input
+                || (entry.participates_in_render
+                    && state.root_surface_is_mapped(entry.root_surface))
+        })
+        .filter(|entry| Some(entry.root_surface) != excluded)
+        .map(|entry| PickRoot { root: entry.root_surface, tier: Some(entry.tier) })
+        .collect::<Vec<_>>();
+    let handle_hit = active_split_handle_zone(state, output_id, pointer_pos);
+    pick_roots(state, pointer_pos, &roots, handle_hit)
+}
+
+struct PickRoot {
+    root: Resolved<WlSurfaceId>,
+    tier: Option<CompositionTier>,
 }
 
 /// Global top-left of `surface`.
@@ -102,39 +108,240 @@ fn surface_global_origin_depth(
 fn pick_roots(
     state: &State,
     pointer_pos: (f64, f64),
-    roots: impl Iterator<Item = Resolved<WlSurfaceId>>,
+    roots: &[PickRoot],
+    handle_hit: Option<CompositorZone>,
 ) -> ScenePick {
-    for root_surface in roots {
-        let Some(surface) = root_surface.try_ref(state) else {
-            continue;
-        };
-        if !surface.is_root()
-            || surface.has_cursor_role()
-            || surface.has_dnd_icon_role()
-            || surface.has_lock_surface_role()
-            || surface.is_hidden_xwayland_surface()
-            || surface.has_input_popup_role()
-        {
-            continue;
+    let mut passed_handle_layer = false;
+    for (index, candidate) in roots.iter().enumerate() {
+        // Handles sit under floating windows and Top/Overlay layers, and over tiled windows.
+        if !passed_handle_layer && split_handle_layer_starts(state, candidate) {
+            passed_handle_layer = true;
+            if let Some(zone) = handle_hit {
+                return split_resize_pick(state, pointer_pos, &roots[index..], zone);
+            }
         }
-        let hit_pos = state.logical_pointer_for_surface(root_surface, pointer_pos);
-        let root_hit = hit_test_subtree(state, root_surface, 0, 0, hit_pos.0, hit_pos.1);
-        let has_mapped_bounds =
-            WlSurface::local_surface_tree_bounds_from_ref(state, &surface).is_some();
-        let window_target_for_root = has_mapped_bounds
-            .then(|| state.committed_root_geometry(root_surface))
-            .flatten()
-            .filter(|geometry| rect_contains_point(geometry.window_target_rect(), hit_pos))
-            .and_then(|_| build_window_target(state, root_surface));
-        if root_hit.is_some() || window_target_for_root.is_some() {
-            return ScenePick {
-                surface_focus: root_hit,
-                window_target: window_target_for_root,
-            };
+        if let Some(pick) = try_pick_root(state, pointer_pos, candidate.root) {
+            return pick;
         }
     }
+    if !passed_handle_layer {
+        if let Some(zone) = handle_hit {
+            return split_resize_pick(state, pointer_pos, &[], zone);
+        }
+    }
+    ScenePick { surface_focus: None, window_target: None, zone: None }
+}
 
-    ScenePick { surface_focus: None, window_target: None }
+fn split_handle_layer_starts(state: &State, candidate: &PickRoot) -> bool {
+    match candidate.tier {
+        Some(CompositionTier::Background | CompositionTier::Bottom) => true,
+        _ => state
+            .window_for_root(candidate.root)
+            .is_some_and(|window| state.window_is_tiled(window)),
+    }
+}
+
+fn active_split_handle_zone(
+    state: &State,
+    output_id: crate::state::OutputId,
+    pointer_pos: (f64, f64),
+) -> Option<CompositorZone> {
+    let workspace = state.active_workspace_for_output(output_id)?;
+    let handles = &state.workspaces.try_get(workspace)?.layout.split_handles;
+    let (splits, cursor_edges) = crate::tiling::split_handles_at(
+        handles,
+        pointer_pos,
+        f64::from(corner_len(
+            state.config.decorations.rounding,
+            state.config.decorations.border.size,
+        )),
+    )?;
+    Some(CompositorZone::SplitResize { workspace, splits, cursor_edges })
+}
+
+fn split_resize_pick(
+    state: &State,
+    pointer_pos: (f64, f64),
+    roots_from_here: &[PickRoot],
+    zone: CompositorZone,
+) -> ScenePick {
+    let window_target = roots_from_here.iter().find_map(|candidate| {
+        let target = build_window_target(state, candidate.root)?;
+        let WindowRoleSnapshot::Toplevel { window, .. } = target.role else {
+            return None;
+        };
+        if !state.window_is_tiled(window) {
+            return None;
+        }
+        let hit_pos = state.logical_pointer_for_surface(candidate.root, pointer_pos);
+        let frame = state
+            .committed_root_geometry(candidate.root)?
+            .frame_rect_global();
+        rect_contains_point(frame, hit_pos).then_some(target)
+    });
+    ScenePick { surface_focus: None, window_target, zone: Some(zone) }
+}
+
+fn try_pick_root(
+    state: &State,
+    pointer_pos: (f64, f64),
+    root_surface: Resolved<WlSurfaceId>,
+) -> Option<ScenePick> {
+    let surface = root_surface.try_ref(state)?;
+    if !surface.is_root()
+        || surface.has_cursor_role()
+        || surface.has_dnd_icon_role()
+        || surface.has_lock_surface_role()
+        || surface.is_hidden_xwayland_surface()
+        || surface.has_input_popup_role()
+    {
+        return None;
+    }
+    let hit_pos = state.logical_pointer_for_surface(root_surface, pointer_pos);
+    if let Some(pick) = floating_extent_scene_pick(state, root_surface, hit_pos) {
+        return Some(pick);
+    }
+    let root_hit = hit_test_subtree(state, root_surface, 0, 0, hit_pos.0, hit_pos.1);
+    let has_mapped_bounds =
+        WlSurface::local_surface_tree_bounds_from_ref(state, &surface).is_some();
+    let window_target_for_root = has_mapped_bounds
+        .then(|| state.committed_root_geometry(root_surface))
+        .flatten()
+        .filter(|geometry| rect_contains_point(geometry.window_target_rect(), hit_pos))
+        .and_then(|_| build_window_target(state, root_surface));
+    if root_hit.is_none() && window_target_for_root.is_none() {
+        return None;
+    }
+    let mut zone = window_target_for_root
+        .as_ref()
+        .and_then(|target| compositor_zone_for_target(state, target, hit_pos));
+    let surface_focus = match (&zone, &root_hit) {
+        (Some(_), Some(hit)) if hit_is_popup_of_root(state, hit.target.surface, root_surface) => {
+            zone = None;
+            root_hit
+        }
+        (Some(_), _) => None,
+        (None, _) => root_hit,
+    };
+    Some(ScenePick { surface_focus, window_target: window_target_for_root, zone })
+}
+
+/// Eligible floating window: the ring outside the frame, the border, or a curved corner.
+///
+/// A popup of this root keeps pointer focus and suppresses the zone. The extent never
+/// becomes a focus target, and `window_target_rect` stays the frame.
+fn floating_extent_scene_pick(
+    state: &State,
+    root_surface: Resolved<WlSurfaceId>,
+    hit_pos: (f64, f64),
+) -> Option<ScenePick> {
+    let target = build_window_target(state, root_surface)?;
+    let edges = floating_resize_edges_for_target(state, &target, hit_pos)?;
+    let popup_hit = hit_test_subtree(state, root_surface, 0, 0, hit_pos.0, hit_pos.1)
+        .filter(|hit| hit_is_popup_of_root(state, hit.target.surface, root_surface));
+    if popup_hit.is_some() {
+        return Some(ScenePick {
+            surface_focus: popup_hit,
+            window_target: Some(target),
+            zone: None,
+        });
+    }
+    Some(ScenePick {
+        surface_focus: None,
+        window_target: Some(target),
+        zone: Some(CompositorZone::WindowResize { target, edges }),
+    })
+}
+
+/// `Role` has no popup variant. Climb subsurface parents, then `popup_parent_surface`.
+fn hit_is_popup_of_root(
+    state: &State,
+    mut surface: Resolved<WlSurfaceId>,
+    root: Resolved<WlSurfaceId>,
+) -> bool {
+    for _ in 0..32 {
+        while let Some(parent) = surface
+            .try_ref(state)
+            .and_then(|wl_surface| wl_surface.parent_surface().copied())
+        {
+            surface = parent;
+        }
+        if surface == root {
+            return false;
+        }
+        let Some(popup_parent) = state.popup_parent_surface(surface) else {
+            return false;
+        };
+        if popup_parent == root {
+            return true;
+        }
+        surface = popup_parent;
+    }
+    false
+}
+
+fn floating_resize_edges_for_target(
+    state: &State,
+    target: &WindowSnapshot,
+    pointer: (f64, f64),
+) -> Option<u32> {
+    if !window_allows_compositor_interaction(target) {
+        return None;
+    }
+    let WindowRoleSnapshot::Toplevel { window, is_maximized, .. } = target.role else {
+        return None;
+    };
+    if state.window_is_tiled(window) || is_maximized {
+        return None;
+    }
+    let geometry = state.committed_root_geometry(target.root_surface)?;
+    floating_resize_edges(
+        &FrameZoneParams {
+            frame: geometry.frame_rect_global(),
+            content: geometry.content_rect_global(),
+            extent: state.config.decorations.resize_grab_extent,
+            corner_len: corner_len(
+                state.config.decorations.rounding,
+                state.config.decorations.border.size,
+            ),
+            content_clip: state
+                .root_surface_window_clip(target.root_surface)
+                .map(|clip| clip.clip()),
+        },
+        pointer,
+    )
+}
+
+/// Floating edges, or the split handles under a tiled window.
+///
+/// The point is already inside this root's frame. The outward floating ring is handled
+/// before the surface test. Output-less picks still resolve a handle that lies on a tile.
+fn compositor_zone_for_target(
+    state: &State,
+    target: &WindowSnapshot,
+    pointer: (f64, f64),
+) -> Option<CompositorZone> {
+    if !window_allows_compositor_interaction(target) {
+        return None;
+    }
+    let WindowRoleSnapshot::Toplevel { window, .. } = target.role else {
+        return None;
+    };
+    if state.window_is_tiled(window) {
+        let workspace = state.root_surface_workspace(target.root_surface)?;
+        let handles = &state.workspaces.try_get(workspace)?.layout.split_handles;
+        let (splits, cursor_edges) = crate::tiling::split_handles_at(
+            handles,
+            pointer,
+            f64::from(corner_len(
+                state.config.decorations.rounding,
+                state.config.decorations.border.size,
+            )),
+        )?;
+        return Some(CompositorZone::SplitResize { workspace, splits, cursor_edges });
+    }
+    let edges = floating_resize_edges_for_target(state, target, pointer)?;
+    Some(CompositorZone::WindowResize { target: *target, edges })
 }
 
 fn pointer_output(state: &State, pointer_pos: (f64, f64)) -> Option<crate::state::OutputId> {
@@ -390,22 +597,22 @@ fn hit_test_subtree(
 
 fn pick_mapped_lock_surface(state: &State, pointer_pos: (f64, f64)) -> ScenePick {
     let Some(output_id) = pointer_output(state, pointer_pos) else {
-        return ScenePick { surface_focus: None, window_target: None };
+        return ScenePick { surface_focus: None, window_target: None, zone: None };
     };
     if !state.session_lock.shows_lock_surface(output_id) {
-        return ScenePick { surface_focus: None, window_target: None };
+        return ScenePick { surface_focus: None, window_target: None, zone: None };
     }
     let Some(lock_surface) = state.session_lock.surface_for_output(output_id) else {
-        return ScenePick { surface_focus: None, window_target: None };
+        return ScenePick { surface_focus: None, window_target: None, zone: None };
     };
     let Some(surface) = lock_surface
         .try_ref(state)
         .map(|lock_surface| lock_surface.wl_surface())
     else {
-        return ScenePick { surface_focus: None, window_target: None };
+        return ScenePick { surface_focus: None, window_target: None, zone: None };
     };
     let Some(bounds) = state.output_bounds(output_id) else {
-        return ScenePick { surface_focus: None, window_target: None };
+        return ScenePick { surface_focus: None, window_target: None, zone: None };
     };
     ScenePick {
         surface_focus: hit_test_lock_tree(
@@ -417,6 +624,7 @@ fn pick_mapped_lock_surface(state: &State, pointer_pos: (f64, f64)) -> ScenePick
             pointer_pos.1,
         ),
         window_target: None,
+        zone: None,
     }
 }
 
@@ -962,6 +1170,7 @@ mod tests {
         assert!(scene_pick_at(&state, (20.0, 45.0)).surface_focus.is_none());
 
         let hit = crate::input::window_hit_at(&state, (270.0, 45.0)).unwrap();
+        assert!(hit.zone.is_none());
         assert_eq!(hit.binding_resize_edges, ResizeEdge::Right as u32);
     }
 

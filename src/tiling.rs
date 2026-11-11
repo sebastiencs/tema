@@ -30,6 +30,7 @@ pub const EDGE_RIGHT: u32 = 8;
 pub const SNAP_TILED_RESIZE: bool = true;
 
 const MIN_CHILD_WEIGHT: f64 = 0.1;
+const MIN_SPLIT_HANDLE_SPAN: i32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GapPolicy {
@@ -102,6 +103,7 @@ pub struct ContainerNode {
     pub parent: Option<LayoutNodeId>,
     pub children: Vec<LayoutChild>,
     pub focused_child: Option<usize>,
+    pub last_applied_rect: Option<RectI>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,14 +130,82 @@ pub struct FullscreenState {
     pub window: WindowId,
 }
 
+/// Boundary between `children[first]` and `children[first + 1]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitRef {
+    pub container: LayoutNodeId,
+    pub first: usize,
+}
+
+/// One split on each axis. A corner sets both; a single edge sets one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitPair {
+    pub horizontal: Option<SplitRef>,
+    pub vertical: Option<SplitRef>,
+}
+
+impl SplitPair {
+    pub fn is_empty(self) -> bool {
+        self.horizontal.is_none() && self.vertical.is_none()
+    }
+}
+
+/// A split resize anchored to the two child node ids, not their indices.
+///
+/// Positive [`WorkspaceLayout::apply_split_drag`] grows `first_id`.
 #[derive(Clone, Copy, Debug)]
-pub struct TiledResizeState {
+pub struct SplitDrag {
+    split: SplitRef,
     axis: SplitAxis,
-    leaf_index: usize,
-    neighbor_index: usize,
+    first_id: LayoutNodeId,
+    second_id: LayoutNodeId,
     pair_weight: f64,
-    initial_leaf_weight: f64,
+    initial_first_weight: f64,
     axis_span: i32,
+}
+
+/// At most one drag per axis.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SplitDragPair {
+    pub horizontal: Option<SplitDrag>,
+    pub vertical: Option<SplitDrag>,
+}
+
+/// Screen strip that grabs one split: both borders, the inner gap, and a
+/// minimum width. `center` is the middle of the gap, on the split's main axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplitHandle {
+    pub split: SplitRef,
+    pub axis: SplitAxis,
+    pub rect: RectI,
+    pub center: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitHandleParams {
+    border: i32,
+    grab_extent: i32,
+}
+
+impl SplitHandleParams {
+    const NONE: Self = Self { border: 0, grab_extent: 0 };
+
+    fn from_state(state: &State) -> Self {
+        Self {
+            border: state.frame_insets().left,
+            grab_extent: state.config.decorations.resize_grab_extent,
+        }
+    }
+}
+
+impl SplitDragPair {
+    pub fn is_empty(self) -> bool {
+        self.horizontal.is_none() && self.vertical.is_none()
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = SplitDrag> {
+        self.horizontal.into_iter().chain(self.vertical)
+    }
 }
 
 /// A tiled window removed from the tree, with the layout needed to put it back.
@@ -154,6 +224,7 @@ pub struct WorkspaceLayout {
     pub fullscreen: Option<FullscreenState>,
     pub focused_leaf: Option<LayoutNodeId>,
     pub dirty: bool,
+    pub split_handles: Vec<SplitHandle>,
     next_node_id: u64,
 }
 
@@ -532,183 +603,182 @@ impl WorkspaceLayout {
         changed
     }
 
+    /// Keyboard and legacy resize. `dx`/`dy` grow the window's right/bottom
+    /// edge and shrink its left/top edge, including through ancestor splits.
     pub fn resize_tiled_window(&mut self, window: WindowId, edges: u32, dx: i32, dy: i32) -> bool {
-        let Some(resize_state) = self.begin_tiled_resize(window, edges) else {
-            return false;
-        };
-        self.resize_tiled_window_from_state(window, resize_state, dx, dy)
+        let drags = self.begin_split_drags(self.splits_for_window_edges(window, edges));
+        self.apply_split_drags(&drags, dx, dy)
     }
 
-    pub fn begin_tiled_resize(&self, window: WindowId, edges: u32) -> Option<TiledResizeState> {
+    /// Nearest split on one `edge` of the subtree rooted at `node`.
+    ///
+    /// `EDGE_LEFT` and `EDGE_RIGHT` walk horizontal containers; `EDGE_TOP` and
+    /// `EDGE_BOTTOM` walk vertical ones. A container of the right axis with no
+    /// neighbour on that side is skipped. Drag-and-drop can nest two containers
+    /// of the same axis, and the outer edge of the inner one is the next split.
+    pub fn split_for_node_edge(&self, node: LayoutNodeId, edge: u32) -> Option<SplitRef> {
+        let (axis, toward_second) = match edge {
+            EDGE_LEFT => (SplitAxis::Horizontal, true),
+            EDGE_RIGHT => (SplitAxis::Horizontal, false),
+            EDGE_TOP => (SplitAxis::Vertical, true),
+            EDGE_BOTTOM => (SplitAxis::Vertical, false),
+            _ => return None,
+        };
+        let mut child = node;
+        loop {
+            let parent_id = self.nodes.get(&child)?.parent()?;
+            let container = self.nodes.get(&parent_id)?.as_container()?;
+            let index = container
+                .children
+                .iter()
+                .position(|candidate| candidate.node_id == child)?;
+            if container.axis == axis {
+                if toward_second && index > 0 {
+                    return Some(SplitRef { container: parent_id, first: index - 1 });
+                }
+                if !toward_second && index + 1 < container.children.len() {
+                    return Some(SplitRef { container: parent_id, first: index });
+                }
+            }
+            child = parent_id;
+        }
+    }
+
+    /// Up to one split per axis. Left/top wins when both bits of an axis are set
+    /// and that side has a neighbour; otherwise the other bit is tried.
+    pub fn splits_for_window_edges(&self, window: WindowId, edges: u32) -> SplitPair {
         let Some(&leaf_id) = self.window_leaves.get(&window) else {
-            return None;
+            return SplitPair::default();
         };
-        let Some(parent_id) = self.nodes.get(&leaf_id).and_then(LayoutNode::parent) else {
-            return None;
-        };
-        let Some((axis, children)) = self
-            .nodes
-            .get(&parent_id)
-            .and_then(LayoutNode::as_container)
-            .map(|container| (container.axis, container.children.clone()))
-        else {
-            return None;
-        };
-        let Some(index) = children.iter().position(|child| child.node_id == leaf_id) else {
-            return None;
-        };
+        SplitPair {
+            horizontal: self.split_for_requested_edge(leaf_id, edges, EDGE_LEFT, EDGE_RIGHT),
+            vertical: self.split_for_requested_edge(leaf_id, edges, EDGE_TOP, EDGE_BOTTOM),
+        }
+    }
 
-        let neighbor_index = match axis {
-            SplitAxis::Horizontal => {
-                if edges & EDGE_LEFT != 0 && index > 0 {
-                    index - 1
-                } else if edges & EDGE_RIGHT != 0 && index + 1 < children.len() {
-                    index + 1
-                } else {
-                    return None;
-                }
+    fn split_for_requested_edge(
+        &self,
+        node: LayoutNodeId,
+        edges: u32,
+        near_edge: u32,
+        far_edge: u32,
+    ) -> Option<SplitRef> {
+        if edges & near_edge != 0 {
+            if let Some(split) = self.split_for_node_edge(node, near_edge) {
+                return Some(split);
             }
-            SplitAxis::Vertical => {
-                if edges & EDGE_TOP != 0 && index > 0 {
-                    index - 1
-                } else if edges & EDGE_BOTTOM != 0 && index + 1 < children.len() {
-                    index + 1
-                } else {
-                    return None;
-                }
-            }
-        };
+        }
+        if edges & far_edge != 0 {
+            self.split_for_node_edge(node, far_edge)
+        } else {
+            None
+        }
+    }
 
-        let axis_span = match axis {
-            SplitAxis::Horizontal => {
-                let Some(left) = self.leaf_rect(children[index].node_id) else {
-                    return None;
-                };
-                let Some(right) = self.leaf_rect(children[neighbor_index].node_id) else {
-                    return None;
-                };
-                left.width + right.width
-            }
-            SplitAxis::Vertical => {
-                let Some(top) = self.leaf_rect(children[index].node_id) else {
-                    return None;
-                };
-                let Some(bottom) = self.leaf_rect(children[neighbor_index].node_id) else {
-                    return None;
-                };
-                top.height + bottom.height
-            }
+    pub fn begin_split_drag(&self, split: SplitRef) -> Option<SplitDrag> {
+        let container = self.nodes.get(&split.container)?.as_container()?;
+        let first = container.children.get(split.first)?;
+        let second = container.children.get(split.first.checked_add(1)?)?;
+        let first_rect = self.node_rect(first.node_id)?;
+        let second_rect = self.node_rect(second.node_id)?;
+        let axis_span = match container.axis {
+            SplitAxis::Horizontal => first_rect.width.saturating_add(second_rect.width),
+            SplitAxis::Vertical => first_rect.height.saturating_add(second_rect.height),
         };
         if axis_span <= 1 {
             return None;
         }
-
-        let pair_weight = children[index].weight + children[neighbor_index].weight;
-        Some(TiledResizeState {
-            axis,
-            leaf_index: index,
-            neighbor_index,
-            pair_weight,
-            initial_leaf_weight: children[index].weight,
+        Some(SplitDrag {
+            split,
+            axis: container.axis,
+            first_id: first.node_id,
+            second_id: second.node_id,
+            pair_weight: first.weight + second.weight,
+            initial_first_weight: first.weight,
             axis_span,
         })
     }
 
-    /// Returns `true` when the step changed the split; `false` when it was a
-    /// no-op or the window is not in a resizable split.
-    pub fn resize_tiled_window_from_state(
-        &mut self,
-        window: WindowId,
-        resize_state: TiledResizeState,
-        dx: i32,
-        dy: i32,
-    ) -> bool {
-        let Some(&leaf_id) = self.window_leaves.get(&window) else {
+    pub fn begin_split_drags(&self, splits: SplitPair) -> SplitDragPair {
+        SplitDragPair {
+            horizontal: splits
+                .horizontal
+                .and_then(|split| self.begin_split_drag(split)),
+            vertical: splits
+                .vertical
+                .and_then(|split| self.begin_split_drag(split)),
+        }
+    }
+
+    /// Returns whether a weight changed. `false` is also a missing or
+    /// non-adjacent pair: indices are resolved again from the stored node ids.
+    pub fn apply_split_drag(&mut self, drag: &SplitDrag, delta_px: i32) -> bool {
+        let Some((first_index, second_index)) = self.split_drag_indices(drag) else {
             return false;
         };
-        let Some(parent_id) = self.nodes.get(&leaf_id).and_then(LayoutNode::parent) else {
-            return false;
-        };
-        let Some(container) = self
-            .nodes
-            .get(&parent_id)
-            .and_then(LayoutNode::as_container)
+        let delta_weight = (delta_px as f64 / drag.axis_span as f64) * drag.pair_weight;
+        let updated_first = (drag.initial_first_weight + delta_weight)
+            .clamp(MIN_CHILD_WEIGHT, drag.pair_weight - MIN_CHILD_WEIGHT);
+        let updated_second = drag.pair_weight - updated_first;
+        let Some(LayoutNode::Container(container)) = self.nodes.get_mut(&drag.split.container)
         else {
             return false;
         };
-        if resize_state.leaf_index >= container.children.len()
-            || resize_state.neighbor_index >= container.children.len()
-            || container.children[resize_state.leaf_index].node_id != leaf_id
+        if container.children[first_index].weight == updated_first
+            && container.children[second_index].weight == updated_second
         {
             return false;
         }
-
-        let delta_pixels = match resize_state.axis {
-            SplitAxis::Horizontal => {
-                if resize_state.neighbor_index < resize_state.leaf_index {
-                    -dx
-                } else {
-                    dx
-                }
-            }
-            SplitAxis::Vertical => {
-                if resize_state.neighbor_index < resize_state.leaf_index {
-                    -dy
-                } else {
-                    dy
-                }
-            }
-        };
-
-        let delta_weight =
-            (delta_pixels as f64 / resize_state.axis_span as f64) * resize_state.pair_weight;
-        let mut updated_leaf_weight = resize_state.initial_leaf_weight + delta_weight;
-        updated_leaf_weight = updated_leaf_weight
-            .clamp(MIN_CHILD_WEIGHT, resize_state.pair_weight - MIN_CHILD_WEIGHT);
-        let updated_neighbor_weight = resize_state.pair_weight - updated_leaf_weight;
-
-        let Some(LayoutNode::Container(container)) = self.nodes.get_mut(&parent_id) else {
-            return false;
-        };
-        let leaf_weight = container.children[resize_state.leaf_index].weight;
-        let neighbor_weight = container.children[resize_state.neighbor_index].weight;
-        if leaf_weight == updated_leaf_weight && neighbor_weight == updated_neighbor_weight {
-            return false;
-        }
-        container.children[resize_state.leaf_index].weight = updated_leaf_weight;
-        container.children[resize_state.neighbor_index].weight = updated_neighbor_weight;
+        container.children[first_index].weight = updated_first;
+        container.children[second_index].weight = updated_second;
         self.mark_dirty();
         true
     }
 
-    pub fn resize_affected_windows(
-        &self,
-        window: WindowId,
-        resize_state: TiledResizeState,
-    ) -> Option<BTreeSet<WindowId>> {
-        let &leaf_id = self.window_leaves.get(&window)?;
-        let parent_id = self.nodes.get(&leaf_id).and_then(LayoutNode::parent)?;
-        let container = self
-            .nodes
-            .get(&parent_id)
-            .and_then(LayoutNode::as_container)?;
-        if resize_state.leaf_index >= container.children.len()
-            || resize_state.neighbor_index >= container.children.len()
-            || container.children[resize_state.leaf_index].node_id != leaf_id
-        {
+    pub fn apply_split_drags(&mut self, drags: &SplitDragPair, dx: i32, dy: i32) -> bool {
+        let mut changed = false;
+        if let Some(drag) = drags.horizontal {
+            changed |= self.apply_split_drag(&drag, dx);
+        }
+        if let Some(drag) = drags.vertical {
+            changed |= self.apply_split_drag(&drag, dy);
+        }
+        changed
+    }
+
+    pub fn split_drag_resolves(&self, drag: &SplitDrag) -> bool {
+        self.split_drag_indices(drag).is_some()
+    }
+
+    pub fn split_drag_affected_windows(&self, drag: &SplitDrag) -> BTreeSet<WindowId> {
+        let mut windows = Vec::new();
+        self.collect_leaf_windows(drag.first_id, &mut windows);
+        self.collect_leaf_windows(drag.second_id, &mut windows);
+        windows.into_iter().collect()
+    }
+
+    pub fn split_drags_affected_windows(&self, drags: &SplitDragPair) -> BTreeSet<WindowId> {
+        let mut windows = BTreeSet::new();
+        for drag in drags.iter() {
+            windows.extend(self.split_drag_affected_windows(&drag));
+        }
+        windows
+    }
+
+    fn split_drag_indices(&self, drag: &SplitDrag) -> Option<(usize, usize)> {
+        let container = self.nodes.get(&drag.split.container)?.as_container()?;
+        if container.axis != drag.axis {
             return None;
         }
-
-        let mut surfaces = Vec::new();
-        self.collect_leaf_windows(
-            container.children[resize_state.leaf_index].node_id,
-            &mut surfaces,
-        );
-        self.collect_leaf_windows(
-            container.children[resize_state.neighbor_index].node_id,
-            &mut surfaces,
-        );
-        Some(surfaces.into_iter().collect())
+        let first = container
+            .children
+            .iter()
+            .position(|child| child.node_id == drag.first_id)?;
+        let second = container
+            .children
+            .iter()
+            .position(|child| child.node_id == drag.second_id)?;
+        (second == first + 1).then_some((first, second))
     }
 
     fn alloc_leaf(&mut self, window: WindowId, parent: Option<LayoutNodeId>) -> LayoutNodeId {
@@ -735,6 +805,7 @@ impl WorkspaceLayout {
                 parent,
                 focused_child: children.len().checked_sub(1),
                 children,
+                last_applied_rect: None,
             }),
         );
         id
@@ -1035,8 +1106,11 @@ impl WorkspaceLayout {
         }
     }
 
-    fn leaf_rect(&self, node_id: LayoutNodeId) -> Option<RectI> {
-        self.nodes.get(&node_id)?.as_leaf()?.last_applied_rect
+    fn node_rect(&self, node_id: LayoutNodeId) -> Option<RectI> {
+        match self.nodes.get(&node_id)? {
+            LayoutNode::Leaf(leaf) => leaf.last_applied_rect,
+            LayoutNode::Container(container) => container.last_applied_rect,
+        }
     }
 
     fn first_leaf_in_subtree(&self, node_id: LayoutNodeId) -> Option<LayoutNodeId> {
@@ -1188,6 +1262,7 @@ pub fn initial_root_geometry_for_surface(
         gap_policy,
         &keyed_by_window(state, &decoration_insets),
         &keyed_by_window(state, &min_sizes),
+        SplitHandleParams::from_state(state),
     );
     let window = state.window_for_root(surface_object_id)?;
     let allocation = predictive_layout
@@ -1382,6 +1457,7 @@ pub fn relayout_dirty_workspaces_with_motion(
         );
         let window_insets = keyed_by_window(state, &decoration_insets);
         let window_min_sizes = keyed_by_window(state, &min_sizes);
+        let handle_params = SplitHandleParams::from_state(state);
         let operations = {
             let Some(workspace) = state.workspaces.try_get_mut(workspace_id) else {
                 continue;
@@ -1393,6 +1469,7 @@ pub fn relayout_dirty_workspaces_with_motion(
                 gap_policy,
                 &window_insets,
                 &window_min_sizes,
+                handle_params,
             )
         };
         for operation in operations {
@@ -1450,31 +1527,18 @@ fn tiled_resize_snap_windows(state: &State) -> BTreeSet<WindowId> {
         return BTreeSet::new();
     }
     let mut windows = state.seat.tiled_resize_snap_windows.clone();
-    if let Some((window, resize_state)) = state.seat.active_tiled_resize() {
-        windows.extend(affected_tiled_resize_windows(state, window, resize_state));
-    }
+    windows.extend(active_split_resize_windows(state));
     windows
 }
 
-pub(crate) fn affected_tiled_resize_windows(
-    state: &State,
-    window: WindowId,
-    resize_state: TiledResizeState,
-) -> BTreeSet<WindowId> {
-    let Some(root) = state.window_root_surface(window) else {
-        return BTreeSet::new();
-    };
-    let Some(workspace_id) = state.root_surface_workspace(root) else {
+pub(crate) fn active_split_resize_windows(state: &State) -> BTreeSet<WindowId> {
+    let Some((workspace_id, drags)) = state.seat.active_tiled_resize() else {
         return BTreeSet::new();
     };
     state
         .workspaces
         .try_get(workspace_id)
-        .and_then(|workspace| {
-            workspace
-                .layout
-                .resize_affected_windows(window, resize_state)
-        })
+        .map(|workspace| workspace.layout.split_drags_affected_windows(&drags))
         .unwrap_or_default()
 }
 
@@ -1706,6 +1770,224 @@ fn sync_workspace_layout_candidates(
     layout.set_fullscreen(fullscreen);
 }
 
+/// Hit-test split handles. One split per axis; a nearby perpendicular handle
+/// joins when it is within `corner_len` (Chebyshev). The cursor edges are
+/// `EDGE_RIGHT` or `EDGE_BOTTOM` for one axis, and a diagonal for two.
+///
+/// Containment matches [`rect_contains_point`]: the far edges are included.
+pub fn split_handles_at(
+    handles: &[SplitHandle],
+    point: (f64, f64),
+    corner_len: f64,
+) -> Option<(SplitPair, u32)> {
+    let horizontal = closest_containing_handle(handles, SplitAxis::Horizontal, point);
+    let vertical = closest_containing_handle(handles, SplitAxis::Vertical, point);
+    let (horizontal, vertical) = match (horizontal, vertical) {
+        (None, None) => return None,
+        (Some(horizontal), None) => (
+            Some(horizontal),
+            handle_within_corner(handles, SplitAxis::Vertical, point, corner_len),
+        ),
+        (None, Some(vertical)) => (
+            handle_within_corner(handles, SplitAxis::Horizontal, point, corner_len),
+            Some(vertical),
+        ),
+        pair => pair,
+    };
+    let splits = SplitPair {
+        horizontal: horizontal.map(|handle| handle.split),
+        vertical: vertical.map(|handle| handle.split),
+    };
+    if splits.is_empty() {
+        return None;
+    }
+    Some((splits, split_handle_cursor_edges(horizontal, vertical, point)))
+}
+
+fn closest_containing_handle(
+    handles: &[SplitHandle],
+    axis: SplitAxis,
+    point: (f64, f64),
+) -> Option<&SplitHandle> {
+    handles
+        .iter()
+        .filter(|handle| handle.axis == axis && rect_contains_point(handle.rect, point.0, point.1))
+        .min_by(|left, right| {
+            handle_main_distance(left, point)
+                .partial_cmp(&handle_main_distance(right, point))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn handle_within_corner<'a>(
+    handles: &'a [SplitHandle],
+    axis: SplitAxis,
+    point: (f64, f64),
+    corner_len: f64,
+) -> Option<&'a SplitHandle> {
+    let handle = handles
+        .iter()
+        .filter(|handle| handle.axis == axis)
+        .min_by(|left, right| {
+            chebyshev_distance_to_rect(left.rect, point)
+                .partial_cmp(&chebyshev_distance_to_rect(right.rect, point))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    (chebyshev_distance_to_rect(handle.rect, point) <= corner_len).then_some(handle)
+}
+
+fn handle_main_distance(handle: &SplitHandle, point: (f64, f64)) -> f64 {
+    let main = match handle.axis {
+        SplitAxis::Horizontal => point.0,
+        SplitAxis::Vertical => point.1,
+    };
+    (main - handle.center).abs()
+}
+
+fn split_handle_cursor_edges(
+    horizontal: Option<&SplitHandle>,
+    vertical: Option<&SplitHandle>,
+    point: (f64, f64),
+) -> u32 {
+    match (horizontal, vertical) {
+        (Some(_), None) => EDGE_RIGHT,
+        (None, Some(_)) => EDGE_BOTTOM,
+        (Some(horizontal), Some(vertical)) => {
+            let left_of_vertical_boundary = point.0 < horizontal.center;
+            let above_horizontal_boundary = point.1 < vertical.center;
+            if (left_of_vertical_boundary && above_horizontal_boundary)
+                || (!left_of_vertical_boundary && !above_horizontal_boundary)
+            {
+                EDGE_BOTTOM | EDGE_RIGHT
+            } else {
+                EDGE_BOTTOM | EDGE_LEFT
+            }
+        }
+        (None, None) => 0,
+    }
+}
+
+fn chebyshev_distance_to_rect(rect: RectI, point: (f64, f64)) -> f64 {
+    let left = rect.x as f64;
+    let right = left + rect.width.max(0) as f64;
+    let top = rect.y as f64;
+    let bottom = top + rect.height.max(0) as f64;
+    let dx = if point.0 < left {
+        left - point.0
+    } else if point.0 > right {
+        point.0 - right
+    } else {
+        0.0
+    };
+    let dy = if point.1 < top {
+        top - point.1
+    } else if point.1 > bottom {
+        point.1 - bottom
+    } else {
+        0.0
+    };
+    dx.max(dy)
+}
+
+fn rebuild_split_handles(layout: &mut WorkspaceLayout, params: SplitHandleParams) {
+    let mut handles = Vec::new();
+    if layout.fullscreen.is_none() {
+        if let Some(root_id) = layout.root {
+            collect_split_handles(layout, root_id, params, &mut handles);
+        }
+    }
+    layout.split_handles = handles;
+}
+
+fn collect_split_handles(
+    layout: &WorkspaceLayout,
+    node_id: LayoutNodeId,
+    params: SplitHandleParams,
+    handles: &mut Vec<SplitHandle>,
+) {
+    let Some(LayoutNode::Container(container)) = layout.nodes.get(&node_id) else {
+        return;
+    };
+    let axis = container.axis;
+    let container_rect = container.last_applied_rect;
+    let children = container
+        .children
+        .iter()
+        .map(|child| child.node_id)
+        .collect::<Vec<_>>();
+    if let Some(container_rect) = container_rect {
+        for (index, pair) in children.windows(2).enumerate() {
+            let (Some(first), Some(second)) =
+                (layout.node_rect(pair[0]), layout.node_rect(pair[1]))
+            else {
+                continue;
+            };
+            if let Some(handle) = split_handle_for_pair(
+                SplitRef { container: node_id, first: index },
+                axis,
+                first,
+                second,
+                container_rect,
+                params,
+            ) {
+                handles.push(handle);
+            }
+        }
+    }
+    for child in children {
+        collect_split_handles(layout, child, params, handles);
+    }
+}
+
+fn split_handle_for_pair(
+    split: SplitRef,
+    axis: SplitAxis,
+    first: RectI,
+    second: RectI,
+    container: RectI,
+    params: SplitHandleParams,
+) -> Option<SplitHandle> {
+    let border = params.border.max(0);
+    let min_span = params.grab_extent.max(MIN_SPLIT_HANDLE_SPAN);
+    let (x1, y1, x2, y2, center) = match axis {
+        SplitAxis::Horizontal => {
+            let center = (f64::from(first.x2()) + f64::from(second.x)) / 2.0;
+            let (x1, x2) = widened_main_span(
+                first.x2().saturating_sub(border),
+                second.x.saturating_add(border),
+                center,
+                min_span,
+            );
+            (x1, container.y, x2, container.y2(), center)
+        }
+        SplitAxis::Vertical => {
+            let center = (f64::from(first.y2()) + f64::from(second.y)) / 2.0;
+            let (y1, y2) = widened_main_span(
+                first.y2().saturating_sub(border),
+                second.y.saturating_add(border),
+                center,
+                min_span,
+            );
+            (container.x, y1, container.x2(), y2, center)
+        }
+    };
+    let rect = RectI::from_extents(x1, y1, x2, y2)?;
+    if rect.is_empty() {
+        return None;
+    }
+    Some(SplitHandle { split, axis, rect, center })
+}
+
+/// Keep a span that is already wide enough. Otherwise center `min_span` on the gap.
+fn widened_main_span(start: i32, end: i32, center: f64, min_span: i32) -> (i32, i32) {
+    if end >= start && end.saturating_sub(start) >= min_span {
+        (start, end)
+    } else {
+        let start = (center - (f64::from(min_span) / 2.0)).round() as i32;
+        (start, start.saturating_add(min_span))
+    }
+}
+
 fn apply_workspace_layout(
     layout: &mut WorkspaceLayout,
     tiling_bounds: RectI,
@@ -1713,6 +1995,7 @@ fn apply_workspace_layout(
     gap_policy: GapPolicy,
     decoration_insets: &BTreeMap<WindowId, DecorationInsets>,
     min_sizes: &BTreeMap<WindowId, (i32, i32)>,
+    handle_params: SplitHandleParams,
 ) -> Vec<LayoutOperation> {
     let mut operations = Vec::new();
     if let Some(fullscreen) = layout.fullscreen.as_ref() {
@@ -1730,6 +2013,7 @@ fn apply_workspace_layout(
                 fullscreen: true,
             },
         });
+        layout.split_handles.clear();
         layout.dirty = false;
         return operations;
     }
@@ -1748,6 +2032,7 @@ fn apply_workspace_layout(
             &mut operations,
         );
     }
+    rebuild_split_handles(layout, handle_params);
     layout.dirty = false;
     operations
 }
@@ -1783,6 +2068,9 @@ fn apply_node_layout(
             });
         }
         LayoutNode::Container(container) => {
+            if let Some(LayoutNode::Container(live)) = layout.nodes.get_mut(&node_id) {
+                live.last_applied_rect = Some(rect);
+            }
             let axis_span = match container.axis {
                 SplitAxis::Horizontal => rect.width,
                 SplitAxis::Vertical => rect.height,
@@ -2334,18 +2622,6 @@ fn is_managed_root_surface_candidate_common(
         && state
             .window_for_root(surface_object_id)
             .is_some_and(|window| state.toplevel(window).is_some())
-}
-
-#[cfg(test)]
-pub(crate) fn test_tiled_resize_state() -> TiledResizeState {
-    TiledResizeState {
-        axis: SplitAxis::Horizontal,
-        leaf_index: 0,
-        neighbor_index: 1,
-        pair_weight: 1.0,
-        initial_leaf_weight: 0.5,
-        axis_span: 100,
-    }
 }
 
 #[cfg(test)]
@@ -3189,7 +3465,7 @@ mod tests {
         }
     }
 
-    fn two_tiled_windows() -> (WorkspaceLayout, WindowId, TiledResizeState) {
+    fn two_tiled_windows() -> (WorkspaceLayout, SplitDrag) {
         let mut layout = WorkspaceLayout::default();
         let left = WindowId::for_tests(1);
         let right = WindowId::for_tests(2);
@@ -3204,20 +3480,26 @@ mod tests {
             GapPolicy::default(),
             &BTreeMap::default(),
             &BTreeMap::default(),
+            SplitHandleParams::NONE,
         );
-        let resize_state = layout
-            .begin_tiled_resize(left, EDGE_RIGHT)
-            .expect("left leaf should support right-edge resize");
-        (layout, left, resize_state)
+        let drag = layout
+            .begin_split_drag(
+                layout
+                    .splits_for_window_edges(left, EDGE_RIGHT)
+                    .horizontal
+                    .expect("left leaf should support right-edge resize"),
+            )
+            .expect("split drag");
+        (layout, drag)
     }
 
     #[test]
     fn repeated_resize_step_is_reported_once() {
-        let (mut layout, left, resize_state) = two_tiled_windows();
-        assert!(layout.resize_tiled_window_from_state(left, resize_state, 10, 0));
+        let (mut layout, drag) = two_tiled_windows();
+        assert!(layout.apply_split_drag(&drag, 10));
         let first_left_weight = root_child_weight(&layout, 0);
 
-        assert!(!layout.resize_tiled_window_from_state(left, resize_state, 10, 0));
+        assert!(!layout.apply_split_drag(&drag, 10));
         let second_left_weight = root_child_weight(&layout, 0);
 
         assert_eq!(first_left_weight, second_left_weight);
@@ -3285,20 +3567,20 @@ mod tests {
         let mut state = state_for_tests();
         let (left, right) = settled_side_by_side(&mut state);
         let left_window = state.window_for_root(left).unwrap();
-        let resize_state = state
-            .begin_tiled_window_resize(left_window, EDGE_RIGHT)
+        let (workspace, drags) = state
+            .begin_window_edge_drags(left_window, EDGE_RIGHT)
             .expect("left leaf should support right-edge resize");
         let now = Instant::now();
         state.seat.pointer_interactive_grab =
-            Some(crate::input::PointerInteractiveGrab::ResizeTiled {
-                window: left_window,
-                root_surface: left,
-                edges: EDGE_RIGHT,
+            Some(crate::input::PointerInteractiveGrab::ResizeSplit {
+                workspace,
+                drags,
+                cursor_edges: EDGE_RIGHT,
                 initial_pointer_pos: (0.0, 0.0),
-                resize_state,
+                origin_window: Some(left_window),
             });
 
-        assert!(state.resize_tiled_window_from_state(left_window, resize_state, 40, 0));
+        assert!(state.apply_split_drags(workspace, &drags, 40, 0));
         // The configure pass relayouts again while the grab is still held.
         state.relayout_dirty_workspaces();
         state.advance_visual_animations(now);
@@ -3367,18 +3649,18 @@ mod tests {
             .is_active());
 
         let top_window = state.window_for_root(top).unwrap();
-        let resize_state = state
-            .begin_tiled_window_resize(top_window, EDGE_BOTTOM)
+        let (workspace, drags) = state
+            .begin_window_edge_drags(top_window, EDGE_BOTTOM)
             .expect("nested pair should support a bottom-edge resize");
         state.seat.pointer_interactive_grab =
-            Some(crate::input::PointerInteractiveGrab::ResizeTiled {
-                window: top_window,
-                root_surface: top,
-                edges: EDGE_BOTTOM,
+            Some(crate::input::PointerInteractiveGrab::ResizeSplit {
+                workspace,
+                drags,
+                cursor_edges: EDGE_BOTTOM,
                 initial_pointer_pos: (0.0, 0.0),
-                resize_state,
+                origin_window: Some(top_window),
             });
-        assert!(state.resize_tiled_window_from_state(top_window, resize_state, 0, 40));
+        assert!(state.apply_split_drags(workspace, &drags, 0, 40));
         state.relayout_dirty_workspaces();
         state.advance_visual_animations(now + Duration::from_millis(50));
 
@@ -3481,16 +3763,298 @@ mod tests {
 
     #[test]
     fn clamped_resize_step_is_not_reported_again() {
-        let (mut layout, left, resize_state) = two_tiled_windows();
-        assert!(layout.resize_tiled_window_from_state(left, resize_state, 10_000, 0));
-        assert!(!layout.resize_tiled_window_from_state(left, resize_state, 20_000, 0));
+        let (mut layout, drag) = two_tiled_windows();
+        assert!(layout.apply_split_drag(&drag, 10_000));
+        assert!(!layout.apply_split_drag(&drag, 20_000));
     }
 
     #[test]
     fn resize_step_back_to_start_is_reported() {
-        let (mut layout, left, resize_state) = two_tiled_windows();
-        assert!(layout.resize_tiled_window_from_state(left, resize_state, 10, 0));
-        assert!(layout.resize_tiled_window_from_state(left, resize_state, 0, 0));
+        let (mut layout, drag) = two_tiled_windows();
+        assert!(layout.apply_split_drag(&drag, 10));
+        assert!(layout.apply_split_drag(&drag, 0));
+    }
+
+    fn apply_bounds(layout: &mut WorkspaceLayout, width: i32, height: i32) {
+        let bounds = RectI { x: 0, y: 0, width, height };
+        apply_workspace_layout(
+            layout,
+            bounds,
+            bounds,
+            GapPolicy::default(),
+            &BTreeMap::default(),
+            &BTreeMap::default(),
+            SplitHandleParams::NONE,
+        );
+    }
+
+    fn apply_handles(
+        layout: &mut WorkspaceLayout,
+        bounds: RectI,
+        inner_gap: i32,
+        border: i32,
+        grab_extent: i32,
+    ) {
+        apply_workspace_layout(
+            layout,
+            bounds,
+            bounds,
+            GapPolicy { outer_gap: 0, inner_gap },
+            &BTreeMap::default(),
+            &BTreeMap::default(),
+            SplitHandleParams { border, grab_extent },
+        );
+    }
+
+    #[test]
+    fn split_handle_covers_both_borders_and_the_inner_gap() {
+        let mut layout = WorkspaceLayout::default();
+        let left = WindowId::for_tests(51);
+        let right = WindowId::for_tests(52);
+        assert!(layout.insert_tiled(left));
+        assert!(layout.insert_tiled(right));
+        apply_handles(&mut layout, RectI { x: 0, y: 0, width: 200, height: 100 }, 10, 2, 10);
+
+        assert_eq!(layout.split_handles.len(), 1);
+        let handle = layout.split_handles[0];
+        assert_eq!(handle.axis, SplitAxis::Horizontal);
+        assert_eq!(handle.rect, RectI { x: 93, y: 0, width: 14, height: 100 });
+        assert_eq!(handle.center, 100.0);
+        assert_eq!(handle.split, SplitRef { container: layout.root.unwrap(), first: 0 });
+
+        let (splits, edges) = split_handles_at(&layout.split_handles, (100.0, 50.0), 10.0).unwrap();
+        assert_eq!(splits.horizontal, Some(handle.split));
+        assert!(splits.vertical.is_none());
+        assert_eq!(edges, EDGE_RIGHT);
+        assert!(split_handles_at(&layout.split_handles, (20.0, 50.0), 10.0).is_none());
+        assert!(split_handles_at(&layout.split_handles, (92.0, 50.0), 10.0).is_none());
+        assert!(split_handles_at(&layout.split_handles, (1.0, 50.0), 10.0).is_none());
+    }
+
+    #[test]
+    fn split_handle_widens_to_the_grab_extent_when_border_and_gap_are_zero() {
+        let mut layout = WorkspaceLayout::default();
+        let left = WindowId::for_tests(53);
+        let right = WindowId::for_tests(54);
+        assert!(layout.insert_tiled(left));
+        assert!(layout.insert_tiled(right));
+        apply_handles(&mut layout, RectI { x: 0, y: 0, width: 200, height: 80 }, 0, 0, 10);
+
+        assert_eq!(layout.split_handles.len(), 1);
+        assert_eq!(layout.split_handles[0].rect, RectI { x: 95, y: 0, width: 10, height: 80 });
+        assert_eq!(layout.split_handles[0].center, 100.0);
+    }
+
+    #[test]
+    fn split_handle_corner_capture_adds_the_perpendicular_split() {
+        let mut layout = WorkspaceLayout::default();
+        let left = WindowId::for_tests(55);
+        let top = WindowId::for_tests(56);
+        let bottom = WindowId::for_tests(57);
+        assert!(layout.insert_tiled(left));
+        assert!(layout.insert_tiled(top));
+        assert!(layout.insert_tiled(bottom));
+        apply_handles(&mut layout, RectI { x: 0, y: 0, width: 200, height: 100 }, 0, 0, 10);
+
+        let root = layout.root.unwrap();
+        let vertical = match layout.nodes.get(&root).unwrap() {
+            LayoutNode::Container(columns) => {
+                assert_eq!(columns.axis, SplitAxis::Horizontal);
+                columns.children[1].node_id
+            }
+            LayoutNode::Leaf(_) => panic!("root should be a split"),
+        };
+        assert_eq!(
+            layout
+                .nodes
+                .get(&vertical)
+                .and_then(LayoutNode::as_container)
+                .map(|rows| rows.axis),
+            Some(SplitAxis::Vertical)
+        );
+        let columns = SplitRef { container: root, first: 0 };
+        let rows = SplitRef { container: vertical, first: 0 };
+
+        let (near, near_edges) =
+            split_handles_at(&layout.split_handles, (97.0, 30.0), 20.0).unwrap();
+        assert_eq!(near, SplitPair { horizontal: Some(columns), vertical: Some(rows) });
+        assert_eq!(near_edges, EDGE_BOTTOM | EDGE_RIGHT);
+
+        let (far, far_edges) = split_handles_at(&layout.split_handles, (97.0, 5.0), 20.0).unwrap();
+        assert_eq!(far, SplitPair { horizontal: Some(columns), vertical: None });
+        assert_eq!(far_edges, EDGE_RIGHT);
+    }
+
+    #[test]
+    fn fullscreen_and_a_single_tile_publish_no_split_handles() {
+        let mut layout = WorkspaceLayout::default();
+        let first = WindowId::for_tests(58);
+        let bounds = RectI { x: 0, y: 0, width: 200, height: 100 };
+        assert!(layout.insert_tiled(first));
+        apply_handles(&mut layout, bounds, 10, 2, 10);
+        assert!(layout.split_handles.is_empty());
+
+        let second = WindowId::for_tests(59);
+        assert!(layout.insert_tiled(second));
+        apply_handles(&mut layout, bounds, 10, 2, 10);
+        assert_eq!(layout.split_handles.len(), 1);
+        assert!(layout.set_fullscreen(Some(first)));
+        apply_handles(&mut layout, bounds, 10, 2, 10);
+        assert!(layout.split_handles.is_empty());
+    }
+
+    /// `H[A, V[B, C]]` after three focused inserts.
+    fn nested_stack() -> (WorkspaceLayout, WindowId, WindowId, WindowId) {
+        let mut layout = WorkspaceLayout::default();
+        let a = WindowId::for_tests(21);
+        let b = WindowId::for_tests(22);
+        let c = WindowId::for_tests(23);
+        assert!(layout.insert_tiled(a));
+        assert!(layout.insert_tiled(b));
+        assert!(layout.insert_tiled(c));
+        apply_bounds(&mut layout, 200, 100);
+        let root = layout.root.expect("root");
+        let LayoutNode::Container(columns) = layout.nodes.get(&root).unwrap() else {
+            panic!("root should be a horizontal split");
+        };
+        assert_eq!(columns.axis, SplitAxis::Horizontal);
+        let vertical = columns.children[1].node_id;
+        let LayoutNode::Container(rows) = layout.nodes.get(&vertical).unwrap() else {
+            panic!("second column should be a vertical stack");
+        };
+        assert_eq!(rows.axis, SplitAxis::Vertical);
+        assert_eq!(rows.children[0].node_id, layout.window_leaves[&b]);
+        assert_eq!(rows.children[1].node_id, layout.window_leaves[&c]);
+        (layout, a, b, c)
+    }
+
+    fn vertical_stack_id(layout: &WorkspaceLayout) -> LayoutNodeId {
+        let root = layout.root.expect("root");
+        match layout.nodes.get(&root).unwrap() {
+            LayoutNode::Container(columns) => columns.children[1].node_id,
+            LayoutNode::Leaf(_) => panic!("root should be a container"),
+        }
+    }
+
+    #[test]
+    fn nested_edges_walk_to_the_ancestor_split() {
+        let (layout, _a, _b, c) = nested_stack();
+        let root = layout.root.unwrap();
+        let between_columns = SplitRef { container: root, first: 0 };
+        let between_rows = SplitRef { container: vertical_stack_id(&layout), first: 0 };
+
+        assert_eq!(
+            layout.splits_for_window_edges(c, EDGE_LEFT),
+            SplitPair { horizontal: Some(between_columns), vertical: None }
+        );
+        assert!(layout.splits_for_window_edges(c, EDGE_RIGHT).is_empty());
+        assert_eq!(
+            layout.splits_for_window_edges(c, EDGE_TOP),
+            SplitPair { horizontal: None, vertical: Some(between_rows) }
+        );
+        assert_eq!(
+            layout.splits_for_window_edges(c, EDGE_TOP | EDGE_LEFT),
+            SplitPair {
+                horizontal: Some(between_columns),
+                vertical: Some(between_rows),
+            }
+        );
+    }
+
+    #[test]
+    fn ancestor_split_drag_resizes_every_leaf_under_both_children() {
+        let (mut layout, a, b, c) = nested_stack();
+        let before_a = layout.tiled_rect(a).unwrap().width;
+        let before_b = layout.tiled_rect(b).unwrap().width;
+        let before_c = layout.tiled_rect(c).unwrap().width;
+        let split = layout
+            .splits_for_window_edges(c, EDGE_LEFT)
+            .horizontal
+            .unwrap();
+        let drag = layout.begin_split_drag(split).unwrap();
+
+        assert!(layout.apply_split_drag(&drag, 40));
+        apply_bounds(&mut layout, 200, 100);
+
+        assert!(layout.tiled_rect(a).unwrap().width > before_a);
+        assert!(layout.tiled_rect(b).unwrap().width < before_b);
+        assert!(layout.tiled_rect(c).unwrap().width < before_c);
+        assert_eq!(layout.split_drag_affected_windows(&drag), BTreeSet::from([a, b, c]));
+    }
+
+    #[test]
+    fn split_drag_reresolves_ids_and_aborts_when_the_container_is_removed() {
+        let (mut layout, a, b, c) = nested_stack();
+        let vertical = vertical_stack_id(&layout);
+        let split = layout
+            .splits_for_window_edges(c, EDGE_LEFT)
+            .horizontal
+            .unwrap();
+        let drag = layout.begin_split_drag(split).unwrap();
+        assert!(layout.apply_split_drag(&drag, 40));
+
+        let d = WindowId::for_tests(24);
+        let leaf = layout.alloc_leaf(d, Some(vertical));
+        {
+            let LayoutNode::Container(container) = layout.nodes.get_mut(&vertical).unwrap() else {
+                panic!("vertical stack");
+            };
+            container
+                .children
+                .push(LayoutChild { node_id: leaf, weight: 1.0 });
+        }
+        assert!(layout.split_drag_resolves(&drag));
+        assert!(layout.apply_split_drag(&drag, 80));
+        assert_eq!(layout.split_drag_affected_windows(&drag), BTreeSet::from([a, b, c, d]));
+
+        assert!(layout.remove_window(b));
+        assert!(layout.remove_window(c));
+        assert!(layout.nodes.get(&vertical).is_none());
+        assert!(!layout.split_drag_resolves(&drag));
+        assert!(!layout.apply_split_drag(&drag, 120));
+    }
+
+    #[test]
+    fn same_axis_nesting_uses_the_ancestor_split_on_the_outer_edge() {
+        let mut layout = WorkspaceLayout::default();
+        let a = WindowId::for_tests(31);
+        let b = WindowId::for_tests(32);
+        let c = WindowId::for_tests(33);
+        assert!(layout.insert_tiled(a));
+        assert!(layout.insert_tiled(b));
+        assert!(layout.split_leaf_for_drag(b, c, SplitAxis::Horizontal, false, 0.5));
+
+        let outer = layout.root.unwrap();
+        let LayoutNode::Container(outer_node) = layout.nodes.get(&outer).unwrap() else {
+            panic!("outer split");
+        };
+        assert_eq!(outer_node.axis, SplitAxis::Horizontal);
+        let inner = outer_node.children[1].node_id;
+        assert_eq!(
+            layout.splits_for_window_edges(b, EDGE_RIGHT).horizontal,
+            Some(SplitRef { container: inner, first: 0 })
+        );
+        assert_eq!(
+            layout.splits_for_window_edges(b, EDGE_LEFT).horizontal,
+            Some(SplitRef { container: outer, first: 0 })
+        );
+        assert!(layout.splits_for_window_edges(c, EDGE_RIGHT).is_empty());
+    }
+
+    #[test]
+    fn resize_tiled_window_follows_ancestor_splits() {
+        let (mut layout, a, b, c) = nested_stack();
+        let a_width = layout.tiled_rect(a).unwrap().width;
+        let b_height = layout.tiled_rect(b).unwrap().height;
+
+        assert!(!layout.resize_tiled_window(c, EDGE_RIGHT, 40, 0));
+        assert!(layout.resize_tiled_window(c, EDGE_LEFT, 40, 0));
+        apply_bounds(&mut layout, 200, 100);
+        assert!(layout.tiled_rect(a).unwrap().width > a_width);
+
+        assert!(layout.resize_tiled_window(c, EDGE_TOP | EDGE_LEFT, 0, 40));
+        apply_bounds(&mut layout, 200, 100);
+        assert!(layout.tiled_rect(b).unwrap().height > b_height);
     }
 
     #[test]
@@ -3508,6 +4072,7 @@ mod tests {
             GapPolicy::default(),
             &BTreeMap::default(),
             &BTreeMap::default(),
+            SplitHandleParams::NONE,
         );
 
         assert_eq!(
@@ -3619,6 +4184,7 @@ mod tests {
             GapPolicy::default(),
             &BTreeMap::default(),
             &min_sizes,
+            SplitHandleParams::NONE,
         );
 
         assert_eq!(operations.len(), 2);
@@ -3652,6 +4218,7 @@ mod tests {
             GapPolicy { outer_gap: 0, inner_gap: 10 },
             &BTreeMap::default(),
             &BTreeMap::default(),
+            SplitHandleParams::NONE,
         );
 
         assert_eq!(operations.len(), 2);
@@ -3676,6 +4243,7 @@ mod tests {
             GapPolicy::default(),
             &BTreeMap::default(),
             &BTreeMap::default(),
+            SplitHandleParams::NONE,
         );
 
         let left_leaf_id = layout.window_leaves[&left];
@@ -4167,6 +4735,7 @@ mod tests {
             GapPolicy { outer_gap: 10, inner_gap: 7 },
             &BTreeMap::from([(surface, DecorationInsets { top: 2, right: 2, bottom: 2, left: 2 })]),
             &BTreeMap::default(),
+            SplitHandleParams::NONE,
         );
 
         assert_eq!(operations[0].allocation.frame_rect, fullscreen_bounds);
@@ -4190,6 +4759,7 @@ mod tests {
                 (right, DecorationInsets::default()),
             ]),
             &BTreeMap::default(),
+            SplitHandleParams::NONE,
         );
 
         assert_eq!(operations.len(), 2);
@@ -4226,6 +4796,7 @@ mod tests {
             GapPolicy { outer_gap: 0, inner_gap: 4 },
             &BTreeMap::default(),
             &BTreeMap::from([(left, (10, 1)), (right, (10, 1))]),
+            SplitHandleParams::NONE,
         );
 
         let total_width = operations
@@ -4312,6 +4883,7 @@ mod tests {
             GapPolicy::default(),
             &BTreeMap::default(),
             &BTreeMap::default(),
+            SplitHandleParams::NONE,
         );
 
         let first_edges = layout.nodes[&layout.window_leaves[&first]]

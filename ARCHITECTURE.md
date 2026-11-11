@@ -1038,6 +1038,18 @@ These maps stay keyed by the root surface: the geometry cache, output membership
 
 A managed X window uses this same `WindowId`, `ManagedWindowState`, and `Toplevel` path. The role object is an `XToplevel` created with `insert_object`. It is not in any client's id map. `insert_window` runs when the window becomes managed. `destroy_window` runs on unmap, on `DestroyNotify`, and when the WM stops. The next map allocates a new `WindowId`. Section 21 is that path.
 
+### Interactive resize
+
+Press and hover share one decision. The scene pick in `src/input/pick.rs` returns a `CompositorZone`. `window_interaction_intent_at` and `decoration_hover_cursor_icon_names` both read that zone. Inside a zone the pick's `surface_focus` is empty, so the client gets a pointer leave and the compositor draws the resize cursor.
+
+A floating window produces `WindowResize`. The grab is the frame plus `decorations.resize_grab_extent` logical pixels outside it. The default is 10, read from `state.config` when the zone is built. A corner spans `rounding + border + 10`, and no more than half the content width or height. A transparent rounded corner inside the content is a corner. That geometry lives in `src/input/resize_zone.rs`. A maximized or fullscreen window has no zone. With `border.size = 0` the outer ring and the curved corners remain.
+
+A tiled window produces `SplitResize`. `src/tiling.rs` rebuilds the split handles at the end of each layout. A handle covers the two borders and the gap between siblings, and is at least `max(resize_grab_extent, 4)` pixels across. An edge is a handle when some ancestor has a neighbour on that side. A corner where a horizontal handle meets a vertical one resizes both. The cursor uses the xdg resize-edge bits.
+
+The pick walks the output from the top. An `Overlay` or `Top` layer wins. A floating window is next: its extent wins over whatever is below it, and a popup of that window keeps pointer focus and clears the zone. Split handles come after that, above the tiled windows and above `Bottom` and `Background` layers. A point in the gap has a zone and no window. Hover and press still start the resize. Mod+drag and `xdg_toplevel.resize` still name a window. They use `resize_edges_for_pointer` on the binding rect, then `begin_window_edge_drags`, and become the same split drags.
+
+The pointer grab is `ResizeSplit` in `src/input/types.rs`. It stores the workspace, the drags, the cursor edges, and an optional origin window. It is not tied to one client. While the grab is held, `SNAP_TILED_RESIZE` makes the tiles jump to the new rectangles. Keyboard resize stays on `State::resize_tiled_window` and keeps the window animation.
+
 ## 19. The X11 connection
 
 `src/x11/` is the library the window manager in section 20 owns. Section 17 launches Xwayland and holds the `-wm` socket open. This library is what speaks on it.

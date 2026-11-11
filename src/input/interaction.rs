@@ -1,7 +1,7 @@
 use crate::{
     clients::Resolved,
     config,
-    protocol_generated::{xdg_toplevel::ResizeEdge, WlSurfaceId, XdgToplevelId},
+    protocol_generated::{WlSurfaceId, XdgToplevelId},
     runner::Dispatcher,
     state::State,
     wayland_objects::xdg_surface::xdg_toplevel::InteractiveSizeConstraints,
@@ -10,12 +10,10 @@ use crate::{
 use super::{
     apply_interaction_intent, build_protocol_move_target, build_protocol_resize_target,
     popup_keyboard_focus, rect_contains_point, resize_cursor_icon_names, resize_edges_for_pointer,
-    scene_pick_at, set_keyboard_focus, HitSemantics, InteractionIntent, SurfaceFocus,
+    scene_pick_at, set_keyboard_focus, CompositorZone, InteractionIntent, SurfaceFocus,
     SurfaceFocusPick, WindowHit, WindowRoleSnapshot, WindowTarget,
     POINTER_INTERACTION_START_OPTIONS, PROTOCOL_INTERACTION_START_OPTIONS,
 };
-
-const POINTER_MOVE_CURSOR_ICON_NAMES: &[&str] = &["grab", "grabbing", "move"];
 
 pub(crate) fn window_allows_compositor_interaction(target: &WindowTarget) -> bool {
     !matches!(
@@ -125,22 +123,22 @@ pub(crate) fn begin_decoration_pointer_action(
 }
 
 pub(crate) fn window_hit_at(state: &State, pointer_pos: (f64, f64)) -> Option<WindowHit> {
-    let target = scene_pick_at(state, pointer_pos).window_target?;
+    let pick = scene_pick_at(state, pointer_pos);
+    let target = pick.window_target?;
     let pointer_pos = state.logical_pointer_for_surface(target.root_surface, pointer_pos);
-    let semantics = classify_window_semantics(state, &target, pointer_pos);
     let binding_resize_edges = rect_contains_point(target.geometry.binding_rect, pointer_pos)
         .then(|| resize_edges_for_pointer(target.geometry.binding_rect, pointer_pos))
         .unwrap_or(0);
-    Some(WindowHit { target, semantics, binding_resize_edges })
+    Some(WindowHit { target, zone: pick.zone, binding_resize_edges })
 }
 
 pub(crate) fn decoration_hover_cursor_icon_names(state: &State) -> Option<&'static [&'static str]> {
-    let pointer_pos = state.seat.pointer_position();
-    let hit = window_hit_at(state, pointer_pos)?;
-    match hit.semantics {
-        HitSemantics::CompositorMove => Some(POINTER_MOVE_CURSOR_ICON_NAMES),
-        HitSemantics::CompositorResize(edges) => Some(resize_cursor_icon_names(edges)),
-        HitSemantics::SurfaceContent | HitSemantics::NoCompositorAction => None,
+    // A gap has a zone and no window. Mod+drag still goes through `window_hit_at`.
+    match scene_pick_at(state, state.seat.pointer_position()).zone? {
+        CompositorZone::WindowResize { edges, .. } => Some(resize_cursor_icon_names(edges)),
+        CompositorZone::SplitResize { cursor_edges, .. } => {
+            Some(resize_cursor_icon_names(cursor_edges))
+        }
     }
 }
 
@@ -262,79 +260,22 @@ fn interaction_intent_for_pointer_binding(
     }
 }
 
-fn classify_window_semantics(
-    state: &State,
-    target: &WindowTarget,
-    pointer_pos: (f64, f64),
-) -> HitSemantics {
-    if !window_allows_compositor_interaction(target) {
-        return HitSemantics::NoCompositorAction;
-    }
-    let root_clip = state.root_surface_clip(target.root_surface);
-    let Some(layout) = state.root_surface_decoration_layout(target.root_surface) else {
-        return HitSemantics::SurfaceContent;
-    };
-    if !rect_contains_point(layout.frame_rect, pointer_pos)
-        || rect_contains_point(layout.client_window_rect, pointer_pos)
-    {
-        return HitSemantics::SurfaceContent;
-    }
-    if root_clip.is_some_and(|clip| !clip.contains_point(pointer_pos.0, pointer_pos.1)) {
-        // `root_surface_clip` is the outer frame at `rounding + border.size - correction`.
-        return HitSemantics::SurfaceContent;
-    }
-
-    let x = pointer_pos.0.round() as i32;
-    let y = pointer_pos.1.round() as i32;
-    let border_resize_height = state
-        .root_surface_decoration_insets(target.root_surface)
-        .map(|insets| insets.left.max(insets.right).max(insets.bottom).max(6))
-        .unwrap_or(6);
-    let top_resize_height =
-        (layout.client_window_rect.y - layout.frame_rect.y).clamp(1, border_resize_height);
-    let top_resize_limit = layout.frame_rect.y.saturating_add(top_resize_height);
-
-    if x < layout.client_window_rect.x {
-        return HitSemantics::CompositorResize(if y < layout.client_window_rect.y {
-            ResizeEdge::TopLeft as u32
-        } else if y >= layout.client_window_rect.y2() {
-            ResizeEdge::BottomLeft as u32
-        } else {
-            ResizeEdge::Left as u32
-        });
-    }
-    if x >= layout.client_window_rect.x2() {
-        return HitSemantics::CompositorResize(if y < layout.client_window_rect.y {
-            ResizeEdge::TopRight as u32
-        } else if y >= layout.client_window_rect.y2() {
-            ResizeEdge::BottomRight as u32
-        } else {
-            ResizeEdge::Right as u32
-        });
-    }
-    if y >= layout.client_window_rect.y2() {
-        return HitSemantics::CompositorResize(ResizeEdge::Bottom as u32);
-    }
-    if y < layout.client_window_rect.y {
-        if y < top_resize_limit {
-            return HitSemantics::CompositorResize(ResizeEdge::Top as u32);
-        }
-        return HitSemantics::CompositorMove;
-    }
-
-    HitSemantics::SurfaceContent
-}
-
 fn window_interaction_intent_at(
     state: &State,
     pointer_pos: (f64, f64),
 ) -> Option<InteractionIntent> {
-    let hit = window_hit_at(state, pointer_pos)?;
-    match hit.semantics {
-        HitSemantics::CompositorMove => Some(InteractionIntent::StartMove(hit.target)),
-        HitSemantics::CompositorResize(edges) => {
-            Some(InteractionIntent::StartResize(hit.target, edges))
+    let pick = scene_pick_at(state, pointer_pos);
+    match pick.zone? {
+        CompositorZone::WindowResize { target, edges } => {
+            Some(InteractionIntent::StartResize(target, edges))
         }
-        HitSemantics::SurfaceContent | HitSemantics::NoCompositorAction => None,
+        CompositorZone::SplitResize { workspace, splits, cursor_edges } => {
+            Some(InteractionIntent::StartSplitResize {
+                workspace,
+                splits,
+                cursor_edges,
+                origin: pick.window_target,
+            })
+        }
     }
 }

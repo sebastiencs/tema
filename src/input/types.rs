@@ -2,7 +2,8 @@ use crate::{
     clients::{ClientId, Resolved},
     protocol_generated::WlSurfaceId,
     root_geometry::WindowTargetGeometry,
-    tiling::TiledResizeState,
+    state::WorkspaceId,
+    tiling::{SplitDragPair, SplitPair},
     wayland_objects::xdg_surface::xdg_toplevel::{
         InteractiveSizeConstraints, ToplevelDecorationMode,
     },
@@ -44,6 +45,16 @@ pub(crate) struct SurfaceFocusPick {
 pub(crate) struct ScenePick {
     pub surface_focus: Option<SurfaceFocusPick>,
     pub window_target: Option<WindowSnapshot>,
+    pub zone: Option<CompositorZone>,
+}
+
+/// A point the compositor owns: a floating resize edge, or one or two split handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompositorZone {
+    /// Floating window edge or corner. `edges` uses xdg `ResizeEdge` bits.
+    WindowResize { target: WindowSnapshot, edges: u32 },
+    /// One split, or two perpendicular splits at a corner.
+    SplitResize { workspace: crate::state::WorkspaceId, splits: SplitPair, cursor_edges: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,18 +91,16 @@ impl WindowSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HitSemantics {
-    SurfaceContent,
-    CompositorMove,
-    CompositorResize(u32),
-    NoCompositorAction,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InteractionIntent {
     FocusSurface(SurfaceFocus),
     StartMove(WindowSnapshot),
     StartResize(WindowSnapshot, u32),
+    StartSplitResize {
+        workspace: crate::state::WorkspaceId,
+        splits: SplitPair,
+        cursor_edges: u32,
+        origin: Option<WindowSnapshot>,
+    },
     DismissPopupGrab,
     None,
 }
@@ -99,7 +108,7 @@ pub(crate) enum InteractionIntent {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WindowHit {
     pub target: WindowSnapshot,
-    pub semantics: HitSemantics,
+    pub zone: Option<CompositorZone>,
     pub binding_resize_edges: u32,
 }
 
@@ -131,12 +140,12 @@ pub(crate) enum ActiveGrab {
         initial_geometry: WindowTargetGeometry,
         last_size: (i32, i32),
     },
-    ResizeTiled {
-        window: WindowId,
-        root_surface: Resolved<WlSurfaceId>,
-        edges: u32,
+    ResizeSplit {
+        workspace: WorkspaceId,
+        drags: SplitDragPair,
+        cursor_edges: u32,
         initial_pointer_pos: (f64, f64),
-        resize_state: TiledResizeState,
+        origin_window: Option<WindowId>,
     },
     /// Compositor move of a tiled window. The window stays tiled until the pointer
     /// travels past `threshold`, then it becomes a temporary floating preview.
