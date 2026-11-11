@@ -335,6 +335,10 @@ pub struct SeatState {
     cursor: CursorState,
     popup_grab: Option<PopupGrabState>,
     pub(crate) pointer_interactive_grab: Option<ActiveGrabState>,
+    /// Tiles to snap on the relayout that follows release of a tiled resize.
+    /// The grab is already cleared by then. Emptied once the animation pump
+    /// has applied that relayout.
+    pub(crate) tiled_resize_snap_windows: BTreeSet<crate::window::WindowId>,
     /// Layout cloned before a tiled drag left the tree. Dropped without restore
     /// when the dragged surface is gone.
     pub(crate) tiled_drag_origin: Option<crate::tiling::ExtractedTiledLeaf>,
@@ -388,6 +392,7 @@ impl Default for SeatState {
             cursor,
             popup_grab: None,
             pointer_interactive_grab: None,
+            tiled_resize_snap_windows: BTreeSet::new(),
             tiled_drag_origin: None,
             client_serials: BTreeMap::default(),
             data_device_resources: BTreeMap::default(),
@@ -1533,6 +1538,17 @@ impl SeatState {
         self.pointer_interactive_grab = None;
         self.tiled_drag_origin = None;
         self.intercepted_pointer_buttons.clear();
+    }
+
+    pub(crate) fn active_tiled_resize(
+        &self,
+    ) -> Option<(crate::window::WindowId, TiledResizeState)> {
+        match self.pointer_interactive_grab {
+            Some(PointerInteractiveGrab::ResizeTiled { window, resize_state, .. }) => {
+                Some((window, resize_state))
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn resize_grab_window(&self) -> Option<crate::window::WindowId> {

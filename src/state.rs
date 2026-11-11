@@ -2752,6 +2752,7 @@ impl State {
             .collect::<Vec<_>>();
         let mut damaged_rects = Vec::new();
         let mut has_active_animations = false;
+        let mut advanced_surfaces = BTreeSet::new();
         for window in windows {
             let Some(surface) = self.window_root_surface(window) else {
                 continue;
@@ -2759,6 +2760,7 @@ impl State {
             if !include_surface(surface) {
                 continue;
             }
+            advanced_surfaces.insert(surface);
             let goal = self.focus_visual_base(surface);
             let damage_rect = self.root_surface_visual_damage_rect(surface);
             let before_visual = self
@@ -2943,6 +2945,22 @@ impl State {
                 }
                 completed_transition_outputs.extend(self.workspace_group_output_ids(group_id));
             }
+        }
+        // Release of a tiled resize relayouts after the grab is gone. Drop a
+        // tile from the snap set once this pass has applied its goal, so the
+        // next layout change animates again.
+        let finished_snap = self
+            .seat
+            .tiled_resize_snap_windows
+            .iter()
+            .copied()
+            .filter(|window| {
+                self.window_root_surface(*window)
+                    .is_none_or(|surface| advanced_surfaces.contains(&surface))
+            })
+            .collect::<Vec<_>>();
+        for window in finished_snap {
+            self.seat.tiled_resize_snap_windows.remove(&window);
         }
         VisualAnimationAdvance {
             damaged_rects,
@@ -3614,9 +3632,11 @@ impl State {
 
     /// Apply one pointer step of a tiled resize.
     ///
-    /// The windows whose tiles change snap to the new rectangle. This path
-    /// follows the pointer, as Hyprland's `warpPositionSize()` does during a
-    /// mouse resize. Keyboard resizes stay on [`Self::resize_tiled_window`]
+    /// When [`tiling::SNAP_TILED_RESIZE`] is set, the tiles that change jump
+    /// to the new rectangle. Relayout keeps that snap while the grab is active,
+    /// because the configure pass relayouts again and would otherwise start the
+    /// `windows` animation. Hyprland's `warpPositionSize()` does the same
+    /// during a mouse resize. Keyboard resizes stay on [`Self::resize_tiled_window`]
     /// and keep the `windows` animation.
     pub fn resize_tiled_window_from_state(
         &mut self,

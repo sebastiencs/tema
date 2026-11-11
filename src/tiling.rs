@@ -20,6 +20,15 @@ pub const EDGE_BOTTOM: u32 = 2;
 pub const EDGE_LEFT: u32 = 4;
 pub const EDGE_RIGHT: u32 = 8;
 
+/// Pointer resizes of tiled windows jump to the new tile.
+///
+/// `false` plays the `windows` animation for that drag. Keyboard resizes and
+/// every other layout change keep their own motion either way. Hyprland's
+/// `warpPositionSize()` snaps a mouse resize the same way. The configure pass
+/// and button release both relayout after the grab's own warp, so the snap has
+/// to be applied there too or the animation replaces it.
+pub const SNAP_TILED_RESIZE: bool = true;
+
 const MIN_CHILD_WEIGHT: f64 = 0.1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1336,6 +1345,7 @@ pub fn relayout_dirty_workspaces_with_motion(
     state: &mut State,
     motion: WindowGeometryMotion,
 ) -> Vec<Resolved<WlSurfaceId>> {
+    let snap_windows = tiled_resize_snap_windows(state);
     let workspace_ids = state
         .workspace_ids()
         .into_iter()
@@ -1419,11 +1429,53 @@ pub fn relayout_dirty_workspaces_with_motion(
         }
         for surface in workspace_surface_ids {
             if let Some(window) = state.window_for_root(surface) {
-                state.sync_window_geometry_goal(window, motion);
+                let window_motion = if snap_windows.contains(&window) {
+                    WindowGeometryMotion::Warp
+                } else {
+                    motion
+                };
+                state.sync_window_geometry_goal(window, window_motion);
             }
         }
     }
     opened
+}
+
+/// Tiles whose pointer resize should jump instead of animating.
+///
+/// The grab covers the drag itself. The seat set covers button release, which
+/// clears the grab before the workspace relayout runs.
+fn tiled_resize_snap_windows(state: &State) -> BTreeSet<WindowId> {
+    if !SNAP_TILED_RESIZE {
+        return BTreeSet::new();
+    }
+    let mut windows = state.seat.tiled_resize_snap_windows.clone();
+    if let Some((window, resize_state)) = state.seat.active_tiled_resize() {
+        windows.extend(affected_tiled_resize_windows(state, window, resize_state));
+    }
+    windows
+}
+
+pub(crate) fn affected_tiled_resize_windows(
+    state: &State,
+    window: WindowId,
+    resize_state: TiledResizeState,
+) -> BTreeSet<WindowId> {
+    let Some(root) = state.window_root_surface(window) else {
+        return BTreeSet::new();
+    };
+    let Some(workspace_id) = state.root_surface_workspace(root) else {
+        return BTreeSet::new();
+    };
+    state
+        .workspaces
+        .try_get(workspace_id)
+        .and_then(|workspace| {
+            workspace
+                .layout
+                .resize_affected_windows(window, resize_state)
+        })
+        .unwrap_or_default()
 }
 
 fn workspace_usable_bounds(state: &State, workspace_id: WorkspaceId) -> Option<RectI> {
@@ -3237,8 +3289,18 @@ mod tests {
             .begin_tiled_window_resize(left_window, EDGE_RIGHT)
             .expect("left leaf should support right-edge resize");
         let now = Instant::now();
+        state.seat.pointer_interactive_grab =
+            Some(crate::input::PointerInteractiveGrab::ResizeTiled {
+                window: left_window,
+                root_surface: left,
+                edges: EDGE_RIGHT,
+                initial_pointer_pos: (0.0, 0.0),
+                resize_state,
+            });
 
         assert!(state.resize_tiled_window_from_state(left_window, resize_state, 40, 0));
+        // The configure pass relayouts again while the grab is still held.
+        state.relayout_dirty_workspaces();
         state.advance_visual_animations(now);
 
         assert_geometry_snapped(&state, left);
@@ -3255,6 +3317,16 @@ mod tests {
                 .layout_rect_global
                 .width
         );
+
+        let mut dispatcher = Dispatcher::default();
+        crate::input::finish_pointer_interactive_grab(&mut state, &mut dispatcher, 0);
+        assert!(state.seat.pointer_interactive_grab.is_none());
+        assert!(!state.seat.tiled_resize_snap_windows.is_empty());
+        state.relayout_dirty_workspaces();
+        state.advance_visual_animations(now);
+        assert_geometry_snapped(&state, left);
+        assert_geometry_snapped(&state, right);
+        assert!(state.seat.tiled_resize_snap_windows.is_empty());
     }
 
     #[test]
@@ -3298,7 +3370,16 @@ mod tests {
         let resize_state = state
             .begin_tiled_window_resize(top_window, EDGE_BOTTOM)
             .expect("nested pair should support a bottom-edge resize");
+        state.seat.pointer_interactive_grab =
+            Some(crate::input::PointerInteractiveGrab::ResizeTiled {
+                window: top_window,
+                root_surface: top,
+                edges: EDGE_BOTTOM,
+                initial_pointer_pos: (0.0, 0.0),
+                resize_state,
+            });
         assert!(state.resize_tiled_window_from_state(top_window, resize_state, 0, 40));
+        state.relayout_dirty_workspaces();
         state.advance_visual_animations(now + Duration::from_millis(50));
 
         assert_geometry_snapped(&state, top);

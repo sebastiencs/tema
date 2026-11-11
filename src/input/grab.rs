@@ -262,6 +262,12 @@ fn settle_pointer_interactive_grab(
             state.clear_resize_anchor(window);
         }
     }
+    if was_tiled_resize && crate::tiling::SNAP_TILED_RESIZE {
+        if let ActiveGrabState::ResizeTiled { window, resize_state, .. } = grab {
+            let windows = crate::tiling::affected_tiled_resize_windows(state, window, resize_state);
+            state.seat.tiled_resize_snap_windows = windows;
+        }
+    }
     state.seat.clear_pointer_interactive_grab();
     crate::session::note_window_changed(state, dispatcher);
     if let ActiveGrabState::MoveTiled(session) = grab {
