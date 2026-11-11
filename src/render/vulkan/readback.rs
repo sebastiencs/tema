@@ -150,6 +150,11 @@ pub(super) fn read_color(
         log::error!("{error}");
         RendererError::ReadbackFailed
     })?;
+    super::format::expand_packed_readback(
+        target.attachment_format(),
+        target.readback_opaque(),
+        &mut tightly,
+    );
     for row in 0..rect.height as usize {
         let src = row * row_bytes;
         let dst_row = row * stride;

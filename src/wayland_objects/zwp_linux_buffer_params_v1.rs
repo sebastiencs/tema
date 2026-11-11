@@ -9,7 +9,7 @@ use crate::{
     clients::{Client, ClientDispatcher, EventWriter, RawRequest},
     dmabuf::{DmaBuf, DmaBufId, DmaBufPlane},
     dmabuf_feedback::render_dev_t,
-    drm::{Modifier, FORMATS_MAP},
+    drm::{client_format, Modifier},
     object::{Object, Parser, RequestResult},
     protocol_generated::{zwp_linux_buffer_params_v1, WaylandId, ZwpLinuxBufferParamsV1Id},
     render::Renderer,
@@ -74,9 +74,8 @@ impl ZwpLinuxBufferParamsV1 {
         }
         let drm_format = drm::buffer::DrmFourcc::try_from(format)
             .map_err(|_| zwp_linux_buffer_params_v1::Error::InvalidFormat)?;
-        let format = *FORMATS_MAP
-            .get(&drm_format)
-            .ok_or(zwp_linux_buffer_params_v1::Error::InvalidFormat)?;
+        let format =
+            client_format(drm_format).ok_or(zwp_linux_buffer_params_v1::Error::InvalidFormat)?;
         if self.planes.is_empty() {
             return Err(zwp_linux_buffer_params_v1::Error::Incomplete);
         }

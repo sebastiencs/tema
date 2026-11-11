@@ -132,6 +132,7 @@ pub fn test_output(
         enabled: true,
         current_mode: OutputMode { width, height, refresh_millihz: 60_000 },
         preferred_mode: None,
+        color_description: crate::color::ColorManager::new().srgb_gamma22(),
     }
 }
 

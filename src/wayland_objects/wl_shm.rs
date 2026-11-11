@@ -1,6 +1,9 @@
 use crate::{
     clients::{Client, ClientDispatcher, EventWriter, RawRequest},
-    drm::{Format, ARGB8888, FORMATS, XRGB8888},
+    drm::{
+        Format, ABGR16161616F, ABGR2101010, ARGB2101010, ARGB8888, XBGR16161616F, XBGR2101010,
+        XRGB2101010, XRGB8888,
+    },
     globals::{Global, GlobalName},
     object::{Object, Parser, RequestResult},
     protocol_generated::{wl_shm, Constants, NewId, WaylandId, WlShmId},
@@ -17,7 +20,31 @@ impl WlShmGlobal {
     }
 }
 
-pub static SHM_FORMATS: [&'static Format; 2] = [XRGB8888, ARGB8888];
+/// Client SHM formats, in the order `wl_shm.format` is sent.
+///
+/// XRGB8888 comes first, then ARGB8888. Wider formats follow in the same
+/// opaque-then-alpha order: 10-bit, then FP16.
+pub static SHM_FORMATS: [&'static Format; 8] = [
+    XRGB8888,
+    ARGB8888,
+    XRGB2101010,
+    ARGB2101010,
+    XBGR2101010,
+    ABGR2101010,
+    XBGR16161616F,
+    ABGR16161616F,
+];
+
+/// A format in [`SHM_FORMATS`] that every current renderer can upload.
+///
+/// With no DRM device yet, every listed format is accepted. A GLES 2 device
+/// drops the 10-bit and FP16 formats.
+pub(crate) fn shm_format_supported(state: &crate::state::State, format: &Format) -> bool {
+    state
+        .drm
+        .iter()
+        .all(|(_, drm)| drm.accepts_shm_format(format.drm))
+}
 
 impl Global for WlShmGlobal {
     fn interface(&self) -> (&'static str, u32) {
@@ -32,11 +59,15 @@ impl Global for WlShmGlobal {
         dispatcher: &mut ClientDispatcher,
     ) {
         let id = WlShmId::from(id);
+        let codes: Vec<u32> = SHM_FORMATS
+            .iter()
+            .filter(|format| shm_format_supported(state, format))
+            .filter_map(|format| format.wayland_shm_id)
+            .collect();
         let (_, wl_shm) = client.insert_object(state, WlShm { id, version });
 
-        // TODO: Send other supported formats
-        for format in SHM_FORMATS {
-            wl_shm.send_event(wl_shm::Event::Format { format: format.wayland_id }, dispatcher);
+        for code in codes {
+            wl_shm.send_event(wl_shm::Event::Format { format: code }, dispatcher);
         }
     }
 }

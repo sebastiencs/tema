@@ -414,6 +414,7 @@ impl Udev {
             return;
         };
         let changed_outputs = sync_output_nodes_for_backend(state, drm_id);
+        crate::drm::request_output_color_redraws(state, dispatcher);
         for output_id in changed_outputs {
             dispatcher.dispatch_to(
                 crate::scheduler::output_scheduler_id(output_id),
@@ -762,21 +763,23 @@ impl Udev {
 
         eprintln!("DRM TAKEN {:?}", device.devnode());
 
-        let drm = match Drm::create_drm(fd, device, state.config.general.renderer) {
-            Ok(drm) => drm,
-            Err(error) => {
-                if from_resume {
-                    crate::runner::isolate_session_fault(
-                        crate::runner::SessionFault::UnusableResumeFd,
-                        format!("DRM device {devnum} failed: {error}"),
-                    );
-                } else {
-                    log::error!("DRM device {devnum} failed: {error}");
+        let renderer = state.config.general.renderer;
+        let drm =
+            match Drm::create_drm(fd, device, renderer, |name| state.config.output_color(name)) {
+                Ok(drm) => drm,
+                Err(error) => {
+                    if from_resume {
+                        crate::runner::isolate_session_fault(
+                            crate::runner::SessionFault::UnusableResumeFd,
+                            format!("DRM device {devnum} failed: {error}"),
+                        );
+                    } else {
+                        log::error!("DRM device {devnum} failed: {error}");
+                    }
+                    dispatcher.dispatch(DbusAction::ReleaseDevice { devnum });
+                    return self.settle_initial_drm(devnum, state);
                 }
-                dispatcher.dispatch(DbusAction::ReleaseDevice { devnum });
-                return self.settle_initial_drm(devnum, state);
-            }
-        };
+            };
         let drm_id = state.drm.insert(drm);
         let drm_output_ids = state
             .drm
@@ -789,8 +792,12 @@ impl Udev {
         dispatcher.start_model(drm_id, DrmReader::new(drm_id, fd));
         let mut output_ids = Vec::with_capacity(drm_output_ids.len());
         for drm_output_id in drm_output_ids {
-            let output =
-                Output::new(BackendOutputRef::new(drm_id), drm_output_id, state.drm.get(drm_id));
+            let output = Output::new(
+                BackendOutputRef::new(drm_id),
+                drm_output_id,
+                state.drm.get(drm_id),
+                &state.color_manager,
+            );
             let output_id = state.insert_output(output);
             self.place_output_automatically(output_id, state);
             self.publish_output_node(output_id, state, dispatcher);
@@ -816,6 +823,7 @@ impl Udev {
                 dispatcher,
             );
         }
+        let _ = state.take_output_color_redraws();
         if state.drm.get(drm_id).supports_linux_drm_syncobj() {
             let global = WpLinuxDrmSyncobjManagerV1Global::new(drm_id);
             let (interface, version) = global.interface();

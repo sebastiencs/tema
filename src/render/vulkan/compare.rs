@@ -3,6 +3,10 @@ use std::{fs::OpenOptions, os::fd::OwnedFd, path::PathBuf, rc::Rc};
 use drm::buffer::DrmFourcc;
 
 use crate::{
+    color::{
+        ColorManager, ColorTransform, ImageDescriptionParams, Luminances, NamedPrimaries,
+        Primaries, RenderIntent, TransferFunction,
+    },
     config::{RendererSelection, RgbaColor, RoundingPower, ShadowPower},
     drm::DrmFd,
     gbm::{GbmDevice, UseFlags},
@@ -91,6 +95,10 @@ fn element(
             damage: DamageRegion::from_rect(rect),
             blend: alpha < u8::MAX || !matches!(mask, TextureMask::None),
             alpha,
+            alpha_multiplier: u32::MAX,
+            color: None,
+            alpha_mode: 0,
+            yuv: None,
             mask,
         },
     }
@@ -123,6 +131,7 @@ fn paint_scene(
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: None,
+                linear_blend: None,
             },
         )
         .expect("render");
@@ -509,6 +518,7 @@ fn vulkan_draws_a_texture_when_the_frame_also_has_an_effect() {
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: None,
+                linear_blend: None,
             },
         )
         .expect("render the texture under the dim overlay");
@@ -543,6 +553,7 @@ fn paint_elements(
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: None,
+                linear_blend: None,
             },
         )
         .expect("render");
@@ -786,6 +797,7 @@ fn vulkan_preserves_untouched_scanout_pixels() {
                     sync_mode: RenderSyncMode::BlockingFinishFallback,
                     blur_reference: None,
                     clear_color: None,
+                    linear_blend: None,
                 },
             )
             .expect("paint the scanout buffer");
@@ -802,6 +814,7 @@ fn vulkan_preserves_untouched_scanout_pixels() {
                     sync_mode: RenderSyncMode::BlockingFinishFallback,
                     blur_reference: None,
                     clear_color: None,
+                    linear_blend: None,
                 },
             )
             .expect("redraw the damaged half");
@@ -867,6 +880,7 @@ fn vulkan_output_target_preserves_contents_across_frames() {
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: Some([1.0, 0.0, 0.0, 1.0]),
+                linear_blend: None,
             },
         )
         .expect("paint the scanout buffer red");
@@ -882,6 +896,7 @@ fn vulkan_output_target_preserves_contents_across_frames() {
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: Some([0.0, 1.0, 0.0, 1.0]),
+                linear_blend: None,
             },
         )
         .expect("paint the damaged corner green");
@@ -996,6 +1011,7 @@ fn clear_output(
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: Some(color),
+                linear_blend: None,
             },
         )
         .expect("paint the client buffer");
@@ -1032,6 +1048,10 @@ fn render_cursor_image(
                 damage: DamageRegion::from_rect(image),
                 blend: true,
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
+                color: None,
+                alpha_mode: 0,
+                yuv: None,
                 mask: TextureMask::None,
             },
         }],
@@ -1048,6 +1068,7 @@ fn render_cursor_image(
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: None,
                 clear_color: Some([0.0, 0.0, 0.0, 0.0]),
+                linear_blend: None,
             },
         )
         .expect("cursor render");
@@ -1175,6 +1196,282 @@ fn vulkan_xrgb_shm_stays_opaque_when_blended() {
     );
 }
 
+#[test]
+fn alpha_multiplier_matches_on_argb_and_xrgb() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping alpha multiplier comparison: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let factor = (0.51 * f64::from(u32::MAX)) as u32;
+    let white = [255, 255, 255, 255];
+    // Little-endian B, G, R, A. Opaque red, and the same red stored as XRGB.
+    let cases = [([0, 0, 255, 255], DrmFourcc::Argb8888), ([0, 0, 255, 0], DrmFourcc::Xrgb8888)];
+    for (pixel, fourcc) in cases {
+        let gl_back = pair.gl.upload_rgba(&white, 1, 1).expect("gles backdrop");
+        let vk_back = pair
+            .vulkan
+            .upload_rgba(&white, 1, 1)
+            .expect("vulkan backdrop");
+        let gl_tex = pair
+            .gl
+            .import_shm(ShmImage { bytes: &pixel, width: 1, height: 1, stride: 4, fourcc })
+            .expect("gles pixel");
+        let vk_tex = pair
+            .vulkan
+            .import_shm(ShmImage { bytes: &pixel, width: 1, height: 1, stride: 4, fourcc })
+            .expect("vulkan pixel");
+        let gles = paint_scene(
+            &mut *pair.gl,
+            vec![
+                element(gl_back, 0, 0, 1, 1, u8::MAX, TextureMask::None),
+                multiplied(gl_tex, factor),
+            ],
+            1,
+            1,
+            OutputPresentationTransform::FlipY,
+        );
+        let vulkan = paint_scene(
+            &mut *pair.vulkan,
+            vec![
+                element(vk_back, 0, 0, 1, 1, u8::MAX, TextureMask::None),
+                multiplied(vk_tex, factor),
+            ],
+            1,
+            1,
+            OutputPresentationTransform::FlipY,
+        );
+        assert_close(&gles, &vulkan, 1);
+        // Premultiplied red over white stays red and lets the white through in the other channels.
+        assert!(gles[2] > 250, "blended red stays bright, got {gles:?}");
+        assert!(gles[0] > 80, "white shows through the multiplier, got {gles:?}");
+    }
+}
+
+#[test]
+fn ten_bit_gradient_matches_on_gles_and_vulkan() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping 10-bit gradient comparison: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let width = 4;
+    let samples = [(0, 1023, 512), (341, 682, 512), (682, 341, 512), (1023, 0, 512)];
+    let cases = [
+        (DrmFourcc::Xrgb2101010, true, 0u32),
+        (DrmFourcc::Argb2101010, true, 0),
+        (DrmFourcc::Xbgr2101010, false, 0),
+        (DrmFourcc::Abgr2101010, false, 3),
+    ];
+    for (fourcc, argb_order, alpha) in cases {
+        let mut bytes = Vec::with_capacity(width * 4);
+        for (red, green, blue) in samples {
+            bytes.extend(pack_2101010(red, green, blue, alpha, argb_order));
+        }
+        let gl_tex = pair
+            .gl
+            .import_shm(ShmImage {
+                bytes: &bytes,
+                width: width as i32,
+                height: 1,
+                stride: width * 4,
+                fourcc,
+            })
+            .expect("gles 10-bit");
+        let vk_tex = pair
+            .vulkan
+            .import_shm(ShmImage {
+                bytes: &bytes,
+                width: width as i32,
+                height: 1,
+                stride: width * 4,
+                fourcc,
+            })
+            .expect("vulkan 10-bit");
+        let gles = paint(
+            &mut *pair.gl,
+            element(gl_tex, 0, 0, width as i32, 1, u8::MAX, TextureMask::None),
+            width as i32,
+            1,
+        );
+        let vulkan = paint(
+            &mut *pair.vulkan,
+            element(vk_tex, 0, 0, width as i32, 1, u8::MAX, TextureMask::None),
+            width as i32,
+            1,
+        );
+        assert_close(&gles, &vulkan, 1);
+        let first = pixel(&gles, width as i32, 0, 0);
+        let last = pixel(&gles, width as i32, width as i32 - 1, 0);
+        assert!(first[2] <= 1, "{fourcc:?} left edge stays dark red, got {first:?}");
+        assert!(last[2] >= 254, "{fourcc:?} right edge stays bright red, got {last:?}");
+        assert!(
+            first[0] > 100 && first[0] < 160,
+            "{fourcc:?} blue channel stays mid, got {first:?}"
+        );
+        assert!(last[1] <= 1, "{fourcc:?} right edge has no green, got {last:?}");
+        let expect_alpha = if alpha == 0 && !fourcc_has_alpha(fourcc) {
+            255
+        } else if alpha == 0 {
+            0
+        } else {
+            255
+        };
+        assert_eq!(first[3], expect_alpha, "{fourcc:?} alpha, got {first:?}");
+    }
+}
+
+fn fourcc_has_alpha(fourcc: DrmFourcc) -> bool {
+    matches!(fourcc, DrmFourcc::Argb2101010 | DrmFourcc::Abgr2101010)
+}
+
+/// Little-endian `2:10:10:10`. `argb_order` stores blue in the low 10 bits.
+fn pack_2101010(red: u32, green: u32, blue: u32, alpha: u32, argb_order: bool) -> [u8; 4] {
+    let (low, high) = if argb_order { (blue, red) } else { (red, blue) };
+    let word =
+        (low & 0x3ff) | ((green & 0x3ff) << 10) | ((high & 0x3ff) << 20) | ((alpha & 0x3) << 30);
+    word.to_le_bytes()
+}
+
+#[test]
+fn fp16_windows_scrgb_matches_the_cpu_transform() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping fp16 scrgb comparison: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let manager = ColorManager::new();
+    let transform = ColorTransform::between(
+        &manager.windows_scrgb(),
+        &manager.srgb_gamma22(),
+        RenderIntent::Perceptual,
+    )
+    .expect("scrgb to srgb");
+    assert!(transform.tonemap.is_some(), "scRGB's 10000 nit target tone maps onto SDR");
+    let clipped = ColorTransform::between(
+        &manager.windows_scrgb(),
+        &manager.srgb_gamma22(),
+        RenderIntent::RelativeBpc,
+    )
+    .expect("scrgb clip");
+    let signal_one = expected_linear(&transform, [1.0, 1.0, 1.0]);
+    let signal_two = expected_linear(&transform, [2.0, 2.0, 2.0]);
+    let reference_white = 203.0_f64 / 80.0;
+    let white = expected_linear(&transform, [reference_white, reference_white, reference_white]);
+    let clipped_white =
+        expected_linear(&clipped, [reference_white, reference_white, reference_white]);
+    assert!(signal_one[0] < 200, "scRGB 1.0 stays below sRGB white, got {signal_one:?}");
+    assert!(
+        signal_two[0] > signal_one[0] + 10,
+        "scRGB 2.0 stays above 1.0 after the shoulder, got {signal_two:?} vs {signal_one:?}"
+    );
+    assert!(
+        clipped_white[..3].iter().all(|channel| *channel >= 254),
+        "relative intent still encodes scRGB 203 nits as sRGB white, got {clipped_white:?}"
+    );
+    assert!(
+        white[0] + 2 < clipped_white[0],
+        "perceptual reference white sits below the clip, got {white:?} vs {clipped_white:?}"
+    );
+
+    for fourcc in [DrmFourcc::Abgr16161616f, DrmFourcc::Xbgr16161616f] {
+        let alpha = if fourcc == DrmFourcc::Abgr16161616f { 1.0 } else { 0.0 };
+        let (gles, vulkan) = paint_fp16(&mut pair, fourcc, 1.0, alpha, transform);
+        assert_pixel_close("gles scrgb 1.0", &gles, &signal_one);
+        assert_pixel_close("vulkan scrgb 1.0", &vulkan, &signal_one);
+        assert_eq!(gles[3], 255, "{fourcc:?} alpha, got {gles:?}");
+        assert_eq!(vulkan[3], 255, "{fourcc:?} alpha, got {vulkan:?}");
+    }
+    let (gles, vulkan) = paint_fp16(&mut pair, DrmFourcc::Abgr16161616f, 2.0, 1.0, transform);
+    assert_pixel_close("gles scrgb 2.0", &gles, &signal_two);
+    assert_pixel_close("vulkan scrgb 2.0", &vulkan, &signal_two);
+    let (gles, vulkan) =
+        paint_fp16(&mut pair, DrmFourcc::Abgr16161616f, reference_white as f32, 1.0, transform);
+    assert_pixel_close("gles scrgb reference white", &gles, &white);
+    assert_pixel_close("vulkan scrgb reference white", &vulkan, &white);
+}
+
+fn paint_fp16(
+    pair: &mut Pair,
+    fourcc: DrmFourcc,
+    value: f32,
+    alpha: f32,
+    color: ColorTransform,
+) -> ([u8; 4], [u8; 4]) {
+    let bytes = fp16_pixel(value, value, value, alpha);
+    let image = ShmImage { bytes: &bytes, width: 1, height: 1, stride: 8, fourcc };
+    let gl_tex = pair.gl.import_shm(image).expect("gles fp16");
+    let vk_tex = pair
+        .vulkan
+        .import_shm(ShmImage { bytes: &bytes, width: 1, height: 1, stride: 8, fourcc })
+        .expect("vulkan fp16");
+    (paint_colored(&mut *pair.gl, gl_tex, color), paint_colored(&mut *pair.vulkan, vk_tex, color))
+}
+
+fn paint_colored(
+    renderer: &mut dyn Renderer,
+    texture: Rc<dyn Texture>,
+    color: ColorTransform,
+) -> [u8; 4] {
+    let FrameElement::Texture { phase, mut element } =
+        element(texture, 0, 0, 1, 1, u8::MAX, TextureMask::None)
+    else {
+        unreachable!("texture element");
+    };
+    element.color = Some(Rc::new(color));
+    let bytes = paint(renderer, FrameElement::Texture { phase, element }, 1, 1);
+    [bytes[0], bytes[1], bytes[2], bytes[3]]
+}
+
+fn expected_linear(transform: &ColorTransform, rgb: [f64; 3]) -> [u8; 4] {
+    let mapped = transform.map_rgb(rgb);
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [channel(mapped[2]), channel(mapped[1]), channel(mapped[0]), 255]
+}
+
+fn fp16_pixel(red: f32, green: f32, blue: f32, alpha: f32) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    for (index, value) in [red, green, blue, alpha].into_iter().enumerate() {
+        bytes[index * 2..index * 2 + 2].copy_from_slice(&f16_bits(value).to_le_bytes());
+    }
+    bytes
+}
+
+/// Round a positive finite value to binary16.
+fn f16_bits(value: f32) -> u16 {
+    if value == 0.0 {
+        return 0;
+    }
+    assert!(value.is_finite() && value > 0.0, "fp16 test value {value}");
+    let bits = value.to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x7fffff;
+    assert!((1..31).contains(&exponent), "fp16 exponent for {value}");
+    let mut result = ((exponent as u16) << 10) | ((mantissa >> 13) as u16);
+    let remainder = mantissa & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && (mantissa & 0x2000) != 0) {
+        result += 1;
+    }
+    result
+}
+
+#[test]
+fn half_float_one_and_two_use_the_binary16_encodings() {
+    assert_eq!(f16_bits(1.0), 0x3c00);
+    assert_eq!(f16_bits(2.0), 0x4000);
+}
+
+fn multiplied(texture: Rc<dyn Texture>, alpha_multiplier: u32) -> FrameElement {
+    let FrameElement::Texture { mut element, .. } =
+        element(texture, 0, 0, 1, 1, u8::MAX, TextureMask::None)
+    else {
+        unreachable!("texture element");
+    };
+    element.blend = false;
+    element.alpha_multiplier = alpha_multiplier;
+    FrameElement::Texture { phase: FramePhase::Content, element }
+}
+
 fn blended_pixel(texture: Rc<dyn Texture>) -> FrameElement {
     let rect = RectI::new(0, 0, 1, 1).expect("rect");
     FrameElement::Texture {
@@ -1190,7 +1487,605 @@ fn blended_pixel(texture: Rc<dyn Texture>) -> FrameElement {
             damage: DamageRegion::from_rect(rect),
             blend: true,
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
+            color: None,
+            alpha_mode: 0,
+            yuv: None,
             mask: TextureMask::None,
         },
     }
+}
+
+#[test]
+fn color_transforms_match_on_gles_and_vulkan() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping color transform comparison: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let manager = ColorManager::new();
+    let srgb = manager.srgb_gamma22();
+    let display_p3 = manager.intern(ImageDescriptionParams {
+        tf: TransferFunction::Gamma22,
+        primaries: Primaries::DISPLAY_P3,
+        named_primaries: Some(NamedPrimaries::DisplayP3),
+        luminances: Luminances::SRGB,
+        target_primaries: Primaries::DISPLAY_P3,
+        target_luminances: (Luminances::SRGB.min, Luminances::SRGB.max),
+        max_cll: None,
+        max_fall: None,
+    });
+    let to_p3 =
+        ColorTransform::between(&srgb, &display_p3, RenderIntent::Perceptual).expect("srgb to p3");
+    let p3_pixel = [220, 40, 90, 255];
+    assert_ne!(
+        expected_bgra(&to_p3, p3_pixel)[0..3],
+        [p3_pixel[2], p3_pixel[1], p3_pixel[0]],
+        "sRGB red-heavy pixel must move in Display P3"
+    );
+    assert_renderers_match(&mut pair, p3_pixel, to_p3);
+
+    let mut pq_params = ImageDescriptionParams::srgb_gamma22();
+    pq_params.tf = TransferFunction::St2084Pq;
+    pq_params.luminances = Luminances::ST2084_PQ;
+    let pq = manager.intern(pq_params);
+    let to_srgb =
+        ColorTransform::between(&pq, &srgb, RenderIntent::Perceptual).expect("pq to srgb");
+    let white = TransferFunction::St2084Pq.encode(203.0 / 10_000.0);
+    let white_byte = (white.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let pq_white = [white_byte, white_byte, white_byte, 255];
+    let expected_white = expected_bgra(&to_srgb, pq_white);
+    assert!(
+        expected_white[..3].iter().all(|channel| *channel >= 254),
+        "PQ 203 nits must stay white, got {expected_white:?}"
+    );
+    assert_renderers_match(&mut pair, pq_white, to_srgb);
+
+    let to_srgb_from_linear =
+        ColorTransform::between(&manager.windows_scrgb(), &srgb, RenderIntent::Perceptual)
+            .expect("scrgb to srgb");
+    assert_renderers_match(&mut pair, [255, 255, 255, 255], to_srgb_from_linear);
+}
+
+fn assert_renderers_match(pair: &mut Pair, rgba: [u8; 4], color: ColorTransform) {
+    let gles = painted_color(&mut *pair.gl, rgba, color);
+    let vulkan = painted_color(&mut *pair.vulkan, rgba, color);
+    let expected = expected_bgra(&color, rgba);
+    assert_pixel_close("gles", &gles, &expected);
+    assert_pixel_close("vulkan", &vulkan, &expected);
+    assert_pixel_close("gles/vulkan", &gles, &vulkan);
+}
+
+fn painted_color(renderer: &mut dyn Renderer, rgba: [u8; 4], color: ColorTransform) -> [u8; 4] {
+    let texture = renderer.upload_rgba(&rgba, 1, 1).expect("rgba");
+    let FrameElement::Texture { phase, mut element } =
+        element(texture, 0, 0, 1, 1, u8::MAX, TextureMask::None)
+    else {
+        unreachable!("texture element");
+    };
+    element.color = Some(Rc::new(color));
+    let bytes = paint(renderer, FrameElement::Texture { phase, element }, 1, 1);
+    [bytes[0], bytes[1], bytes[2], bytes[3]]
+}
+
+#[test]
+fn nv12_and_p010_match_the_bt709_limited_matrix() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping yuv comparison: no matching DRM node");
+        return;
+    };
+    paint_flat_yuv(&mut pair, DrmFourcc::Nv12, false, 126, 64, 192, None);
+    paint_flat_yuv(&mut pair, DrmFourcc::P010, true, 470, 256, 768, None);
+    let bt601 = crate::color::ColorRepresentation {
+        coefficients: Some(crate::color::Coefficients {
+            kind: crate::color::yuv::CoefficientKind::Bt601,
+            range: crate::color::yuv::VideoRange::Limited,
+        }),
+        ..crate::color::ColorRepresentation::default()
+    }
+    .yuv_conversion(false);
+    paint_flat_yuv(&mut pair, DrmFourcc::Nv12, false, 126, 64, 192, Some(bt601));
+    paint_nv12_checker(&mut pair);
+}
+
+fn import_yuv_textures(
+    pair: &mut Pair,
+    mut dmabuf: crate::dmabuf::DmaBuf,
+    fourcc: DrmFourcc,
+) -> Option<(Option<Rc<dyn Texture>>, Option<Rc<dyn Texture>>)> {
+    dmabuf.modifier = crate::drm::Modifier::LINEAR;
+    let gl_texture = match pair.gl.import_dmabuf(&dmabuf) {
+        Ok(texture) => Some(texture),
+        Err(error) => {
+            yuv_note(&format!("{fourcc:?} gles: {error}"));
+            None
+        }
+    };
+    let vk_texture = match pair.vulkan.import_dmabuf(&dmabuf) {
+        Ok(texture) => Some(texture),
+        Err(error) => {
+            yuv_note(&format!("{fourcc:?} vulkan: {error}"));
+            None
+        }
+    };
+    if gl_texture.is_none() && vk_texture.is_none() {
+        None
+    } else {
+        Some((gl_texture, vk_texture))
+    }
+}
+
+fn yuv_note(message: &str) {
+    eprintln!("{message}");
+}
+
+#[test]
+fn straight_and_optical_alpha_match_the_cpu() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping alpha-mode comparison: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let premul = [0, 0, 128, 128];
+    let straight = [0, 0, 255, 128];
+    let premul_out = paint_bgra(&mut pair, premul, 0);
+    let straight_out = paint_bgra(&mut pair, straight, 2);
+    for (name, bytes) in [("premul", &premul_out), ("straight", &straight_out)] {
+        for (renderer, pixel) in [("gles", &bytes.0), ("vulkan", &bytes.1)] {
+            assert_bgra_close(&format!("{name} {renderer}"), pixel, &premul);
+        }
+    }
+
+    let optical = [0, 0, 200, 128];
+    let encoded = 200.0_f32 / 255.0;
+    let alpha = 128.0_f32 / 255.0;
+    let linear = encoded.powf(2.2) / alpha;
+    let red = (linear.powf(1.0 / 2.2) * alpha * 255.0).round() as u8;
+    assert!(
+        (red as i32 - 200).abs() > 2,
+        "optical premultiplication must leave gamma 2.2, got {red}"
+    );
+    let (gles, vulkan) = paint_bgra(&mut pair, optical, 1);
+    let expected = [0, 0, red, 128];
+    assert_bgra_close("optical gles", &gles, &expected);
+    assert_bgra_close("optical vulkan", &vulkan, &expected);
+}
+
+#[test]
+fn hdr_translucency_blends_in_linear_then_encodes_pq() {
+    let pq = TransferFunction::St2084Pq;
+    let alpha = 128.0 / 255.0;
+    let quant = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let sample = |byte: u8| f64::from(byte) / 255.0;
+    let bottom = quant(pq.encode(0.25));
+    let top_red = quant(pq.encode(0.9) * alpha);
+    let top_green = quant(pq.encode(0.05) * alpha);
+    let decode_premul = |byte: u8| pq.decode(sample(byte) / alpha);
+    let blend_linear = |top: u8| {
+        quant(pq.encode(decode_premul(top) * alpha + pq.decode(sample(bottom)) * (1.0 - alpha)))
+    };
+    let blend_encoded = |top: u8| quant(sample(top) + sample(bottom) * (1.0 - alpha));
+    let linear = [blend_linear(top_green), blend_linear(top_green), blend_linear(top_red), 255];
+    let encoded = [blend_encoded(top_green), blend_encoded(top_green), blend_encoded(top_red), 255];
+    assert!(
+        linear[..3].iter().zip(encoded[..3].iter()).any(|(left, right)| left.abs_diff(*right) > 1),
+        "PQ blending in linear must leave the encoded-space blend, linear {linear:?} encoded {encoded:?}"
+    );
+
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping linear blend comparison: no matching DRM node");
+        return;
+    };
+    let bottom_px = [bottom, bottom, bottom, 255];
+    let top_px = [top_green, top_green, top_red, 128];
+    let paint = |renderer: &mut dyn Renderer, linear_blend| {
+        paint_layers(renderer, &[(bottom_px, false), (top_px, true)], linear_blend)
+    };
+    let gles = paint(&mut *pair.gl, Some(pq));
+    let vulkan = paint(&mut *pair.vulkan, Some(pq));
+    assert_pixel_close("linear blend gles", &gles, &linear);
+    assert_pixel_close("linear blend vulkan", &vulkan, &linear);
+
+    let gles_encoded = paint(&mut *pair.gl, None);
+    let vulkan_encoded = paint(&mut *pair.vulkan, None);
+    assert_pixel_close("encoded blend gles", &gles_encoded, &encoded);
+    assert_pixel_close("encoded blend vulkan", &vulkan_encoded, &encoded);
+
+    let opaque = |renderer: &mut dyn Renderer, linear_blend| {
+        paint_layers(renderer, &[(bottom_px, false)], linear_blend)
+    };
+    let gles_direct = opaque(&mut *pair.gl, None);
+    let gles_elided = opaque(&mut *pair.gl, Some(pq));
+    let vulkan_direct = opaque(&mut *pair.vulkan, None);
+    let vulkan_elided = opaque(&mut *pair.vulkan, Some(pq));
+    assert_pixel_close("opaque elision gles", &gles_elided, &gles_direct);
+    assert_pixel_close("opaque elision vulkan", &vulkan_elided, &vulkan_direct);
+    assert_eq!(gles_direct, bottom_px, "an opaque texel is copied");
+}
+
+fn paint_layers(
+    renderer: &mut dyn Renderer,
+    layers: &[([u8; 4], bool)],
+    linear_blend: Option<TransferFunction>,
+) -> [u8; 4] {
+    let mut elements = Vec::with_capacity(layers.len());
+    for (bytes, translucent) in layers {
+        let texture = renderer
+            .import_shm(ShmImage {
+                bytes,
+                width: 1,
+                height: 1,
+                stride: 4,
+                fourcc: DrmFourcc::Argb8888,
+            })
+            .expect("shm");
+        let mut painted = element(texture, 0, 0, 1, 1, u8::MAX, TextureMask::None);
+        if let FrameElement::Texture { element, .. } = &mut painted {
+            element.blend = *translucent;
+        }
+        elements.push(painted);
+    }
+    let recipe = OutputFrameRecipe { elements };
+    let damage = DamageRegion::from_rect(RectI::new(0, 0, 1, 1).expect("damage"));
+    let mut target = renderer.create_offscreen_target(1, 1).expect("offscreen");
+    renderer
+        .render(
+            &mut *target,
+            RenderFrame {
+                recipe: &recipe,
+                damage: &damage,
+                preserve_contents: false,
+                presentation_transform: OutputPresentationTransform::FlipY,
+                sync_mode: RenderSyncMode::BlockingFinishFallback,
+                blur_reference: None,
+                clear_color: None,
+                linear_blend,
+            },
+        )
+        .expect("render");
+    let mut bytes = [0_u8; 4];
+    renderer
+        .readback(&*target, RectI::new(0, 0, 1, 1).expect("read"), 4, &mut bytes)
+        .expect("readback");
+    bytes
+}
+
+fn paint_bgra(pair: &mut Pair, bgra: [u8; 4], alpha_mode: u32) -> ([u8; 4], [u8; 4]) {
+    let with_mode = |texture| {
+        let mut painted = element(texture, 0, 0, 1, 1, u8::MAX, TextureMask::None);
+        if let FrameElement::Texture { element, .. } = &mut painted {
+            element.alpha_mode = alpha_mode;
+        }
+        painted
+    };
+    let gl_texture = pair
+        .gl
+        .import_shm(ShmImage {
+            bytes: &bgra,
+            width: 1,
+            height: 1,
+            stride: 4,
+            fourcc: DrmFourcc::Argb8888,
+        })
+        .expect("gles shm");
+    let vk_texture = pair
+        .vulkan
+        .import_shm(ShmImage {
+            bytes: &bgra,
+            width: 1,
+            height: 1,
+            stride: 4,
+            fourcc: DrmFourcc::Argb8888,
+        })
+        .expect("vulkan shm");
+    let gles = paint(&mut *pair.gl, with_mode(gl_texture), 1, 1);
+    let vulkan = paint(&mut *pair.vulkan, with_mode(vk_texture), 1, 1);
+    ([gles[0], gles[1], gles[2], gles[3]], [vulkan[0], vulkan[1], vulkan[2], vulkan[3]])
+}
+
+fn paint_flat_yuv(
+    pair: &mut Pair,
+    fourcc: DrmFourcc,
+    ten_bit: bool,
+    y: u16,
+    cb: u16,
+    cr: u16,
+    conversion: Option<crate::color::YuvConversion>,
+) {
+    let Some(dmabuf) = dumb_yuv(&pair.gbm, fourcc, 4, 4, ten_bit, |plane, x, _row| {
+        if plane == 0 {
+            y
+        } else if x % 2 == 0 {
+            cb
+        } else {
+            cr
+        }
+    }) else {
+        yuv_note(&format!("skip {fourcc:?}: no dumb buffer"));
+        return;
+    };
+    let Some((gl_texture, vk_texture)) = import_yuv_textures(pair, dmabuf, fourcc) else {
+        yuv_note(&format!("skip {fourcc:?}: neither renderer imported it"));
+        return;
+    };
+    let paint_one = |texture| {
+        let mut painted = element(texture, 0, 0, 4, 4, u8::MAX, TextureMask::None);
+        if let FrameElement::Texture { element, .. } = &mut painted {
+            element.yuv = conversion;
+        }
+        painted
+    };
+    let gles = gl_texture.map(|texture| paint(&mut *pair.gl, paint_one(texture), 4, 4));
+    let vulkan = vk_texture.map(|texture| paint(&mut *pair.vulkan, paint_one(texture), 4, 4));
+    let rows = conversion
+        .unwrap_or_else(|| crate::color::ColorRepresentation::default().yuv_conversion(ten_bit))
+        .rows;
+    let sample = if ten_bit {
+        let norm = |code: u16| ((u32::from(code) << 6) as f32) / 65535.0;
+        crate::color::yuv::apply_rows(rows, norm(y), norm(cb), norm(cr))
+    } else {
+        crate::color::yuv::apply_rows(rows, y as f32 / 255.0, cb as f32 / 255.0, cr as f32 / 255.0)
+    };
+    let expected = bgra_of(sample);
+    for y_px in 0..4 {
+        for x in 0..4 {
+            if let Some(gles) = &gles {
+                assert_bgra_close(
+                    &format!("{fourcc:?} gles {x},{y_px}"),
+                    pixel(gles, 4, x, y_px),
+                    &expected,
+                );
+            }
+            if let Some(vulkan) = &vulkan {
+                assert_bgra_close(
+                    &format!("{fourcc:?} vulkan {x},{y_px}"),
+                    pixel(vulkan, 4, x, y_px),
+                    &expected,
+                );
+            }
+        }
+    }
+}
+
+fn paint_nv12_checker(pair: &mut Pair) {
+    let chroma = |x: usize, chroma_row: usize| match (x / 2, chroma_row) {
+        (0, 0) => (64u16, 128u16),
+        (1, 0) => (192, 128),
+        (0, 1) => (128, 64),
+        _ => (128, 192),
+    };
+    let Some(dmabuf) = dumb_yuv(&pair.gbm, DrmFourcc::Nv12, 4, 4, false, |plane, x, row| {
+        if plane == 0 {
+            126
+        } else {
+            let (cb, cr) = chroma(x, row);
+            if x % 2 == 0 {
+                cb
+            } else {
+                cr
+            }
+        }
+    }) else {
+        yuv_note("skip checker: no dumb buffer");
+        return;
+    };
+    let Some((gl_texture, vk_texture)) = import_yuv_textures(pair, dmabuf, DrmFourcc::Nv12) else {
+        yuv_note("skip checker: neither renderer imported it");
+        return;
+    };
+    let gles = gl_texture.map(|texture| {
+        paint(&mut *pair.gl, element(texture, 0, 0, 4, 4, u8::MAX, TextureMask::None), 4, 4)
+    });
+    let vulkan = vk_texture.map(|texture| {
+        paint(&mut *pair.vulkan, element(texture, 0, 0, 4, 4, u8::MAX, TextureMask::None), 4, 4)
+    });
+    let expect = |x: i32, y: i32| {
+        let (cb, cr) = chroma(x as usize, (y / 2) as usize);
+        bgra_of(crate::color::yuv::bt709_limited_rgb(
+            126.0 / 255.0,
+            cb as f32 / 255.0,
+            cr as f32 / 255.0,
+            false,
+        ))
+    };
+    for (x, y) in [(0, 0), (2, 0), (0, 3), (2, 3)] {
+        if let Some(gles) = &gles {
+            assert_bgra_close(
+                &format!("nv12 checker gles {x},{y}"),
+                pixel(gles, 4, x, y),
+                &expect(x, y),
+            );
+        }
+        if let Some(vulkan) = &vulkan {
+            assert_bgra_close(
+                &format!("nv12 checker vulkan {x},{y}"),
+                pixel(vulkan, 4, x, y),
+                &expect(x, y),
+            );
+        }
+    }
+}
+
+fn dumb_create(
+    gbm: &GbmDevice,
+    width: u32,
+    height: u32,
+    bpp: u32,
+) -> Option<(std::os::fd::OwnedFd, drm_ffi::drm_sys::drm_mode_create_dumb)> {
+    use std::os::fd::{AsFd, OwnedFd};
+    let mut devices = Vec::new();
+    if let Ok(fd) = gbm.as_fd().try_clone_to_owned() {
+        devices.push(fd);
+    }
+    if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("card"))
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                devices.push(OwnedFd::from(file));
+            }
+        }
+    }
+    for fd in devices {
+        match drm_ffi::mode::dumbbuffer::create(fd.as_fd(), width, height, bpp, 0) {
+            Ok(created) => return Some((fd, created)),
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+/// GBM on this machine will not allocate NV12. A linear dumb buffer is one
+/// dma-buf with the chroma plane placed after the luma rows.
+fn dumb_yuv(
+    gbm: &GbmDevice,
+    fourcc: DrmFourcc,
+    width: u32,
+    height: u32,
+    ten_bit: bool,
+    sample: impl Fn(usize, usize, usize) -> u16,
+) -> Option<crate::dmabuf::DmaBuf> {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    let bpp = if ten_bit { 16 } else { 8 };
+    let (device, created) = match dumb_create(gbm, width, height + height / 2, bpp) {
+        Some(created) => created,
+        None => {
+            yuv_note(&format!("dumb create {fourcc:?}: no device accepted it"));
+            return None;
+        }
+    };
+    let pitch = created.pitch as usize;
+    let sample_bpp = bpp as usize / 8;
+    let luma_bytes = pitch * height as usize;
+    let total = pitch * (height as usize + height as usize / 2);
+    if created.size < total as u64 || pitch < width as usize * sample_bpp {
+        let _ = drm_ffi::mode::dumbbuffer::destroy(device.as_fd(), created.handle);
+        yuv_note(&format!("dumb {fourcc:?} pitch {pitch} size {} is short", created.size));
+        return None;
+    }
+    let mut bytes = vec![0u8; total];
+    for row in 0..height as usize {
+        for col in 0..width as usize {
+            store(&mut bytes, row * pitch + col * sample_bpp, sample(0, col, row), ten_bit);
+        }
+    }
+    for row in 0..height as usize / 2 {
+        for col in 0..width as usize {
+            store(
+                &mut bytes,
+                luma_bytes + row * pitch + col * sample_bpp,
+                sample(1, col, row),
+                ten_bit,
+            );
+        }
+    }
+    let mapped = match drm_ffi::mode::dumbbuffer::map(device.as_fd(), created.handle, 0, 0) {
+        Ok(mapped) => mapped,
+        Err(error) => {
+            let _ = drm_ffi::mode::dumbbuffer::destroy(device.as_fd(), created.handle);
+            yuv_note(&format!("dumb map {fourcc:?}: {error}"));
+            return None;
+        }
+    };
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            created.size as libc::size_t,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            device.as_raw_fd(),
+            mapped.offset as libc::off_t,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        let _ = drm_ffi::mode::dumbbuffer::destroy(device.as_fd(), created.handle);
+        yuv_note(&format!("dumb mmap {fourcc:?} failed"));
+        return None;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
+        libc::munmap(ptr, created.size as libc::size_t);
+    }
+    let prime =
+        match drm_ffi::gem::handle_to_fd(device.as_fd(), created.handle, libc::O_CLOEXEC as u32) {
+            Ok(prime) => prime,
+            Err(error) => {
+                let _ = drm_ffi::mode::dumbbuffer::destroy(device.as_fd(), created.handle);
+                yuv_note(&format!("dumb prime {fourcc:?}: {error}"));
+                return None;
+            }
+        };
+    let _ = drm_ffi::mode::dumbbuffer::destroy(device.as_fd(), created.handle);
+    let fd = unsafe { OwnedFd::from_raw_fd(prime.fd) };
+    let Ok(dup) = fd.try_clone() else {
+        return None;
+    };
+    let format = crate::drm::client_format(fourcc)?;
+    Some(crate::dmabuf::DmaBuf {
+        id: crate::dmabuf::DmaBufId::next(),
+        width: width as i32,
+        height: height as i32,
+        format,
+        modifier: crate::drm::Modifier::LINEAR,
+        planes: vec![
+            crate::dmabuf::DmaBufPlane { offset: 0, stride: created.pitch, fd },
+            crate::dmabuf::DmaBufPlane {
+                offset: luma_bytes as u32,
+                stride: created.pitch,
+                fd: dup,
+            },
+        ]
+        .into_boxed_slice(),
+        sampling_device: None,
+    })
+}
+
+fn store(bytes: &mut [u8], at: usize, code: u16, ten_bit: bool) {
+    if ten_bit {
+        bytes[at..at + 2].copy_from_slice(&(code << 6).to_le_bytes());
+    } else {
+        bytes[at] = code as u8;
+    }
+}
+
+fn bgra_of(rgb: [f32; 3]) -> [u8; 4] {
+    [
+        crate::color::yuv::encode_byte(rgb[2]),
+        crate::color::yuv::encode_byte(rgb[1]),
+        crate::color::yuv::encode_byte(rgb[0]),
+        255,
+    ]
+}
+
+fn assert_bgra_close(label: &str, got: &[u8], want: &[u8; 4]) {
+    for (index, (got, want)) in got.iter().zip(want).enumerate() {
+        let delta = got.abs_diff(*want);
+        assert!(delta <= 2, "{label} channel {index}: {got} vs {want}");
+    }
+}
+
+fn assert_pixel_close(label: &str, got: &[u8], want: &[u8]) {
+    for (index, (got, want)) in got.iter().zip(want).enumerate() {
+        let delta = got.abs_diff(*want);
+        assert!(delta <= 1, "{label} channel {index}: {got} vs {want}");
+    }
+}
+
+fn expected_bgra(transform: &ColorTransform, rgba: [u8; 4]) -> [u8; 4] {
+    let sample = |byte: u8| f64::from(byte) / 255.0;
+    let mapped = transform.map_rgb([sample(rgba[0]), sample(rgba[1]), sample(rgba[2])]);
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [channel(mapped[2]), channel(mapped[1]), channel(mapped[0]), rgba[3]]
 }

@@ -21,7 +21,7 @@ use {
     },
     crate::{
         dmabuf::DmaBuf,
-        drm::{DrmFd, Format, Modifier, FORMATS_MAP},
+        drm::{known_format, DrmFd, Format, Modifier},
         gbm::GbmDevice,
         render::{RenderDeviceId, RendererError},
     },
@@ -38,6 +38,8 @@ pub struct EglContext {
     pub opengl_formats: HashMap<DrmFourcc, OpenGlFormat>,
     opengl_extensions: BTreeSet<String>,
     device_id: RenderDeviceId,
+    /// `3` when the driver created an OpenGL ES 3 context, otherwise `2`.
+    pub(super) client_version: i32,
     pub(super) programs: Rc<GlesPrograms>,
 }
 
@@ -74,9 +76,26 @@ impl EglContext {
             .map(|s| s.trim().to_string())
             .collect();
 
-        let context = egl
-            .create_context(display, config, None, &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE])
-            .map_err(|error| format!("eglCreateContext: {error:?}"))?;
+        let (context, client_version) = match egl.create_context(
+            display,
+            config,
+            None,
+            &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE],
+        ) {
+            Ok(context) => (context, 3),
+            Err(error) => {
+                log::info!("EGL ES 3 context unavailable ({error:?}); using ES 2");
+                let context = egl
+                    .create_context(
+                        display,
+                        config,
+                        None,
+                        &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE],
+                    )
+                    .map_err(|error| format!("eglCreateContext: {error:?}"))?;
+                (context, 2)
+            }
+        };
 
         let formats = Self::query_formats(egl, &display);
 
@@ -125,6 +144,7 @@ impl EglContext {
             opengl_formats,
             opengl_extensions,
             device_id: RenderDeviceId::next(),
+            client_version,
             programs: Rc::new(GlesPrograms::new()),
         })
     }
@@ -204,6 +224,76 @@ impl EglContext {
         })
     }
 
+    /// Import NV12 or P010 as two single-plane `TEXTURE_2D` images.
+    ///
+    /// The buffer fourcc is not passed to EGL. Each plane uses `R8`/`GR88` or
+    /// `R16`/`GR1616`, so the driver does not apply its own YCbCr matrix.
+    pub fn import_yuv_dmabuf(&self, buf: &DmaBuf) -> Result<(EglImage, EglImage), RendererError> {
+        let Some((luma, chroma)) = crate::drm::yuv_plane_fourccs(buf.format) else {
+            return Err(RendererError::UnsupportedFormat);
+        };
+        if buf.planes.len() != 2
+            || buf.width <= 0
+            || buf.height <= 0
+            || buf.width % 2 != 0
+            || buf.height % 2 != 0
+        {
+            return Err(RendererError::UnsupportedFormat);
+        }
+        let luma =
+            self.import_plane_image(luma, buf.width, buf.height, buf.modifier, &buf.planes[0])?;
+        let chroma = self.import_plane_image(
+            chroma,
+            buf.width / 2,
+            buf.height / 2,
+            buf.modifier,
+            &buf.planes[1],
+        )?;
+        Ok((luma, chroma))
+    }
+
+    fn import_plane_image(
+        &self,
+        fourcc: DrmFourcc,
+        width: i32,
+        height: i32,
+        modifier: Modifier,
+        plane: &crate::dmabuf::DmaBufPlane,
+    ) -> Result<EglImage, RendererError> {
+        let Some(egl_format) = self.formats.get(&fourcc) else {
+            return Err(RendererError::UnsupportedFormat);
+        };
+        let Some(egl_modifier) = egl_format.modifiers.get(&modifier) else {
+            return Err(RendererError::UnsupportedFormat);
+        };
+        if egl_modifier.external_only {
+            return Err(RendererError::UnsupportedFormat);
+        }
+        let mut attribs = Vec::<egl::Int>::with_capacity(32);
+        attribs.extend([egl::WIDTH, width]);
+        attribs.extend([egl::HEIGHT, height]);
+        attribs.extend([egl::LINUX_DRM_FOURCC_EXT, fourcc as i32]);
+        attribs.extend([egl::IMAGE_PRESERVED_KHR, egl::TRUE as i32]);
+        attribs.extend([egl::DMA_BUF_PLANE0_FD_EXT, plane.fd.as_raw_fd()]);
+        attribs.extend([egl::DMA_BUF_PLANE0_PITCH_EXT, plane.stride as i32]);
+        attribs.extend([egl::DMA_BUF_PLANE0_OFFSET_EXT, plane.offset as i32]);
+        if modifier != Modifier::INVALID {
+            attribs.extend([egl::DMA_BUF_PLANE0_MODIFIER_LO_EXT, modifier.low() as i32]);
+            attribs.extend([egl::DMA_BUF_PLANE0_MODIFIER_HI_EXT, modifier.high() as i32]);
+        }
+        attribs.push(egl::NONE);
+        let image = self
+            .egl
+            .create_image_khr(self.display, egl::LINUX_DMA_BUF_EXT as _, &attribs)
+            .map_err(|_| RendererError::ImportFailed)?;
+        Ok(EglImage {
+            display: self.display,
+            image,
+            external_only: false,
+            destroyed: false,
+        })
+    }
+
     pub fn make_fb_from_image(&self, image: &EglImage, dmabuf: &DmaBuf) -> EglFrameBuffer {
         let render_buffer = self.make_render_buffer_from_image(image, dmabuf);
         render_buffer.make_framebuffer(Rc::clone(&self.programs))
@@ -255,16 +345,12 @@ impl EglContext {
         formats
             .iter()
             .filter_map(|fmt| {
-                let format = FORMATS_MAP.get(&DrmFourcc::try_from(*fmt as u32).ok()?)?;
+                let format = known_format(DrmFourcc::try_from(*fmt as u32).ok()?)?;
                 let (modifiers, external_only) = Self::query_modifiers(egl, display, *fmt, format);
 
                 Some((
                     format.drm,
-                    EglFormat {
-                        format: *format,
-                        implicit_external_only: external_only,
-                        modifiers,
-                    },
+                    EglFormat { format, implicit_external_only: external_only, modifiers },
                 ))
             })
             .collect()
@@ -420,7 +506,10 @@ pub fn make_display(
         .unwrap();
 
     // let egl_context = egl.create_context(display, configs[0], None, &[egl::NONE]).unwrap();
-    let gbm_surface = gbm.create_surface(connector.preferred_mode.as_ref().unwrap());
+    let gbm_surface = gbm.create_surface(
+        connector.preferred_mode.as_ref().unwrap(),
+        drm::buffer::DrmFourcc::Xrgb8888,
+    );
 
     let egl_surface = egl
         .create_platform_window_surface(display, config, gbm_surface.raw(), &[egl::NONE as _])

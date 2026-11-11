@@ -239,6 +239,7 @@ impl Renderer for VulkanRenderer {
                 sync_mode: RenderSyncMode::BlockingFinishFallback,
                 blur_reference: Some(blur_reference),
                 clear_color: None,
+                linear_blend: None,
             },
             &mut self.pending_frames,
             acquires,
@@ -478,6 +479,7 @@ mod tests {
                     sync_mode: RenderSyncMode::BlockingFinishFallback,
                     blur_reference: None,
                     clear_color: None,
+                    linear_blend: None,
                 },
             )
             .expect("clear the scanout target");
@@ -553,6 +555,7 @@ mod tests {
                     sync_mode: mode,
                     blur_reference: None,
                     clear_color: None,
+                    linear_blend: None,
                 },
             )
             .expect("render");
@@ -591,6 +594,10 @@ mod tests {
                 damage: DamageRegion::from_rect(rect),
                 blend: false,
                 alpha: 255,
+                alpha_multiplier: u32::MAX,
+                color: None,
+                alpha_mode: 0,
+                yuv: None,
                 mask: TextureMask::None,
             },
         }
@@ -750,6 +757,10 @@ mod tests {
                 damage: DamageRegion::from_rect(rect),
                 blend: false,
                 alpha: 255,
+                alpha_multiplier: u32::MAX,
+                color: None,
+                alpha_mode: 0,
+                yuv: None,
                 mask: TextureMask::None,
             },
         };

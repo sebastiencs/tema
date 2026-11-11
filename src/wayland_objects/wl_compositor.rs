@@ -55,8 +55,13 @@ impl Object for WlCompositor {
 
         match client.parse::<Self>(req, dispatcher)? {
             CreateSurface { id } => {
-                let (resolved, _) = client
-                    .insert_object(state, WlSurface::new(id, client.client_id(), self.version));
+                let untagged = state.color_manager.srgb_gamma22();
+                let resolved = {
+                    let (resolved, surface) = client
+                        .insert_object(state, WlSurface::new(id, client.client_id(), self.version));
+                    surface.set_untagged_description(untagged);
+                    resolved
+                };
                 state.register_root_surface(resolved);
             }
             CreateRegion { id } => {

@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     dmabuf::{DmaBuf, DmaBufId, DmaBufPlane},
-    drm::{Modifier, FORMATS_MAP},
+    drm::{known_format, Modifier},
     utils,
 };
 
@@ -139,11 +139,15 @@ impl GbmDevice {
         Ok(Self { drm, gbm_device, origin })
     }
 
-    pub fn create_surface(&self, mode: &drm::control::Mode) -> GbmSurface {
+    pub fn create_surface(
+        &self,
+        mode: &drm::control::Mode,
+        format: drm::buffer::DrmFourcc,
+    ) -> GbmSurface {
         let (width, height) = mode.size();
         let (width, height) = (width as u32, height as u32);
 
-        let format = drm::buffer::DrmFourcc::Xrgb8888 as u32;
+        let format = format as u32;
         let flags = UseFlags::SCANOUT.bits() | UseFlags::RENDERING.bits();
         // let flags = UseFlags::SCANOUT.bits() | UseFlags::RENDERING.bits() | UseFlags::WRITE.bits();
         // let flags = UseFlags::WRITE.bits();
@@ -158,17 +162,24 @@ impl GbmDevice {
     pub fn create_bo(
         &self,
         mode: &drm::control::Mode,
+        format: drm::buffer::DrmFourcc,
         flags: UseFlags,
         modifiers: &[Modifier],
     ) -> BufferObject {
         let (width, height) = mode.size();
-        self.create_bo_with_size(
-            width as u32,
-            height as u32,
-            drm::buffer::DrmFourcc::Xrgb8888,
-            flags,
-            modifiers,
-        )
+        self.create_bo_with_size(width as u32, height as u32, format, flags, modifiers)
+    }
+
+    /// Scanout allocation that reports failure instead of aborting. The caller falls back.
+    pub fn try_create_scanout_bo(
+        &self,
+        mode: &drm::control::Mode,
+        format: drm::buffer::DrmFourcc,
+        flags: UseFlags,
+        modifiers: &[Modifier],
+    ) -> Option<BufferObject> {
+        let (width, height) = mode.size();
+        exported_bo(self.allocate_bo_ptr(width as u32, height as u32, format, flags, modifiers))
     }
 
     pub fn create_bo_with_size(
@@ -255,8 +266,21 @@ impl GbmDevice {
         width: u32,
         height: u32,
         format: drm::buffer::DrmFourcc,
+        flags: UseFlags,
+        modifiers: &[Modifier],
+    ) -> *mut gbm_bo {
+        let bo = self.allocate_bo_ptr(width, height, format, flags, modifiers);
+        assert!(!bo.is_null());
+        bo
+    }
+
+    fn allocate_bo_ptr(
+        &self,
+        width: u32,
+        height: u32,
+        format: drm::buffer::DrmFourcc,
         mut flags: UseFlags,
-        mut modifiers: &[Modifier],
+        modifiers: &[Modifier],
     ) -> *mut gbm_bo {
         let format = format as u32;
         let use_plain_create = modifiers.is_empty()
@@ -294,7 +318,6 @@ impl GbmDevice {
                 )
             }
         };
-        assert!(!bo.is_null());
         bo
     }
 }
@@ -343,7 +366,7 @@ fn try_export_dmabuf(bo: *mut libc::c_void) -> Option<DmaBuf> {
             return None;
         }
         let format = drm_fourcc::DrmFourcc::try_from(sys::gbm_bo_get_format(bo)).ok()?;
-        let format = *FORMATS_MAP.get(&format)?;
+        let format = known_format(format)?;
         let mut planes = Vec::with_capacity(nplanes as usize);
         for index in 0..nplanes {
             let offset = sys::gbm_bo_get_offset(bo, index);

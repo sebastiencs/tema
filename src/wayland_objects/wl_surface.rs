@@ -1,8 +1,12 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, rc::Rc};
 
 use crate::{
     clients::{
         Client, ClientDispatcher, ClientId, ClientManagerAction, EventWriter, RawRequest, Resolved,
+    },
+    color::{
+        chroma_matches_format, coefficients_match_format, ColorRepresentation, ImageDescription,
+        RenderIntent, RepresentationUpdate,
     },
     drm::{
         begin_managed_toplevel_close_surface, kick_visual_animation_pump, request_active_output,
@@ -13,10 +17,11 @@ use crate::{
     protocol_generated::{
         wl_pointer, wl_surface, wp_fractional_scale_v1, wp_linux_drm_syncobj_surface_v1,
         wp_viewport, xdg_wm_base, ExtSessionLockSurfaceV1Id, WaylandId, WlBufferId, WlCallbackId,
-        WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId, WpFractionalScaleV1Id,
-        WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpTearingControlV1Id, WpViewportId,
-        XdgSurfaceId, XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
-        ZwpInputPopupSurfaceV2Id,
+        WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId, WpAlphaModifierSurfaceV1Id,
+        WpColorManagementSurfaceFeedbackV1Id, WpColorManagementSurfaceV1Id,
+        WpColorRepresentationSurfaceV1Id, WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id,
+        WpPresentationFeedbackId, WpTearingControlV1Id, WpViewportId, XdgSurfaceId,
+        XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id, ZwpInputPopupSurfaceV2Id,
     },
     region::{DamageRegion, RectI, RegionValue},
     scene::visibility::root_participates_in_input,
@@ -217,6 +222,17 @@ pub struct WlSurface {
     syncobj_surface_object: Option<Resolved<WpLinuxDrmSyncobjSurfaceV1Id>>,
     fractional_scale_object: Option<Resolved<WpFractionalScaleV1Id>>,
     tearing_control_object: Option<Resolved<WpTearingControlV1Id>>,
+    alpha_modifier_object: Option<Resolved<WpAlphaModifierSurfaceV1Id>>,
+    color_management_surface: Option<Resolved<WpColorManagementSurfaceV1Id>>,
+    color_representation_object: Option<Resolved<WpColorRepresentationSurfaceV1Id>>,
+    color_feedback: Vec<Resolved<WpColorManagementSurfaceFeedbackV1Id>>,
+    /// Description id last sent on this surface's feedback objects.
+    /// `None` until the first feedback object, which records the current
+    /// preferred id without sending an event.
+    preferred_description_sent: Option<u64>,
+    /// Used when the committed description is absent. Real surfaces use the
+    /// compositor's `ColorManager`; tests use the thread-local default.
+    untagged_description: Rc<ImageDescription>,
     viewport_object: Option<Resolved<WpViewportId>>,
     retired_buffers: Vec<RetiredBufferCandidate>,
     /// `wl_surface.frame` callbacks to complete on the next `commit`.
@@ -248,6 +264,35 @@ pub struct WlSurface {
     closed_window_focus: Option<crate::input::focus::ClosedWindowFocus>,
 }
 
+/// Committed image description. `None` in the outer commit slot means unchanged.
+pub(crate) type SurfaceColor = (Rc<ImageDescription>, RenderIntent);
+
+fn surface_color_changed(
+    current: &Option<SurfaceColor>,
+    pending: &Option<Option<SurfaceColor>>,
+) -> bool {
+    let Some(next) = pending else {
+        return false;
+    };
+    color_identity(current) != color_identity(next)
+}
+
+fn color_identity(color: &Option<SurfaceColor>) -> Option<(u64, RenderIntent)> {
+    color
+        .as_ref()
+        .map(|(description, intent)| (description.id(), *intent))
+}
+
+fn committed_surface_color(
+    current: &Option<SurfaceColor>,
+    pending: &Option<Option<SurfaceColor>>,
+) -> Option<SurfaceColor> {
+    match pending {
+        None => current.clone(),
+        Some(next) => next.clone(),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Pending {
     /// `None` = no attach this commit; `Some(None)` = detach; `Some(Some(id))` = attach.
@@ -258,6 +303,12 @@ struct Pending {
     buffer_scale: i32,
     viewport: SurfaceViewport,
     presentation_hint: PresentationHint,
+    /// `u32::MAX` is opaque. Kept as the raw protocol value.
+    alpha_multiplier: u32,
+    /// `None` means this commit does not change the description.
+    /// `Some(None)` returns the surface to untagged. `Some(Some(_))` sets it.
+    color: Option<Option<SurfaceColor>>,
+    representation: RepresentationUpdate,
     damage_surface: Vec<DamageRect>,
     damage_buffer: Vec<DamageRect>,
     input_region: Option<RegionValue>,
@@ -278,6 +329,9 @@ impl Default for Pending {
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
+            alpha_multiplier: u32::MAX,
+            color: None,
+            representation: RepresentationUpdate::default(),
             damage_surface: Vec::new(),
             damage_buffer: Vec::new(),
             input_region: None,
@@ -298,6 +352,11 @@ struct SurfaceCommitPayload {
     buffer_scale: i32,
     viewport: SurfaceViewport,
     presentation_hint: PresentationHint,
+    alpha_multiplier: u32,
+    /// `None` means this commit does not change the description.
+    /// `Some(None)` returns the surface to untagged. `Some(Some(_))` sets it.
+    color: Option<Option<SurfaceColor>>,
+    representation: RepresentationUpdate,
     damage_surface: Vec<DamageRect>,
     damage_buffer: Vec<DamageRect>,
     input_region: RegionValue,
@@ -335,6 +394,10 @@ struct OnScreen {
     buffer_scale: i32,
     viewport: SurfaceViewport,
     presentation_hint: PresentationHint,
+    alpha_multiplier: u32,
+    /// `None` is an untagged surface.
+    color: Option<SurfaceColor>,
+    representation: ColorRepresentation,
     logical_size: Option<SizeI>,
     sample_transform: transform::Mat3,
     damage: DamageRegion,
@@ -359,6 +422,9 @@ impl Default for OnScreen {
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
+            alpha_multiplier: u32::MAX,
+            color: None,
+            representation: ColorRepresentation::default(),
             logical_size: None,
             sample_transform: transform::Mat3::identity(),
             damage: DamageRegion::new(),
@@ -386,6 +452,14 @@ pub struct SurfaceRenderState {
     pub sync: SurfaceSyncState,
     pub presentation_feedbacks: Vec<SurfacePresentationFeedback>,
     pub inherit_root_clip: bool,
+    /// Raw `wp_alpha_modifier_surface_v1` factor. `u32::MAX` is opaque.
+    pub alpha_multiplier: u32,
+    /// Image description of the committed surface. Untagged surfaces use sRGB gamma 2.2.
+    pub color_description: Rc<ImageDescription>,
+    /// Perceptual when the surface is untagged.
+    pub render_intent: RenderIntent,
+    /// Unset fields use the phase 15 defaults.
+    pub representation: ColorRepresentation,
 }
 
 #[derive(Clone, Debug)]
@@ -403,6 +477,9 @@ struct BlockedSurfaceState {
     buffer_scale: i32,
     viewport: SurfaceViewport,
     presentation_hint: PresentationHint,
+    alpha_multiplier: u32,
+    color: Option<SurfaceColor>,
+    representation: ColorRepresentation,
     input_region: RegionValue,
     opaque_region: RegionValue,
     release_callbacks: Vec<Resolved<WlCallbackId>>,
@@ -459,13 +536,7 @@ fn logical_regions(
     let input = scale.region_to_logical_outward(input);
     let opaque =
         opaque.map_rects(
-            |rect| {
-                if rect.is_empty() {
-                    None
-                } else {
-                    scale.rect_to_logical_inward(rect)
-                }
-            },
+            |rect| if rect.is_empty() { None } else { scale.rect_to_logical_inward(rect) },
         );
     (input, opaque)
 }
@@ -564,6 +635,12 @@ impl WlSurface {
             syncobj_surface_object: None,
             fractional_scale_object: None,
             tearing_control_object: None,
+            alpha_modifier_object: None,
+            color_management_surface: None,
+            color_representation_object: None,
+            color_feedback: Vec::new(),
+            preferred_description_sent: None,
+            untagged_description: crate::color::ColorManager::untagged_srgb_gamma22(),
             viewport_object: None,
             retired_buffers: Vec::new(),
             pending_frame_callbacks: Vec::new(),
@@ -689,6 +766,16 @@ impl WlSurface {
         if self.tearing_control_object.take().is_some() {
             self.pending.presentation_hint = PresentationHint::Vsync;
         }
+
+        if self.alpha_modifier_object.take().is_some() {
+            self.pending.alpha_multiplier = u32::MAX;
+        }
+
+        self.color_management_surface = None;
+        self.color_representation_object = None;
+        self.color_feedback.clear();
+        self.preferred_description_sent = None;
+        self.pending.color = Some(None);
 
         if self.syncobj_surface_object.take().is_some() {
             self.pending.sync = SurfaceSyncState::default();
@@ -1295,6 +1382,162 @@ impl WlSurface {
         self.tearing_control_object.is_some()
     }
 
+    pub fn set_alpha_modifier_object(
+        &mut self,
+        object: Resolved<WpAlphaModifierSurfaceV1Id>,
+    ) -> Result<(), ()> {
+        if self.alpha_modifier_object.is_some() {
+            return Err(());
+        }
+        self.alpha_modifier_object = Some(object);
+        Ok(())
+    }
+
+    pub fn clear_alpha_modifier_object(&mut self, object: Resolved<WpAlphaModifierSurfaceV1Id>) {
+        if self.alpha_modifier_object == Some(object) {
+            self.alpha_modifier_object = None;
+            self.pending.alpha_multiplier = u32::MAX;
+        }
+    }
+
+    pub fn has_alpha_modifier_object(&self) -> bool {
+        self.alpha_modifier_object.is_some()
+    }
+
+    pub(crate) fn set_pending_alpha_multiplier(&mut self, factor: u32) {
+        self.pending.alpha_multiplier = factor;
+    }
+
+    pub(crate) fn set_color_management_surface(
+        &mut self,
+        object: Resolved<WpColorManagementSurfaceV1Id>,
+    ) {
+        self.color_management_surface = Some(object);
+    }
+
+    pub(crate) fn clear_color_management_surface(
+        &mut self,
+        object: Resolved<WpColorManagementSurfaceV1Id>,
+    ) {
+        if self.color_management_surface == Some(object) {
+            self.color_management_surface = None;
+            self.pending.color = Some(None);
+        }
+    }
+
+    pub(crate) fn has_color_management_surface(&self) -> bool {
+        self.color_management_surface.is_some()
+    }
+
+    pub(crate) fn set_color_representation_object(
+        &mut self,
+        object: Resolved<WpColorRepresentationSurfaceV1Id>,
+    ) -> Result<(), ()> {
+        if self.color_representation_object.is_some() {
+            return Err(());
+        }
+        self.color_representation_object = Some(object);
+        Ok(())
+    }
+
+    pub(crate) fn clear_color_representation_object(
+        &mut self,
+        object: Resolved<WpColorRepresentationSurfaceV1Id>,
+    ) {
+        if self.color_representation_object == Some(object) {
+            self.color_representation_object = None;
+        }
+    }
+
+    pub(crate) fn has_color_representation_object(&self) -> bool {
+        self.color_representation_object.is_some()
+    }
+
+    pub(crate) fn set_pending_alpha_mode(&mut self, mode: Option<crate::color::AlphaMode>) {
+        self.pending.representation.alpha_mode = Some(mode);
+    }
+
+    pub(crate) fn set_pending_coefficients(
+        &mut self,
+        coefficients: Option<crate::color::Coefficients>,
+    ) {
+        self.pending.representation.coefficients = Some(coefficients);
+    }
+
+    pub(crate) fn set_pending_chroma(&mut self, site: Option<crate::color::ChromaSite>) {
+        self.pending.representation.chroma = Some(site);
+    }
+
+    pub(crate) fn unset_pending_representation(&mut self) {
+        self.pending.representation = RepresentationUpdate::unset();
+    }
+
+    pub(crate) fn committed_representation(&self) -> ColorRepresentation {
+        self.on_screen.representation
+    }
+
+    pub(crate) fn set_pending_color(&mut self, color: Option<SurfaceColor>) {
+        self.pending.color = Some(color);
+    }
+
+    pub(crate) fn committed_color(&self) -> Option<(u64, RenderIntent)> {
+        color_identity(&self.on_screen.color)
+    }
+
+    pub(crate) fn add_color_feedback(
+        &mut self,
+        feedback: Resolved<WpColorManagementSurfaceFeedbackV1Id>,
+        preferred_id: u64,
+    ) {
+        self.color_feedback.push(feedback);
+        self.preferred_description_sent = Some(preferred_id);
+    }
+
+    pub(crate) fn remove_color_feedback(
+        &mut self,
+        feedback: Resolved<WpColorManagementSurfaceFeedbackV1Id>,
+    ) {
+        self.color_feedback.retain(|existing| *existing != feedback);
+        if self.color_feedback.is_empty() {
+            self.preferred_description_sent = None;
+        }
+    }
+
+    pub(crate) fn preferred_image_description(&self, state: &State) -> Rc<ImageDescription> {
+        self.active_output
+            .and_then(|output_id| state.outputs.try_get(output_id))
+            .map(|output| Rc::clone(&output.color_description))
+            .unwrap_or_else(|| state.color_manager.srgb_gamma22())
+    }
+
+    pub(crate) fn send_preferred_color_description(
+        &mut self,
+        state: &State,
+        dispatcher: &mut ClientDispatcher,
+    ) {
+        if self.color_feedback.is_empty() {
+            return;
+        }
+        let identity = self.preferred_image_description(state).id();
+        if self.preferred_description_sent == Some(identity) {
+            return;
+        }
+        self.preferred_description_sent = Some(identity);
+        for feedback in self.color_feedback.clone() {
+            if let Some(feedback) = feedback.try_ref(state) {
+                feedback.send_preferred_changed(identity, dispatcher);
+            }
+        }
+    }
+
+    pub(crate) fn set_untagged_description(&mut self, description: Rc<ImageDescription>) {
+        self.untagged_description = description;
+    }
+
+    pub(crate) fn committed_alpha_multiplier(&self) -> u32 {
+        self.on_screen.alpha_multiplier
+    }
+
     pub(crate) fn set_pending_presentation_hint(&mut self, hint: PresentationHint) {
         self.pending.presentation_hint = hint;
     }
@@ -1511,6 +1754,9 @@ impl WlSurface {
             buffer_scale: self.on_screen.buffer_scale,
             viewport: self.on_screen.viewport,
             presentation_hint: self.on_screen.presentation_hint,
+            alpha_multiplier: self.on_screen.alpha_multiplier,
+            color: self.on_screen.color.clone(),
+            representation: self.on_screen.representation,
             logical_size: None,
             sample_transform: transform::Mat3::identity(),
             damage: DamageRegion::new(),
@@ -1554,6 +1800,9 @@ impl WlSurface {
             buffer_scale: self.pending.buffer_scale,
             viewport: self.pending.viewport,
             presentation_hint: self.pending.presentation_hint,
+            alpha_multiplier: self.pending.alpha_multiplier,
+            color: self.pending.color.take(),
+            representation: std::mem::take(&mut self.pending.representation),
             damage_surface: std::mem::take(&mut self.pending.damage_surface),
             damage_buffer: std::mem::take(&mut self.pending.damage_buffer),
             input_region,
@@ -1702,6 +1951,11 @@ impl WlSurface {
                 cached.payload.buffer_scale = payload.buffer_scale;
                 cached.payload.viewport = payload.viewport;
                 cached.payload.presentation_hint = payload.presentation_hint;
+                cached.payload.alpha_multiplier = payload.alpha_multiplier;
+                if payload.color.is_some() {
+                    cached.payload.color = payload.color;
+                }
+                cached.payload.representation.merge(payload.representation);
                 cached.payload.damage_surface.extend(payload.damage_surface);
                 cached.payload.damage_buffer.extend(payload.damage_buffer);
                 cached.payload.input_region = payload.input_region;
@@ -1837,6 +2091,57 @@ impl WlSurface {
         state.session_lock.note_mapped(output_id)
     }
 
+    fn validate_pending_representation(
+        &self,
+        client: &Client,
+        state: &State,
+        dispatcher: &mut ClientDispatcher,
+    ) -> bool {
+        let next = self
+            .pending
+            .representation
+            .apply(self.on_screen.representation);
+        if next.coefficients.is_none() && next.chroma.is_none() {
+            return true;
+        }
+        let buffer_id = match self.pending.buffer {
+            Some(None) => return true,
+            Some(Some(buffer)) => buffer,
+            None => match self.on_screen.buffer_object_id {
+                Some(buffer) => buffer,
+                None => return true,
+            },
+        };
+        let Some(buffer) = buffer_id.try_ref(state) else {
+            return true;
+        };
+        let yuv = matches!(buffer.format().kind, crate::drm::FormatKind::Yuv { .. });
+        let Some(object) = self.color_representation_object else {
+            return true;
+        };
+        if !coefficients_match_format(next.coefficients, yuv) {
+            client.send_protocol_error(
+                dispatcher,
+                object.wayland_id().into(),
+                crate::protocol_generated::wp_color_representation_surface_v1::Error::PixelFormat
+                    as u32,
+                "pixel format is incompatible with the coefficients and range",
+            );
+            return false;
+        }
+        if !chroma_matches_format(next.chroma, yuv) {
+            client.send_protocol_error(
+                dispatcher,
+                object.wayland_id().into(),
+                crate::protocol_generated::wp_color_representation_surface_v1::Error::PixelFormat
+                    as u32,
+                "pixel format is incompatible with the chroma location",
+            );
+            return false;
+        }
+        true
+    }
+
     fn validate_pending_mapping(
         &self,
         client: &Client,
@@ -1946,6 +2251,9 @@ impl WlSurface {
             buffer_scale: payload.buffer_scale,
             viewport: payload.viewport,
             presentation_hint: payload.presentation_hint,
+            alpha_multiplier: payload.alpha_multiplier,
+            color: committed_surface_color(&self.on_screen.color, &payload.color),
+            representation: payload.representation.apply(self.on_screen.representation),
             input_region: payload.input_region.clone(),
             opaque_region: payload.opaque_region.clone(),
             release_callbacks: payload.release_callbacks.clone(),
@@ -2046,6 +2354,9 @@ impl WlSurface {
         payload: &SurfaceCommitPayload,
         buffer_changed: bool,
         mapping_changed: bool,
+        multiplier_changed: bool,
+        color_changed: bool,
+        representation_changed: bool,
     ) -> DamageRegion {
         let Some(buffer_object_id) = self.on_screen.buffer_object_id else {
             return DamageRegion::new();
@@ -2056,6 +2367,9 @@ impl WlSurface {
         if !ENABLE_DAMAGE {
             if buffer_changed
                 || mapping_changed
+                || multiplier_changed
+                || color_changed
+                || representation_changed
                 || !payload.damage_surface.is_empty()
                 || !payload.damage_buffer.is_empty()
             {
@@ -2063,7 +2377,12 @@ impl WlSurface {
             }
             return DamageRegion::new();
         }
-        if buffer_changed || mapping_changed {
+        if buffer_changed
+            || mapping_changed
+            || multiplier_changed
+            || color_changed
+            || representation_changed
+        {
             return Self::full_damage_for_logical_size(logical_size);
         }
         self.explicit_damage_region(state, payload, logical_size, buffer_object_id)
@@ -2138,6 +2457,10 @@ impl WlSurface {
         payload: &SurfaceCommitPayload,
     ) -> bool {
         let changes = self.get_changes_for_payload(payload);
+        let multiplier_changed = payload.alpha_multiplier != self.on_screen.alpha_multiplier;
+        let color_changed = surface_color_changed(&self.on_screen.color, &payload.color);
+        let next_representation = payload.representation.apply(self.on_screen.representation);
+        let representation_changed = next_representation != self.on_screen.representation;
         let mut commit_blocked = false;
         let mut committed_damage = DamageRegion::new();
         let previous_feedbacks = std::mem::take(&mut self.on_screen.presentation_feedbacks);
@@ -2156,6 +2479,8 @@ impl WlSurface {
                 }
                 self.cancel_blocked(client, state, dispatcher);
                 self.retire_current();
+                let color = committed_surface_color(&self.on_screen.color, &payload.color);
+                let representation = next_representation;
                 self.on_screen = OnScreen {
                     buffer_object_id: None,
                     content_revision: self.next_content_revision(),
@@ -2166,6 +2491,9 @@ impl WlSurface {
                     buffer_scale: payload.buffer_scale,
                     viewport: payload.viewport,
                     presentation_hint: payload.presentation_hint,
+                    alpha_multiplier: payload.alpha_multiplier,
+                    color,
+                    representation,
                     logical_size: None,
                     sample_transform: transform::Mat3::identity(),
                     damage: DamageRegion::new(),
@@ -2248,6 +2576,9 @@ impl WlSurface {
                     buffer_scale: payload.buffer_scale,
                     viewport: payload.viewport,
                     presentation_hint: payload.presentation_hint,
+                    alpha_multiplier: payload.alpha_multiplier,
+                    color: None,
+                    representation: RepresentationUpdate::default(),
                     damage_surface: Vec::new(),
                     damage_buffer: Vec::new(),
                     input_region: self.on_screen.input_region.clone(),
@@ -2269,6 +2600,11 @@ impl WlSurface {
 
         if !commit_blocked {
             self.on_screen.presentation_hint = payload.presentation_hint;
+            self.on_screen.alpha_multiplier = payload.alpha_multiplier;
+            if let Some(color) = payload.color.clone() {
+                self.on_screen.color = color;
+            }
+            self.on_screen.representation = next_representation;
             self.on_screen.input_region = payload.input_region.clone();
             self.on_screen.opaque_region = payload.opaque_region.clone();
             self.on_screen.wire_inputs = payload.wire_inputs.clone();
@@ -2277,6 +2613,9 @@ impl WlSurface {
                 payload,
                 changes.buffer_changed,
                 changes.mapping_changed,
+                multiplier_changed,
+                color_changed,
+                representation_changed,
             );
             self.on_screen.damage.add_region(&committed_damage);
             if changes.buffer_changed || changes.mapping_changed || !committed_damage.is_empty() {
@@ -2491,6 +2830,11 @@ impl WlSurface {
         }
 
         if !this.validate_pending_sync(client, state, dispatcher) {
+            this.clear_failed_surface_commit();
+            return;
+        }
+
+        if !this.validate_pending_representation(client, state, dispatcher) {
             this.clear_failed_surface_commit();
             return;
         }
@@ -2999,6 +3343,20 @@ impl WlSurface {
             sync: self.on_screen.sync.clone(),
             presentation_feedbacks: Vec::new(),
             inherit_root_clip: true,
+            alpha_multiplier: self.on_screen.alpha_multiplier,
+            color_description: self
+                .on_screen
+                .color
+                .as_ref()
+                .map(|(description, _)| Rc::clone(description))
+                .unwrap_or_else(|| Rc::clone(&self.untagged_description)),
+            render_intent: self
+                .on_screen
+                .color
+                .as_ref()
+                .map(|(_, intent)| *intent)
+                .unwrap_or(RenderIntent::Perceptual),
+            representation: self.on_screen.representation,
         })
     }
 
@@ -3169,6 +3527,9 @@ impl WlSurface {
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
+            alpha_multiplier: u32::MAX,
+            color: None,
+            representation: ColorRepresentation::default(),
             logical_size: Some(SizeI { width, height }),
             sample_transform: transform::Mat3::identity(),
             damage: Self::full_damage_for_logical_size(SizeI { width, height }),
@@ -3244,6 +3605,9 @@ impl WlSurface {
             buffer_scale: next.buffer_scale,
             viewport: next.viewport,
             presentation_hint: next.presentation_hint,
+            alpha_multiplier: next.alpha_multiplier,
+            color: next.color,
+            representation: next.representation,
             logical_size: Some(SizeI { width: next.width, height: next.height }),
             sample_transform: next.tex_transform,
             damage: Self::full_damage_for_logical_size(SizeI {
@@ -3718,6 +4082,9 @@ mod tests {
             buffer_scale: 1,
             viewport: SurfaceViewport::default(),
             presentation_hint: PresentationHint::Vsync,
+            alpha_multiplier: u32::MAX,
+            color: None,
+            representation: crate::color::ColorRepresentation::default(),
             logical_size: Some(SizeI { width: 100, height: 80 }),
             sample_transform: transform::Mat3::identity(),
             damage: DamageRegion::new(),
@@ -6962,6 +7329,12 @@ mod tests {
                 buffer_scale: 1,
                 viewport: SurfaceViewport::default(),
                 presentation_hint: PresentationHint::Vsync,
+                alpha_multiplier: u32::MAX,
+                color: Some(Some((
+                    crate::color::ColorManager::untagged_srgb_gamma22(),
+                    crate::color::RenderIntent::Relative,
+                ))),
+                representation: crate::color::RepresentationUpdate::default(),
                 damage_surface: vec![DamageRect { x: 0, y: 0, width: 10, height: 10 }],
                 damage_buffer: vec![],
                 input_region: RegionValue::infinite(),
@@ -6982,6 +7355,9 @@ mod tests {
                 buffer_scale: 2,
                 viewport: SurfaceViewport::default(),
                 presentation_hint: PresentationHint::Async,
+                alpha_multiplier: 42,
+                color: None,
+                representation: crate::color::RepresentationUpdate::default(),
                 damage_surface: vec![DamageRect { x: 5, y: 6, width: 7, height: 8 }],
                 damage_buffer: vec![],
                 input_region: RegionValue::empty(),
@@ -7000,9 +7376,34 @@ mod tests {
         assert_eq!(cached.payload.buffer_transform, BufferTransform::FlipRotate180);
         assert_eq!(cached.payload.buffer_scale, 2);
         assert_eq!(cached.payload.presentation_hint, PresentationHint::Async);
+        assert_eq!(cached.payload.alpha_multiplier, 42);
         assert_eq!(cached.payload.damage_surface.len(), 2);
         assert_eq!(cached.frame_callbacks, vec![resolved_callback(7), resolved_callback(8),]);
         assert_eq!(cached.presentation_feedbacks, vec![feedback(18, 2)]);
+        assert_eq!(
+            cached.payload.color.as_ref().map(|color| color
+                .as_ref()
+                .map(|(description, intent)| (description.id(), *intent))),
+            Some(Some((1, crate::color::RenderIntent::Relative)))
+        );
+        let (feedbacks, mut clearing) = {
+            let cached = surface.cached_commit.as_ref().unwrap();
+            let feedbacks = cached.presentation_feedbacks.clone();
+            let mut clearing = cached.payload.clone();
+            clearing.color = Some(None);
+            clearing.damage_surface.clear();
+            clearing.damage_buffer.clear();
+            (feedbacks, clearing)
+        };
+        surface.cache_commit_payload(clearing, Vec::new(), feedbacks);
+        assert!(surface
+            .cached_commit
+            .as_ref()
+            .unwrap()
+            .payload
+            .color
+            .as_ref()
+            .is_some_and(|color| color.is_none()));
     }
 
     #[test]
@@ -7199,6 +7600,70 @@ mod tests {
         }));
         assert!(!client.contains_object(WlSubsurfaceId::from(61), &state));
         assert!(!client.contains_object(WlSubsurfaceId::from(62), &state));
+    }
+
+    #[test]
+    fn blocked_commit_keeps_color_alpha_and_representation() {
+        let mut state = state_for_tests();
+        let (client, _) = test_client_and_dispatcher(11);
+        let buffer_object_id =
+            insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(90), 2, 2);
+        let buffer = Resolved::new(client.client_id(), WlBufferId::from(90), buffer_object_id);
+        let mut surface = make_surface();
+        let description = state.color_manager.windows_scrgb();
+        let coefficients = crate::color::Coefficients {
+            kind: crate::color::yuv::CoefficientKind::Bt709,
+            range: crate::color::yuv::VideoRange::Full,
+        };
+        let representation = crate::color::ColorRepresentation {
+            alpha_mode: Some(crate::color::AlphaMode::Straight),
+            coefficients: Some(coefficients),
+            chroma: None,
+        };
+        let payload = SurfaceCommitPayload {
+            buffer: Some(Some(buffer)),
+            offset: (0, 0),
+            sync: SurfaceSyncState::default(),
+            buffer_transform: BufferTransform::Normal,
+            buffer_scale: 1,
+            viewport: SurfaceViewport::default(),
+            presentation_hint: PresentationHint::Vsync,
+            alpha_multiplier: 9,
+            color: Some(Some((
+                std::rc::Rc::clone(&description),
+                crate::color::RenderIntent::RelativeBpc,
+            ))),
+            representation: crate::color::RepresentationUpdate {
+                alpha_mode: Some(Some(crate::color::AlphaMode::Straight)),
+                coefficients: Some(Some(coefficients)),
+                chroma: None,
+            },
+            damage_surface: Vec::new(),
+            damage_buffer: Vec::new(),
+            input_region: RegionValue::infinite(),
+            opaque_region: RegionValue::empty(),
+            release_callbacks: Vec::new(),
+            wire_inputs: None,
+        };
+        let blocked = surface
+            .mapped_state_for_buffer(&state, buffer, 1, 2, &payload)
+            .expect("buffer maps");
+        assert_eq!(blocked.alpha_multiplier, 9);
+        assert_eq!(blocked.color.as_ref().unwrap().0.id(), description.id());
+        assert_eq!(blocked.color.as_ref().unwrap().1, crate::color::RenderIntent::RelativeBpc);
+        assert_eq!(blocked.representation, representation);
+        assert_eq!(surface.on_screen.alpha_multiplier, u32::MAX);
+        assert!(surface.on_screen.color.is_none());
+        assert_eq!(surface.on_screen.representation, crate::color::ColorRepresentation::default());
+
+        surface.blocked = Some(blocked);
+        let waiter = crate::sync::AcquireReadyWaiterId::from(7u64);
+        surface.blocked_waiter_id = Some(waiter);
+        assert!(surface.activate_blocked_if_waiter_ready(waiter));
+        assert_eq!(surface.on_screen.alpha_multiplier, 9);
+        assert_eq!(surface.on_screen.color.as_ref().unwrap().0.id(), description.id());
+        assert_eq!(surface.on_screen.representation, representation);
+        assert!(surface.blocked.is_none());
     }
 
     #[test]

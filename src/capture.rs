@@ -1,6 +1,8 @@
 //! Shared lifecycle and SHM capture queue for both screenshot protocols.
 //!
-//! Output and toplevel copies record pixels, damage, and completion here. A painted screencopy
+//! Output and toplevel copies record pixels, damage, and completion here. Screencopy and
+//! ext-image-copy-capture copy the output framebuffer in the output's encoding and do not
+//! convert those pixels. A painted screencopy
 //! can blend the cursor into its own buffer. This registry also tracks which
 //! protocol objects must stop when an output, toplevel, or pointer disappears, and completes each
 //! queued copy once. The five capture globals are advertised at their implemented versions. Hyprland's screencopy

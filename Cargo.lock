@@ -927,7 +927,6 @@ dependencies = [
  "loom",
  "mktemp",
  "nix",
- "once_cell",
  "owo-colors",
  "quick-xml 0.39.2",
  "rand",

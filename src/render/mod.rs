@@ -1,4 +1,6 @@
 pub mod backend;
+mod blend;
+mod color_pipeline;
 mod factory;
 pub mod gles;
 pub mod recipe;
@@ -23,8 +25,8 @@ pub use {
         Texture,
     },
     recipe::{
-        EffectElement, FrameElement, FramePhase, OutputFrameRecipe, TextureElement, TextureMask,
-        TextureSource,
+        effective_alpha, EffectElement, FrameElement, FramePhase, OutputFrameRecipe,
+        TextureElement, TextureMask, TextureSource,
     },
     visual::{
         map_layout_point, map_layout_rect, place_visual_frame, shadow_geometry, unmap_layout_point,

@@ -9,20 +9,18 @@ use std::{
 
 use drm::control::FbCmd2Flags;
 
-use {
-    drm::{
-        buffer::DrmFourcc,
-        control::{
-            self, connector, crtc, encoder, plane,
-            property::{self, ValueType},
-            Device as CT, ModeTypeFlags, PlaneType, ResourceHandles,
-        },
-        Device,
+use drm::{
+    buffer::DrmFourcc,
+    control::{
+        self, connector, crtc, encoder, plane,
+        property::{self, ValueType},
+        Device as CT, ModeTypeFlags, PlaneType, ResourceHandles,
     },
-    once_cell::sync::Lazy,
+    Device,
 };
 
 use crate::{
+    color::{ColorTransform, ImageDescription, RenderIntent},
     cursor::{CursorImage, CursorImageContentKey, CursorSourceRef},
     dmabuf::DmaBuf,
     gbm::{BufferObject, GbmDevice, UseFlags},
@@ -33,10 +31,10 @@ use crate::{
     object::Object,
     region::{DamageRegion, RectI},
     render::{
-        create_renderer, EffectElement, FrameElement, FramePhase, OutputFrameRecipe,
-        RenderCompletion, RenderFrame, RenderTarget, Renderer, RendererCapabilities,
-        RootSurfaceVisualState, RoundedRing, ShmImage, Texture, TextureElement, TextureMask,
-        TextureSource, WindowClip,
+        create_renderer, BorderGradient, EffectElement, FrameElement, FramePhase,
+        OutputFrameRecipe, RenderCompletion, RenderFrame, RenderTarget, Renderer,
+        RendererCapabilities, RootSurfaceVisualState, RoundedRing, ShadowVisualStyle, ShmImage,
+        Texture, TextureElement, TextureMask, TextureSource, WindowClip,
     },
     runner::{isolate_session_fault, Dispatcher, Model, ModelInstanceId, SessionFault},
     scene::{ComposedEntry, CompositionTier, OutputCompositionView},
@@ -68,43 +66,387 @@ use crate::{
     },
 };
 
+pub(crate) mod edid_cta;
 mod kms_submit;
 pub(crate) mod node;
 mod output_pipeline;
 mod render_planner;
 
+/// How a format is stored.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FormatKind {
+    Rgb8,
+    Rgb10,
+    Fp16,
+    Yuv { planes: u8, sub_x: u8, sub_y: u8, bits: u8 },
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Format {
     pub name: &'static str,
-    pub bpp: u32,
     pub drm: DrmFourcc,
-    pub external_only_guess: bool,
+    /// `wl_shm` format code. `None` is a dmabuf-only format.
+    pub wayland_shm_id: Option<u32>,
+    pub kind: FormatKind,
     pub has_alpha: bool,
-    pub wayland_id: u32,
+    /// Bytes per pixel of a packed format, or of the luma plane for YUV.
+    pub bpp: u32,
+    pub external_only_guess: bool,
 }
 
 pub static ARGB8888: &Format = &Format {
     name: "argb8888",
-    bpp: 4,
     drm: DrmFourcc::Argb8888,
-    external_only_guess: false,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Argb8888 as u32),
+    kind: FormatKind::Rgb8,
     has_alpha: true,
-    wayland_id: 0,
+    bpp: 4,
+    external_only_guess: false,
 };
 
 pub static XRGB8888: &Format = &Format {
     name: "xrgb8888",
-    bpp: 4,
     drm: DrmFourcc::Xrgb8888,
-    external_only_guess: false,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Xrgb8888 as u32),
+    kind: FormatKind::Rgb8,
     has_alpha: false,
-    wayland_id: 1,
+    bpp: 4,
+    external_only_guess: false,
 };
 
-pub static FORMATS: &[Format] = &[*ARGB8888, *XRGB8888];
+pub static ARGB2101010: &Format = &Format {
+    name: "argb2101010",
+    drm: DrmFourcc::Argb2101010,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Argb2101010 as u32),
+    kind: FormatKind::Rgb10,
+    has_alpha: true,
+    bpp: 4,
+    external_only_guess: false,
+};
 
-pub static FORMATS_MAP: Lazy<HashMap<DrmFourcc, &'static Format>> =
-    Lazy::new(|| FORMATS.iter().map(|format| (format.drm, format)).collect());
+pub static XRGB2101010: &Format = &Format {
+    name: "xrgb2101010",
+    drm: DrmFourcc::Xrgb2101010,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Xrgb2101010 as u32),
+    kind: FormatKind::Rgb10,
+    has_alpha: false,
+    bpp: 4,
+    external_only_guess: false,
+};
+
+pub static ABGR2101010: &Format = &Format {
+    name: "abgr2101010",
+    drm: DrmFourcc::Abgr2101010,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Abgr2101010 as u32),
+    kind: FormatKind::Rgb10,
+    has_alpha: true,
+    bpp: 4,
+    external_only_guess: false,
+};
+
+pub static XBGR2101010: &Format = &Format {
+    name: "xbgr2101010",
+    drm: DrmFourcc::Xbgr2101010,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Xbgr2101010 as u32),
+    kind: FormatKind::Rgb10,
+    has_alpha: false,
+    bpp: 4,
+    external_only_guess: false,
+};
+
+pub static ABGR16161616F: &Format = &Format {
+    name: "abgr16161616f",
+    drm: DrmFourcc::Abgr16161616f,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Abgr16161616f as u32),
+    kind: FormatKind::Fp16,
+    has_alpha: true,
+    bpp: 8,
+    external_only_guess: false,
+};
+
+pub static NV12: &Format = &Format {
+    name: "nv12",
+    drm: DrmFourcc::Nv12,
+    wayland_shm_id: None,
+    kind: FormatKind::Yuv { planes: 2, sub_x: 2, sub_y: 2, bits: 8 },
+    has_alpha: false,
+    bpp: 1,
+    external_only_guess: false,
+};
+
+pub static P010: &Format = &Format {
+    name: "p010",
+    drm: DrmFourcc::P010,
+    wayland_shm_id: None,
+    kind: FormatKind::Yuv { planes: 2, sub_x: 2, sub_y: 2, bits: 10 },
+    has_alpha: false,
+    bpp: 2,
+    external_only_guess: false,
+};
+
+pub static XBGR16161616F: &Format = &Format {
+    name: "xbgr16161616f",
+    drm: DrmFourcc::Xbgr16161616f,
+    wayland_shm_id: Some(crate::protocol_generated::wl_shm::Format::Xbgr16161616f as u32),
+    kind: FormatKind::Fp16,
+    has_alpha: false,
+    bpp: 8,
+    external_only_guess: false,
+};
+
+/// Formats a client may submit through `wl_shm` or linux-dmabuf.
+pub static CLIENT_FORMATS: &[&Format] = &[
+    ARGB8888,
+    XRGB8888,
+    ARGB2101010,
+    XRGB2101010,
+    ABGR2101010,
+    XBGR2101010,
+    ABGR16161616F,
+    XBGR16161616F,
+    NV12,
+    P010,
+];
+
+/// Formats tema renders into or scans out. The 8-bit pair stays first. A 10-bit buffer is
+/// allocated only when [`preferred_scanout_fourcc`] asks for one.
+pub static OUTPUT_FORMATS: &[&Format] = &[ARGB8888, XRGB8888, XRGB2101010, XBGR2101010];
+
+/// SHM formats screencopy and image-copy capture can fill. A 10-bit scanout is converted
+/// to these 8-bit pixels on readback.
+pub fn shm_capture_formats() -> impl Iterator<Item = &'static Format> {
+    OUTPUT_FORMATS
+        .iter()
+        .copied()
+        .filter(|format| format.kind == FormatKind::Rgb8 && format.wayland_shm_id.is_some())
+}
+
+/// `XRGB2101010` first, then `XBGR2101010`, when 10-bit scanout is requested and `available`.
+/// Otherwise `XRGB8888`.
+pub(crate) fn preferred_scanout_fourcc(
+    ten_bit: bool,
+    available: impl Fn(DrmFourcc) -> bool,
+) -> DrmFourcc {
+    if ten_bit {
+        for fourcc in [DrmFourcc::Xrgb2101010, DrmFourcc::Xbgr2101010] {
+            if available(fourcc) {
+                return fourcc;
+            }
+        }
+    }
+    DrmFourcc::Xrgb8888
+}
+
+/// Startup tries the preferred format with HDR metadata when `hdr` is set.
+/// A failed HDR attempt retries the same format without metadata, then `XRGB8888`
+/// without metadata. An 8-bit request does not repeat itself.
+pub(crate) fn scanout_attempts(fourcc: DrmFourcc, hdr: bool) -> Vec<(DrmFourcc, bool)> {
+    let mut attempts = vec![(fourcc, hdr)];
+    if hdr {
+        attempts.push((fourcc, false));
+    }
+    if fourcc != DrmFourcc::Xrgb8888 {
+        attempts.push((DrmFourcc::Xrgb8888, false));
+    }
+    attempts.dedup();
+    attempts
+}
+
+pub fn client_format(fourcc: DrmFourcc) -> Option<&'static Format> {
+    CLIENT_FORMATS
+        .iter()
+        .copied()
+        .find(|format| format.drm == fourcc)
+}
+
+pub fn output_format(fourcc: DrmFourcc) -> Option<&'static Format> {
+    OUTPUT_FORMATS
+        .iter()
+        .copied()
+        .find(|format| format.drm == fourcc)
+}
+
+/// A format this compositor can name, whether a client submits it or tema allocates it.
+pub fn known_format(fourcc: DrmFourcc) -> Option<&'static Format> {
+    client_format(fourcc).or_else(|| output_format(fourcc))
+}
+
+/// Single-channel DRM formats used to import each plane of a YUV buffer as `TEXTURE_2D`.
+///
+/// NV12 is `R8` plus `GR88` (byte 0 is Cb). P010 is `R16` plus `GR1616` (low 16 bits are Cb).
+pub fn yuv_plane_fourccs(format: &Format) -> Option<(DrmFourcc, DrmFourcc)> {
+    match format.drm {
+        DrmFourcc::Nv12 => Some((DrmFourcc::R8, DrmFourcc::Gr88)),
+        DrmFourcc::P010 => Some((DrmFourcc::R16, DrmFourcc::Gr1616)),
+        _ => None,
+    }
+}
+
+/// Fourccs the renderer should ask the driver about: client formats plus output formats.
+pub fn renderer_query_fourccs() -> Vec<DrmFourcc> {
+    let mut fourccs = Vec::new();
+    for format in CLIENT_FORMATS.iter().chain(OUTPUT_FORMATS.iter()) {
+        if !fourccs.contains(&format.drm) {
+            fourccs.push(format.drm);
+        }
+    }
+    fourccs
+}
+
+#[cfg(test)]
+mod format_table_tests {
+    use drm::buffer::DrmFourcc;
+
+    use super::{
+        client_format, known_format, output_format, preferred_scanout_fourcc,
+        renderer_query_fourccs, scanout_attempts, shm_capture_formats, FormatKind, ARGB2101010,
+        ARGB8888, CLIENT_FORMATS, OUTPUT_FORMATS, XRGB8888,
+    };
+
+    #[test]
+    fn output_formats_stay_8888_and_clients_gain_wide_formats() {
+        let client: Vec<_> = CLIENT_FORMATS.iter().map(|format| format.drm).collect();
+        let output: Vec<_> = OUTPUT_FORMATS.iter().map(|format| format.drm).collect();
+        assert_eq!(
+            client,
+            vec![
+                DrmFourcc::Argb8888,
+                DrmFourcc::Xrgb8888,
+                DrmFourcc::Argb2101010,
+                DrmFourcc::Xrgb2101010,
+                DrmFourcc::Abgr2101010,
+                DrmFourcc::Xbgr2101010,
+                DrmFourcc::Abgr16161616f,
+                DrmFourcc::Xbgr16161616f,
+                DrmFourcc::Nv12,
+                DrmFourcc::P010,
+            ]
+        );
+        assert_eq!(
+            output,
+            vec![
+                DrmFourcc::Argb8888,
+                DrmFourcc::Xrgb8888,
+                DrmFourcc::Xrgb2101010,
+                DrmFourcc::Xbgr2101010,
+            ]
+        );
+        assert!(CLIENT_FORMATS
+            .iter()
+            .filter(|format| matches!(format.kind, FormatKind::Rgb8 | FormatKind::Rgb10))
+            .all(|format| format.bpp == 4));
+        assert!(CLIENT_FORMATS
+            .iter()
+            .filter(|format| format.kind == FormatKind::Fp16)
+            .all(|format| format.bpp == 8 && !format.external_only_guess));
+        assert!(OUTPUT_FORMATS
+            .iter()
+            .take(2)
+            .all(|format| format.kind == FormatKind::Rgb8));
+        assert!(OUTPUT_FORMATS.iter().skip(2).all(|format| {
+            format.kind == FormatKind::Rgb10 && format.bpp == 4 && !format.has_alpha
+        }));
+        assert_eq!(
+            shm_capture_formats()
+                .map(|format| format.drm)
+                .collect::<Vec<_>>(),
+            vec![DrmFourcc::Argb8888, DrmFourcc::Xrgb8888]
+        );
+        assert_eq!(ARGB8888.wayland_shm_id, Some(0));
+        assert_eq!(XRGB8888.wayland_shm_id, Some(1));
+        assert_eq!(
+            ARGB2101010.wayland_shm_id,
+            Some(crate::protocol_generated::wl_shm::Format::Argb2101010 as u32)
+        );
+        assert!(ARGB8888.has_alpha);
+        assert!(!XRGB8888.has_alpha);
+        assert!(!ARGB8888.external_only_guess);
+        for format in CLIENT_FORMATS
+            .iter()
+            .filter(|format| format.kind == FormatKind::Rgb10)
+        {
+            assert_eq!(format.has_alpha, format.name.starts_with('a'));
+            assert!(!format.external_only_guess);
+            let offered = matches!(format.drm, DrmFourcc::Xrgb2101010 | DrmFourcc::Xbgr2101010);
+            assert_eq!(output_format(format.drm).is_some(), offered);
+        }
+        assert_eq!(preferred_scanout_fourcc(false, |_| true), DrmFourcc::Xrgb8888);
+        assert_eq!(preferred_scanout_fourcc(true, |_| true), DrmFourcc::Xrgb2101010);
+        assert_eq!(
+            preferred_scanout_fourcc(true, |fourcc| fourcc == DrmFourcc::Xbgr2101010),
+            DrmFourcc::Xbgr2101010
+        );
+        assert_eq!(preferred_scanout_fourcc(true, |_| false), DrmFourcc::Xrgb8888);
+        assert_eq!(renderer_query_fourccs(), client);
+    }
+
+    #[test]
+    fn advertised_dmabuf_formats_stay_inside_the_client_list() {
+        let reported =
+            [DrmFourcc::Xrgb8888, DrmFourcc::Nv12, DrmFourcc::Argb8888, DrmFourcc::Abgr8888];
+        let advertised: Vec<_> = reported
+            .into_iter()
+            .filter_map(client_format)
+            .map(|format| format.drm)
+            .collect();
+        assert_eq!(advertised, vec![DrmFourcc::Xrgb8888, DrmFourcc::Nv12, DrmFourcc::Argb8888]);
+        assert!(output_format(DrmFourcc::Nv12).is_none());
+        assert!(client_format(DrmFourcc::Nv12).is_some_and(|format| {
+            !format.has_alpha && format.wayland_shm_id.is_none() && format.bpp == 1
+        }));
+        assert!(client_format(DrmFourcc::P010).is_some_and(|format| format.bpp == 2));
+        assert_eq!(
+            known_format(DrmFourcc::Argb8888).map(|format| format.drm),
+            Some(DrmFourcc::Argb8888)
+        );
+    }
+
+    #[test]
+    fn hdr_scanout_falls_back_without_repeating_an_eight_bit_request() {
+        assert_eq!(
+            scanout_attempts(DrmFourcc::Xrgb2101010, true),
+            vec![
+                (DrmFourcc::Xrgb2101010, true),
+                (DrmFourcc::Xrgb2101010, false),
+                (DrmFourcc::Xrgb8888, false),
+            ]
+        );
+        assert_eq!(
+            scanout_attempts(DrmFourcc::Xrgb8888, true),
+            vec![(DrmFourcc::Xrgb8888, true), (DrmFourcc::Xrgb8888, false)]
+        );
+        assert_eq!(
+            scanout_attempts(DrmFourcc::Xrgb8888, false),
+            vec![(DrmFourcc::Xrgb8888, false)]
+        );
+    }
+
+    #[test]
+    fn shm_event_order_keeps_8888_first_and_every_entry_is_a_client_format() {
+        let shm: Vec<_> = crate::wayland_objects::wl_shm::SHM_FORMATS
+            .iter()
+            .map(|format| format.drm)
+            .collect();
+        assert_eq!(
+            shm,
+            vec![
+                DrmFourcc::Xrgb8888,
+                DrmFourcc::Argb8888,
+                DrmFourcc::Xrgb2101010,
+                DrmFourcc::Argb2101010,
+                DrmFourcc::Xbgr2101010,
+                DrmFourcc::Abgr2101010,
+                DrmFourcc::Xbgr16161616f,
+                DrmFourcc::Abgr16161616f,
+            ]
+        );
+        assert_eq!(crate::wayland_objects::wl_shm::SHM_FORMATS[0].wayland_shm_id, Some(1));
+        assert_eq!(crate::wayland_objects::wl_shm::SHM_FORMATS[1].wayland_shm_id, Some(0));
+        assert!(crate::wayland_objects::wl_shm::SHM_FORMATS
+            .iter()
+            .all(|format| client_format(format.drm).is_some()));
+    }
+}
 
 fn probe_syncobj_eventfd_support(drm: &DrmFd) -> bool {
     let Ok(handle) = drm.create_syncobj(false) else {
@@ -120,8 +462,6 @@ fn probe_syncobj_eventfd_support(drm: &DrmFd) -> bool {
     let _ = drm.destroy_syncobj(handle);
     result.is_ok()
 }
-
-pub const KNOWN_FORMATS: &[DrmFourcc] = &[DrmFourcc::Argb8888, DrmFourcc::Xrgb8888];
 
 #[derive(Debug)]
 struct DrmFrameBuffer {
@@ -183,6 +523,14 @@ impl Drop for Drm {
             "dropping DRM backend after the primary session device; allocator {} closes after the renderer",
             self.gbm.describe_node()
         );
+        let hdr_blobs: Vec<u64> = self
+            .outputs
+            .values()
+            .filter_map(|output| output.held_hdr_blob)
+            .collect();
+        for blob_id in hdr_blobs {
+            let _ = self.fd.destroy_property_blob(blob_id);
+        }
         self.renderer.make_current();
         self.outputs.clear();
     }
@@ -213,6 +561,46 @@ pub struct DrmOutput {
     /// Render buffer or client buffer. Logged when it changes; not an async gate.
     committed_fb_kind: Option<CommittedFramebufferKind>,
     async_flip_rejections: u64,
+    /// Programmed with the modeset when the scanout buffer is 10-bit.
+    scanout_max_bpc: Option<ScanoutMaxBpc>,
+    /// PQ infoframe the output should be showing. `None` is SDR and sends no infoframe.
+    desired_hdr: Option<[u8; 32]>,
+    /// Last value a real commit applied. `None` means the properties have not been touched.
+    programmed_hdr: Option<ProgrammedHdr>,
+    /// Blob id held for `desired_hdr`. Reused until the bytes change.
+    held_hdr_blob: Option<u64>,
+    /// The startup atomic test rejected HDR, so a later refresh must not turn it back on.
+    hdr_kms_rejected: bool,
+}
+
+/// HDR KMS state after a successful commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgrammedHdr {
+    /// Colorspace `Default` and metadata blob 0. Not an SDR infoframe.
+    Off,
+    On([u8; 32]),
+}
+
+/// `None` when the connector should be left alone: SDR that was never programmed,
+/// or HDR whose bytes already match.
+fn hdr_property_update(
+    programmed: Option<ProgrammedHdr>,
+    desired: Option<[u8; 32]>,
+) -> Option<ProgrammedHdr> {
+    match (programmed, desired) {
+        (None, None) => None,
+        (Some(ProgrammedHdr::Off), None) => None,
+        (Some(ProgrammedHdr::On(current)), Some(wanted)) if current == wanted => None,
+        (_, Some(wanted)) => Some(ProgrammedHdr::On(wanted)),
+        (_, None) => Some(ProgrammedHdr::Off),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScanoutMaxBpc {
+    connector: connector::Handle,
+    property: control::property::Handle,
+    bits: u64,
 }
 
 /// Properties that still have to be applied on the next composited commit.
@@ -249,6 +637,9 @@ struct OutputColorState {
 struct PendingColorBlobs {
     gamma_blob_id: Option<u64>,
     ctm_blob_id: Option<u64>,
+    /// Created for this commit. Destroyed if the commit fails. A reused blob stays out.
+    new_hdr_blob: Option<u64>,
+    hdr_applied: Option<ProgrammedHdr>,
 }
 
 type SurfaceKey = Resolved<WlSurfaceId>;
@@ -277,7 +668,15 @@ struct SceneItemState {
     bounds: RectI,
     tex_transform: transform::Mat3,
     alpha: u8,
+    /// Raw `wp_alpha_modifier_surface_v1` factor. `u32::MAX` is 1.0.
+    alpha_multiplier: u32,
     mask: SceneItemMask,
+    /// Client image-description id. Output description changes already damage
+    /// the whole output, so the destination id is not part of this key.
+    /// Zero means the item is not a client surface.
+    color_description_id: u64,
+    render_intent: RenderIntent,
+    representation: crate::color::ColorRepresentation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,10 +696,15 @@ struct SceneItem {
     sample_damage_padding: i32,
     state_has_alpha: bool,
     alpha: u8,
+    /// Raw `wp_alpha_modifier_surface_v1` factor. `u32::MAX` is 1.0.
+    alpha_multiplier: u32,
     opaque_region: DamageRegion,
     opaque: bool,
     sync: crate::sync::SurfaceSyncState,
     direct_scanout: Option<DrmFrameBuffer>,
+    /// `None` keeps the identity shader, including an untagged surface on the
+    /// default output. `Some` is the surface-to-output color transform.
+    color: Option<Rc<ColorTransform>>,
     /// Geometric direct-scanout match. The buffer format may still be wrong.
     scanout_candidate: bool,
     presentation_feedbacks: Vec<SurfacePresentationFeedback>,
@@ -754,6 +1158,7 @@ struct AsyncFlipGate {
     cursor_newly_uploaded: bool,
     gamma_dirty: bool,
     ctm_dirty: bool,
+    hdr_dirty: bool,
     committed_vrr_enabled: Option<bool>,
     vrr_enabled: bool,
 }
@@ -781,7 +1186,7 @@ fn async_flip_block_reason(gate: &AsyncFlipGate) -> Option<AsyncFlipBlock> {
     if gate.cursor_newly_uploaded || gate.committed_cursor != Some(gate.cursor) {
         return Some(AsyncFlipBlock::Cursor);
     }
-    if gate.gamma_dirty || gate.ctm_dirty {
+    if gate.gamma_dirty || gate.ctm_dirty || gate.hdr_dirty {
         return Some(AsyncFlipBlock::Color);
     }
     if gate.committed_vrr_enabled != Some(gate.vrr_enabled) {
@@ -964,6 +1369,13 @@ fn cursor_fences_for_attempts(completion: &RenderCompletion, attempts: usize) ->
         .collect()
 }
 
+/// Draw a cursor image into the hardware cursor plane.
+///
+/// A surface whose `wp_alpha_modifier` factor is below `u32::MAX`, or whose image
+/// description is not the output description, does not use this path.
+/// `build_surface_cursor_plane_request` declines the plane, and the cursor is drawn
+/// as a software scene item so the texture shader applies the factor or the color
+/// transform. Named cursors have no client image description.
 fn cursor_plane_recipe(texture: Rc<dyn Texture>, width: i32, height: i32) -> OutputFrameRecipe {
     let damage = RectI::new(0, 0, width.max(0), height.max(0))
         .map(DamageRegion::from_rect)
@@ -982,6 +1394,10 @@ fn cursor_plane_recipe(texture: Rc<dyn Texture>, width: i32, height: i32) -> Out
                 damage,
                 blend: true,
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
+                color: None,
+                alpha_mode: 0,
+                yuv: None,
                 mask: TextureMask::None,
             },
         }],
@@ -1634,6 +2050,56 @@ struct Encoder {
     possible_crtcs: HashSet<crtc::Handle>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectorMaxBpc {
+    pub handle: control::property::Handle,
+    pub min: u64,
+    pub max: u64,
+}
+
+impl ConnectorMaxBpc {
+    fn includes(self, bits: u64) -> bool {
+        bits >= self.min && bits <= self.max
+    }
+}
+
+impl Connector {
+    /// EDID and property signals phase 20 requires before it builds a PQ description.
+    pub(crate) fn display_hdr(&self) -> crate::color::hdr::DisplayHdr {
+        let chromaticities = self.edid.as_ref().and_then(|edid| {
+            let color = &edid.color;
+            let xy = |(x, y): (f32, f32)| (f64::from(x), f64::from(y));
+            crate::color::Primaries::from_chromaticities(
+                xy(color.red),
+                xy(color.green),
+                xy(color.blue),
+                xy(color.white),
+            )
+        });
+        crate::color::hdr::DisplayHdr {
+            pq: self.cta.hdr.is_some_and(|hdr| hdr.pq),
+            bt2020_rgb: self.cta.colorimetry.is_some_and(|color| color.bt2020_rgb),
+            has_kms_properties: self.hdr.is_some(),
+            min_luminance: self.cta.hdr.and_then(|hdr| hdr.min_luminance),
+            max_luminance: self.cta.hdr.and_then(|hdr| hdr.max_luminance),
+            max_fall: self.cta.hdr.and_then(|hdr| hdr.max_fall),
+            primaries: chromaticities,
+        }
+    }
+}
+
+fn colorspace_enum(info: &control::property::Info, name: &[u8]) -> Option<u64> {
+    let control::property::ValueType::Enum(values) = info.value_type() else {
+        return None;
+    };
+    values
+        .values()
+        .1
+        .iter()
+        .find(|value| value.name().to_bytes() == name)
+        .map(|value| value.value())
+}
+
 #[derive(Clone, Debug)]
 pub struct Connector {
     pub handler: connector::Handle,
@@ -1648,6 +2114,21 @@ pub struct Connector {
     pub interface_name: String,
     pub vrr_capable: bool,
     pub crtc_id_prop: Option<control::property::Handle>,
+    /// Connector `"max bpc"` range. Absent when the driver does not expose it.
+    pub max_bpc: Option<ConnectorMaxBpc>,
+    /// CTA-861 colorimetry and HDR static metadata. Empty when the EDID has none.
+    pub cta: edid_cta::Cta861,
+    /// Present when `Colorspace` has `Default` and `BT2020_RGB` and `HDR_OUTPUT_METADATA` exists.
+    pub hdr: Option<ConnectorHdrProperties>,
+}
+
+/// Connector properties used to enter and leave HDR.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectorHdrProperties {
+    pub colorspace: control::property::Handle,
+    pub default_colorspace: u64,
+    pub bt2020_rgb: u64,
+    pub metadata: control::property::Handle,
 }
 
 #[derive(Debug)]
@@ -1891,6 +2372,44 @@ impl Drm {
         Ok(())
     }
 
+    /// Queues the PQ infoframe. `None` leaves HDR on the next commit by writing
+    /// blob 0. Returns whether the queued value changed.
+    pub fn set_output_hdr(&mut self, drm_crtc_id: u32, metadata: Option<[u8; 32]>) -> bool {
+        let Some(output) = self.output_mut(drm_crtc_id) else {
+            return false;
+        };
+        if output.desired_hdr == metadata {
+            return false;
+        }
+        let eight_bit = metadata.is_some()
+            && output
+                .render_buffer()
+                .bo
+                .dmabuf()
+                .is_none_or(|dmabuf| dmabuf.format.kind != FormatKind::Rgb10);
+        if eight_bit {
+            log::warn!(
+                "output {}: HDR is active on an 8-bit scanout buffer; the framebuffer stays 8-bit until the output is recreated",
+                output.in_use.connector.interface_name
+            );
+        }
+        output.desired_hdr = metadata;
+        true
+    }
+
+    /// False after the startup test rejected an HDR modeset.
+    pub fn hdr_kms_available(&self, drm_crtc_id: u32) -> bool {
+        self.output(drm_crtc_id)
+            .is_none_or(|output| !output.hdr_kms_rejected)
+    }
+
+    fn hdr_needs_modeset(&self, drm_crtc_id: u32) -> bool {
+        self.output(drm_crtc_id).is_some_and(|output| {
+            hdr_property_update(output.programmed_hdr, output.desired_hdr).is_some()
+                && output.in_use.connector.hdr.is_some()
+        })
+    }
+
     fn append_output_color_changes(
         &mut self,
         drm_crtc_id: u32,
@@ -1970,7 +2489,76 @@ impl Drm {
             }
         }
 
+        self.append_hdr_metadata(drm_crtc_id, changes, &mut pending)?;
         Ok(pending)
+    }
+
+    /// Programs `Colorspace` and `HDR_OUTPUT_METADATA` only when the desired
+    /// infoframe differs from the last successful commit. The first SDR frame
+    /// leaves both properties alone. Leaving HDR writes blob 0, never an SDR infoframe.
+    fn append_hdr_metadata(
+        &mut self,
+        drm_crtc_id: u32,
+        changes: &mut control::atomic::AtomicModeReq,
+        pending: &mut PendingColorBlobs,
+    ) -> std::io::Result<()> {
+        let (update, properties, connector, held) = {
+            let Some(output) = self.output(drm_crtc_id) else {
+                return Ok(());
+            };
+            (
+                hdr_property_update(output.programmed_hdr, output.desired_hdr),
+                output.in_use.connector.hdr,
+                output.in_use.connector.handler,
+                output.held_hdr_blob,
+            )
+        };
+        let Some(update) = update else {
+            return Ok(());
+        };
+        let Some(properties) = properties else {
+            return Ok(());
+        };
+        match update {
+            ProgrammedHdr::Off => {
+                changes.add_property(
+                    connector,
+                    properties.colorspace,
+                    control::property::Value::Unknown(properties.default_colorspace),
+                );
+                changes.add_property(
+                    connector,
+                    properties.metadata,
+                    control::property::Value::Blob(0),
+                );
+            }
+            ProgrammedHdr::On(bytes) => {
+                let blob_id = if held.is_some()
+                    && self.output(drm_crtc_id).unwrap().desired_hdr == Some(bytes)
+                {
+                    held.unwrap()
+                } else {
+                    let blob = self.fd.create_property_blob(&bytes)?;
+                    let blob_id = blob
+                        .as_blob()
+                        .ok_or_else(|| std::io::Error::other("HDR metadata blob has no id"))?;
+                    pending.new_hdr_blob = Some(blob_id);
+                    blob_id
+                };
+                changes.add_property(
+                    connector,
+                    properties.colorspace,
+                    control::property::Value::Unknown(properties.bt2020_rgb),
+                );
+                changes.add_property(
+                    connector,
+                    properties.metadata,
+                    control::property::Value::Blob(blob_id),
+                );
+            }
+        }
+        pending.hdr_applied = Some(update);
+        Ok(())
     }
 
     fn append_output_vrr_change(
@@ -1999,13 +2587,19 @@ impl Drm {
         if let Some(blob_id) = blobs.ctm_blob_id {
             let _ = self.fd.destroy_property_blob(blob_id);
         }
+        if let Some(blob_id) = blobs.new_hdr_blob {
+            let _ = self.fd.destroy_property_blob(blob_id);
+        }
     }
 
     fn finish_output_color_commit(&mut self, drm_crtc_id: u32, blobs: PendingColorBlobs) {
         let Some(_) = self.output(drm_crtc_id) else {
+            if let Some(blob_id) = blobs.new_hdr_blob {
+                let _ = self.fd.destroy_property_blob(blob_id);
+            }
             return;
         };
-        let (old_gamma_blob, old_ctm_blob) = {
+        let (old_gamma_blob, old_ctm_blob, old_hdr_blob) = {
             let output = self.output_mut(drm_crtc_id).unwrap();
             let old_gamma_blob = if output.color_state.gamma_dirty {
                 output.color_state.gamma_dirty = false;
@@ -2019,7 +2613,19 @@ impl Drm {
             } else {
                 None
             };
-            (old_gamma_blob, old_ctm_blob)
+            let old_hdr_blob = match blobs.hdr_applied {
+                Some(applied) => {
+                    output.programmed_hdr = Some(applied);
+                    match applied {
+                        ProgrammedHdr::Off => output.held_hdr_blob.take(),
+                        ProgrammedHdr::On(_) => blobs.new_hdr_blob.and_then(|blob_id| {
+                            std::mem::replace(&mut output.held_hdr_blob, Some(blob_id))
+                        }),
+                    }
+                }
+                None => None,
+            };
+            (old_gamma_blob, old_ctm_blob, old_hdr_blob)
         };
 
         if let Some(blob_id) = old_gamma_blob {
@@ -2028,12 +2634,16 @@ impl Drm {
         if let Some(blob_id) = old_ctm_blob {
             let _ = self.fd.destroy_property_blob(blob_id);
         }
+        if let Some(blob_id) = old_hdr_blob {
+            let _ = self.fd.destroy_property_blob(blob_id);
+        }
     }
 
     pub fn create_drm(
         fd: OwnedFd,
         device: udev::Device,
         selection: crate::config::RendererSelection,
+        color: impl Fn(&str) -> crate::config::OutputColorConfig,
     ) -> Result<Self, String> {
         let drm = DrmFd { fd: Rc::new(fd) };
         set_nonblocking(drm.as_raw_fd()).map_err(|error| format!("set nonblocking: {error}"))?;
@@ -2078,7 +2688,7 @@ impl Drm {
 
         let gbm = GbmDevice::new(&drm).map_err(|error| format!("gbm: {error}"))?;
         let mut renderer = create_renderer(selection, &gbm)?;
-        let outputs = Self::init_drm_outputs(&drm, renderer.as_mut(), &gbm, &resources);
+        let outputs = Self::init_drm_outputs(&drm, renderer.as_mut(), &gbm, &resources, &color);
         if outputs.is_empty() {
             return Err("no usable connector".into());
         }
@@ -2470,10 +3080,10 @@ impl Drm {
         let plane = &output.in_use.planes[output.in_use.primary_plane_index];
         let mut pairs = Vec::new();
         for sample in &self.renderer.capabilities().sample_formats {
-            let Some(mapped) = FORMATS_MAP.get(&sample.fourcc) else {
+            let Some(mapped) = client_format(sample.fourcc) else {
                 continue;
             };
-            if mapped.has_alpha {
+            if mapped.has_alpha || matches!(mapped.kind, FormatKind::Yuv { .. }) {
                 continue;
             }
             let Some(plane_format) = plane.formats.get(&sample.fourcc) else {
@@ -2492,13 +3102,16 @@ impl Drm {
         pairs
     }
 
+    pub(crate) fn accepts_shm_format(&self, fourcc: DrmFourcc) -> bool {
+        self.renderer.accepts_shm_format(fourcc)
+    }
+
     pub fn supported_dmabuf_read_formats(&self) -> Vec<(&'static Format, BTreeSet<Modifier>)> {
         self.renderer
-            .capabilities()
-            .sample_formats
+            .sampleable_formats()
             .iter()
             .filter_map(|format| {
-                let mapped = *FORMATS_MAP.get(&format.fourcc)?;
+                let mapped = client_format(format.fourcc)?;
                 let modifiers = format.modifiers.iter().copied().map(Modifier).collect();
                 Some((mapped, modifiers))
             })
@@ -2511,6 +3124,7 @@ impl Drm {
         recipe: &OutputFrameRecipe,
         damage: &DamageRegion,
         preserve_contents: bool,
+        linear_blend: Option<crate::color::TransferFunction>,
     ) -> crate::render::RenderCompletion {
         let Drm { renderer, outputs, .. } = self;
         let output = outputs
@@ -2529,6 +3143,7 @@ impl Drm {
                 sync_mode,
                 blur_reference: None,
                 clear_color: None,
+                linear_blend,
             },
         ) {
             Ok(completion) => completion,
@@ -2767,6 +3382,7 @@ impl Drm {
                 .is_some_and(|cursor| !cursor.completion.used_blocking_fallback),
             gamma_dirty: output.color_state.gamma_dirty,
             ctm_dirty: output.color_state.ctm_dirty,
+            hdr_dirty: hdr_property_update(output.programmed_hdr, output.desired_hdr).is_some(),
             committed_vrr_enabled: output.committed_vrr_enabled,
             vrr_enabled: output.in_use.crtc.vrr_enabled,
         })
@@ -3071,6 +3687,16 @@ impl Drm {
             );
             if let Some(pending) = pending_modeset {
                 append_primary_plane_geometry(&mut changes, &primary_plane, pending.geometry);
+                if let Some(setting) = self
+                    .output(drm_crtc_id)
+                    .and_then(|output| output.scanout_max_bpc)
+                {
+                    changes.add_property(
+                        setting.connector,
+                        setting.property,
+                        control::property::Value::UnsignedRange(setting.bits),
+                    );
+                }
                 if pending_modeset_scope(pending.crtc.is_some())
                     == PendingModesetScope::PlaneCrtcConnector
                 {
@@ -3138,9 +3764,12 @@ impl Drm {
                 return Err(error);
             }
 
-            let commit_result = self
-                .fd
-                .atomic_commit(render_buffer_commit_flags(pending_modeset.is_some()), changes);
+            let commit_result = self.fd.atomic_commit(
+                render_buffer_commit_flags(
+                    pending_modeset.is_some() || self.hdr_needs_modeset(drm_crtc_id),
+                ),
+                changes,
+            );
             match commit_result {
                 Ok(()) => {
                     let submitted_at = Instant::now();
@@ -3406,10 +4035,12 @@ impl Drm {
             self.wait_cursor_render_from(cursor_plane.take());
             return Err(error);
         }
-        if let Err(error) = self.fd.atomic_commit(
-            control::AtomicCommitFlags::PAGE_FLIP_EVENT | control::AtomicCommitFlags::NONBLOCK,
-            changes,
-        ) {
+        let mut scanout_flags =
+            control::AtomicCommitFlags::PAGE_FLIP_EVENT | control::AtomicCommitFlags::NONBLOCK;
+        if self.hdr_needs_modeset(drm_crtc_id) {
+            scanout_flags |= control::AtomicCommitFlags::ALLOW_MODESET;
+        }
+        if let Err(error) = self.fd.atomic_commit(scanout_flags, changes) {
             self.destroy_pending_color_blobs(color_blobs);
             self.wait_cursor_render_from(cursor_plane.take());
             return Err(error);
@@ -3599,6 +4230,7 @@ impl Drm {
                     sync_mode,
                     blur_reference: None,
                     clear_color: Some(CURSOR_CLEAR),
+                    linear_blend: None,
                 },
             )
         };
@@ -3839,19 +4471,53 @@ impl Drm {
             resources,
         })
     }
+}
 
+struct ProgrammedScanout {
+    buffers: [RenderBuffer; 2],
+    geometry: PrimaryPlaneGeometry,
+    max_bpc: Option<ScanoutMaxBpc>,
+    hdr_blob: Option<u64>,
+}
+
+fn renderer_can_render(renderer: &dyn Renderer, fourcc: DrmFourcc) -> bool {
+    renderer
+        .capabilities()
+        .render_formats
+        .iter()
+        .any(|format| format.fourcc == fourcc)
+}
+
+fn scanout_max_bpc(in_use: &ConnectorInUse, fourcc: DrmFourcc) -> Option<ScanoutMaxBpc> {
+    let bits = match fourcc {
+        DrmFourcc::Xrgb2101010 | DrmFourcc::Xbgr2101010 => 10,
+        _ => return None,
+    };
+    let range = in_use.connector.max_bpc?;
+    if !range.includes(bits) {
+        return None;
+    }
+    Some(ScanoutMaxBpc {
+        connector: in_use.connector.handler,
+        property: range.handle,
+        bits,
+    })
+}
+
+impl Drm {
     fn init_drm_outputs(
         drm: &DrmFd,
         renderer: &mut dyn Renderer,
         gbm: &GbmDevice,
         drm_resources: &DrmResources,
+        color_for: &impl Fn(&str) -> crate::config::OutputColorConfig,
     ) -> BTreeMap<u32, DrmOutput> {
         let DrmResources { planes, crtcs, connectors, .. } = drm_resources;
         let mut outputs = BTreeMap::new();
         for in_use in Self::find_valid_connectors(connectors, crtcs, planes) {
             let drm_crtc_id = in_use.crtc_id();
             let name = in_use.connector.interface_name.clone();
-            match Self::init_drm_output(drm, renderer, gbm, in_use) {
+            match Self::init_drm_output(drm, renderer, gbm, in_use, color_for) {
                 Ok(output) => {
                     outputs.insert(drm_crtc_id, output);
                 }
@@ -3866,6 +4532,7 @@ impl Drm {
         renderer: &mut dyn Renderer,
         gbm: &GbmDevice,
         in_use: ConnectorInUse,
+        color_for: &impl Fn(&str) -> crate::config::OutputColorConfig,
     ) -> Result<DrmOutput, String> {
         let Some(mode) = in_use.connector.preferred_mode.as_ref() else {
             return Err("connector has no mode".into());
@@ -3907,42 +4574,69 @@ impl Drm {
             plane_modifiers
         );
 
-        let mut changes = control::atomic::AtomicModeReq::new();
-
-        let buffers: [_; 2] = [
-            Self::make_render_buffer(drm, renderer, gbm, &in_use, false)
-                .map_err(|error| format!("render buffer #0: {error}"))?,
-            Self::make_render_buffer(drm, renderer, gbm, &in_use, false)
-                .map_err(|error| format!("render buffer #1: {error}"))?,
-        ];
-
-        changes.add_property(
-            primary_plane.handle,
-            primary_plane.fb_id,
-            control::property::Value::Object(Some(buffers[0].drm_fb.id().into())),
-        );
-        changes.add_property(
-            primary_plane.handle,
-            primary_plane.crtc_id,
-            control::property::Value::CRTC(Some(in_use.crtc.handle)),
-        );
-        let geometry = primary_plane_geometry(u64::from(hdisplay), u64::from(vdisplay));
-        append_primary_plane_geometry(&mut changes, primary_plane, geometry);
-
-        // Test the plane state without replacing the framebuffer already on screen.
-        // The first rendered frame commits the same geometry with ALLOW_MODESET.
-        if let Err(error) = drm.atomic_commit(
-            control::AtomicCommitFlags::ALLOW_MODESET | control::AtomicCommitFlags::TEST_ONLY,
-            changes,
-        ) {
-            return Err(format!(
-                "initial modeset connector={} crtc={:?} mode={}x{}: {error}",
-                in_use.connector.interface_name, in_use.crtc.handle, hdisplay, vdisplay
-            ));
+        let color = color_for(&in_use.connector.interface_name);
+        let hdr = (color.mode == crate::config::OutputColorMode::Hdr)
+            .then(|| {
+                crate::color::hdr::prepare(
+                    crate::color::hdr::HdrRequest {
+                        white: color.reference_white(true),
+                        min_luminance: color.min_luminance,
+                        max_luminance: color.max_luminance,
+                        max_fall: color.max_fall,
+                    },
+                    in_use.connector.display_hdr(),
+                )
+            })
+            .flatten();
+        let metadata = hdr.as_ref().map(crate::color::hdr::metadata_bytes);
+        let ten_bit_allowed = crate::config::ten_bit_scanout(&color, metadata.is_some())
+            && in_use
+                .connector
+                .max_bpc
+                .is_none_or(|range| range.includes(10));
+        let fourcc = preferred_scanout_fourcc(ten_bit_allowed, |fourcc| {
+            renderer_can_render(renderer, fourcc) && primary_plane.formats.contains_key(&fourcc)
+        });
+        let mut programmed = None;
+        let mut programmed_metadata = None;
+        let mut last_error = String::new();
+        for (attempt_fourcc, attempt_hdr) in scanout_attempts(fourcc, metadata.is_some()) {
+            let bytes = attempt_hdr.then_some(metadata).flatten();
+            match Self::program_scanout_buffers(
+                drm,
+                renderer,
+                gbm,
+                &in_use,
+                attempt_fourcc,
+                hdisplay,
+                vdisplay,
+                bytes.as_ref(),
+            ) {
+                Ok(result) => {
+                    programmed = Some(result);
+                    programmed_metadata = bytes;
+                    break;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "scanout for {} format={attempt_fourcc:?} hdr={attempt_hdr} failed ({error})",
+                        in_use.connector.interface_name
+                    );
+                    last_error = error;
+                }
+            }
         }
+        let Some(programmed) = programmed else {
+            return Err(last_error);
+        };
+        let ProgrammedScanout { buffers, geometry, max_bpc, hdr_blob } = programmed;
         log::info!(
-            "deferred initial modeset until the first rendered frame: connector={} crtc={:?} mode={}x{}",
-            in_use.connector.interface_name, in_use.crtc.handle, hdisplay, vdisplay
+            "deferred initial modeset until the first rendered frame: connector={} crtc={:?} mode={}x{} format={:?}",
+            in_use.connector.interface_name,
+            in_use.crtc.handle,
+            hdisplay,
+            vdisplay,
+            buffers[0].bo.dmabuf().map(|dmabuf| dmabuf.format.drm)
         );
 
         Ok(DrmOutput {
@@ -3963,7 +4657,92 @@ impl Drm {
             committed_vrr_enabled: None,
             committed_fb_kind: None,
             async_flip_rejections: 0,
+            scanout_max_bpc: max_bpc,
+            desired_hdr: programmed_metadata,
+            programmed_hdr: None,
+            held_hdr_blob: hdr_blob,
+            hdr_kms_rejected: metadata.is_some() && programmed_metadata.is_none(),
         })
+    }
+
+    fn program_scanout_buffers(
+        drm: &DrmFd,
+        renderer: &mut dyn Renderer,
+        gbm: &GbmDevice,
+        in_use: &ConnectorInUse,
+        fourcc: DrmFourcc,
+        hdisplay: u16,
+        vdisplay: u16,
+        hdr_metadata: Option<&[u8; 32]>,
+    ) -> Result<ProgrammedScanout, String> {
+        let (primary_plane, _) = in_use.primary_plane();
+        let buffers: [_; 2] = [
+            Self::make_render_buffer(drm, renderer, gbm, in_use, fourcc, false)
+                .map_err(|error| format!("render buffer #0: {error}"))?,
+            Self::make_render_buffer(drm, renderer, gbm, in_use, fourcc, false)
+                .map_err(|error| format!("render buffer #1: {error}"))?,
+        ];
+        let mut changes = control::atomic::AtomicModeReq::new();
+        changes.add_property(
+            primary_plane.handle,
+            primary_plane.fb_id,
+            control::property::Value::Object(Some(buffers[0].drm_fb.id().into())),
+        );
+        changes.add_property(
+            primary_plane.handle,
+            primary_plane.crtc_id,
+            control::property::Value::CRTC(Some(in_use.crtc.handle)),
+        );
+        let geometry = primary_plane_geometry(u64::from(hdisplay), u64::from(vdisplay));
+        append_primary_plane_geometry(&mut changes, primary_plane, geometry);
+        let max_bpc = scanout_max_bpc(in_use, fourcc);
+        if let Some(setting) = max_bpc {
+            changes.add_property(
+                setting.connector,
+                setting.property,
+                control::property::Value::UnsignedRange(setting.bits),
+            );
+        }
+        let hdr_blob = match hdr_metadata {
+            Some(bytes) => {
+                let properties = in_use.connector.hdr.as_ref().ok_or_else(|| {
+                    "connector is missing Colorspace or HDR_OUTPUT_METADATA".to_string()
+                })?;
+                let blob = drm
+                    .create_property_blob(bytes)
+                    .map_err(|error| format!("HDR metadata blob: {error}"))?;
+                let blob_id = blob
+                    .as_blob()
+                    .ok_or_else(|| "HDR metadata blob has no id".to_string())?;
+                changes.add_property(
+                    in_use.connector.handler,
+                    properties.colorspace,
+                    control::property::Value::Unknown(properties.bt2020_rgb),
+                );
+                changes.add_property(
+                    in_use.connector.handler,
+                    properties.metadata,
+                    control::property::Value::Blob(blob_id),
+                );
+                Some(blob_id)
+            }
+            None => None,
+        };
+        // Test the plane state without replacing the framebuffer already on screen.
+        // The first rendered frame commits the same geometry with ALLOW_MODESET.
+        if let Err(error) = drm.atomic_commit(
+            control::AtomicCommitFlags::ALLOW_MODESET | control::AtomicCommitFlags::TEST_ONLY,
+            changes,
+        ) {
+            if let Some(blob_id) = hdr_blob {
+                let _ = drm.destroy_property_blob(blob_id);
+            }
+            return Err(format!(
+                "initial modeset connector={} crtc={:?} mode={}x{} format={fourcc:?}: {error}",
+                in_use.connector.interface_name, in_use.crtc.handle, hdisplay, vdisplay
+            ));
+        }
+        Ok(ProgrammedScanout { buffers, geometry, max_bpc, hdr_blob })
     }
 
     fn make_render_buffer(
@@ -3971,6 +4750,7 @@ impl Drm {
         renderer: &mut dyn Renderer,
         gbm: &GbmDevice,
         in_use: &ConnectorInUse,
+        fourcc: DrmFourcc,
         is_cursor: bool,
     ) -> std::io::Result<RenderBuffer> {
         let (_, plane_modifiers) = in_use.primary_plane();
@@ -3983,9 +4763,11 @@ impl Drm {
                 .capabilities()
                 .render_formats
                 .iter()
-                .find(|format| format.fourcc == DrmFourcc::Xrgb8888)
+                .find(|format| format.fourcc == fourcc)
             else {
-                return Err(std::io::Error::other("renderer has no XRGB8888 render format"));
+                return Err(std::io::Error::other(format!(
+                    "renderer has no {fourcc:?} render format"
+                )));
             };
             format
                 .modifiers
@@ -4004,7 +4786,11 @@ impl Drm {
             flags |= UseFlags::LINEAR;
         }
 
-        let bo = gbm.create_bo(&mode, flags, &modifiers);
+        let Some(bo) = gbm.try_create_scanout_bo(mode, fourcc, flags, &modifiers) else {
+            return Err(std::io::Error::other(format!(
+                "GBM could not allocate a {fourcc:?} scanout buffer"
+            )));
+        };
         let Some(dmabuf) = bo.dmabuf() else {
             return Err(std::io::Error::other("GBM buffer did not export a dmabuf"));
         };
@@ -4241,12 +5027,10 @@ impl Drm {
                 Ok(formats) => formats
                     .into_iter()
                     .filter(|format| !format.modifiers.is_empty())
-                    .filter_map(|format| FORMATS_MAP.get(&format.format).map(|our| (format, our)))
+                    .filter_map(|format| known_format(format.format).map(|our| (format, our)))
                     .map(|(in_format, format)| {
-                        let plane_format = PlaneFormat {
-                            format: (*format).clone(),
-                            modifiers: in_format.modifiers,
-                        };
+                        let plane_format =
+                            PlaneFormat { format: *format, modifiers: in_format.modifiers };
                         (in_format.format, plane_format)
                     })
                     .collect(),
@@ -4259,10 +5043,10 @@ impl Drm {
                 .formats()
                 .iter()
                 .filter_map(|id| DrmFourcc::try_from(*id).ok())
-                .filter_map(|id| FORMATS_MAP.get(&id).map(|format| (id, format)))
+                .filter_map(|id| known_format(id).map(|format| (id, format)))
                 .map(|(id, format)| {
                     let plane_format = PlaneFormat {
-                        format: (*format).clone(),
+                        format: *format,
                         modifiers: [Modifier::INVALID].into_iter().collect(),
                     };
                     (id, plane_format)
@@ -4328,9 +5112,14 @@ impl Drm {
 
         let props = get_props(drm, connector_handle);
 
-        let edid = props
+        let edid_bytes = props
             .get("EDID")
-            .and_then(|(value, _)| drm.get_property_blob(*value).ok())
+            .and_then(|(value, _)| drm.get_property_blob(*value).ok());
+        let cta = edid_bytes
+            .as_deref()
+            .map(edid_cta::parse)
+            .unwrap_or_default();
+        let edid = edid_bytes
             .map(std::io::Cursor::new)
             .and_then(|mut blob| edid_rs::parse(&mut blob).ok());
 
@@ -4393,10 +5182,33 @@ impl Drm {
                 .map(|(value, _)| *value != 0)
                 .unwrap_or(false),
             crtc_id_prop: props.get("CRTC_ID").map(|(_, info)| info.handle()),
+            max_bpc: props
+                .get("max bpc")
+                .and_then(|(_, info)| match info.value_type() {
+                    control::property::ValueType::UnsignedRange(min, max) => {
+                        Some(ConnectorMaxBpc { handle: info.handle(), min, max })
+                    }
+                    _ => None,
+                }),
+            cta,
+            hdr: connector_hdr_properties(&props),
         };
 
         Some((connector_handle, connector))
     }
+}
+
+fn connector_hdr_properties(
+    props: &BTreeMap<String, (u64, property::Info)>,
+) -> Option<ConnectorHdrProperties> {
+    let (_, colorspace) = props.get("Colorspace")?;
+    let (_, metadata) = props.get("HDR_OUTPUT_METADATA")?;
+    Some(ConnectorHdrProperties {
+        colorspace: colorspace.handle(),
+        default_colorspace: colorspace_enum(colorspace, b"Default")?,
+        bt2020_rgb: colorspace_enum(colorspace, b"BT2020_RGB")?,
+        metadata: metadata.handle(),
+    })
 }
 
 fn get_in_formats(drm: &DrmFd, prop: u64) -> std::io::Result<Vec<InFormat>> {
@@ -4977,6 +5789,14 @@ fn dispatch_gamma_control_failed_if_pending(
     }
 }
 
+pub fn request_output_color_redraws(state: &mut State, dispatcher: &mut Dispatcher) {
+    for output_id in state.take_output_description_changes() {
+        dispatcher.dispatch(ClientManagerAction::OutputColorDescriptionChanged { output_id });
+    }
+    let output_ids = state.take_output_color_redraws();
+    request_outputs(state, output_ids, dispatcher);
+}
+
 pub fn request_outputs<I>(state: &State, output_ids: I, dispatcher: &mut Dispatcher)
 where
     I: IntoIterator<Item = OutputId>,
@@ -5535,13 +6355,14 @@ fn render_prepared_toplevels(
                 alpha,
                 None,
                 item.scale,
+                None,
             );
             push_scene_item_frame_elements(&mut elements, item_start..items.len());
             translate_scene_items(&mut items, -bounds.x, -bounds.y);
             translate_recorded_frame_elements(&mut elements, -bounds.x, -bounds.y);
             scale_scene_items(&mut items, item.scale);
             scale_recorded_frame_elements(&mut elements, item.scale);
-            let recipe = build_output_frame_recipe(&items, &elements);
+            let recipe = build_output_frame_recipe(&items, &elements, None);
             wait_scene_acquires(drm, &items);
             let (reference_width, reference_height) = drm
                 .output(drm_crtc_id)
@@ -5573,6 +6394,7 @@ fn render_prepared_toplevels(
                         sync_mode: RenderSyncMode::BlockingFinishFallback,
                         blur_reference: Some((reference_width, reference_height)),
                         clear_color: None,
+                        linear_blend: None,
                     },
                 )
                 .is_err()
@@ -5740,6 +6562,7 @@ impl DrmOutputModel {
                 crate::capture::output_capture_pending(state, self.output_id),
             );
             let tearing_eligible = tearing_decision.is_ok();
+            let effect_color = effect_color_transform(state, self.output_id);
             let drm = state.drm.get_mut(self.drm_id);
             let target_vrr_enabled =
                 matches!(decision.mode, crate::scheduler::frame_clock::FrameClockMode::Variable)
@@ -5881,10 +6704,19 @@ impl DrmOutputModel {
                 Some(releases)
             } else {
                 wait_scene_acquires(drm, &items);
-                let recipe = build_output_frame_recipe(&items, &frame_elements);
+                let recipe = build_output_frame_recipe(&items, &frame_elements, effect_color);
                 let render_started_at = Instant::now();
-                let render_completion =
-                    drm.render_output(drm_crtc_id, &recipe, &damage, preserve_contents);
+                let linear_blend = state.outputs.try_get(self.output_id).and_then(|output| {
+                    let tf = output.color_description.transfer_function();
+                    (tf == crate::color::TransferFunction::St2084Pq).then_some(tf)
+                });
+                let render_completion = drm.render_output(
+                    drm_crtc_id,
+                    &recipe,
+                    &damage,
+                    preserve_contents,
+                    linear_blend,
+                );
                 if crate::capture::output_sample_pending(&state.capture, self.output_id) {
                     let (mode_width, mode_height, scale, transform) = state
                         .outputs
@@ -5973,12 +6805,14 @@ impl DrmOutputModel {
                             let fallback_recipe = build_output_frame_recipe(
                                 &fallback_plan.items,
                                 &fallback_plan.frame_elements,
+                                effect_color,
                             );
                             let fallback_render_completion = drm.render_output(
                                 drm_crtc_id,
                                 &fallback_recipe,
                                 &fallback_plan.damage,
                                 fallback_plan.preserve_contents,
+                                linear_blend,
                             );
                             let fallback_geometry = drm.requested_render_geometry(drm_crtc_id);
                             let fallback_block =
@@ -6313,6 +7147,7 @@ impl DrmOutputModel {
             );
         }
         sync_output_nodes_for_backend(state, self.drm_id);
+        request_output_color_redraws(state, dispatcher);
         dispatcher.dispatch_to(
             output_scheduler_id(self.output_id),
             OutputSchedulerAction::ScheduleAnimation { delay_msec: cursor_animation_delay_msec },
@@ -6528,6 +7363,7 @@ fn collect_protected_scene(
     }
     let surface_start = items.len();
     let output_scale = output_fractional_scale(state, output_id);
+    let output_color = output_color_description(state, output_id);
     {
         let (objects, drm_map) = (&mut state.objects, &mut state.drm);
         let drm = drm_map.get_mut(drm_id);
@@ -6545,6 +7381,7 @@ fn collect_protected_scene(
             u8::MAX,
             None,
             output_scale,
+            Some(&output_color),
         );
     }
     push_scene_item_frame_elements(&mut frame_elements, surface_start..items.len());
@@ -6566,7 +7403,11 @@ fn lock_blank_item(drm: &mut Drm, bounds: RectI, red: bool) -> Option<SceneItem>
             bounds,
             tex_transform: transform::Mat3::identity(),
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             mask: SceneItemMask::None,
+            color_description_id: 0,
+            render_intent: crate::color::RenderIntent::Perceptual,
+            representation: crate::color::ColorRepresentation::default(),
         },
         mask: SceneItemMask::None,
         texture,
@@ -6574,10 +7415,12 @@ fn lock_blank_item(drm: &mut Drm, bounds: RectI, red: bool) -> Option<SceneItem>
         sample_damage_padding: 0,
         state_has_alpha: false,
         alpha: u8::MAX,
+        alpha_multiplier: u32::MAX,
         opaque_region: DamageRegion::from_rect(bounds),
         opaque: true,
         sync: crate::sync::SurfaceSyncState::default(),
         direct_scanout: None,
+        color: None,
         scanout_candidate: false,
         presentation_feedbacks: Vec::new(),
     })
@@ -6781,11 +7624,30 @@ fn dispatch_submission_frame_callbacks(
 }
 
 fn scene_item_requires_compositor_compositing(item: &SceneItem) -> bool {
-    item.alpha < u8::MAX || !matches!(item.mask, SceneItemMask::None)
+    item.color.is_some()
+        || item.alpha < u8::MAX
+        || item.alpha_multiplier < u32::MAX
+        || !matches!(item.mask, SceneItemMask::None)
 }
 
-fn surface_allows_direct_scanout(root_clip: Option<WindowClip>, alpha: u8) -> bool {
-    root_clip.is_none() && alpha == u8::MAX
+fn surface_allows_direct_scanout(
+    root_clip: Option<WindowClip>,
+    alpha: u8,
+    alpha_multiplier: u32,
+) -> bool {
+    root_clip.is_none() && alpha == u8::MAX && alpha_multiplier == u32::MAX
+}
+
+fn multiplier_hides_opaque_region(
+    opaque_region: DamageRegion,
+    opaque: bool,
+    alpha_multiplier: u32,
+) -> (DamageRegion, bool) {
+    if alpha_multiplier < u32::MAX {
+        (DamageRegion::new(), false)
+    } else {
+        (opaque_region, opaque)
+    }
 }
 
 fn effect_transition_requires_full_redraw(has_effects: bool, had_effects_last_frame: bool) -> bool {
@@ -6834,7 +7696,11 @@ fn collect_named_cursor_render_item(
                         bounds,
                         tex_transform: transform::Mat3::identity(),
                         alpha: u8::MAX,
+                        alpha_multiplier: u32::MAX,
                         mask: SceneItemMask::None,
+                        color_description_id: 0,
+                        render_intent: crate::color::RenderIntent::Perceptual,
+                        representation: crate::color::ColorRepresentation::default(),
                     },
                     mask: SceneItemMask::None,
                     texture,
@@ -6842,10 +7708,12 @@ fn collect_named_cursor_render_item(
                     sample_damage_padding: 0,
                     state_has_alpha: true,
                     alpha: u8::MAX,
+                    alpha_multiplier: u32::MAX,
                     opaque_region: DamageRegion::new(),
                     opaque: false,
                     sync: crate::sync::SurfaceSyncState::default(),
                     direct_scanout: None,
+                    color: None,
                     scanout_candidate: false,
                     presentation_feedbacks: Vec::new(),
                 },
@@ -6859,6 +7727,7 @@ fn collect_named_cursor_render_item(
 fn commit_visible_scene_state(items: &mut [SceneItem]) {
     for item in items {
         item.state.alpha = item.alpha;
+        item.state.alpha_multiplier = item.alpha_multiplier;
         item.state.mask = item.mask;
     }
 }
@@ -7046,6 +7915,7 @@ fn push_scene_items_from_snapshots(
     alpha: u8,
     geometry_scale: Option<(RectI, RectI)>,
     output_scale: crate::state::FractionalScale,
+    output_color: Option<&ImageDescription>,
 ) {
     for surface_state in snapshots {
         let buffer_oid = surface_state.buffer.object_id();
@@ -7108,7 +7978,19 @@ fn push_scene_items_from_snapshots(
                 || drm
                     .output(drm_crtc_id)
                     .is_some_and(|output| output.in_use.primary_plane().0.in_fence_fd.is_some()));
-        let scanout_candidate = surface_allows_direct_scanout(root_clip, alpha)
+        let color = surface_output_color(
+            &surface_state.color_description,
+            output_color,
+            surface_state.render_intent,
+        );
+        // A non-identity transform has to run in the texture shader. KMS has no color pipeline.
+        // YUV needs COLOR_ENCODING and COLOR_RANGE on the plane. Keep it in the shader.
+        let scanout_candidate = color.is_none()
+            && surface_state
+                .representation
+                .allows_direct_scanout(buffer.format().has_alpha)
+            && !matches!(buffer.format().kind, FormatKind::Yuv { .. })
+            && surface_allows_direct_scanout(root_clip, alpha, surface_state.alpha_multiplier)
             && allow_direct_scanout
             && buffer.dmabuf().is_some()
             && !buffer.y_inverted()
@@ -7149,6 +8031,8 @@ fn push_scene_items_from_snapshots(
             let opaque = !opaque_region.is_empty();
             (SceneItemMask::None, opaque_region, opaque)
         };
+        let (opaque_region, opaque) =
+            multiplier_hides_opaque_region(opaque_region, opaque, surface_state.alpha_multiplier);
         items.push(SceneItem {
             state: SceneItemState {
                 key: SceneItemKey::Surface(surface_key),
@@ -7157,18 +8041,24 @@ fn push_scene_items_from_snapshots(
                 bounds,
                 tex_transform,
                 alpha,
+                alpha_multiplier: surface_state.alpha_multiplier,
                 mask,
+                color_description_id: surface_state.color_description.id(),
+                render_intent: surface_state.render_intent,
+                representation: surface_state.representation,
             },
             mask,
             texture,
             damage,
             sample_damage_padding,
-            state_has_alpha: buffer.format().has_alpha,
+            state_has_alpha: buffer.format().has_alpha || surface_state.alpha_multiplier < u32::MAX,
             alpha,
+            alpha_multiplier: surface_state.alpha_multiplier,
             opaque_region,
             opaque,
             sync: surface_state.sync,
             direct_scanout,
+            color,
             scanout_candidate,
             presentation_feedbacks: surface_state.presentation_feedbacks,
         });
@@ -7291,6 +8181,7 @@ fn collect_software_cursor_items(
     output_bounds: RectI,
     frame_time_msec: u32,
     output_scale: crate::state::FractionalScale,
+    output_color: &ImageDescription,
     retired_candidates: &mut Vec<RetiredBufferCandidate>,
 ) -> (Vec<SceneItem>, Option<u32>) {
     if let Some((item, next_frame_in_msec)) = collect_named_cursor_render_item(
@@ -7323,6 +8214,7 @@ fn collect_software_cursor_items(
         u8::MAX,
         None,
         output_scale,
+        Some(output_color),
     );
     (items, None)
 }
@@ -7369,6 +8261,7 @@ fn build_surface_cursor_plane_request(
     output_origin: (i32, i32),
     output_bounds: RectI,
     scale: crate::state::FractionalScale,
+    output_color: &ImageDescription,
 ) -> Option<CursorPlaneRequest> {
     let (pointer_x, pointer_y) = state.seat.pointer_position();
     let surface = state
@@ -7381,6 +8274,18 @@ fn build_surface_cursor_plane_request(
     let base_x = pointer_x.round() as i32 - cursor.hotspot_x - root_x;
     let base_y = pointer_y.round() as i32 - cursor.hotspot_y - root_y;
     let render_state = surface.render_state_at(base_x, base_y)?;
+    if render_state.alpha_multiplier < u32::MAX {
+        return None;
+    }
+    if surface_output_color(
+        &render_state.color_description,
+        Some(output_color),
+        render_state.render_intent,
+    )
+    .is_some()
+    {
+        return None;
+    }
     if render_state.tex_transform != transform::Mat3::identity() {
         return None;
     }
@@ -7429,10 +8334,15 @@ fn build_cursor_plane_request(
     output_id: OutputId,
     frame_time_msec: u32,
 ) -> Option<CursorPlaneRequest> {
-    let output = state.outputs.try_get(output_id)?;
-    let scale = output.scale;
-    let output_origin = (output.x, output.y);
-    let output_bounds = output.logical_bounds()?;
+    let (scale, output_origin, output_bounds, output_color) = {
+        let output = state.outputs.try_get(output_id)?;
+        (
+            output.scale,
+            (output.x, output.y),
+            output.logical_bounds()?,
+            Rc::clone(&output.color_description),
+        )
+    };
     let named = matches!(
         state.seat.visible_cursor_source_at(frame_time_msec),
         Some(CursorSourceRef::Named { .. })
@@ -7453,7 +8363,14 @@ fn build_cursor_plane_request(
         CursorSourceRef::Surface { cursor } => cursor.clone(),
         CursorSourceRef::Named { .. } => return None,
     };
-    build_surface_cursor_plane_request(state, &cursor, output_origin, output_bounds, scale)
+    build_surface_cursor_plane_request(
+        state,
+        &cursor,
+        output_origin,
+        output_bounds,
+        scale,
+        &output_color,
+    )
 }
 
 /// Pixel size of the theme cursor on an output: `ceil(theme_size · scale)`, at least 1.
@@ -7507,6 +8424,7 @@ pub(crate) struct PlannedClosingSurface {
     pub tex_transform: transform::Mat3,
     pub sync: crate::sync::SurfaceSyncState,
     pub inherit_root_clip: bool,
+    pub alpha_multiplier: u32,
 }
 
 pub(crate) struct PlannedClosingEffect {
@@ -7719,6 +8637,7 @@ fn plan_closing_from_peek(
             tex_transform: render.tex_transform,
             sync: render.sync,
             inherit_root_clip: render.inherit_root_clip,
+            alpha_multiplier: render.alpha_multiplier,
         })
         .collect();
     Some(ClosingCapturePlan {
@@ -8033,6 +8952,10 @@ fn closing_capture_elements(
                 damage: DamageRegion::from_rect(bounds),
                 blend: true,
                 alpha: plan.content_alpha,
+                alpha_multiplier: surface.alpha_multiplier,
+                color: None,
+                alpha_mode: 0,
+                yuv: None,
                 mask,
             },
         });
@@ -8095,7 +9018,11 @@ fn append_closing_snapshots(
                 bounds,
                 tex_transform: transform::Mat3::identity(),
                 alpha,
+                alpha_multiplier: u32::MAX,
                 mask: SceneItemMask::None,
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask: SceneItemMask::None,
             texture: snapshot.texture(),
@@ -8103,10 +9030,12 @@ fn append_closing_snapshots(
             sample_damage_padding: 0,
             state_has_alpha: true,
             alpha,
+            alpha_multiplier: u32::MAX,
             opaque_region: DamageRegion::new(),
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         });
@@ -8162,6 +9091,7 @@ fn collect_render_items_for_output_view(
     let mut content_entries = Vec::new();
     let mut rendered_content = false;
     let output_scale = output_fractional_scale(state, output_id);
+    let output_color = output_color_description(state, output_id);
     for entry in &view.entries {
         if entry.tier == CompositionTier::Content && !rendered_content {
             content_entries.push(entry);
@@ -8176,6 +9106,7 @@ fn collect_render_items_for_output_view(
                 drm_crtc_id,
                 output_id,
                 output_bounds,
+                &output_color,
                 &content_entries,
                 &mut items,
                 &mut frame_elements,
@@ -8192,6 +9123,7 @@ fn collect_render_items_for_output_view(
             entry,
             WorkspaceMotion::IDENTITY,
             output_scale,
+            &output_color,
             &mut items,
             &mut frame_elements,
             &mut retired_candidates,
@@ -8204,6 +9136,7 @@ fn collect_render_items_for_output_view(
             drm_crtc_id,
             output_id,
             output_bounds,
+            &output_color,
             &content_entries,
             &mut items,
             &mut frame_elements,
@@ -8260,6 +9193,7 @@ fn collect_render_items_for_output_view(
             output_bounds,
             frame_time_msec,
             output_scale,
+            &output_color,
             &mut retired_candidates,
         );
     if cursor_animation_delay_msec.is_none() {
@@ -8293,6 +9227,7 @@ fn collect_input_popup_render_items(
         return;
     }
     let popups = state.seat.ime.input_popups().to_vec();
+    let output_color = output_color_description(state, output_id);
     for popup in popups {
         let Some(global) = popup.global else {
             continue;
@@ -8339,6 +9274,7 @@ fn collect_input_popup_render_items(
             u8::MAX,
             None,
             output_scale,
+            Some(&output_color),
         );
     }
 }
@@ -8391,6 +9327,7 @@ fn collect_dnd_render_items(
         &mut snapshots,
     );
     let output_scale = output_fractional_scale(state, output_id);
+    let output_color = output_color_description(state, output_id);
     let (objects, drm_map) = (&mut state.objects, &mut state.drm);
     let drm = drm_map.get_mut(drm_id);
     let drm_fd = drm.fd();
@@ -8407,6 +9344,7 @@ fn collect_dnd_render_items(
         u8::MAX,
         None,
         output_scale,
+        Some(&output_color),
     );
 }
 
@@ -8422,6 +9360,18 @@ fn scene_item_to_texture_element(item: &SceneItem) -> TextureElement {
         damage: item.damage.clone(),
         blend: item.state_has_alpha,
         alpha: item.alpha,
+        alpha_multiplier: item.alpha_multiplier,
+        color: item.color.clone(),
+        alpha_mode: if item.texture.samples_as_opaque() {
+            0
+        } else {
+            item.state.representation.shader_alpha_mode()
+        },
+        yuv: (item.texture.yuv_mode() != 0).then(|| {
+            item.state
+                .representation
+                .yuv_conversion(item.texture.yuv_mode() == 2)
+        }),
         mask: match item.mask {
             SceneItemMask::None => TextureMask::None,
             SceneItemMask::RoundedClip { clip } => {
@@ -8437,9 +9387,37 @@ fn scene_item_to_texture_element(item: &SceneItem) -> TextureElement {
     }
 }
 
+fn output_color_description(state: &State, output_id: OutputId) -> Rc<ImageDescription> {
+    state
+        .outputs
+        .try_get(output_id)
+        .map(|output| Rc::clone(&output.color_description))
+        .unwrap_or_else(|| state.color_manager.srgb_gamma22())
+}
+
+/// `None` is the identity shader. An absent output description (an offscreen
+/// re-render) stays on that path, the same as a matching surface and output.
+fn surface_output_color(
+    source: &ImageDescription,
+    output: Option<&ImageDescription>,
+    intent: RenderIntent,
+) -> Option<Rc<ColorTransform>> {
+    ColorTransform::between(source, output?, intent).map(Rc::new)
+}
+
+fn effect_color_transform(state: &State, output_id: OutputId) -> Option<ColorTransform> {
+    let output = state.outputs.try_get(output_id)?;
+    ColorTransform::between(
+        &state.color_manager.srgb_gamma22(),
+        &output.color_description,
+        RenderIntent::Perceptual,
+    )
+}
+
 fn build_output_frame_recipe(
     items: &[SceneItem],
     frame_elements: &[RecordedFrameElement],
+    effect_color: Option<ColorTransform>,
 ) -> OutputFrameRecipe {
     OutputFrameRecipe {
         elements: frame_elements
@@ -8451,12 +9429,57 @@ fn build_output_frame_recipe(
                         element: scene_item_to_texture_element(item),
                     })
                 }
-                RecordedFrameElement::Effect { phase, element } => {
-                    Some(FrameElement::Effect { phase: *phase, element: *element })
-                }
+                RecordedFrameElement::Effect { phase, element } => Some(FrameElement::Effect {
+                    phase: *phase,
+                    element: map_effect_colors(*element, effect_color),
+                }),
             })
             .collect(),
     }
+}
+
+/// Config colors are gamma-2.2 sRGB. Perceptual maps them into the output encoding.
+/// Dim overlays stay a black coverage mask: perceptual black-point compensation
+/// leaves that black unchanged, so the overlay has no color of its own.
+fn map_effect_colors(element: EffectElement, transform: Option<ColorTransform>) -> EffectElement {
+    let Some(transform) = transform else {
+        return element;
+    };
+    match element {
+        EffectElement::WindowBorder { ring, gradient, alpha } => EffectElement::WindowBorder {
+            ring,
+            alpha,
+            gradient: BorderGradient {
+                start_color: map_config_color(gradient.start_color, transform),
+                end_color: map_config_color(gradient.end_color, transform),
+                angle_degrees: gradient.angle_degrees,
+            },
+        },
+        EffectElement::WindowShadow { clip, style, alpha } => EffectElement::WindowShadow {
+            clip,
+            alpha,
+            style: ShadowVisualStyle { color: map_config_color(style.color, transform), ..style },
+        },
+        other => other,
+    }
+}
+
+fn map_config_color(
+    color: crate::config::RgbaColor,
+    transform: ColorTransform,
+) -> crate::config::RgbaColor {
+    let mapped = transform.map_rgb([
+        f64::from(color.r) / 255.0,
+        f64::from(color.g) / 255.0,
+        f64::from(color.b) / 255.0,
+    ]);
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    crate::config::RgbaColor::new(
+        channel(mapped[0]),
+        channel(mapped[1]),
+        channel(mapped[2]),
+        color.a,
+    )
 }
 
 fn translate_scene_items(items: &mut [SceneItem], dx: i32, dy: i32) {
@@ -8591,6 +9614,7 @@ fn render_workspace_content(
     drm_crtc_id: u32,
     output_id: OutputId,
     output_bounds: RectI,
+    output_color: &ImageDescription,
     entries: &[&ComposedEntry],
     items: &mut Vec<SceneItem>,
     frame_elements: &mut Vec<RecordedFrameElement>,
@@ -8622,6 +9646,7 @@ fn render_workspace_content(
                 entries[index],
                 motion,
                 output_scale,
+                output_color,
                 items,
                 frame_elements,
                 retired_candidates,
@@ -8656,6 +9681,7 @@ fn render_workspace_content(
             entry,
             motion,
             output_scale,
+            output_color,
             items,
             frame_elements,
             retired_candidates,
@@ -8679,6 +9705,7 @@ fn render_composed_entry(
     entry: &ComposedEntry,
     motion: WorkspaceMotion,
     output_scale: crate::state::FractionalScale,
+    output_color: &ImageDescription,
     items: &mut Vec<SceneItem>,
     frame_elements: &mut Vec<RecordedFrameElement>,
     retired_candidates: &mut Vec<RetiredBufferCandidate>,
@@ -8757,6 +9784,7 @@ fn render_composed_entry(
             .unwrap_or(u8::MAX),
         geometry_scale,
         output_scale,
+        Some(output_color),
     );
     push_scene_item_frame_elements(frame_elements, item_start..items.len());
     if effects_on_output {
@@ -9735,7 +10763,11 @@ mod window_animation_tests {
                 bounds,
                 tex_transform: crate::transform::Mat3::identity(),
                 alpha: 200,
+                alpha_multiplier: u32::MAX,
                 mask: super::SceneItemMask::RoundedClip { clip },
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask: super::SceneItemMask::RoundedClip { clip },
             texture: crate::render::inert_texture(),
@@ -9743,10 +10775,12 @@ mod window_animation_tests {
             sample_damage_padding: 0,
             state_has_alpha: false,
             alpha: 200,
+            alpha_multiplier: u32::MAX,
             opaque_region: crate::region::DamageRegion::from_rect(bounds),
             opaque: true,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
@@ -10188,12 +11222,14 @@ mod closing_capture_tests {
         }
         let mut items = Vec::new();
         let mut elements = Vec::new();
+        let output_color = super::output_color_description(&state, output_id);
         super::render_workspace_content(
             &mut state,
             DrmId::from(0usize),
             0,
             output_id,
             RectI::new(0, 0, 800, 600).unwrap(),
+            &output_color,
             &[],
             &mut items,
             &mut elements,
@@ -10265,12 +11301,14 @@ mod closing_capture_tests {
 
         let mut items = Vec::new();
         let mut elements = Vec::new();
+        let output_color = super::output_color_description(&state, output_id);
         super::render_workspace_content(
             &mut state,
             DrmId::from(0usize),
             0,
             output_id,
             RectI::new(0, 0, 800, 600).unwrap(),
+            &output_color,
             &[],
             &mut items,
             &mut elements,
@@ -10372,7 +11410,7 @@ mod cursor_policy_tests {
 mod render_recipe_tests {
     use {
         super::{
-            build_output_frame_recipe, push_root_surface_effect_elements,
+            build_output_frame_recipe, map_config_color, push_root_surface_effect_elements,
             scene_item_to_texture_element, translate_recorded_frame_elements, RecordedFrameElement,
             SceneItem, SceneItemContentKey, SceneItemKey, SceneItemMask, SceneItemState,
         },
@@ -10406,7 +11444,11 @@ mod render_recipe_tests {
                 bounds: item_bounds,
                 tex_transform: transform::Mat3::identity(),
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
                 mask: SceneItemMask::RoundedClip { clip },
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask: SceneItemMask::RoundedClip { clip },
             texture: crate::render::inert_texture(),
@@ -10414,10 +11456,12 @@ mod render_recipe_tests {
             sample_damage_padding: 0,
             state_has_alpha: false,
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             opaque_region: DamageRegion::new(),
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
@@ -10433,6 +11477,48 @@ mod render_recipe_tests {
                 ),
             }
         );
+        assert!(render_item.color.is_none());
+    }
+
+    #[test]
+    fn identity_surface_color_stays_off_the_shader() {
+        let manager = crate::color::ColorManager::new();
+        let srgb = manager.srgb_gamma22();
+        let untagged = crate::color::ColorManager::untagged_srgb_gamma22();
+        assert!(super::surface_output_color(
+            &untagged,
+            Some(&srgb),
+            crate::color::RenderIntent::Perceptual,
+        )
+        .is_none());
+        assert!(super::surface_output_color(
+            &srgb,
+            Some(&srgb),
+            crate::color::RenderIntent::Relative,
+        )
+        .is_none());
+        assert!(super::surface_output_color(&srgb, None, crate::color::RenderIntent::Perceptual)
+            .is_none());
+        assert!(super::surface_output_color(
+            &untagged,
+            Some(&manager.windows_scrgb()),
+            crate::color::RenderIntent::Perceptual,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn scene_item_forwards_surface_color_transform() {
+        let manager = crate::color::ColorManager::new();
+        let color = super::surface_output_color(
+            &manager.srgb_gamma22(),
+            Some(&manager.windows_scrgb()),
+            crate::color::RenderIntent::Perceptual,
+        );
+        let mut item = cursor_scene_item(RectI::new(0, 0, 10, 10).unwrap());
+        item.color = color.clone();
+        let element = scene_item_to_texture_element(&item);
+        assert!(std::rc::Rc::ptr_eq(element.color.as_ref().unwrap(), color.as_ref().unwrap(),));
     }
 
     #[test]
@@ -10453,7 +11539,11 @@ mod render_recipe_tests {
                 bounds: item_bounds,
                 tex_transform: transform::Mat3::identity(),
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
                 mask: SceneItemMask::CornerRoundedClip { clip },
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask: SceneItemMask::CornerRoundedClip { clip },
             texture: crate::render::inert_texture(),
@@ -10461,10 +11551,12 @@ mod render_recipe_tests {
             sample_damage_padding: 0,
             state_has_alpha: false,
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             opaque_region: DamageRegion::new(),
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
@@ -10564,6 +11656,158 @@ mod render_recipe_tests {
         )));
     }
 
+    fn cursor_scene_item(bounds: RectI) -> SceneItem {
+        SceneItem {
+            state: SceneItemState {
+                key: SceneItemKey::Cursor,
+                surface_key: None,
+                content_key: SceneItemContentKey::NamedCursor(
+                    crate::cursor::CursorImageContentKey { width: 1, height: 1, fingerprint: 1 },
+                ),
+                bounds,
+                tex_transform: transform::Mat3::identity(),
+                alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
+                mask: SceneItemMask::None,
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
+            },
+            mask: SceneItemMask::None,
+            texture: crate::render::inert_texture(),
+            damage: DamageRegion::from_rect(bounds),
+            sample_damage_padding: 0,
+            state_has_alpha: true,
+            alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
+            opaque_region: DamageRegion::new(),
+            opaque: false,
+            sync: crate::sync::SurfaceSyncState::default(),
+            direct_scanout: None,
+            color: None,
+            scanout_candidate: false,
+            presentation_feedbacks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn output_encoding_converts_border_and_shadow_and_leaves_surfaces_untagged() {
+        use crate::{
+            color::{ColorManager, ColorTransform, Primaries, RenderIntent, TransferFunction},
+            config::{OutputColorConfig, OutputColorPrimaries, OutputColorTransfer, RgbaColor},
+            state::output_image_description,
+        };
+
+        let manager = ColorManager::new();
+        let (wide, fell_back) = output_image_description(
+            &manager,
+            OutputColorConfig {
+                tf: OutputColorTransfer::Gamma22,
+                primaries: OutputColorPrimaries::Edid,
+                ..OutputColorConfig::DEFAULT
+            },
+            Some(crate::state::EdidChromaticities {
+                red: Primaries::DISPLAY_P3.r,
+                green: Primaries::DISPLAY_P3.g,
+                blue: Primaries::DISPLAY_P3.b,
+                white: Primaries::DISPLAY_P3.w,
+            }),
+            None,
+        );
+        assert!(!fell_back);
+        assert_eq!(wide.transfer_function(), TransferFunction::Gamma22);
+        let transform =
+            ColorTransform::between(&manager.srgb_gamma22(), &wide, RenderIntent::Perceptual)
+                .unwrap();
+        let border = RgbaColor::new(220, 40, 90, 255);
+        let shadow = RgbaColor::new(10, 20, 30, 180);
+        let clip = RootSurfaceClip::new(
+            RectI::new(0, 0, 80, 60).unwrap(),
+            0,
+            crate::config::RoundingPower::DEFAULT,
+        );
+        let bounds = RectI::new(0, 0, 80, 60).unwrap();
+        let items = vec![cursor_scene_item(bounds)];
+        let frame_elements = vec![
+            RecordedFrameElement::Effect {
+                phase: FramePhase::UnderWindow,
+                element: EffectElement::WindowShadow {
+                    clip,
+                    style: ShadowVisualStyle {
+                        radius: 8,
+                        offset_x: 0,
+                        offset_y: 2,
+                        color: shadow,
+                        power: crate::config::ShadowPower::DEFAULT,
+                    },
+                    alpha: u8::MAX,
+                },
+            },
+            RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 0 },
+            RecordedFrameElement::Effect {
+                phase: FramePhase::OverWindow,
+                element: EffectElement::WindowBorder {
+                    ring: crate::render::RoundedRing { outer: clip, inner: clip },
+                    gradient: BorderGradient {
+                        start_color: border,
+                        end_color: border,
+                        angle_degrees: 0,
+                    },
+                    alpha: u8::MAX,
+                },
+            },
+            RecordedFrameElement::Effect {
+                phase: FramePhase::Overlay,
+                element: EffectElement::DimOverlay { clip, alpha: 40 },
+            },
+        ];
+        let identity = build_output_frame_recipe(&items, &frame_elements, None);
+        let converted = build_output_frame_recipe(&items, &frame_elements, Some(transform));
+        let expected_border = map_config_color(border, transform);
+        let expected_shadow = map_config_color(shadow, transform);
+        assert_ne!(expected_border, border);
+        assert_ne!(expected_shadow, shadow);
+        match &converted.elements[0] {
+            crate::render::FrameElement::Effect {
+                element: EffectElement::WindowShadow { style, .. },
+                ..
+            } => assert_eq!(style.color, expected_shadow),
+            other => panic!("shadow element changed shape: {other:?}"),
+        }
+        match &converted.elements[1] {
+            crate::render::FrameElement::Texture { element, .. } => {
+                assert!(element.color.is_none())
+            }
+            other => panic!("surface element changed shape: {other:?}"),
+        }
+        match &converted.elements[2] {
+            crate::render::FrameElement::Effect {
+                element: EffectElement::WindowBorder { gradient, .. },
+                ..
+            } => {
+                assert_eq!(gradient.start_color, expected_border);
+                assert_eq!(gradient.end_color, expected_border);
+            }
+            other => panic!("border element changed shape: {other:?}"),
+        }
+        match (&identity.elements[3], &converted.elements[3]) {
+            (
+                crate::render::FrameElement::Effect {
+                    element: EffectElement::DimOverlay { clip: left, alpha: left_alpha },
+                    ..
+                },
+                crate::render::FrameElement::Effect {
+                    element: EffectElement::DimOverlay { clip: right, alpha: right_alpha },
+                    ..
+                },
+            ) => {
+                assert_eq!(left, right);
+                assert_eq!(left_alpha, right_alpha);
+            }
+            _ => panic!("dim overlay was rewritten"),
+        }
+    }
+
     #[test]
     fn ordered_frame_recipe_preserves_window_local_phase_order() {
         let bounds_a = RectI::new(10, 20, 80, 60).unwrap();
@@ -10588,7 +11832,11 @@ mod render_recipe_tests {
                     bounds: bounds_a,
                     tex_transform: transform::Mat3::identity(),
                     alpha: u8::MAX,
+                    alpha_multiplier: u32::MAX,
                     mask: SceneItemMask::None,
+                    color_description_id: 0,
+                    render_intent: crate::color::RenderIntent::Perceptual,
+                    representation: crate::color::ColorRepresentation::default(),
                 },
                 mask: SceneItemMask::None,
                 texture: crate::render::inert_texture(),
@@ -10596,10 +11844,12 @@ mod render_recipe_tests {
                 sample_damage_padding: 0,
                 state_has_alpha: true,
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
                 opaque_region: DamageRegion::new(),
                 opaque: false,
                 sync: crate::sync::SurfaceSyncState::default(),
                 direct_scanout: None,
+                color: None,
                 scanout_candidate: false,
                 presentation_feedbacks: Vec::new(),
             },
@@ -10617,7 +11867,11 @@ mod render_recipe_tests {
                     bounds: bounds_b,
                     tex_transform: transform::Mat3::identity(),
                     alpha: u8::MAX,
+                    alpha_multiplier: u32::MAX,
                     mask: SceneItemMask::None,
+                    color_description_id: 0,
+                    render_intent: crate::color::RenderIntent::Perceptual,
+                    representation: crate::color::ColorRepresentation::default(),
                 },
                 mask: SceneItemMask::None,
                 texture: crate::render::inert_texture(),
@@ -10625,10 +11879,12 @@ mod render_recipe_tests {
                 sample_damage_padding: 0,
                 state_has_alpha: true,
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
                 opaque_region: DamageRegion::new(),
                 opaque: false,
                 sync: crate::sync::SurfaceSyncState::default(),
                 direct_scanout: None,
+                color: None,
                 scanout_candidate: false,
                 presentation_feedbacks: Vec::new(),
             },
@@ -10670,7 +11926,7 @@ mod render_recipe_tests {
             RecordedFrameElement::Texture { phase: FramePhase::Content, item_index: 1 },
         ];
 
-        let recipe = build_output_frame_recipe(&items, &frame_elements);
+        let recipe = build_output_frame_recipe(&items, &frame_elements, None);
 
         assert!(matches!(
             recipe.elements[0],
@@ -10797,7 +12053,11 @@ mod render_recipe_tests {
                 bounds: item_bounds,
                 tex_transform: transform::Mat3::identity(),
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
                 mask: SceneItemMask::None,
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask: SceneItemMask::None,
             texture: crate::render::inert_texture(),
@@ -10805,10 +12065,12 @@ mod render_recipe_tests {
             sample_damage_padding: 0,
             state_has_alpha: true,
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             opaque_region: DamageRegion::new(),
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: Vec::new(),
         }];
@@ -10853,7 +12115,7 @@ mod render_recipe_tests {
         ];
 
         translate_recorded_frame_elements(&mut frame_elements, -300, -200);
-        let recipe = build_output_frame_recipe(&items, &frame_elements);
+        let recipe = build_output_frame_recipe(&items, &frame_elements, None);
 
         assert!(matches!(
             recipe.elements[0],
@@ -10887,18 +12149,19 @@ mod presentation_timing_tests {
             cursor_plane_supports_requested_cursor, cursor_render_sync_mode, cursor_target_damage,
             cursor_target_size_retained, cursor_theme_pixels, cursor_upload_reuses_cached,
             direct_scanout_blocked, dropped_in_fence_wait, effect_transition_requires_full_redraw,
-            find_cursor_slot_index_for_key, import_cursor_render_target, log_async_flip_rejection,
-            mode_blob_replaced, optional_plane_attempts, pending_modeset_scope,
-            primary_plane_geometry, rejected_explicit_kms_sync, render_buffer_commit_flags,
+            find_cursor_slot_index_for_key, hdr_property_update, import_cursor_render_target,
+            log_async_flip_rejection, mode_blob_replaced, multiplier_hides_opaque_region,
+            optional_plane_attempts, pending_modeset_scope, primary_plane_geometry,
+            rejected_explicit_kms_sync, render_buffer_commit_flags,
             render_planner::select_presentation_output_for_scene, request_output,
             request_outputs_for_rects, retired_mode_blob, rgba_to_drm_argb8888,
             scene_item_requires_compositor_compositing, select_cursor_upload_slot,
             submitted_frame_feedbacks_for_discard, surface_allows_direct_scanout, AsyncFencePlan,
             AsyncFlipBlock, AsyncFlipGate, AsyncFlipStep, CommittedCursor, CursorBufferAllocation,
             CursorPlaneContentKey, CursorSurfaceContentKey, Modifier, OutputSubmission,
-            PendingModesetScope, RecordedCursor, RenderSyncMode, SceneItem, SceneItemContentKey,
-            SceneItemKey, SceneItemMask, SceneItemState, SubmissionPresentationFeedback,
-            SubmittedFrame, ARGB8888, CURSOR_CLEAR,
+            PendingModesetScope, ProgrammedHdr, RecordedCursor, RenderSyncMode, SceneItem,
+            SceneItemContentKey, SceneItemKey, SceneItemMask, SceneItemState,
+            SubmissionPresentationFeedback, SubmittedFrame, ARGB8888, CURSOR_CLEAR,
         },
         crate::{
             clients::{ClientId, Resolved},
@@ -10968,7 +12231,11 @@ mod presentation_timing_tests {
                 bounds,
                 tex_transform: transform::Mat3::identity(),
                 alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
                 mask: SceneItemMask::None,
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
             },
             mask: SceneItemMask::None,
             texture: crate::render::inert_texture(),
@@ -10976,10 +12243,12 @@ mod presentation_timing_tests {
             sample_damage_padding: 0,
             state_has_alpha: true,
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             opaque_region: DamageRegion::new(),
             opaque: false,
             sync: crate::sync::SurfaceSyncState::default(),
             direct_scanout: None,
+            color: None,
             scanout_candidate: false,
             presentation_feedbacks: feedbacks,
         }
@@ -11225,6 +12494,7 @@ mod presentation_timing_tests {
         assert_eq!((element.x, element.y, element.width, element.height), (0, 0, 24, 16));
         assert!(element.blend);
         assert_eq!(element.alpha, u8::MAX);
+        assert_eq!(element.alpha_multiplier, u32::MAX);
         assert_eq!(recipe.elements.len(), 1);
 
         let damage = cursor_target_damage(64, 64).expect("target damage");
@@ -11341,6 +12611,7 @@ mod presentation_timing_tests {
             cursor_newly_uploaded: false,
             gamma_dirty: false,
             ctm_dirty: false,
+            hdr_dirty: false,
             committed_vrr_enabled: Some(false),
             vrr_enabled: false,
         }
@@ -11362,6 +12633,19 @@ mod presentation_timing_tests {
         let mut modeset = matching_async_gate();
         modeset.pending_modeset = true;
         assert!(!async_flip_is_allowed(&modeset));
+
+        let mut hdr = matching_async_gate();
+        hdr.hdr_dirty = true;
+        assert_eq!(async_flip_block_reason(&hdr), Some(AsyncFlipBlock::Color));
+        assert!(hdr_property_update(None, None).is_none());
+        let infoframe = [2u8; 32];
+        assert_eq!(hdr_property_update(None, Some(infoframe)), Some(ProgrammedHdr::On(infoframe)));
+        assert!(hdr_property_update(Some(ProgrammedHdr::On(infoframe)), Some(infoframe)).is_none());
+        assert_eq!(
+            hdr_property_update(Some(ProgrammedHdr::On(infoframe)), None),
+            Some(ProgrammedHdr::Off)
+        );
+        assert!(hdr_property_update(Some(ProgrammedHdr::Off), None).is_none());
 
         let mut geometry = matching_async_gate();
         geometry.geometry = primary_plane_geometry(1280, 720);
@@ -11530,6 +12814,7 @@ mod presentation_timing_tests {
             surface.test_map(buffer_object_id, 4, 5, 16, 12);
         }
 
+        let output_color = state.color_manager.srgb_gamma22();
         let request = build_surface_cursor_plane_request(
             &state,
             &CursorSurface {
@@ -11544,6 +12829,7 @@ mod presentation_timing_tests {
             (0, 0),
             RectI::new(0, 0, 1920, 1080).unwrap(),
             FractionalScale::ONE,
+            &output_color,
         )
         .unwrap();
 
@@ -11574,6 +12860,70 @@ mod presentation_timing_tests {
         assert_eq!(request.plane_y, request.y);
         assert_eq!(request.pixel_width, 16);
         assert_eq!(request.pixel_height, 12);
+    }
+
+    #[test]
+    fn tagged_cursor_skips_the_hardware_plane() {
+        let mut state = state_for_tests();
+        let srgb = state.color_manager.srgb_gamma22();
+        let wide = state.color_manager.windows_scrgb();
+        let buffer_object_id = state
+            .insert_object(WlBuffer::test_argb8888_shm(
+                WlBufferId::from(1),
+                ClientId::from_raw(1),
+                16,
+                12,
+                vec![0x80; 16 * 12 * 4],
+            ))
+            .1;
+        let surface_object_id = state
+            .insert_object(WlSurface::new(WlSurfaceId::from(2), ClientId::from_raw(1), 6))
+            .1;
+        {
+            let surface = state
+                .objects
+                .get_mut(surface_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            surface.test_map(buffer_object_id, 4, 5, 16, 12);
+            surface.set_untagged_description(wide);
+        }
+        let cursor = CursorSurface {
+            surface: crate::clients::Resolved::new(
+                ClientId::from_raw(1),
+                WlSurfaceId::from(2),
+                surface_object_id,
+            ),
+            hotspot_x: 0,
+            hotspot_y: 0,
+        };
+        assert!(build_surface_cursor_plane_request(
+            &state,
+            &cursor,
+            (0, 0),
+            RectI::new(0, 0, 100, 100).unwrap(),
+            FractionalScale::ONE,
+            &srgb,
+        )
+        .is_none());
+
+        {
+            let surface = state
+                .objects
+                .get_mut(surface_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            surface.set_untagged_description(srgb.clone());
+        }
+        assert!(build_surface_cursor_plane_request(
+            &state,
+            &cursor,
+            (0, 0),
+            RectI::new(0, 0, 100, 100).unwrap(),
+            FractionalScale::ONE,
+            &srgb,
+        )
+        .is_some());
     }
 
     #[test]
@@ -11634,6 +12984,7 @@ mod presentation_timing_tests {
             assert!(surface.apply_pending_tree_state(&mut state));
         }
 
+        let output_color = state.color_manager.srgb_gamma22();
         let request = build_surface_cursor_plane_request(
             &state,
             &CursorSurface {
@@ -11648,6 +12999,7 @@ mod presentation_timing_tests {
             (0, 0),
             RectI::new(0, 0, 100, 100).unwrap(),
             FractionalScale::ONE,
+            &output_color,
         );
 
         assert!(request.is_none());
@@ -11788,7 +13140,11 @@ mod presentation_timing_tests {
             bounds: RectI::new(80, 0, 80, 100).unwrap(),
             tex_transform: transform::Mat3::identity(),
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             mask: SceneItemMask::None,
+            color_description_id: 0,
+            render_intent: crate::color::RenderIntent::Perceptual,
+            representation: crate::color::ColorRepresentation::default(),
         }];
 
         let selected = select_presentation_output_for_scene(&state, drm_id, &scene);
@@ -11815,7 +13171,11 @@ mod presentation_timing_tests {
             bounds: RectI::new(50, 0, 100, 100).unwrap(),
             tex_transform: transform::Mat3::identity(),
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             mask: SceneItemMask::None,
+            color_description_id: 0,
+            render_intent: crate::color::RenderIntent::Perceptual,
+            representation: crate::color::ColorRepresentation::default(),
         }];
 
         let selected = select_presentation_output_for_scene(&state, drm_id, &scene);
@@ -11882,12 +13242,17 @@ mod presentation_timing_tests {
         ));
     }
 
+    #[test]
     fn direct_scanout_requires_surface_without_compositor_processing() {
         let mut item = make_surface_scene_item(30, RectI::new(0, 0, 100, 100).unwrap(), Vec::new());
         item.alpha = 200;
         assert!(scene_item_requires_compositor_compositing(&item));
 
         item.alpha = u8::MAX;
+        item.alpha_multiplier = 1;
+        assert!(scene_item_requires_compositor_compositing(&item));
+
+        item.alpha_multiplier = u32::MAX;
         item.mask = SceneItemMask::RoundedClip {
             clip: crate::state::RootSurfaceClip::new(
                 RectI::new(0, 0, 100, 100).unwrap(),
@@ -11896,12 +13261,37 @@ mod presentation_timing_tests {
             ),
         };
         assert!(scene_item_requires_compositor_compositing(&item));
+
+        item.mask = SceneItemMask::None;
+        item.alpha = u8::MAX;
+        item.alpha_multiplier = u32::MAX;
+        let manager = crate::color::ColorManager::new();
+        item.color = super::surface_output_color(
+            &manager.srgb_gamma22(),
+            Some(&manager.windows_scrgb()),
+            crate::color::RenderIntent::Perceptual,
+        );
+        assert!(scene_item_requires_compositor_compositing(&item));
+        item.color = None;
+        assert!(!scene_item_requires_compositor_compositing(&item));
+    }
+
+    #[test]
+    fn alpha_multiplier_below_one_is_not_opaque() {
+        let region = DamageRegion::from_rect(RectI::new(0, 0, 10, 10).unwrap());
+        let (kept, opaque) = multiplier_hides_opaque_region(region.clone(), true, u32::MAX);
+        assert!(opaque);
+        assert_eq!(kept.rects(), region.rects());
+        let (cleared, translucent) = multiplier_hides_opaque_region(region, true, 1);
+        assert!(!translucent);
+        assert!(cleared.is_empty());
     }
 
     #[test]
     fn candidate_scanout_requires_full_opacity_no_dim_and_no_clip() {
-        assert!(surface_allows_direct_scanout(None, u8::MAX));
-        assert!(!surface_allows_direct_scanout(None, 200));
+        assert!(surface_allows_direct_scanout(None, u8::MAX, u32::MAX));
+        assert!(!surface_allows_direct_scanout(None, 200, u32::MAX));
+        assert!(!surface_allows_direct_scanout(None, u8::MAX, u32::MAX / 2));
         assert!(!surface_allows_direct_scanout(
             Some(crate::render::WindowClip::Frame(crate::state::RootSurfaceClip::new(
                 RectI::new(0, 0, 100, 100).unwrap(),
@@ -11909,6 +13299,7 @@ mod presentation_timing_tests {
                 crate::config::RoundingPower::DEFAULT,
             ))),
             u8::MAX,
+            u32::MAX,
         ));
     }
 
@@ -12427,7 +13818,11 @@ mod tearing_policy_tests {
             bounds: RectI::new(0, 0, 10, 10).unwrap(),
             tex_transform: crate::transform::Mat3::identity(),
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             mask: SceneItemMask::None,
+            color_description_id: 0,
+            render_intent: crate::color::RenderIntent::Perceptual,
+            representation: crate::color::ColorRepresentation::default(),
         }
     }
 
@@ -12439,7 +13834,11 @@ mod tearing_policy_tests {
             bounds: RectI::new(0, 0, 8, 8).unwrap(),
             tex_transform: crate::transform::Mat3::identity(),
             alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
             mask: SceneItemMask::None,
+            color_description_id: 0,
+            render_intent: crate::color::RenderIntent::Perceptual,
+            representation: crate::color::ColorRepresentation::default(),
         }
     }
 

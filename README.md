@@ -33,6 +33,8 @@ The essentials are done:
 - Renderer selectable per GPU device (`opengl`, `vulkan`, or `auto`)
 - Variable Refresh Rate (VRR) (tested on 240hz monitor)
 - Direct DRM/KMS atomic modesetting, GBM buffer allocation, dmabuf import
+- SDR color management (`wp_color_manager_v1`) and color representation
+  (`wp_color_representation_manager_v1`: alpha mode, YCbCr coefficients, chroma siting)
 - Explicit synchronization (`linux-drm-syncobj`) and incremental damage
   tracking (`FB_DAMAGE_CLIPS`, buffer age, occlusion)
 
