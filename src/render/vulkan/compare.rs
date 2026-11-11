@@ -704,6 +704,52 @@ fn vulkan_matches_gles_blur_and_keeps_later_textures_on_top() {
 }
 
 #[test]
+fn vulkan_matches_gles_region_blur() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping vulkan region blur comparison: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let width = 8;
+    let height = 2;
+    let mut bytes = Vec::new();
+    for _y in 0..height {
+        for x in 0..width {
+            let color = if x % 2 == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+            bytes.extend_from_slice(&color);
+        }
+    }
+    let gl_stripes = shm(&mut *pair.gl, &bytes, width, height);
+    let vk_stripes = shm(&mut *pair.vulkan, &bytes, width, height);
+    let region = crate::render::BlurRegion {
+        bounds: RectI::new(0, 0, 7, height).expect("bounds"),
+        rects: Rc::from(vec![
+            RectI::new(0, 0, 2, height).expect("left"),
+            RectI::new(5, 0, 2, height).expect("right"),
+        ]),
+    };
+    let scene = |backdrop| {
+        vec![
+            element(backdrop, 0, 0, width, height, u8::MAX, TextureMask::None),
+            FrameElement::Effect {
+                phase: FramePhase::UnderWindow,
+                element: EffectElement::SurfaceBlurBackdrop {
+                    region: region.clone(),
+                    style: BlurVisualStyle { radius: 2, passes: 1 },
+                    alpha: u8::MAX,
+                },
+            },
+        ]
+    };
+    let gles = paint_elements(&mut *pair.gl, scene(gl_stripes), width, height);
+    let vulkan = paint_elements(&mut *pair.vulkan, scene(vk_stripes), width, height);
+    assert_close(&gles, &vulkan, 3);
+    assert_eq!(pixel(&gles, width, 2, 0), &[255, 0, 0, 255]);
+    assert_eq!(pixel(&vulkan, width, 2, 0), &[255, 0, 0, 255]);
+    assert_ne!(pixel(&gles, width, 0, 0), &[255, 0, 0, 255]);
+}
+
+#[test]
 fn vulkan_capture_transparent_matches_gles() {
     let Some(mut pair) = pair() else {
         eprintln!("skipping vulkan capture comparison: no matching DRM node");

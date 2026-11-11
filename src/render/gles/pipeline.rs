@@ -1126,7 +1126,10 @@ impl GlesDraw<'_> {
                                     y: rect.y,
                                     width: rect.width,
                                     height: rect.height,
-                                    tex_transform: blur_source_transform(blur_bounds, rect),
+                                    tex_transform: crate::render::blur_source_transform(
+                                        blur_bounds,
+                                        rect,
+                                    ),
                                     damage: DamageRegion::from_rect(rect),
                                     blend: true,
                                     alpha: *alpha,
@@ -1738,14 +1741,6 @@ fn scissor_y(
         .unwrap_or(0)
 }
 
-/// Map the unit square onto `rect` inside the blurred `bounds` texture.
-fn blur_source_transform(bounds: RectI, rect: RectI) -> Mat3 {
-    let width = bounds.width as f32;
-    let height = bounds.height as f32;
-    Mat3::translation((rect.x - bounds.x) as f32 / width, (rect.y - bounds.y) as f32 / height)
-        .mul(Mat3::scale(rect.width as f32 / width, rect.height as f32 / height))
-}
-
 fn framebuffer_rect_for_target(
     target_height: i32,
     rect: RectI,
@@ -1776,13 +1771,11 @@ fn shadow_color_with_alpha(color: crate::config::RgbaColor, alpha: u8) -> [f32; 
 #[cfg(test)]
 mod tests {
     use {
-        super::{
-            blur_pass_draws, blur_source_transform, framebuffer_rect_for_target,
-            shadow_color_with_alpha,
-        },
+        super::{blur_pass_draws, framebuffer_rect_for_target, shadow_color_with_alpha},
         crate::{
             config::RgbaColor,
             region::RectI,
+            render::blur_source_transform,
             transform::{Mat3, OutputPresentationTransform},
         },
     };

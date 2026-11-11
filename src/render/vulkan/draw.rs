@@ -95,7 +95,11 @@ struct QuadDraw {
 
 enum FrameOp {
     Quad(QuadDraw),
-    Blur { job: BlurJob, result: QuadDraw },
+    /// One framebuffer blur, then one or more textured composites of that result.
+    Blur {
+        job: BlurJob,
+        results: Vec<QuadDraw>,
+    },
 }
 
 #[repr(C)]
@@ -391,7 +395,7 @@ fn record_blend_pass(
     for op in &pass.ops {
         match op {
             FrameOp::Quad(quad) => draw_quad(vulkan, command, quad),
-            FrameOp::Blur { job, result } => {
+            FrameOp::Blur { job, results } => {
                 unsafe { vulkan.cmd_end_render_pass(command) };
                 let mut layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
                 job.record(vulkan, command, draw, pass.image, &mut layout);
@@ -408,7 +412,9 @@ fn record_blend_pass(
                     [0.0, 0.0, 0.0, 0.0],
                     &mut cleared,
                 );
-                draw_quad(vulkan, command, result);
+                for result in results {
+                    draw_quad(vulkan, command, result);
+                }
             }
         }
     }
@@ -575,7 +581,7 @@ pub(super) fn paint(
                     }
                     draw_quad(vulkan, command, quad);
                 }
-                FrameOp::Blur { job, result } => {
+                FrameOp::Blur { job, results } => {
                     if !pass_open {
                         begin_output_pass(
                             vulkan,
@@ -599,7 +605,9 @@ pub(super) fn paint(
                         &mut cleared,
                     );
                     pass_open = true;
-                    draw_quad(vulkan, command, result);
+                    for result in results {
+                        draw_quad(vulkan, command, result);
+                    }
                 }
             }
         }
@@ -1047,9 +1055,8 @@ fn prepare_effect(
         EffectElement::WindowBlurBackdrop { ring, style, alpha } => {
             prepare_blur(device, draw, target, frame, *ring, *style, *alpha)
         }
-        EffectElement::SurfaceBlurBackdrop { .. } => {
-            // Wired in phase 7. The region is already in the frame plan.
-            None
+        EffectElement::SurfaceBlurBackdrop { region, style, alpha } => {
+            prepare_surface_blur(device, draw, target, frame, region, *style, *alpha)
         }
     }
 }
@@ -1218,8 +1225,6 @@ fn prepare_blur(
     alpha: u8,
 ) -> Option<FrameOp> {
     let bounds = blur_snapshot_bounds(target, frame.blur_reference, ring.outer, style)?;
-    let copy = framebuffer_rect(target.height(), bounds, frame.presentation_transform)
-        .and_then(vulkan_scissor)?;
     let mask = TextureMask::FrameRing {
         ring: RoundedRing {
             outer: RootSurfaceClip::new(
@@ -1238,7 +1243,82 @@ fn prepare_blur(
             ),
         },
     };
-    let job = BlurJob::new(
+    let job = blur_framebuffer_rect(device, draw, target, frame, bounds, style)?;
+    let result = blur_quad(
+        device,
+        draw,
+        target,
+        frame,
+        job.result_view(),
+        bounds,
+        Mat3::identity(),
+        &mask,
+        frame.damage,
+        alpha,
+    )?;
+    Some(FrameOp::Blur { job, results: vec![result] })
+}
+
+fn prepare_surface_blur(
+    device: &Rc<VulkanDevice>,
+    draw: &mut DrawState,
+    target: &dyn PaintedTarget,
+    frame: &RenderFrame<'_>,
+    region: &crate::render::BlurRegion,
+    style: BlurVisualStyle,
+    alpha: u8,
+) -> Option<FrameOp> {
+    let output = RectI::new(0, 0, target.width(), target.height())?;
+    let bounds = region.bounds.intersection(output)?;
+    let job = blur_framebuffer_rect(device, draw, target, frame, bounds, style)?;
+    let view = job.result_view();
+    let mut results = Vec::new();
+    for rect in region.rects.iter().copied() {
+        let Some(rect) = rect.intersection(bounds) else {
+            continue;
+        };
+        let Some(scissors) = effect_scissors(target, frame, rect) else {
+            continue;
+        };
+        let Some(mut quad) = blur_quad(
+            device,
+            draw,
+            target,
+            frame,
+            view,
+            rect,
+            crate::render::blur_source_transform(bounds, rect),
+            &TextureMask::None,
+            &DamageRegion::from_rect(rect),
+            alpha,
+        ) else {
+            continue;
+        };
+        quad.scissors = scissors;
+        results.push(quad);
+    }
+    if results.is_empty() {
+        return None;
+    }
+    Some(FrameOp::Blur { job, results })
+}
+
+/// Copy `bounds` out of the framebuffer and blur it. A window passes its padded
+/// ring box; a client region passes `BlurRegion::bounds`.
+fn blur_framebuffer_rect(
+    device: &Rc<VulkanDevice>,
+    draw: &mut DrawState,
+    target: &dyn PaintedTarget,
+    frame: &RenderFrame<'_>,
+    bounds: RectI,
+    style: BlurVisualStyle,
+) -> Option<BlurJob> {
+    if bounds.is_empty() {
+        return None;
+    }
+    let copy = framebuffer_rect(target.height(), bounds, frame.presentation_transform)
+        .and_then(vulkan_scissor)?;
+    BlurJob::new(
         device,
         draw,
         bounds.width,
@@ -1247,35 +1327,47 @@ fn prepare_blur(
         style.passes.max(1),
         frame.presentation_transform,
         copy,
-    )?;
-    let result = match prepare_sampled(
+    )
+}
+
+fn blur_quad(
+    device: &Rc<VulkanDevice>,
+    draw: &mut DrawState,
+    target: &dyn PaintedTarget,
+    frame: &RenderFrame<'_>,
+    view: vk::ImageView,
+    bounds: RectI,
+    tex_transform: Mat3,
+    mask: &TextureMask,
+    damage: &DamageRegion,
+    alpha: u8,
+) -> Option<QuadDraw> {
+    match prepare_sampled(
         device,
         draw,
         target,
         frame,
         draw.pipeline(),
-        job.result_view(),
-        job.result_view(),
+        view,
+        view,
         [0.0, 0.0],
         crate::color::ColorRepresentation::default().yuv_conversion(false),
         bounds.x,
         bounds.y,
         bounds.width,
         bounds.height,
-        Mat3::identity(),
+        tex_transform,
         f32::from(alpha) / 255.0,
-        &mask,
-        frame.damage,
+        mask,
+        damage,
         None,
     ) {
-        Ok(Some(quad)) => quad,
-        Ok(None) => return None,
+        Ok(quad) => quad,
         Err(_) => {
             log::error!("vulkan skipped blur");
-            return None;
+            None
         }
-    };
-    Some(FrameOp::Blur { job, result })
+    }
 }
 
 fn blur_snapshot_bounds(

@@ -4,6 +4,7 @@ use crate::{
     config::{RgbaColor, RoundingPower, ShadowPower},
     region::{DamageRegion, RectI, RegionValue},
     state::{FractionalScale, RootSurfaceClip},
+    transform::Mat3,
 };
 
 /// Rectangles kept for one client blur region. Waybar rasterises rounded
@@ -140,6 +141,14 @@ impl BlurRegion {
             BLUR_REGION_RECT_CAP,
         )
     }
+}
+
+/// Map the unit square onto `rect` inside a blurred texture that covers `bounds`.
+pub fn blur_source_transform(bounds: RectI, rect: RectI) -> Mat3 {
+    let width = bounds.width as f32;
+    let height = bounds.height as f32;
+    Mat3::translation((rect.x - bounds.x) as f32 / width, (rect.y - bounds.y) as f32 / height)
+        .mul(Mat3::scale(rect.width as f32 / width, rect.height as f32 / height))
 }
 
 fn blur_region_from_rects(
