@@ -1,5 +1,5 @@
 use crate::{
-    clients::{Client, ClientDispatcher, RawRequest},
+    clients::{Client, ClientDispatcher, ClientManagerAction, RawRequest},
     drm::{request_active_output, request_outputs_for_rect},
     globals::Global,
     object::{Object, Parser, RequestResult},
@@ -85,6 +85,16 @@ impl Object for XdgActivationV1 {
                     );
                     return Ok(());
                 };
+                let window = state.window_for_root(focus.surface);
+                let workspace_id = state.root_surface_workspace(focus.surface);
+                if let (Some(window), Some(workspace_id)) = (window, workspace_id) {
+                    if !state.workspace_is_active(workspace_id) {
+                        if state.set_window_urgent(window, true) {
+                            dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
+                        }
+                        return Ok(());
+                    }
+                }
                 let raised = state
                     .window_for_root(focus.surface)
                     .is_some_and(|window| state.raise_window(window));
@@ -111,16 +121,24 @@ mod tests {
     use {
         super::{XdgActivationV1, XdgActivationV1Global},
         crate::{
-            clients::{Client, ClientId, RawEvent},
+            clients::{Client, ClientId, ClientManagerAction, RawEvent},
+            io_uring::model::IoUringAction,
             object::{Object, RequestResult},
             protocol_generated::{
-                Constants, WlSeatId, WlSurfaceId, XdgActivationTokenV1Id, XdgActivationV1Id,
+                ext_workspace_handle_v1, Constants, ExtWorkspaceManagerV1Id, WlSeatId, WlSurfaceId,
+                XdgActivationTokenV1Id, XdgActivationV1Id,
             },
             runner::Dispatcher,
             seat::{handle_keyboard_key, set_keyboard_focus_from_surface},
-            state::{GrabbedObject, ObjectId, State},
-            test_support::{focus_for_surface, state_for_tests, test_client_and_dispatcher},
-            wayland_objects::{wl_seat::WlSeat, wl_surface::WlSurface},
+            state::{BackendOutputRef, DrmId, GrabbedObject, ObjectId, State, WorkspaceId},
+            test_support::{
+                focus_for_surface, state_for_tests, test_client_and_dispatcher,
+                test_output_with_crtc_name,
+            },
+            wayland_objects::{
+                ext_workspace_manager_v1::ExtWorkspaceManagerV1, wl_seat::WlSeat,
+                wl_surface::WlSurface,
+            },
         },
     };
 
@@ -199,6 +217,139 @@ mod tests {
     fn commit_request(token_id: XdgActivationTokenV1Id) -> crate::clients::RawRequest<'static> {
         let event = RawEvent::new(token_id.into(), 3, 0);
         (&*event.into_bytes()).try_into().unwrap()
+    }
+
+    fn output_workspaces(state: &mut State) -> (WorkspaceId, WorkspaceId) {
+        let output_id = state.insert_output(test_output_with_crtc_name(
+            BackendOutputRef::new(DrmId::from(0usize)),
+            1,
+            0,
+            0,
+            100,
+            100,
+        ));
+        let group_id = state.workspace_group_for_output(output_id).unwrap();
+        let workspaces = state.workspace_groups[group_id].workspaces.clone();
+        (workspaces[0], workspaces[1])
+    }
+
+    fn press_for_serial(
+        state: &mut State,
+        client: &mut Client,
+        dispatcher: &mut Dispatcher,
+        surface_id: WlSurfaceId,
+        object_id: ObjectId,
+    ) -> u32 {
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        set_keyboard_focus_from_surface(
+            state,
+            &mut client_dispatcher,
+            Some(focus_for_surface(client.client_id(), surface_id, object_id)),
+        );
+        handle_keyboard_key(state, &mut client_dispatcher, 30, 1, 100);
+        state.seat.last_keyboard_trigger_serial().unwrap()
+    }
+
+    fn issue_token(
+        state: &mut State,
+        client: &mut Client,
+        dispatcher: &mut Dispatcher,
+        manager_id: XdgActivationV1Id,
+        token_id: XdgActivationTokenV1Id,
+        seat_id: WlSeatId,
+        requester: WlSurfaceId,
+        serial: u32,
+    ) -> String {
+        {
+            let mut manager = state
+                .objects
+                .grab_object::<XdgActivationV1>(client.object_id(manager_id));
+            let mut client_dispatcher = client.test_dispatcher(dispatcher);
+            manager
+                .on(
+                    client,
+                    state,
+                    get_activation_token_request(manager_id, token_id),
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+        }
+        for request in [
+            set_surface_request(token_id, requester),
+            set_serial_request(token_id, serial, seat_id),
+            commit_request(token_id),
+        ] {
+            let token = state.objects.grab_object::<
+                crate::wayland_objects::xdg_activation_token_v1::XdgActivationTokenV1,
+            >(client.object_id(token_id));
+            let mut client_dispatcher = client.test_dispatcher(dispatcher);
+            token
+                .on(client, state, request, &mut client_dispatcher)
+                .unwrap();
+        }
+        state.activation_tokens.first_token().unwrap()
+    }
+
+    fn activate(
+        state: &mut State,
+        client: &mut Client,
+        dispatcher: &mut Dispatcher,
+        manager_id: XdgActivationV1Id,
+        token: &str,
+        target: WlSurfaceId,
+    ) {
+        let mut manager = state
+            .objects
+            .grab_object::<XdgActivationV1>(client.object_id(manager_id));
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        manager
+            .on(client, state, activate_request(manager_id, token, target), &mut client_dispatcher)
+            .unwrap();
+    }
+
+    fn sync_workspaces(
+        state: &mut State,
+        client: &mut Client,
+        dispatcher: &mut Dispatcher,
+        manager_id: ExtWorkspaceManagerV1Id,
+    ) {
+        let mut manager = state
+            .objects
+            .grab_object::<ExtWorkspaceManagerV1>(client.object_id(manager_id));
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        manager.sync(client, state, &mut client_dispatcher, true);
+    }
+
+    fn workspace_state_values(dispatcher: &Dispatcher, object: u32) -> Vec<u32> {
+        let mut values = Vec::new();
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            let IoUringAction::Sendmsg { buffer, .. } = action else {
+                return;
+            };
+            let mut offset = 0;
+            while offset + 8 <= buffer.len() {
+                let id = u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap());
+                let header = u32::from_ne_bytes(buffer[offset + 4..offset + 8].try_into().unwrap());
+                let size = (header >> 16) as usize;
+                let opcode = header as u16;
+                if size < 8 || offset + size > buffer.len() {
+                    break;
+                }
+                if id == object && opcode == 3 && offset + 12 <= offset + size {
+                    values.push(u32::from_ne_bytes(
+                        buffer[offset + 8..offset + 12].try_into().unwrap(),
+                    ));
+                }
+                offset += size;
+            }
+        });
+        values
+    }
+
+    fn workspace_state_changed(dispatcher: &Dispatcher) -> usize {
+        dispatcher.test_count_queued_action::<ClientManagerAction>(|action| {
+            matches!(action, ClientManagerAction::WorkspaceStateChanged)
+        })
     }
 
     #[test]
@@ -633,6 +784,141 @@ mod tests {
         assert_eq!(
             global.interface(),
             (XdgActivationV1::INTERFACE_NAME, XdgActivationV1::INTERFACE_VERSION)
+        );
+    }
+
+    #[test]
+    fn activation_on_another_workspace_sets_urgent_without_focus() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let (_active, inactive) = output_workspaces(&mut state);
+        let requester_surface_id = WlSurfaceId::from(70u32);
+        let target_surface_id = WlSurfaceId::from(71u32);
+        let requester_object_id =
+            insert_mapped_surface(&mut state, &mut client, requester_surface_id, 700);
+        let target_object_id =
+            insert_mapped_surface(&mut state, &mut client, target_surface_id, 701);
+        let target = client.resolve(target_surface_id, &state).unwrap();
+        let window = crate::test_support::insert_window(&mut state, target);
+        assert!(state.assign_window_to_workspace(window, inactive));
+        let manager_id = XdgActivationV1Id::from(72u32);
+        let token_id = XdgActivationTokenV1Id::from(73u32);
+        let seat_id = WlSeatId::from(74u32);
+        let workspace_manager_id = ExtWorkspaceManagerV1Id::from(75u32);
+        insert_manager(&mut state, &mut client, manager_id);
+        insert_seat(&mut state, &mut client, seat_id);
+        client.insert_object(&mut state, ExtWorkspaceManagerV1::new(workspace_manager_id, 1));
+        sync_workspaces(&mut state, &mut client, &mut dispatcher, workspace_manager_id);
+        let handle = client
+            .resolve(workspace_manager_id, &state)
+            .unwrap()
+            .rref(&state)
+            .workspace_handle_id(inactive)
+            .unwrap();
+        let focus =
+            focus_for_surface(client.client_id(), requester_surface_id, requester_object_id);
+        let serial = press_for_serial(
+            &mut state,
+            &mut client,
+            &mut dispatcher,
+            requester_surface_id,
+            requester_object_id,
+        );
+        let token = issue_token(
+            &mut state,
+            &mut client,
+            &mut dispatcher,
+            manager_id,
+            token_id,
+            seat_id,
+            requester_surface_id,
+            serial,
+        );
+
+        activate(&mut state, &mut client, &mut dispatcher, manager_id, &token, target_surface_id);
+
+        assert!(state.managed_window_state(window).unwrap().urgent);
+        assert!(state.workspace_is_urgent(inactive));
+        assert!(!state.workspace_is_active(inactive));
+        assert_eq!(state.seat.keyboard_focus(), Some(focus));
+        assert_eq!(workspace_state_changed(&dispatcher), 1);
+        sync_workspaces(&mut state, &mut client, &mut dispatcher, workspace_manager_id);
+        let urgent = ext_workspace_handle_v1::State::Urgent as u32;
+        let active_bit = ext_workspace_handle_v1::State::Active as u32;
+        assert_eq!(
+            workspace_state_values(&dispatcher, u32::from(handle.wayland_id())),
+            vec![0, urgent]
+        );
+
+        assert!(state.activate_workspace(inactive));
+        set_keyboard_focus_from_surface(
+            &mut state,
+            &mut client.test_dispatcher(&mut dispatcher),
+            Some(focus_for_surface(client.client_id(), target_surface_id, target_object_id)),
+        );
+        assert!(!state.managed_window_state(window).unwrap().urgent);
+        assert!(!state.workspace_is_urgent(inactive));
+        assert!(state.workspace_is_active(inactive));
+        sync_workspaces(&mut state, &mut client, &mut dispatcher, workspace_manager_id);
+        assert_eq!(
+            workspace_state_values(&dispatcher, u32::from(handle.wayland_id())),
+            vec![0, urgent, active_bit]
+        );
+    }
+
+    #[test]
+    fn activation_on_the_active_workspace_still_focuses() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(8);
+        let (active, _) = output_workspaces(&mut state);
+        let requester_surface_id = WlSurfaceId::from(80u32);
+        let target_surface_id = WlSurfaceId::from(81u32);
+        let requester_object_id =
+            insert_mapped_surface(&mut state, &mut client, requester_surface_id, 800);
+        let target_object_id =
+            insert_mapped_surface(&mut state, &mut client, target_surface_id, 801);
+        let target = client.resolve(target_surface_id, &state).unwrap();
+        let window = crate::test_support::insert_window(&mut state, target);
+        assert_eq!(state.managed_window_state(window).unwrap().workspace_id, active);
+        state
+            .workspaces
+            .try_get_mut(active)
+            .unwrap()
+            .layout
+            .floating
+            .stack
+            .push(window);
+        let manager_id = XdgActivationV1Id::from(82u32);
+        let token_id = XdgActivationTokenV1Id::from(83u32);
+        let seat_id = WlSeatId::from(84u32);
+        insert_manager(&mut state, &mut client, manager_id);
+        insert_seat(&mut state, &mut client, seat_id);
+        let serial = press_for_serial(
+            &mut state,
+            &mut client,
+            &mut dispatcher,
+            requester_surface_id,
+            requester_object_id,
+        );
+        let token = issue_token(
+            &mut state,
+            &mut client,
+            &mut dispatcher,
+            manager_id,
+            token_id,
+            seat_id,
+            requester_surface_id,
+            serial,
+        );
+
+        activate(&mut state, &mut client, &mut dispatcher, manager_id, &token, target_surface_id);
+
+        assert!(!state.managed_window_state(window).unwrap().urgent);
+        assert!(!state.workspace_is_urgent(active));
+        assert_eq!(workspace_state_changed(&dispatcher), 0);
+        assert_eq!(
+            state.seat.keyboard_focus(),
+            Some(focus_for_surface(client.client_id(), target_surface_id, target_object_id))
         );
     }
 }

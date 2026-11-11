@@ -58,6 +58,9 @@ impl ExtWorkspaceHandleV1 {
             if state.workspace_is_active(self.workspace_id) {
                 bits |= ext_workspace_handle_v1::State::Active as u32;
             }
+            if state.workspace_is_urgent(self.workspace_id) {
+                bits |= ext_workspace_handle_v1::State::Urgent as u32;
+            }
             bits
         })
     }
