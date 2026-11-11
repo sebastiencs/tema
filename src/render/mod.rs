@@ -13,6 +13,7 @@ pub const OUTPUT_BACKGROUND: [f32; 4] = [40.0 / 255.0, 40.0 / 255.0, 40.0 / 255.
 #[cfg(test)]
 pub(crate) mod mock;
 
+pub(crate) use blend::padded_blur_rect;
 pub use factory::create_renderer;
 
 #[cfg(test)]

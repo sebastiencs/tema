@@ -72,7 +72,7 @@ pub enum EffectElement {
         style: BlurVisualStyle,
         alpha: u8,
     },
-    /// Client-requested blur under one root surface. Drawn in a later phase.
+    /// Client-requested blur under one root surface, drawn immediately before its texture.
     SurfaceBlurBackdrop {
         region: BlurRegion,
         style: BlurVisualStyle,

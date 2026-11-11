@@ -1563,6 +1563,7 @@ pub fn reload_from_disk(
     let scaling_mode_changed = next.xwayland.scaling_mode != state.config.xwayland.scaling_mode;
     let import_changed = next.general.import_environment != state.config.general.import_environment;
     let session_management_changed = next.session_management != state.config.session_management;
+    let previous_blur = state.config.effects.blur;
     let changed = state.config != next;
     state.config = next;
     if import_changed {
@@ -1589,6 +1590,15 @@ pub fn reload_from_disk(
     if changed {
         state.mark_all_workspaces_dirty();
         dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
+        dispatcher.dispatch(ClientManagerAction::BackgroundEffectCapabilitiesChanged);
+        if state.config.effects.blur != previous_blur {
+            let rects = state
+                .outputs
+                .iter()
+                .filter_map(|(output_id, _)| state.output_bounds(output_id))
+                .collect::<Vec<_>>();
+            crate::drm::queue_global_damage(state, &rects);
+        }
         request_outputs(state, state.outputs.iter().map(|(output_id, _)| output_id), dispatcher);
         kick_visual_animation_pump(dispatcher);
     }

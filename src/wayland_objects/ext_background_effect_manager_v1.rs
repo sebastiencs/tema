@@ -13,11 +13,17 @@ use crate::{
     },
 };
 
-/// Blur is advertised only once a commit can actually blur the backdrop.
-/// Until then the client may still create an effect object; the region is stored
-/// and the compositor draws nothing.
-pub(crate) fn background_effect_capabilities(_state: &State) -> u32 {
-    0
+/// `Blur` while `effects.blur.enabled` is set, otherwise none.
+///
+/// An effect object is accepted either way. The region is stored, and
+/// `State::root_surface_blur_region` returns nothing while the flag is off,
+/// so the compositor draws no client blur.
+pub(crate) fn background_effect_capabilities(state: &State) -> u32 {
+    if state.config.effects.blur.enabled {
+        ext_background_effect_manager_v1::Capability::Blur as u32
+    } else {
+        0
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +123,7 @@ mod tests {
             ext_background_effect_surface_v1, ExtBackgroundEffectManagerV1Id,
             ExtBackgroundEffectSurfaceV1Id, NewId, WaylandId, WlRegionId, WlSurfaceId,
         },
+        runner::Model,
         test_support::{state_for_tests, test_client_and_dispatcher},
         wayland_objects::{wl_region::WlRegion, wl_surface::WlSurface},
     };
@@ -226,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_sends_no_blur_capability_until_rendering_exists() {
+    fn bind_sends_no_blur_capability_when_blur_is_disabled() {
         let mut globals = Globals::new();
         globals.initialize();
         assert!(globals.contains_interface(ExtBackgroundEffectManagerV1::INTERFACE_NAME));
@@ -241,6 +248,35 @@ mod tests {
         assert!(client.contains_object(ExtBackgroundEffectManagerV1Id::from(6), &state));
         assert_eq!(background_effect_capabilities(&state), 0);
         assert_eq!(capability_flags(&dispatcher, 6), vec![0]);
+    }
+
+    #[test]
+    fn enabling_blur_advertises_the_capability_and_a_reload_resends_it() {
+        let mut globals = Globals::new();
+        globals.initialize();
+        let mut state = state_for_tests();
+        state.config.effects.blur.enabled = true;
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(1);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut global = ExtBackgroundEffectManagerV1Global;
+            global.bind(&mut client, &mut state, NewId::from(6), 1, &mut client_dispatcher);
+        }
+        assert_eq!(
+            background_effect_capabilities(&state),
+            ext_background_effect_manager_v1::Capability::Blur as u32
+        );
+        assert_eq!(capability_flags(&dispatcher, 6), vec![1]);
+
+        state.config.effects.blur.enabled = false;
+        client
+            .process(
+                &mut state,
+                crate::clients::ClientAction::BackgroundEffectCapabilitiesChanged,
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert_eq!(capability_flags(&dispatcher, 6), vec![1, 0]);
     }
 
     #[test]

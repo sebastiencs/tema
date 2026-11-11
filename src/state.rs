@@ -3514,6 +3514,19 @@ impl State {
         Some(blur)
     }
 
+    /// Global bounds a client blur can dirty, including the sample kernel.
+    ///
+    /// The padding is `radius * passes * 4`, the same expansion `blend.rs` uses
+    /// for the backdrop. `None` when blur is off or this root draws no region.
+    pub(crate) fn client_blur_padded_bounds(&self, root: Resolved<WlSurfaceId>) -> Option<RectI> {
+        let region = self.root_surface_blur_region(root)?;
+        let blur = self.config.effects.blur;
+        crate::render::padded_blur_rect(
+            region.bounds,
+            crate::render::BlurVisualStyle { radius: blur.radius, passes: blur.passes },
+        )
+    }
+
     fn accepts_client_blur(&self, surface: Resolved<WlSurfaceId>) -> bool {
         let Some(wl_surface) = surface.try_ref(self) else {
             return false;
@@ -7167,6 +7180,11 @@ mod tests {
         state.config.effects.blur.enabled = true;
         let blur = state.root_surface_blur_region(surface).unwrap();
         assert_eq!(blur.rects.as_ref(), &[RectI::new(8, 9, 20, 10).unwrap()]);
+        // Default radius 12 and 2 passes pad by 12 * 2 * 4.
+        assert_eq!(
+            state.client_blur_padded_bounds(surface),
+            Some(RectI::new(-88, -87, 212, 202).unwrap())
+        );
     }
 
     #[test]

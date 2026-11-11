@@ -6079,6 +6079,10 @@ fn animation_damage_targets(state: &State, rects: &[RectI]) -> Vec<(OutputId, Re
     targets
 }
 
+pub(crate) fn queue_global_damage(state: &mut State, rects: &[RectI]) {
+    queue_animation_damage(state, rects);
+}
+
 fn queue_animation_damage(state: &mut State, rects: &[RectI]) {
     let targets = animation_damage_targets(state, rects);
     for (output_id, local) in targets {

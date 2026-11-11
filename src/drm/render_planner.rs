@@ -1062,6 +1062,41 @@ mod tests {
     }
 
     #[test]
+    fn output_scale_grows_surface_blur_and_it_counts_as_an_effect() {
+        let rect = RectI::new(8, 16, 40, 20).unwrap();
+        let mut elements = [super::super::RecordedFrameElement::Effect {
+            phase: crate::render::FramePhase::UnderWindow,
+            element: crate::render::EffectElement::SurfaceBlurBackdrop {
+                region: crate::render::BlurRegion {
+                    bounds: rect,
+                    rects: std::rc::Rc::from([rect]),
+                },
+                style: crate::render::BlurVisualStyle { radius: 12, passes: 2 },
+                alpha: 200,
+            },
+        }];
+        let recipe = super::super::build_output_frame_recipe(&[], &elements, None);
+        assert!(recipe.has_effects());
+
+        super::super::scale_recorded_frame_elements(
+            &mut elements,
+            crate::state::FractionalScale::TWO,
+        );
+
+        assert!(matches!(
+            &elements[0],
+            super::super::RecordedFrameElement::Effect {
+                element: crate::render::EffectElement::SurfaceBlurBackdrop { region, style, alpha },
+                ..
+            } if region.bounds == RectI::new(16, 32, 80, 40).unwrap()
+                && region.rects.as_ref() == [RectI::new(16, 32, 80, 40).unwrap()]
+                && style.radius == 24
+                && style.passes == 2
+                && *alpha == 200
+        ));
+    }
+
+    #[test]
     fn output_scale_scanout_accepts_a_physical_fullscreen_buffer() {
         let output = RectI::new(1920, 0, 1920, 1080).unwrap();
         let scale = crate::state::FractionalScale::TWO;

@@ -113,7 +113,10 @@ pub fn shadow_coverage(
     [color[0] * coverage, color[1] * coverage, color[2] * coverage, color[3] * coverage]
 }
 
-fn padded_blur_rect(bounds: RectI, style: crate::render::BlurVisualStyle) -> Option<RectI> {
+pub(crate) fn padded_blur_rect(
+    bounds: RectI,
+    style: crate::render::BlurVisualStyle,
+) -> Option<RectI> {
     let padding = style
         .radius
         .max(1)

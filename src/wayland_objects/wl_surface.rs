@@ -2673,6 +2673,7 @@ impl WlSurface {
             self.on_screen.sample_transform = next.tex_transform;
         }
 
+        let blur_changed = !commit_blocked && payload.blur_region != self.on_screen.blur_region;
         if !commit_blocked {
             self.on_screen.presentation_hint = payload.presentation_hint;
             self.on_screen.alpha_multiplier = payload.alpha_multiplier;
@@ -2713,7 +2714,10 @@ impl WlSurface {
             dispatcher.dispatch_post_action(crate::input::pointer_lock::RecheckPointerLock);
         }
 
-        changes.buffer_changed || changes.mapping_changed || !committed_damage.is_empty()
+        changes.buffer_changed
+            || changes.mapping_changed
+            || !committed_damage.is_empty()
+            || blur_changed
     }
 
     fn apply_cached_commit(
@@ -2953,6 +2957,8 @@ impl WlSurface {
         }
 
         let has_cached_commit = this.cached_commit.is_some();
+        let (mut this, old_blur_bounds) = client
+            .with_ungrabbed(this, state, |state| state.client_blur_padded_bounds(resolved_surface));
         let (changed, needs_frame) = if has_cached_commit {
             let discarded =
                 this.cache_commit_payload(payload, frame_callbacks, presentation_feedbacks);
@@ -2978,6 +2984,16 @@ impl WlSurface {
                 false,
             )
         };
+        let (mut this, new_blur_bounds) = client
+            .with_ungrabbed(this, state, |state| state.client_blur_padded_bounds(resolved_surface));
+        if old_blur_bounds != new_blur_bounds {
+            let rects = old_blur_bounds
+                .into_iter()
+                .chain(new_blur_bounds)
+                .collect::<Vec<_>>();
+            crate::drm::queue_global_damage(state, &rects);
+            request_outputs_for_rects(state, rects.iter().copied(), dispatcher);
+        }
         if mapped {
             dispatcher.dispatch_post_action(crate::input::focus::RefreshLockFocus);
         }
@@ -3043,11 +3059,12 @@ impl WlSurface {
                 state.mark_root_geometry_dirty_for_surface(resolved_surface);
             });
             if changed {
-                let (regrabbed, (moved, old_bounds, new_bounds, snapped)) =
+                let (regrabbed, (moved, old_bounds, new_bounds, snapped, old_blur, new_blur)) =
                     client.with_ungrabbed(this, state, |state| {
                         // Tiled root_pos is computed, so a rebuild already sits at
                         // the anchored origin. Damage the new buffer at the
                         // surface position from before that rebuild.
+                        let old_blur = state.client_blur_padded_bounds(resolved_surface);
                         let previous_root_pos = resolved_surface
                             .try_ref(state)
                             .map(|surface| surface.root_position());
@@ -3071,7 +3088,8 @@ impl WlSurface {
                             .or_else(|| state.root_surface_content_rect_global(resolved_surface));
                         let snapped = state.snap_settled_floating_geometry(resolved_surface);
                         state.clear_resize_anchor_if_idle(resolved_surface);
-                        (moved, old_bounds, new_bounds, snapped)
+                        let new_blur = state.client_blur_padded_bounds(resolved_surface);
+                        (moved, old_bounds, new_bounds, snapped, old_blur, new_blur)
                     });
                 this = regrabbed;
                 if moved {
@@ -3087,9 +3105,11 @@ impl WlSurface {
                             root: resolved_surface,
                         },
                     );
+                    let blur_rects = old_blur.into_iter().chain(new_blur).collect::<Vec<_>>();
+                    crate::drm::queue_global_damage(state, &blur_rects);
                     request_outputs_for_rects(
                         state,
-                        old_bounds.into_iter().chain(new_bounds),
+                        old_bounds.into_iter().chain(new_bounds).chain(blur_rects),
                         dispatcher,
                     );
                 }

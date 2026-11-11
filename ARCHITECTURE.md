@@ -482,6 +482,14 @@ Layout, input, and protocol positions are logical pixels. `State::output_bounds`
 
 A closing snapshot and a toplevel capture are window-local physical pixels at the output's scale. Live blur stays logical until the output plan scales it. Output capture and any debug view of the CRTC use this same plan. There is no separate overlay renderer. Output rotation is not applied. Scale happens first so a later transform can sit on the physical rect.
 
+### Client blur
+
+A client asks for blur with `ext_background_effect_v1`. The committed region is a `BlurRegion`: the bounds plus the rects that show the blur, capped at 256. `State::root_surface_blur_region` returns it for a layer surface, an xdg toplevel, or an xdg popup, and only while `effects.blur.enabled` is set. Any other role may still create the object. The compositor accepts it and draws nothing.
+
+The capability bit is `Blur` exactly when that flag is on. A config reload resends `capabilities` to every bound manager. Turning the flag off stops the effect; the query returns nothing, so the next frame does not draw it.
+
+The effect is recorded as `SurfaceBlurBackdrop` immediately before that surface's texture. The radius and the pass count come from `effects.blur`. The client only supplies the region. A window that also has the config-driven decoration blur gets both: the ring behind the frame, and this region on the surface. Fractional scale goes through `scale_effect_element`. A region change, a move, or a blur config change damages the region bounds padded by `radius * passes * 4`. A frame that contains the effect is not a direct-scanout candidate.
+
 ## 9. Format and Modifier
 
 These two are easy to confuse.

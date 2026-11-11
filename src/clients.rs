@@ -217,6 +217,8 @@ pub enum ClientManagerAction {
     OutputColorDescriptionChanged {
         output_id: OutputId,
     },
+    /// `effects.blur.enabled` may have changed. Every client resends `capabilities`.
+    BackgroundEffectCapabilitiesChanged,
     GammaControlFailed {
         output_id: OutputId,
     },
@@ -487,6 +489,12 @@ impl Model for ClientManager {
                     );
                 }
             }
+            BackgroundEffectCapabilitiesChanged => {
+                for client_id in self.set.iter().copied() {
+                    dispatcher
+                        .dispatch_to(client_id, ClientAction::BackgroundEffectCapabilitiesChanged);
+                }
+            }
             GammaControlFailed { output_id } => {
                 for client_id in self.set.iter().copied() {
                     dispatcher
@@ -709,6 +717,7 @@ pub enum ClientAction {
     OutputColorDescriptionChanged {
         output_id: OutputId,
     },
+    BackgroundEffectCapabilitiesChanged,
     GammaControlFailed {
         output_id: OutputId,
     },
@@ -2795,6 +2804,28 @@ impl Client {
         self.flush_deferred_resize_configure(state, dispatcher, xdg_toplevel);
     }
 
+    fn send_background_effect_capabilities(
+        &self,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+    ) {
+        let flags = crate::wayland_objects::ext_background_effect_manager_v1::background_effect_capabilities(state);
+        let managers = self
+            .iter_resolved_of::<crate::protocol_generated::ExtBackgroundEffectManagerV1Id>(state)
+            .collect::<Vec<_>>();
+        for manager in managers {
+            let Some(manager) = manager.try_grab(state) else {
+                continue;
+            };
+            manager.send_event(
+                crate::protocol_generated::ext_background_effect_manager_v1::Event::Capabilities {
+                    flags,
+                },
+                dispatcher,
+            );
+        }
+    }
+
     pub(crate) fn notify_output_color_description(
         &mut self,
         state: &mut State,
@@ -3400,6 +3431,9 @@ impl Model for Client {
             }
             OutputColorDescriptionChanged { output_id } => {
                 self.notify_output_color_description(state, &mut dispatcher, output_id);
+            }
+            BackgroundEffectCapabilitiesChanged => {
+                self.send_background_effect_capabilities(state, &mut dispatcher);
             }
             GammaControlFailed { output_id } => {
                 if self.invalidate_gamma_control_for_output(state, &mut dispatcher, output_id)
