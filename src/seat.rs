@@ -6132,14 +6132,12 @@ mod xdg_seat_tests {
         let geometry = state.committed_root_geometry(root(&state, window)).unwrap();
         let surface = geometry.surface_bounds_global().unwrap();
         let visual_now = window_visual(&state, window);
-        let pointer = crate::render::map_layout_point(
-            geometry.layout_rect_global,
-            visual_now,
-            (
-                surface.x as f64 + surface.width as f64 / 2.0,
-                surface.y as f64 + surface.height as f64 / 2.0,
-            ),
-        );
+        let pointer =
+            crate::render::RectMapping { logical: geometry.layout_rect_global, visual: visual_now }
+                .map_point((
+                    surface.x as f64 + surface.width as f64 / 2.0,
+                    surface.y as f64 + surface.height as f64 / 2.0,
+                ));
         state.seat.pointer_pos = pointer;
         handle_pointer_button(&mut state, &mut dispatcher, 0x110, 1, 200);
         assert!(state.seat.pointer_interactive_grab.is_some(), "second press missed the window");

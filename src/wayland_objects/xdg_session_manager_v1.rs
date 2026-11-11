@@ -378,6 +378,7 @@ mod tests {
                 restore_floating_state_on_next_configure: false,
                 hold_floating_layout: false,
                 resize_anchor: None,
+                tiled_content_basis: None,
                 focus_animation: FocusVisualAnimation::settled(WindowVisualBase {
                     content_alpha: 255,
                     dim_alpha: 0,

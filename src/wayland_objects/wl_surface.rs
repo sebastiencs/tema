@@ -2638,10 +2638,27 @@ impl WlSurface {
             if changed {
                 let (regrabbed, (moved, old_bounds, new_bounds, snapped)) =
                     client.with_ungrabbed(this, state, |state| {
-                        let old_bounds = state
-                            .root_surface_surface_bounds_global(resolved_surface)
-                            .or_else(|| state.root_surface_content_rect_global(resolved_surface));
-                        let moved = state.apply_resize_anchor(resolved_surface);
+                        // Tiled root_pos is computed, so a rebuild already sits at
+                        // the anchored origin. Damage the new buffer at the
+                        // surface position from before that rebuild.
+                        let previous_root_pos = resolved_surface
+                            .try_ref(state)
+                            .map(|surface| surface.root_position());
+                        state.refresh_tiled_content_basis(resolved_surface);
+                        let anchored = state.is_tiled_root_surface(resolved_surface)
+                            && !state.root_surface_is_fullscreen(resolved_surface);
+                        let old_bounds = if anchored {
+                            previous_root_pos.and_then(|root_pos| {
+                                state
+                                    .committed_root_geometry(resolved_surface)
+                                    .and_then(|geometry| geometry.surface_bounds_at(root_pos))
+                            })
+                        } else {
+                            state.root_surface_surface_bounds_global(resolved_surface)
+                        }
+                        .or_else(|| state.root_surface_content_rect_global(resolved_surface));
+                        let moved = state.apply_resize_anchor(resolved_surface)
+                            || state.sync_anchored_root_position(resolved_surface);
                         let new_bounds = state
                             .root_surface_surface_bounds_global(resolved_surface)
                             .or_else(|| state.root_surface_content_rect_global(resolved_surface));

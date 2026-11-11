@@ -57,6 +57,17 @@ struct PendingConfigure {
     state: ConfigureState,
 }
 
+/// Toplevel configure size, when it is a real size request.
+///
+/// `0x0` means the client chooses its size.
+fn toplevel_size_request(state: &ConfigureState) -> Option<(i32, i32)> {
+    let ConfigureState::Toplevel(configure) = state else {
+        return None;
+    };
+    let size = (configure.width, configure.height);
+    (size != (0, 0)).then_some(size)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CommitRoleChanges {
     pub apply_window_geometry: bool,
@@ -89,6 +100,10 @@ pub struct XdgSurface {
     next_configure_serial: u32,
     pending_configures: VecDeque<PendingConfigure>,
     last_acked: Option<PendingConfigure>,
+    /// False from an ack until the next commit. Layout configures do not set
+    /// `resize_throttle`, so this is what keeps a size request pending across
+    /// that gap. Jay's configure timeout only covers the throttled resize path.
+    last_acked_committed: bool,
     pending_window_geometry: Option<RectI>,
     current_window_geometry: Option<RectI>,
     popup_children: Vec<Resolved<XdgPopupId>>,
@@ -117,6 +132,7 @@ impl XdgSurface {
             next_configure_serial: 1,
             pending_configures: VecDeque::new(),
             last_acked: None,
+            last_acked_committed: true,
             pending_window_geometry: None,
             current_window_geometry: None,
             popup_children: Vec::new(),
@@ -337,6 +353,21 @@ impl XdgSurface {
         serial
     }
 
+    /// Pretend the client acked the newest configure and committed.
+    ///
+    /// Clears the size-request flags the real commit path clears, without a
+    /// buffer. Tests resize the buffer separately.
+    #[cfg(test)]
+    pub(crate) fn test_commit_answered_configure(&mut self) {
+        if let Some(newest) = self.pending_configures.pop_back() {
+            self.last_acked = Some(newest);
+        }
+        self.pending_configures.clear();
+        self.last_acked_committed = true;
+        self.resize_throttle = None;
+        self.deferred_resize_configure = false;
+    }
+
     /// The toplevel configure most recently sent: the newest unacked one, or
     /// the last acked one. `None` before the first configure, after a reset,
     /// or when the newest configure is not a toplevel configure.
@@ -391,6 +422,7 @@ impl XdgSurface {
         self.initial_commit_complete = false;
         self.pending_configures.clear();
         self.last_acked = None;
+        self.last_acked_committed = true;
         self.pending_window_geometry = None;
         self.current_window_geometry = None;
         self.resize_throttle = None;
@@ -400,6 +432,29 @@ impl XdgSurface {
     /// A resize configure is in flight or was deferred until the next commit.
     pub(crate) fn resize_configure_outstanding(&self) -> bool {
         self.resize_throttle.is_some() || self.deferred_resize_configure
+    }
+
+    /// True while a size configure has been sent and the client has not
+    /// committed after it.
+    ///
+    /// `committed_size` is the current window-geometry size. A `0x0` configure
+    /// lets the client choose and is not a request. Hyprland keeps the same
+    /// gap as a pending size ack; this is that check for a tiled window.
+    pub(crate) fn size_request_pending(&self, committed_size: (i32, i32)) -> bool {
+        if self.resize_configure_outstanding() {
+            return true;
+        }
+        if self.pending_configures.iter().any(|pending| {
+            toplevel_size_request(&pending.state).is_some_and(|size| size != committed_size)
+        }) {
+            return true;
+        }
+        !self.last_acked_committed
+            && self
+                .last_acked
+                .as_ref()
+                .and_then(|acked| toplevel_size_request(&acked.state))
+                .is_some_and(|size| size != committed_size)
     }
 
     /// Whether a throttled resize configure may go out at `now`. When it
@@ -496,6 +551,7 @@ impl XdgSurface {
         dispatcher: &mut ClientDispatcher,
         role_changes: CommitRoleChanges,
     ) {
+        self.last_acked_committed = true;
         if role_changes.apply_window_geometry {
             let pending_window_geometry = self.pending_window_geometry;
             if self.pending_window_geometry.is_some() {
@@ -882,6 +938,7 @@ impl Object for XdgSurface {
                 let acked = self.pending_configures[position].clone();
                 self.pending_configures.drain(..=position);
                 self.last_acked = Some(acked.clone());
+                self.last_acked_committed = false;
 
                 match acked.state {
                     ConfigureState::Toplevel(ToplevelConfigureState {
@@ -2962,6 +3019,7 @@ mod tests {
             next_configure_serial: 1,
             pending_configures: VecDeque::new(),
             last_acked: None,
+            last_acked_committed: true,
             pending_window_geometry: None,
             current_window_geometry: None,
             popup_children: Vec::new(),
@@ -3220,6 +3278,183 @@ mod tests {
         assert!(xdg_surface.resize_throttle.is_none());
         assert!(!xdg_surface.deferred_resize_configure);
         assert!(xdg_surface.resize_configure_allowed(t0));
+    }
+
+    fn queue_toplevel_size(xdg_surface: &mut XdgSurface, width: i32, height: i32) {
+        let client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        xdg_surface.queue_toplevel_configure(
+            width,
+            height,
+            vec![4],
+            ToplevelDecorationMode::ClientSide,
+            &mut client_dispatcher,
+        );
+    }
+
+    fn ack_newest_configure(xdg_surface: &mut XdgSurface) {
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+        xdg_surface.last_acked_committed = false;
+    }
+
+    #[test]
+    fn size_request_stays_pending_until_the_commit() {
+        let mut xdg_surface = test_xdg_surface();
+        let committed = (80, 60);
+        assert!(!xdg_surface.size_request_pending(committed));
+        queue_toplevel_size(&mut xdg_surface, 120, 60);
+        assert!(xdg_surface.size_request_pending(committed));
+        ack_newest_configure(&mut xdg_surface);
+        assert!(xdg_surface.pending_configures.is_empty());
+        assert!(xdg_surface.size_request_pending(committed));
+        xdg_surface.last_acked_committed = true;
+        assert!(!xdg_surface.size_request_pending((120, 60)));
+    }
+
+    #[test]
+    fn size_request_ends_when_the_client_commits_a_different_size() {
+        let mut xdg_surface = test_xdg_surface();
+        queue_toplevel_size(&mut xdg_surface, 120, 60);
+        ack_newest_configure(&mut xdg_surface);
+        xdg_surface.last_acked_committed = true;
+        assert!(!xdg_surface.size_request_pending((90, 50)));
+    }
+
+    #[test]
+    fn deferred_resize_stays_pending_until_that_configure_is_committed() {
+        let mut xdg_surface = test_xdg_surface();
+        let t0 = std::time::Instant::now();
+        queue_toplevel_size(&mut xdg_surface, 100, 60);
+        xdg_surface.note_resize_configure_sent(t0);
+        assert!(!xdg_surface.resize_configure_allowed(t0 + std::time::Duration::from_millis(10)));
+        assert!(xdg_surface.size_request_pending((80, 60)));
+        ack_newest_configure(&mut xdg_surface);
+        assert!(xdg_surface.size_request_pending((80, 60)));
+        assert!(xdg_surface.release_resize_throttle_on_commit());
+        xdg_surface.last_acked_committed = true;
+        queue_toplevel_size(&mut xdg_surface, 140, 60);
+        xdg_surface.note_resize_configure_sent(t0 + std::time::Duration::from_millis(10));
+        assert!(xdg_surface.size_request_pending((100, 60)));
+        ack_newest_configure(&mut xdg_surface);
+        assert!(xdg_surface.size_request_pending((100, 60)));
+        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        xdg_surface.last_acked_committed = true;
+        assert!(!xdg_surface.size_request_pending((140, 60)));
+    }
+
+    #[test]
+    fn state_only_configure_and_client_chosen_size_are_not_size_requests() {
+        let mut xdg_surface = test_xdg_surface();
+        queue_toplevel_size(&mut xdg_surface, 80, 60);
+        assert!(!xdg_surface.size_request_pending((80, 60)));
+        ack_newest_configure(&mut xdg_surface);
+        assert!(!xdg_surface.size_request_pending((80, 60)));
+        queue_toplevel_size(&mut xdg_surface, 0, 0);
+        assert!(!xdg_surface.size_request_pending((80, 60)));
+    }
+
+    #[test]
+    fn size_request_stays_pending_when_the_client_never_acks() {
+        let mut xdg_surface = test_xdg_surface();
+        queue_toplevel_size(&mut xdg_surface, 120, 60);
+        assert!(xdg_surface.size_request_pending((80, 60)));
+        assert!(xdg_surface.pending_configures.len() == 1);
+        assert!(xdg_surface.size_request_pending((80, 60)));
+    }
+
+    #[test]
+    fn tiled_size_answer_pending_follows_the_xdg_request_and_ignores_other_modes() {
+        let mut state = state_for_tests();
+        let output_id = state.insert_output(test_output_drm0_wh(800, 600));
+        let workspace_id = state.active_workspace_for_output(output_id).unwrap();
+        let client_id = ClientId::from_raw(77);
+        let (wl_surface, xdg_surface) = insert_test_xdg_surface(
+            &mut state,
+            client_id,
+            WlSurfaceId::from(10),
+            XdgSurfaceId::from(11),
+        );
+        let mut dispatcher = Dispatcher::default();
+        let client = Client::new_for_tests(client_id);
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        {
+            let mut surface = state
+                .objects
+                .grab_object::<WlSurface>(wl_surface.object_id());
+            assert!(surface
+                .set_role(Role::XdgSurface, &mut client_dispatcher)
+                .is_ok());
+            surface.test_map(ObjectId::from(950usize), 0, 0, 80, 60);
+        }
+        assert!(!state.tiled_size_answer_pending(wl_surface));
+        let window = state.allocate_window_id();
+        let (_, toplevel_object_id) =
+            state.insert_object(XdgToplevel::new(XdgToplevelId::from(12), xdg_surface, 7, window));
+        let toplevel = Resolved::new(client_id, XdgToplevelId::from(12), toplevel_object_id);
+        state.insert_window(window, wl_surface, toplevel.object_id());
+        state
+            .objects
+            .get_mut(xdg_surface.object_id())
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .role_object = RoleObject::Toplevel(toplevel);
+        assert!(state
+            .workspaces
+            .try_get_mut(workspace_id)
+            .unwrap()
+            .layout
+            .insert_tiled(window));
+        state.relayout_dirty_workspaces();
+        assert!(state.is_tiled_root_surface(wl_surface));
+        assert!(!state.tiled_size_answer_pending(wl_surface));
+
+        {
+            let mut dispatcher = Dispatcher::default();
+            let client = Client::new_for_tests(client_id);
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            state
+                .objects
+                .get_mut(xdg_surface.object_id())
+                .downcast_mut::<XdgSurface>()
+                .unwrap()
+                .queue_toplevel_configure(
+                    200,
+                    100,
+                    vec![4],
+                    ToplevelDecorationMode::ClientSide,
+                    &mut client_dispatcher,
+                );
+        }
+        assert!(state.tiled_size_answer_pending(wl_surface));
+        assert!(state.set_root_surface_floating(wl_surface, true));
+        assert!(!state.tiled_size_answer_pending(wl_surface));
+        assert!(state.set_root_surface_floating(wl_surface, false));
+        assert!(state.tiled_size_answer_pending(wl_surface));
+        assert!(state.set_window_fullscreen(window, true));
+        assert!(!state.tiled_size_answer_pending(wl_surface));
+    }
+
+    #[test]
+    fn tiled_size_answer_pending_is_false_for_xwayland() {
+        let mut state = state_for_tests();
+        let output_id = state.insert_output(test_output_drm0_wh(800, 600));
+        let workspace_id = state.active_workspace_for_output(output_id).unwrap();
+        let object_id = crate::test_support::insert_root_surface(&mut state, 30);
+        let wl_surface = root(&state, object_id);
+        assert!(state
+            .objects
+            .grab_object::<WlSurface>(object_id)
+            .assign_xwayland_role());
+        let window = crate::test_support::insert_window(&mut state, wl_surface);
+        state
+            .workspaces
+            .try_get_mut(workspace_id)
+            .unwrap()
+            .layout
+            .insert_tiled(window);
+        assert!(state.is_tiled_root_surface(wl_surface));
+        assert!(!state.tiled_size_answer_pending(wl_surface));
     }
 
     fn geometry_for_size(width: i32, height: i32) -> crate::root_geometry::CommittedRootGeometry {
@@ -3536,6 +3771,7 @@ mod tests {
                 next_configure_serial: 1,
                 pending_configures: VecDeque::new(),
                 last_acked: None,
+                last_acked_committed: true,
                 pending_window_geometry: None,
                 current_window_geometry: None,
                 popup_children: Vec::new(),
@@ -3641,6 +3877,7 @@ mod tests {
                 next_configure_serial: 1,
                 pending_configures: VecDeque::new(),
                 last_acked: None,
+                last_acked_committed: true,
                 pending_window_geometry: None,
                 current_window_geometry: None,
                 popup_children: Vec::new(),
@@ -3751,6 +3988,7 @@ mod tests {
                 next_configure_serial: 1,
                 pending_configures: VecDeque::new(),
                 last_acked: None,
+                last_acked_committed: true,
                 pending_window_geometry: None,
                 current_window_geometry: None,
                 popup_children: Vec::new(),

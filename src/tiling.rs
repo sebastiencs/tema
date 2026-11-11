@@ -27,6 +27,10 @@ pub const EDGE_RIGHT: u32 = 8;
 /// `warpPositionSize()` snaps a mouse resize the same way. The configure pass
 /// and button release both relayout after the grab's own warp, so the snap has
 /// to be applied there too or the animation replaces it.
+///
+/// While the client still owes the new size, `tiled_size_answer_pending`
+/// stretches the current buffer into the jumped tile. The snap therefore
+/// shows the old content filling the new box until that commit arrives.
 pub const SNAP_TILED_RESIZE: bool = true;
 
 const MIN_CHILD_WEIGHT: f64 = 0.1;
@@ -1458,6 +1462,23 @@ pub fn relayout_dirty_workspaces_with_motion(
         let window_insets = keyed_by_window(state, &decoration_insets);
         let window_min_sizes = keyed_by_window(state, &min_sizes);
         let handle_params = SplitHandleParams::from_state(state);
+        let previous_frames = state
+            .workspaces
+            .try_get(workspace_id)
+            .map(|workspace| {
+                workspace
+                    .layout
+                    .tiled_windows()
+                    .into_iter()
+                    .filter_map(|window| {
+                        workspace
+                            .layout
+                            .tiled_rect(window)
+                            .map(|rect| (window, rect))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         let operations = {
             let Some(workspace) = state.workspaces.try_get_mut(workspace_id) else {
                 continue;
@@ -1472,10 +1493,16 @@ pub fn relayout_dirty_workspaces_with_motion(
                 handle_params,
             )
         };
+        let mut basis_roots = Vec::new();
         for operation in operations {
             let Some(root) = state.window_root_surface(operation.window) else {
                 continue;
             };
+            if previous_frames.get(&operation.window).copied()
+                != Some(operation.allocation.frame_rect)
+            {
+                basis_roots.push(root);
+            }
             let Some(mut surface) = root.try_grab(state) else {
                 continue;
             };
@@ -1497,6 +1524,9 @@ pub fn relayout_dirty_workspaces_with_motion(
             surface.set_root_position(geometry.root_pos.0, geometry.root_pos.1);
             drop(surface);
             state.mark_root_geometry_dirty(root);
+        }
+        for root in basis_roots {
+            state.refresh_tiled_content_basis(root);
         }
         for surface in &workspace_surface_ids {
             if !state.is_tiled_root_surface(*surface) && !state.root_surface_is_fullscreen(*surface)
@@ -2822,6 +2852,315 @@ mod tests {
             .iter()
             .any(|rect| rect.intersects(initial)));
         assert!(moved.damaged_rects.iter().any(|rect| rect.intersects(mid)));
+    }
+
+    #[test]
+    fn window_render_mapping_is_the_layout_to_visual_pair_mid_animation() {
+        let mut state = state_for_tests();
+        state
+            .config
+            .animations
+            .set_duration_msec(crate::animation_config::AnimationNode::Windows, 200);
+        state
+            .config
+            .animations
+            .set_linear(crate::animation_config::AnimationNode::Windows);
+        state.config.animations.set_open_duration_msec(0);
+        let surface = live_toplevel(&mut state);
+        state.relayout_dirty_workspaces();
+        let now = std::time::Instant::now();
+        state.advance_visual_animations(now);
+        let initial = state
+            .committed_root_geometry(surface)
+            .unwrap()
+            .layout_rect_global;
+
+        assert!(state.set_root_surface_floating(surface, true));
+        {
+            let mut wl_surface = surface.try_grab(&mut state).unwrap();
+            wl_surface.set_root_position(initial.x + 80, initial.y + 40);
+        }
+        state.mark_root_geometry_dirty(surface);
+        state.sync_window_geometry_goal(
+            state.window_for_root(surface).unwrap(),
+            crate::visual_animation::WindowGeometryMotion::Layout,
+        );
+        state.advance_visual_animations(now);
+        state.advance_visual_animations(now + std::time::Duration::from_millis(100));
+
+        let logical = state
+            .committed_root_geometry(surface)
+            .unwrap()
+            .layout_rect_global;
+        let visual = state
+            .managed_window(surface)
+            .unwrap()
+            .geometry_animation
+            .visual_rect()
+            .unwrap();
+        assert_ne!(logical, visual);
+        let expected = crate::render::RectMapping { logical, visual };
+        let mapping = state.window_render_mapping(surface);
+        assert_eq!(mapping.frame, Some(expected));
+        assert_eq!(mapping.content, Some(expected));
+        assert_eq!(
+            state
+                .committed_root_geometry(surface)
+                .unwrap()
+                .content_rect_global(),
+            logical,
+            "border is zero here, so the content pair is the frame pair"
+        );
+    }
+
+    fn place_tiled(state: &mut State, surface: crate::clients::Resolved<WlSurfaceId>, rect: RectI) {
+        let window = state.window_for_root(surface).unwrap();
+        let workspace_id = state.root_surface_workspace(surface).unwrap();
+        let workspace = state.workspaces.try_get_mut(workspace_id).unwrap();
+        workspace.layout.insert_tiled(window);
+        set_tiled_rect(&mut workspace.layout, window, rect);
+        state.mark_root_geometry_dirty(surface);
+    }
+
+    fn queue_toplevel_size(
+        state: &mut State,
+        surface: crate::clients::Resolved<WlSurfaceId>,
+        width: i32,
+        height: i32,
+    ) {
+        let xdg = surface.try_ref(state).unwrap().xdg_surface().unwrap();
+        let mut dispatcher = Dispatcher::default();
+        let client = Client::new_for_tests(ClientId::from_raw(4));
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        state
+            .objects
+            .get_mut(xdg.object_id())
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .queue_toplevel_configure(
+                width,
+                height,
+                vec![4],
+                ToplevelDecorationMode::ClientSide,
+                &mut client_dispatcher,
+            );
+    }
+
+    fn answer_size_configure(state: &mut State, surface: crate::clients::Resolved<WlSurfaceId>) {
+        let xdg = surface.try_ref(state).unwrap().xdg_surface().unwrap();
+        state
+            .objects
+            .get_mut(xdg.object_id())
+            .downcast_mut::<XdgSurface>()
+            .unwrap()
+            .test_commit_answered_configure();
+    }
+
+    #[test]
+    fn pending_tiled_size_stretches_the_old_buffer_into_the_visual_content() {
+        let mut state = state_for_tests();
+        let surface = live_toplevel(&mut state);
+        let matched = RectI { x: 10, y: 20, width: 80, height: 60 };
+        place_tiled(&mut state, surface, matched);
+        assert!(state.refresh_tiled_content_basis(surface));
+        let grown = RectI { x: 10, y: -20, width: 80, height: 100 };
+        place_tiled(&mut state, surface, grown);
+        queue_toplevel_size(&mut state, surface, grown.width, grown.height);
+        assert!(state.tiled_size_answer_pending(surface));
+
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        let client = geometry.client_content_rect_global().unwrap();
+        let visual_content = geometry.content_rect_global();
+        assert_eq!(client.y2(), visual_content.y2());
+        assert_eq!(client.height, 60);
+        let mapping = state.window_render_mapping(surface);
+        assert_eq!(mapping.frame, None);
+        assert_eq!(
+            mapping.content,
+            Some(crate::render::RectMapping { logical: client, visual: visual_content })
+        );
+
+        let pointer = state.logical_pointer_for_surface(
+            surface,
+            (visual_content.x2() as f64, visual_content.y2() as f64),
+        );
+        assert_eq!(pointer.0.round() as i32, client.x2());
+        assert_eq!(pointer.1.round() as i32, client.y2());
+
+        {
+            let mut wl_surface = surface.try_grab(&mut state).unwrap();
+            wl_surface.test_map(ObjectId::from(901usize), 0, 0, grown.width, grown.height);
+        }
+        answer_size_configure(&mut state, surface);
+        state.mark_root_geometry_dirty(surface);
+        assert!(state.refresh_tiled_content_basis(surface));
+        assert!(!state.tiled_size_answer_pending(surface));
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        assert_eq!(geometry.client_content_rect_global(), Some(geometry.content_rect_global()));
+        assert_eq!(state.window_render_mapping(surface).content, None);
+    }
+
+    #[test]
+    fn a_smaller_answer_is_unscaled_and_pinned_to_the_unmoved_edge() {
+        let mut state = state_for_tests();
+        let surface = live_toplevel(&mut state);
+        let matched = RectI { x: 10, y: 20, width: 80, height: 60 };
+        place_tiled(&mut state, surface, matched);
+        assert!(state.refresh_tiled_content_basis(surface));
+        let grown = RectI { x: 10, y: -20, width: 80, height: 100 };
+        place_tiled(&mut state, surface, grown);
+        queue_toplevel_size(&mut state, surface, grown.width, grown.height);
+        {
+            let mut wl_surface = surface.try_grab(&mut state).unwrap();
+            wl_surface.test_map(ObjectId::from(902usize), 0, 0, 80, 40);
+        }
+        answer_size_configure(&mut state, surface);
+        state.mark_root_geometry_dirty(surface);
+        assert!(!state.refresh_tiled_content_basis(surface));
+        assert!(!state.tiled_size_answer_pending(surface));
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        let content = geometry.content_rect_global();
+        let client = geometry.client_content_rect_global().unwrap();
+        assert_eq!(client.y2(), content.y2());
+        assert_eq!(client.height, 40);
+        assert_ne!(client, content);
+        assert_eq!(state.window_render_mapping(surface).content, None);
+    }
+
+    #[test]
+    fn floating_fullscreen_and_x11_tiles_are_not_stretched() {
+        let mut state = state_for_tests();
+        let surface = live_toplevel(&mut state);
+        let matched = RectI { x: 10, y: 20, width: 80, height: 60 };
+        place_tiled(&mut state, surface, matched);
+        assert!(state.refresh_tiled_content_basis(surface));
+        queue_toplevel_size(&mut state, surface, 200, 100);
+        assert!(state.set_root_surface_floating(surface, true));
+        assert!(!state.tiled_size_answer_pending(surface));
+        let floating = state.committed_root_geometry(surface).unwrap();
+        assert_eq!(floating.client_content_rect_global(), Some(floating.content_rect_global()));
+        if let Some(content) = state.window_render_mapping(surface).content {
+            assert_eq!(content.logical, floating.content_rect_global());
+        }
+
+        assert!(state.set_root_surface_floating(surface, false));
+        place_tiled(&mut state, surface, matched);
+        let window = state.window_for_root(surface).unwrap();
+        assert!(state.set_window_fullscreen(window, true));
+        {
+            let mut wl_surface = surface.try_grab(&mut state).unwrap();
+            wl_surface.test_map(ObjectId::from(903usize), 0, 0, 40, 30);
+        }
+        state.mark_root_geometry_dirty(surface);
+        queue_toplevel_size(&mut state, surface, 800, 600);
+        assert!(!state.tiled_size_answer_pending(surface));
+        let fullscreen = state.committed_root_geometry(surface).unwrap();
+        let client = fullscreen.client_content_rect_global().unwrap();
+        assert_ne!(client, fullscreen.content_rect_global());
+        let fullscreen_content = state.window_render_mapping(surface).content;
+        assert_eq!(
+            fullscreen_content.map(|content| content.logical),
+            fullscreen_content.map(|_| fullscreen.content_rect_global())
+        );
+
+        let mut xstate = state_for_tests();
+        let output_id = xstate.insert_output(crate::test_support::test_output_drm0_wh(800, 600));
+        let workspace_id = xstate.active_workspace_for_output(output_id).unwrap();
+        let object_id = crate::test_support::insert_root_surface(&mut xstate, 30);
+        let xsurface = root(&xstate, object_id);
+        assert!(xstate
+            .objects
+            .grab_object::<WlSurface>(object_id)
+            .assign_xwayland_role());
+        {
+            let mut wl_surface = xstate.objects.grab_object::<WlSurface>(object_id);
+            wl_surface.test_map(ObjectId::from(904usize), 0, 0, 80, 60);
+        }
+        let xwindow = crate::test_support::insert_window(&mut xstate, xsurface);
+        xstate
+            .workspaces
+            .try_get_mut(workspace_id)
+            .unwrap()
+            .layout
+            .insert_tiled(xwindow);
+        set_tiled_rect(
+            &mut xstate.workspaces.try_get_mut(workspace_id).unwrap().layout,
+            xwindow,
+            RectI { x: 0, y: 0, width: 120, height: 90 },
+        );
+        xstate.mark_root_geometry_dirty(xsurface);
+        assert!(xstate.is_tiled_root_surface(xsurface));
+        assert!(!xstate.tiled_size_answer_pending(xsurface));
+        let xgeometry = xstate.committed_root_geometry(xsurface).unwrap();
+        assert_ne!(xgeometry.client_content_rect_global(), Some(xgeometry.content_rect_global()));
+        assert_eq!(xstate.window_render_mapping(xsurface).content, None);
+    }
+
+    #[test]
+    fn animated_content_stays_inside_the_border_and_the_ssd_clip_follows_it() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 10;
+        state.config.decorations.rounding = 20;
+        state
+            .config
+            .animations
+            .set_duration_msec(crate::animation_config::AnimationNode::Windows, 200);
+        state
+            .config
+            .animations
+            .set_linear(crate::animation_config::AnimationNode::Windows);
+        state.config.animations.set_open_duration_msec(0);
+        let surface = live_toplevel(&mut state);
+        let window = state.window_for_root(surface).unwrap();
+        state
+            .objects
+            .get_mut(state.window_role_object(window).unwrap())
+            .downcast_mut::<XdgToplevel>()
+            .unwrap()
+            .test_set_decoration_mode(ToplevelDecorationMode::ServerSide);
+        let matched = RectI { x: 10, y: 20, width: 100, height: 80 };
+        place_tiled(&mut state, surface, matched);
+        state
+            .sync_window_geometry_goal(window, crate::visual_animation::WindowGeometryMotion::Warp);
+        let now = std::time::Instant::now();
+        state.advance_visual_animations(now);
+        let grown = RectI { x: 10, y: 20, width: 160, height: 120 };
+        place_tiled(&mut state, surface, grown);
+        state.sync_window_geometry_goal(
+            window,
+            crate::visual_animation::WindowGeometryMotion::Layout,
+        );
+        state.advance_visual_animations(now);
+        let moved = state.advance_visual_animations(now + std::time::Duration::from_millis(100));
+        let initial_visual = RectI {
+            x: matched.x,
+            y: matched.y,
+            width: matched.width,
+            height: matched.height,
+        };
+        assert!(moved
+            .damaged_rects
+            .iter()
+            .any(|rect| rect.intersects(initial_visual)));
+
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        let mapping = state.window_render_mapping(surface);
+        let frame = mapping.frame.expect("animation moves the frame");
+        let content = mapping.content.expect("content is inset from the frame");
+        assert_eq!(content.logical, geometry.content_rect_global());
+        assert_ne!(content.logical, frame.logical);
+        assert_ne!(content.visual, geometry.content_rect_global());
+        assert!(moved
+            .damaged_rects
+            .iter()
+            .any(|rect| rect.intersects(content.visual)));
+
+        let mut visual = state.root_surface_visual_state(surface).unwrap();
+        crate::render::place_visual_frame(&mut visual, frame.logical, frame.visual);
+        let crate::render::WindowClip::Frame(clip) = visual.clip.expect("ssd clip") else {
+            panic!("server-side clip should be a hard frame");
+        };
+        assert_eq!(clip.outer_rect, content.visual);
     }
 
     fn queues_animation_frame(dispatcher: &Dispatcher, output_id: crate::state::OutputId) -> bool {
@@ -4520,6 +4859,102 @@ mod tests {
             geometry.content_rect_global(),
             RectI { x: 650, y: 25, width: 605, height: 750 }
         );
+    }
+
+    #[test]
+    fn tiled_buffer_anchors_to_the_tile_edges_that_did_not_move() {
+        let mut state = state_for_tests();
+        let surface = live_toplevel(&mut state);
+        let window = state.window_for_root(surface).unwrap();
+        let workspace_id = state.root_surface_workspace(surface).unwrap();
+        let place = |state: &mut State, rect: RectI| {
+            let workspace = state.workspaces.try_get_mut(workspace_id).unwrap();
+            workspace.layout.insert_tiled(window);
+            set_tiled_rect(&mut workspace.layout, window, rect);
+            state.mark_root_geometry_dirty(surface);
+        };
+        let matched = RectI { x: 10, y: 20, width: 80, height: 60 };
+        place(&mut state, matched);
+        assert!(state.refresh_tiled_content_basis(surface));
+        assert_eq!(state.managed_window(surface).unwrap().tiled_content_basis, Some(matched));
+        let fullscreen = {
+            let wl_surface = state
+                .objects
+                .try_ref_object::<WlSurface>(surface.object_id())
+                .unwrap();
+            root_geometry::build_committed_root_geometry(
+                &state,
+                surface,
+                wl_surface,
+                Some(LayoutAllocation {
+                    frame_rect: RectI { x: 10, y: -20, width: 80, height: 100 },
+                    tiled_edges: EDGE_TOP | EDGE_BOTTOM | EDGE_LEFT | EDGE_RIGHT,
+                    fullscreen: true,
+                }),
+                root_geometry::GeometryBuildOverrides {
+                    decoration_mode: None,
+                    explicit_window_geometry: None,
+                    decoration_insets: None,
+                    root_pos: None,
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(fullscreen.root_pos.1, fullscreen.content_rect_global().y);
+
+        let moved = RectI { x: 50, y: 20, width: 80, height: 60 };
+        place(&mut state, moved);
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        assert_eq!(geometry.content_rect_global(), moved);
+        assert_eq!(geometry.root_pos, (moved.x, moved.y));
+        assert_eq!(geometry.client_content_rect_global(), Some(moved));
+        assert!(state.refresh_tiled_content_basis(surface));
+        assert_eq!(state.managed_window(surface).unwrap().tiled_content_basis, Some(moved));
+
+        let grown_top = RectI { x: 50, y: -20, width: 80, height: 100 };
+        place(&mut state, grown_top);
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        let content = geometry.content_rect_global();
+        assert_eq!(content, grown_top);
+        assert_eq!(geometry.root_pos.1, content.y + 40);
+        let client = geometry.client_content_rect_global().unwrap();
+        assert_eq!(client.y2(), content.y2());
+        assert_eq!(client.height, 60);
+
+        let grown_left = RectI { x: 10, y: 20, width: 120, height: 60 };
+        place(&mut state, grown_left);
+        // The basis is still the pure-move rect: the top grow did not match.
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        let content = geometry.content_rect_global();
+        assert_eq!(content, grown_left);
+        assert_eq!(geometry.root_pos.0, content.x + 40);
+        let client = geometry.client_content_rect_global().unwrap();
+        assert_eq!(client.x2(), content.x2());
+        assert_eq!(client.width, 80);
+
+        place(&mut state, grown_top);
+        {
+            let mut wl_surface = surface.try_grab(&mut state).unwrap();
+            wl_surface.test_map(ObjectId::from(900usize), 0, 0, 80, 100);
+        }
+        state.mark_root_geometry_dirty(surface);
+        assert!(state.refresh_tiled_content_basis(surface));
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        assert_eq!(state.managed_window(surface).unwrap().tiled_content_basis, Some(grown_top));
+        assert_eq!(geometry.root_pos, (grown_top.x, grown_top.y));
+        assert_eq!(geometry.client_content_rect_global(), Some(grown_top));
+    }
+
+    #[test]
+    fn floating_client_content_matches_the_content_rect() {
+        let mut state = state_for_tests();
+        state.config.decorations.border.size = 4;
+        let surface = live_toplevel(&mut state);
+        assert!(state.set_root_surface_floating(surface, true));
+        state.mark_root_geometry_dirty(surface);
+        let geometry = state.committed_root_geometry(surface).unwrap();
+        assert_eq!(geometry.client_content_rect_global(), Some(geometry.content_rect_global()));
+        assert!(!geometry.fullscreen);
     }
 
     #[test]

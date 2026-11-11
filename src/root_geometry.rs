@@ -85,7 +85,22 @@ impl CommittedRootGeometry {
 
     /// Derive the committed visual surface-tree bounds in global space.
     pub fn surface_bounds_global(self) -> Option<RectI> {
-        translated_surface_tree_bounds(self.surface_bounds_local, self.root_pos)
+        self.surface_bounds_at(self.root_pos)
+    }
+
+    /// Surface-tree bounds translated so the root origin is `root_pos`.
+    pub fn surface_bounds_at(self, root_pos: (i32, i32)) -> Option<RectI> {
+        translated_surface_tree_bounds(self.surface_bounds_local, root_pos)
+    }
+
+    /// Where the current buffer's window geometry is drawn, in global space.
+    ///
+    /// This is `logical_window_local` placed at `root_pos`. For a floating
+    /// window it equals `content_rect_global()`. For a tiled window it follows
+    /// the anchor and can differ from the tile content rect while the buffer
+    /// size does not match the tile.
+    pub fn client_content_rect_global(self) -> Option<RectI> {
+        self.logical_window_rect_global()
     }
 
     /// Derive the whole outer frame rect in global space.
@@ -343,6 +358,53 @@ pub fn decoration_insets_from_window_geometry_and_logical_size(
     })
 }
 
+/// Global top-left of the client content inside `tile_content`.
+///
+/// Sway places a tiled surface at the content box's top-left
+/// (`view_center_and_clip_surface`) and only centers floating windows. Pinning
+/// the edge that stayed put keeps that edge still while the buffer is still
+/// the previous size. Per axis: no basis, or sizes already equal, keeps the
+/// tile origin. Only the start edge moved pins the end. Every other case,
+/// including both edges moving, keeps the tile origin.
+pub fn anchored_content_origin(
+    tile_content: RectI,
+    basis: Option<RectI>,
+    client_size: (i32, i32),
+) -> (i32, i32) {
+    (
+        anchored_axis(
+            tile_content.x,
+            tile_content.x2(),
+            tile_content.width,
+            basis.map(|basis| (basis.x, basis.x2())),
+            client_size.0,
+        ),
+        anchored_axis(
+            tile_content.y,
+            tile_content.y2(),
+            tile_content.height,
+            basis.map(|basis| (basis.y, basis.y2())),
+            client_size.1,
+        ),
+    )
+}
+
+fn anchored_axis(origin: i32, end: i32, span: i32, basis: Option<(i32, i32)>, client: i32) -> i32 {
+    let Some((basis_origin, basis_end)) = basis else {
+        return origin;
+    };
+    if client == span {
+        return origin;
+    }
+    let start_moved = origin != basis_origin;
+    let end_moved = end != basis_end;
+    if start_moved && !end_moved {
+        end.saturating_sub(client)
+    } else {
+        origin
+    }
+}
+
 /// Clamp explicit window geometry to committed surface bounds, or fall back to
 /// committed surface-tree bounds when the client did not provide one.
 pub fn effective_window_geometry_for_surface(
@@ -408,12 +470,27 @@ pub fn build_committed_root_geometry(
             );
             // The client's window-geometry origin places its content inside the root surface.
             // Align the root so that content lands on the compositor content rect. A client
-            // shadow then hangs outside that rect.
+            // shadow then hangs outside that rect. A tiled window that still has a previous
+            // size is pinned to the tile edges that did not move since that size matched.
+            let is_tiled = !allocation.fullscreen && state.is_tiled_root_surface(surface_id);
+            let basis = is_tiled
+                .then(|| state.managed_window(surface_id))
+                .flatten()
+                .and_then(|managed| managed.tiled_content_basis);
             let computed_root_pos = effective_window_geometry
                 .map(|window_geometry| {
+                    let origin = if is_tiled {
+                        anchored_content_origin(
+                            content_rect_global,
+                            basis,
+                            (window_geometry.width, window_geometry.height),
+                        )
+                    } else {
+                        (content_rect_global.x, content_rect_global.y)
+                    };
                     (
-                        content_rect_global.x.saturating_sub(window_geometry.x),
-                        content_rect_global.y.saturating_sub(window_geometry.y),
+                        origin.0.saturating_sub(window_geometry.x),
+                        origin.1.saturating_sub(window_geometry.y),
                     )
                 })
                 .unwrap_or((content_rect_global.x, content_rect_global.y));
@@ -695,5 +772,43 @@ mod tests {
             effective_window_geometry_for_surface(&state, &surface, Some(explicit)),
             Some(explicit)
         );
+    }
+
+    fn rect(x: i32, y: i32, width: i32, height: i32) -> RectI {
+        RectI { x, y, width, height }
+    }
+
+    #[test]
+    fn anchored_content_origin_pins_the_edge_that_stayed() {
+        let client = (100, 50);
+        let basis = rect(0, 0, 100, 50);
+
+        assert_eq!(anchored_content_origin(rect(0, 0, 140, 50), None, client), (0, 0));
+        assert_eq!(
+            anchored_content_origin(rect(10, 20, 100, 50), Some(basis), client),
+            (10, 20),
+            "matching size follows the tile"
+        );
+
+        // Left edge moved, right stayed at x=100. Pin the right edge.
+        assert_eq!(anchored_content_origin(rect(-40, 0, 140, 50), Some(basis), client), (0, 0));
+        // Right edge moved, left stayed. Pin the left edge.
+        assert_eq!(anchored_content_origin(rect(0, 0, 140, 50), Some(basis), client), (0, 0));
+        // Top moved up by 40, bottom stayed at y=50.
+        assert_eq!(anchored_content_origin(rect(0, -40, 100, 90), Some(basis), client), (0, 0));
+        // Bottom moved, top stayed.
+        assert_eq!(anchored_content_origin(rect(0, 0, 100, 90), Some(basis), client), (0, 0));
+        // Both horizontal edges moved: keep the tile's left.
+        assert_eq!(anchored_content_origin(rect(30, 0, 80, 50), Some(basis), client), (30, 0));
+    }
+
+    #[test]
+    fn anchored_content_origin_lets_a_larger_buffer_overflow_the_moved_edge() {
+        // Tile shrank from the left. The old right edge is still at x=100, and
+        // the 100px buffer starts at x=0, left of the new tile.
+        let origin =
+            anchored_content_origin(rect(20, 0, 80, 50), Some(rect(0, 0, 100, 50)), (100, 50));
+        assert_eq!(origin, (0, 0));
+        assert!(origin.0 < 20);
     }
 }

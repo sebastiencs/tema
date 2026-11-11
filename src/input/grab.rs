@@ -448,26 +448,17 @@ fn anchored_grab_target(
         return target;
     }
     let pointer = state.seat.pointer_position();
-    let logical = state
-        .root_geometry_cache
-        .get(&target.root_surface)
-        .and_then(|entry| entry.get().geometry)
-        .map(|geometry| geometry.layout_rect_global)
-        .unwrap_or(target.geometry.target_rect);
-    let Some(visual) = state
-        .window_for_root(target.root_surface)
-        .and_then(|window| {
-            state
-                .managed_window_state(window)
-                .and_then(|managed| managed.geometry_animation.visual_rect())
-        })
+    let Some(frame) = state
+        .window_render_mapping_with_logical_fallback(
+            target.root_surface,
+            Some(target.geometry.target_rect),
+        )
+        .frame
     else {
         return target;
     };
-    if visual == logical {
-        return target;
-    }
-    let logical_point = crate::render::unmap_layout_point(logical, visual, pointer);
+    let logical = frame.logical;
+    let logical_point = frame.unmap_point(pointer);
     let dx = (pointer.0 - logical_point.0).round() as i32;
     let dy = (pointer.1 - logical_point.1).round() as i32;
     if dx != 0 || dy != 0 {

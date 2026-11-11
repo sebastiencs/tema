@@ -594,6 +594,12 @@ pub struct ManagedWindowState {
     /// Fixed edges of a floating resize, in root-position space, kept until
     /// the client commits the final size.
     pub resize_anchor: Option<ResizeAnchor>,
+    /// Tile content rect the client's current buffer size was produced for.
+    ///
+    /// Updated whenever the committed window-geometry size equals the tile
+    /// content size. `None` until that first happens, and cleared when the
+    /// window leaves tiling or becomes fullscreen.
+    pub tiled_content_basis: Option<RectI>,
     pub focus_animation: FocusVisualAnimation,
     pub lifecycle_animation: WindowLifecycleAnimation,
     pub geometry_animation: WindowGeometryAnimation,
@@ -1177,6 +1183,28 @@ pub(crate) enum TearingCandidateDenial {
     Hint,
 }
 
+/// Visual content box: `visual_frame` shrunk by the same edge gaps that put
+/// `content` inside `frame`. Fullscreen has no gap, so the result is the frame.
+fn visual_content_rect(frame: RectI, content: RectI, visual_frame: RectI) -> RectI {
+    let left = content.x.saturating_sub(frame.x);
+    let top = content.y.saturating_sub(frame.y);
+    let right = frame.x2().saturating_sub(content.x2());
+    let bottom = frame.y2().saturating_sub(content.y2());
+    RectI::new(
+        visual_frame.x.saturating_add(left),
+        visual_frame.y.saturating_add(top),
+        visual_frame
+            .width
+            .saturating_sub(left.saturating_add(right))
+            .max(1),
+        visual_frame
+            .height
+            .saturating_sub(top.saturating_add(bottom))
+            .max(1),
+    )
+    .unwrap_or(visual_frame)
+}
+
 impl State {
     // Root wrappers that still have callers. Each one resolves `window_for_root` and calls
     // the window function.
@@ -1426,6 +1454,7 @@ impl State {
             restore_floating_state_on_next_configure: false,
             hold_floating_layout: false,
             resize_anchor: None,
+            tiled_content_basis: None,
             focus_animation: FocusVisualAnimation::settled(self.focus_visual_base(root)),
             lifecycle_animation: WindowLifecycleAnimation::idle(),
             geometry_animation: WindowGeometryAnimation::unarmed(),
@@ -2362,6 +2391,68 @@ impl State {
         self.clear_resize_anchor(window);
     }
 
+    /// Record the tile content rect when the committed buffer already has that size.
+    ///
+    /// A later tile change anchors against this rect. Returns whether the stored
+    /// rect changed; a change invalidates the root geometry cache.
+    pub(crate) fn refresh_tiled_content_basis(&mut self, root: Resolved<WlSurfaceId>) -> bool {
+        if !self.is_tiled_root_surface(root) || self.root_surface_is_fullscreen(root) {
+            return false;
+        }
+        // Unmapped surfaces have no committed window geometry. The builder then
+        // invents a local rect the size of the tile, which must not become a basis.
+        let mapped = root
+            .try_ref(self)
+            .is_some_and(|surface| surface.logical_size().is_some());
+        if !mapped {
+            return false;
+        }
+        let Some(geometry) = self.committed_root_geometry(root) else {
+            return false;
+        };
+        let Some(client) = geometry.logical_window_local else {
+            return false;
+        };
+        let content = geometry.content_rect_global();
+        if client.width != content.width || client.height != content.height {
+            return false;
+        }
+        {
+            let Some(managed) = self.managed_window_mut(root) else {
+                return false;
+            };
+            if managed.tiled_content_basis == Some(content) {
+                return false;
+            }
+            managed.tiled_content_basis = Some(content);
+        }
+        self.mark_root_geometry_dirty(root);
+        true
+    }
+
+    /// Copy a tiled window's computed root position onto the surface.
+    ///
+    /// Floating geometry reads the position it was given, so this is a no-op
+    /// there. Returns whether the surface moved.
+    pub(crate) fn sync_anchored_root_position(&mut self, root: Resolved<WlSurfaceId>) -> bool {
+        if !self.is_tiled_root_surface(root) || self.root_surface_is_fullscreen(root) {
+            return false;
+        }
+        let Some(geometry) = self.ensure_root_geometry_fresh(root) else {
+            return false;
+        };
+        let Some(mut surface) = root.try_grab(self) else {
+            return false;
+        };
+        if surface.root_position() == geometry.root_pos {
+            return false;
+        }
+        surface.set_root_position(geometry.root_pos.0, geometry.root_pos.1);
+        drop(surface);
+        self.mark_root_geometry_dirty(root);
+        true
+    }
+
     /// Saved floating frame while the attached buffer is still a different size.
     fn held_floating_layout(&mut self, window: WindowId) -> Option<RectI> {
         let surface = self.window_root_surface(window)?;
@@ -2634,6 +2725,115 @@ impl State {
         }
     }
 
+    /// Frame and content rectangles for one window.
+    ///
+    /// The frame follows the geometry animation. The content fills the visual
+    /// box inside the border. While a tiled size request is unanswered, that
+    /// content is the current buffer stretched to the box; otherwise it is the
+    /// tile content, unscaled apart from the animation.
+    pub(crate) fn window_render_mapping(
+        &self,
+        root: Resolved<WlSurfaceId>,
+    ) -> crate::render::WindowRenderMapping {
+        self.window_render_mapping_with_logical_fallback(root, None)
+    }
+
+    /// [`window_render_mapping`](Self::window_render_mapping), using
+    /// `fallback_logical` when the layout rect cannot be read.
+    ///
+    /// A direct floating move starts inside the toplevel request, which still
+    /// holds that object. Rebuilding geometry would call [`State::toplevel`]
+    /// and panic, so the mapping keeps the cached rect and, when the cache is
+    /// empty, the rect the move intent already computed.
+    pub(crate) fn window_render_mapping_with_logical_fallback(
+        &self,
+        root: Resolved<WlSurfaceId>,
+        fallback_logical: Option<RectI>,
+    ) -> crate::render::WindowRenderMapping {
+        let geometry = self.geometry_for_mapping(root);
+        let Some(frame_logical) = geometry
+            .map(|geometry| geometry.layout_rect_global)
+            .or(fallback_logical)
+        else {
+            return crate::render::WindowRenderMapping::default();
+        };
+        let animated = self
+            .managed_window(root)
+            .and_then(|managed| managed.geometry_animation.visual_rect());
+        let Some(geometry) = geometry else {
+            let Some(visual) = animated else {
+                return crate::render::WindowRenderMapping::default();
+            };
+            let pair = crate::render::RectMapping::between(frame_logical, visual);
+            return crate::render::WindowRenderMapping { frame: pair, content: pair };
+        };
+        let visual_frame = animated.unwrap_or(frame_logical);
+        let frame = crate::render::RectMapping::between(frame_logical, visual_frame);
+        let visual_content =
+            visual_content_rect(frame_logical, geometry.content_rect_global(), visual_frame);
+        let stretch = !geometry.fullscreen && self.tiled_size_answer_pending(root);
+        let content_logical = if stretch {
+            geometry
+                .client_content_rect_global()
+                .unwrap_or_else(|| geometry.content_rect_global())
+        } else {
+            geometry.content_rect_global()
+        };
+        let content = crate::render::RectMapping::between(content_logical, visual_content);
+        crate::render::WindowRenderMapping { frame, content }
+    }
+
+    /// Committed geometry for mapping and the size-answer check.
+    ///
+    /// A grabbed root or role object cannot be rebuilt: [`State::toplevel`]
+    /// panics while a request handler holds it.
+    fn geometry_for_mapping(
+        &self,
+        root: Resolved<WlSurfaceId>,
+    ) -> Option<crate::root_geometry::CommittedRootGeometry> {
+        let role_grabbed = self
+            .window_for_root(root)
+            .and_then(|window| self.window_role_object(window))
+            .is_some_and(|role| self.objects.is_grabbed(role));
+        if role_grabbed || self.objects.is_grabbed(root.object_id()) {
+            return self
+                .root_geometry_cache
+                .get(&root)
+                .and_then(|entry| entry.get().geometry);
+        }
+        self.committed_root_geometry(root)
+    }
+
+    /// True while tema has asked this tiled window for a size it has not answered yet.
+    pub(crate) fn tiled_size_answer_pending(&self, root: Resolved<WlSurfaceId>) -> bool {
+        if !self.is_managed_window(root)
+            || self.is_floating_root_surface(root)
+            || self.root_surface_is_fullscreen(root)
+            || !self.is_tiled_root_surface(root)
+        {
+            return false;
+        }
+        if root
+            .try_ref(self)
+            .is_some_and(|surface| surface.has_xwayland_role())
+        {
+            return false;
+        }
+        let committed = self
+            .geometry_for_mapping(root)
+            .and_then(|geometry| geometry.logical_window_local)
+            .map(|rect| (rect.width, rect.height))
+            .unwrap_or((0, 0));
+        let xdg_id = root.try_ref(self).and_then(|surface| surface.xdg_surface());
+        let Some(xdg_id) = xdg_id else {
+            return false;
+        };
+        let Some(xdg_surface) = xdg_id.try_ref(self) else {
+            return false;
+        };
+        xdg_surface.size_request_pending(committed)
+    }
+
     /// Pointer position in the root's logical layout space.
     ///
     /// The animated box is what the user sees. Surface-local coordinates stay in the logical
@@ -2646,10 +2846,11 @@ impl State {
         if self.objects.is_grabbed(surface.object_id()) {
             return pointer;
         }
-        let Some((logical, visual)) = self.geometry_scale_for_surface(surface) else {
+        let root = self.root_surface_for_surface(surface).unwrap_or(surface);
+        let Some(content) = self.window_render_mapping(root).content else {
             return pointer;
         };
-        crate::render::unmap_layout_point(logical, visual, pointer)
+        content.unmap_point(pointer)
     }
 
     /// Global cursor position for a point already expressed in logical layout space.
@@ -2661,19 +2862,11 @@ impl State {
         if self.objects.is_grabbed(surface.object_id()) {
             return logical_pointer;
         }
-        let Some((logical, visual)) = self.geometry_scale_for_surface(surface) else {
+        let root = self.root_surface_for_surface(surface).unwrap_or(surface);
+        let Some(content) = self.window_render_mapping(root).content else {
             return logical_pointer;
         };
-        crate::render::map_layout_point(logical, visual, logical_pointer)
-    }
-
-    fn geometry_scale_for_surface(&self, surface: Resolved<WlSurfaceId>) -> Option<(RectI, RectI)> {
-        let root = self.root_surface_for_surface(surface).unwrap_or(surface);
-        let logical = self.committed_root_geometry(root)?.layout_rect_global;
-        let visual = self
-            .managed_window(root)
-            .and_then(|managed| managed.geometry_animation.visual_rect())?;
-        (logical != visual && logical.width > 0 && logical.height > 0).then_some((logical, visual))
+        content.map_point(logical_pointer)
     }
 
     pub fn root_surface_visual_damage_rect(&self, surface: Resolved<WlSurfaceId>) -> Option<RectI> {
@@ -3420,6 +3613,9 @@ impl State {
                 managed.remembered_floating_state = Some(remembered_state);
             }
         }
+        if managed.mode != new_mode {
+            managed.tiled_content_basis = None;
+        }
         managed.mode = new_mode;
         if !floating {
             managed.resize_anchor = None;
@@ -3487,6 +3683,7 @@ impl State {
         };
         managed.mode = ManagedWindowMode::Floating;
         managed.fullscreen = false;
+        managed.tiled_content_basis = None;
         managed.restore_floating_state_on_next_configure = false;
         managed.hold_floating_layout = false;
         if let Some(workspace) = self.workspaces.try_get_mut(workspace_id) {
@@ -3512,6 +3709,7 @@ impl State {
         let workspace_id = managed.workspace_id;
         managed.mode = ManagedWindowMode::Tiled;
         managed.resize_anchor = None;
+        managed.tiled_content_basis = None;
         managed.restore_floating_state_on_next_configure = false;
         managed.hold_floating_layout = false;
         tiling::mark_workspace_dirty(self, workspace_id);
@@ -3572,6 +3770,7 @@ impl State {
             managed.hold_floating_layout = false;
             managed.fullscreen = true;
             managed.resize_anchor = None;
+            managed.tiled_content_basis = None;
         } else {
             {
                 let Some(managed) = self.managed_window_state_mut(window) else {
@@ -3656,7 +3855,9 @@ impl State {
     /// because the configure pass relayouts again and would otherwise start the
     /// `windows` animation. Hyprland's `warpPositionSize()` does the same
     /// during a mouse resize. Keyboard resizes stay on [`Self::resize_tiled_window`]
-    /// and keep the `windows` animation.
+    /// and keep the `windows` animation. The unanswered buffer is stretched
+    /// into the jumped tile until the client commits, so the snap does not
+    /// leave the old size sitting inside the new frame.
     pub fn apply_split_drags(
         &mut self,
         workspace_id: WorkspaceId,

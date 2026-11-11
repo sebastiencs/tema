@@ -7047,7 +7047,7 @@ fn push_scene_items_from_snapshots(
     allow_direct_scanout: bool,
     root_clip: Option<WindowClip>,
     alpha: u8,
-    geometry_scale: Option<(RectI, RectI)>,
+    content_mapping: Option<crate::render::RectMapping>,
     output_scale: crate::state::FractionalScale,
 ) {
     for surface_state in snapshots {
@@ -7057,7 +7057,7 @@ fn push_scene_items_from_snapshots(
         else {
             continue;
         };
-        if !bounds_visible_on_output(bounds, output_bounds, geometry_scale) {
+        if !bounds_visible_on_output(bounds, output_bounds, content_mapping) {
             continue;
         }
         let mut damage = surface_state.damage.clone();
@@ -7883,10 +7883,10 @@ fn split_closing_effects(
 fn bounds_visible_on_output(
     bounds: RectI,
     output_bounds: RectI,
-    geometry_scale: Option<(RectI, RectI)>,
+    content_mapping: Option<crate::render::RectMapping>,
 ) -> bool {
-    let visible = match geometry_scale {
-        Some((logical, visual)) => crate::render::map_layout_rect(logical, visual, bounds),
+    let visible = match content_mapping {
+        Some(mapping) => mapping.map_rect(bounds),
         None => bounds,
     };
     visible.intersects(output_bounds)
@@ -8758,30 +8758,16 @@ fn render_composed_entry(
     {
         return;
     }
-    let logical_layout = state
-        .committed_root_geometry(root_surface)
-        .map(|geometry| geometry.layout_rect_global);
-    let visual_layout = state.window_for_root(root_surface).and_then(|window| {
-        state
-            .managed_window_state(window)
-            .and_then(|managed| managed.geometry_animation.visual_rect())
-    });
-    let geometry_scale = match (logical_layout, visual_layout) {
-        (Some(logical), Some(visual))
-            if logical != visual && logical.width > 0 && logical.height > 0 =>
-        {
-            Some((logical, visual))
-        }
-        _ => None,
-    };
+    let mapping = state.window_render_mapping(root_surface);
     let mut visual_state = state.root_surface_visual_state(root_surface);
-    if let Some((logical, visual)) = geometry_scale {
+    if let Some(frame) = mapping.frame {
         if let Some(visual_state) = visual_state.as_mut() {
-            crate::render::place_visual_frame(visual_state, logical, visual);
+            crate::render::place_visual_frame(visual_state, frame.logical, frame.visual);
         }
     }
     let allow_direct_scanout = entry.allow_direct_scanout
-        && geometry_scale.is_none()
+        && mapping.frame.is_none()
+        && mapping.content.is_none()
         && motion.is_identity()
         && !workspace_transition_blocks_scanout(state, root_surface);
     let root_clip = visual_state.and_then(|visual| visual.clip);
@@ -8811,7 +8797,7 @@ fn render_composed_entry(
         visual_state
             .map(|visual| visual.effects.opacity_alpha)
             .unwrap_or(u8::MAX),
-        geometry_scale,
+        mapping.content,
         output_scale,
     );
     push_scene_item_frame_elements(frame_elements, item_start..items.len());
@@ -8819,15 +8805,15 @@ fn render_composed_entry(
         push_root_surface_effect_elements(frame_elements, visual_state, FramePhase::OverWindow);
         push_root_surface_effect_elements(frame_elements, visual_state, FramePhase::Overlay);
     }
-    if let Some((logical, visual)) = geometry_scale {
-        scale_scene_items_into_visual_box(&mut items[item_start..], logical, visual);
+    if let Some(content) = mapping.content {
+        scale_scene_items_into_visual_box(&mut items[item_start..], content);
     }
     apply_workspace_motion(&mut items[item_start..], &mut frame_elements[effect_start..], motion);
 }
 
-fn scale_scene_items_into_visual_box(items: &mut [SceneItem], logical: RectI, visual: RectI) {
+fn scale_scene_items_into_visual_box(items: &mut [SceneItem], content: crate::render::RectMapping) {
     for item in items {
-        item.state.bounds = crate::render::map_layout_rect(logical, visual, item.state.bounds);
+        item.state.bounds = content.map_rect(item.state.bounds);
         item.damage = DamageRegion::from_rect(item.state.bounds);
         item.opaque = false;
         item.opaque_region.clear();
@@ -9210,7 +9196,11 @@ mod window_animation_tests {
         let visual = RectI::new(200, 0, 50, 40).unwrap();
         let destination = RectI::new(200, 0, 100, 100).unwrap();
         assert!(!logical.intersects(destination));
-        assert!(super::bounds_visible_on_output(logical, destination, Some((logical, visual))));
+        assert!(super::bounds_visible_on_output(
+            logical,
+            destination,
+            crate::render::RectMapping::between(logical, visual),
+        ));
         assert!(!super::bounds_visible_on_output(logical, destination, None));
     }
 

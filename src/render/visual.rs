@@ -168,6 +168,53 @@ pub fn shadow_geometry(clip: RootSurfaceClip, style: ShadowVisualStyle) -> Optio
     Some(ShadowGeometry { bounds, inner_rect, shadow_range })
 }
 
+/// One rectangle mapped onto another.
+///
+/// `None` on [`WindowRenderMapping`] means identity. A mapping exists only when
+/// the two rectangles differ and the logical one has a positive size, which is
+/// the guard the renderer and pointer code used before this type existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RectMapping {
+    pub logical: RectI,
+    pub visual: RectI,
+}
+
+impl RectMapping {
+    /// `None` when the rectangles are equal or `logical` cannot be a scale source.
+    pub fn between(logical: RectI, visual: RectI) -> Option<Self> {
+        (logical != visual && logical.width > 0 && logical.height > 0)
+            .then_some(Self { logical, visual })
+    }
+
+    pub fn map_rect(self, rect: RectI) -> RectI {
+        map_layout_rect(self.logical, self.visual, rect)
+    }
+
+    pub fn map_point(self, point: (f64, f64)) -> (f64, f64) {
+        map_layout_point(self.logical, self.visual, point)
+    }
+
+    pub fn unmap_point(self, point: (f64, f64)) -> (f64, f64) {
+        unmap_layout_point(self.logical, self.visual, point)
+    }
+}
+
+/// Logical-to-visual rectangles for one window.
+///
+/// The frame pair moves the border and shadow. The content pair moves the
+/// client surfaces and pointer coordinates. Hyprland stores the animated box
+/// on the window (`m_realPosition` / `m_realSize`); sway leaves a tiled buffer
+/// at the content origin and does not stretch it. The stretch here is the
+/// extra step while the client has not answered a size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowRenderMapping {
+    /// Border, shadow, rounded clip: tile frame -> visual frame.
+    pub frame: Option<RectMapping>,
+    /// Surfaces of the root tree and pointer coordinates:
+    /// client content -> visual content.
+    pub content: Option<RectMapping>,
+}
+
 /// Map `rect` from the logical layout rectangle into the sampled visual rectangle.
 ///
 /// The layout rectangle itself maps exactly. Other rectangles, including popups that stick out,

@@ -27,8 +27,8 @@ pub use {
         TextureSource,
     },
     visual::{
-        map_layout_point, map_layout_rect, place_visual_frame, shadow_geometry, unmap_layout_point,
-        BlurVisualStyle, BorderGradient, BorderVisualStyle, RootSurfaceVisualState, RoundedRing,
-        ShadowVisualStyle, SurfaceEffectStyle, WindowClip,
+        map_layout_rect, place_visual_frame, shadow_geometry, BlurVisualStyle, BorderGradient,
+        BorderVisualStyle, RectMapping, RootSurfaceVisualState, RoundedRing, ShadowVisualStyle,
+        SurfaceEffectStyle, WindowClip, WindowRenderMapping,
     },
 };
