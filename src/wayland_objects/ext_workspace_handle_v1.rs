@@ -19,6 +19,7 @@ pub struct ExtWorkspaceHandleV1 {
     manager: Resolved<ExtWorkspaceManagerV1Id>,
     workspace_id: WorkspaceId,
     version: u32,
+    sent_id: Option<String>,
     sent_name: Option<String>,
     sent_coordinates: Option<Vec<u32>>,
     sent_state: Option<u32>,
@@ -38,6 +39,7 @@ impl ExtWorkspaceHandleV1 {
             manager,
             workspace_id,
             version,
+            sent_id: None,
             sent_name: None,
             sent_coordinates: None,
             sent_state: None,
@@ -87,6 +89,14 @@ impl ExtWorkspaceHandleV1 {
 
         if self.removed {
             return;
+        }
+
+        if self.sent_id.as_ref() != Some(&workspace.stable_id) {
+            self.send_event(
+                ext_workspace_handle_v1::Event::Id { id: workspace.stable_id.clone() },
+                dispatcher,
+            );
+            self.sent_id = Some(workspace.stable_id.clone());
         }
 
         if self.sent_name.as_ref() != Some(&workspace.name) {

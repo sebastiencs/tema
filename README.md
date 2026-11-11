@@ -45,6 +45,13 @@ The essentials are done:
 - Blur, shadows, gradient borders with corner rounding
 - Inactive-window dimming and opacity
 
+## Waybar
+
+`ext-workspace` `id` is the workspace stable id (`workspace-1`, `workspace-2`, …),
+the same string the IPC snapshot uses. Waybar's default `ext/workspaces` sort
+compares that string, so `workspace-10` comes before `workspace-2`. Set
+`"sort-by-coordinates": true` on the module to follow workspace order instead.
+
 ## Build & run
 
 Requires a Rust **nightly** toolchain and `libshaderc_shared.so`

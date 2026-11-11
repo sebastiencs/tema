@@ -310,10 +310,12 @@ impl Object for ExtWorkspaceManagerV1 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use {
         super::ExtWorkspaceManagerV1,
         crate::{
-            clients::{Client, ClientId, ClientManagerAction, RawEvent, Resolved},
+            clients::{Arguments, Client, ClientId, ClientManagerAction, RawEvent, Resolved},
             io_uring::model::IoUringAction,
             object::Object,
             protocol_generated::{
@@ -534,5 +536,114 @@ mod tests {
         assert!(!handles
             .client
             .contains_object(handles.workspace_id, &handles.state));
+    }
+
+    struct Wire {
+        object: u32,
+        opcode: u16,
+        args: Vec<u32>,
+    }
+
+    fn sync_manager(handles: &mut Handles, dispatcher: &mut Dispatcher) {
+        let mut client_dispatcher = handles.client.test_dispatcher(dispatcher);
+        let mut manager = handles
+            .state
+            .objects
+            .grab_object::<ExtWorkspaceManagerV1>(handles.manager.object_id());
+        manager.sync(&mut handles.client, &mut handles.state, &mut client_dispatcher, true);
+    }
+
+    fn queued_events(dispatcher: &Dispatcher) -> Vec<Wire> {
+        let mut events = Vec::new();
+        dispatcher.test_for_each_queued_action::<IoUringAction>(|action| {
+            let IoUringAction::Sendmsg { buffer, .. } = action else {
+                return;
+            };
+            let mut offset = 0;
+            while offset + 8 <= buffer.len() {
+                let object = u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap());
+                let header = u32::from_ne_bytes(buffer[offset + 4..offset + 8].try_into().unwrap());
+                let size = (header >> 16) as usize;
+                let opcode = header as u16;
+                if size < 8 || offset + size > buffer.len() {
+                    break;
+                }
+                let mut args = Vec::new();
+                let mut word = offset + 8;
+                while word + 4 <= offset + size {
+                    args.push(u32::from_ne_bytes(buffer[word..word + 4].try_into().unwrap()));
+                    word += 4;
+                }
+                events.push(Wire { object, opcode, args });
+                offset += size;
+            }
+        });
+        events
+    }
+
+    fn wayland_string(args: &[u32]) -> String {
+        Arguments::from_words(VecDeque::from(args.to_vec()))
+            .string()
+            .unwrap()
+    }
+
+    /// Object ids announced by `ext_workspace_manager_v1.workspace` (opcode 1).
+    fn announced_workspaces(events: &[Wire], manager: u32) -> Vec<u32> {
+        events
+            .iter()
+            .filter(|event| event.object == manager && event.opcode == 1)
+            .map(|event| event.args[0])
+            .collect()
+    }
+
+    fn id_strings(events: &[Wire], manager: u32) -> Vec<String> {
+        let workspaces = announced_workspaces(events, manager);
+        events
+            .iter()
+            .filter(|event| event.opcode == 0 && workspaces.contains(&event.object))
+            .map(|event| wayland_string(&event.args))
+            .collect()
+    }
+
+    fn id_precedes_name(events: &[Wire], workspace: u32) -> bool {
+        let opcodes = events
+            .iter()
+            .filter(|event| event.object == workspace)
+            .map(|event| event.opcode)
+            .collect::<Vec<_>>();
+        let id = opcodes.iter().position(|opcode| *opcode == 0);
+        let name = opcodes.iter().position(|opcode| *opcode == 1);
+        matches!((id, name), (Some(id), Some(name)) if id < name)
+    }
+
+    #[test]
+    fn workspace_id_is_sent_once_per_handle() {
+        let mut handles = handles();
+        let workspace_id = handles.state.create_workspace(None, None);
+        let stable_id = handles.state.workspaces[workspace_id].stable_id.clone();
+        let manager = u32::from(handles.manager_id);
+        let mut dispatcher = Dispatcher::default();
+
+        sync_manager(&mut handles, &mut dispatcher);
+        let events = queued_events(&dispatcher);
+        let workspaces = announced_workspaces(&events, manager);
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(id_strings(&events, manager), vec![stable_id.clone()]);
+        assert!(id_precedes_name(&events, workspaces[0]));
+
+        sync_manager(&mut handles, &mut dispatcher);
+        let events = queued_events(&dispatcher);
+        assert_eq!(id_strings(&events, manager), vec![stable_id.clone()]);
+
+        handles
+            .manager
+            .ref_mut(&mut handles.state)
+            .release_workspace_handle(workspace_id);
+        sync_manager(&mut handles, &mut dispatcher);
+        let events = queued_events(&dispatcher);
+        assert_eq!(id_strings(&events, manager), vec![stable_id.clone(), stable_id]);
+        let workspaces = announced_workspaces(&events, manager);
+        assert_eq!(workspaces.len(), 2);
+        assert!(id_precedes_name(&events, workspaces[1]));
     }
 }
