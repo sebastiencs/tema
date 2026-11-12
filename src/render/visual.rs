@@ -538,8 +538,15 @@ fn round_to_i32(value: f64) -> i32 {
     }
 }
 
+/// Thinnest border ring that hides the clip's outward-grown fade.
+///
+/// The grown fade reaches 1.5 px past the window's curve, so a thinner ring
+/// would let window colour show outside it.
+const MIN_BORDER_FOR_GROWN_CLIP: i32 = 2;
+
 impl RootSurfaceVisualState {
-    /// True when an opaque border is drawn over the edge of the client clip.
+    /// True when an opaque border at least [`MIN_BORDER_FOR_GROWN_CLIP`] px
+    /// thick is drawn over the edge of the client clip.
     ///
     /// The ring's inner shape is the content clip's shape
     /// (`push_root_surface_effect_elements`), so the clip can fade 1px further
@@ -551,10 +558,16 @@ impl RootSurfaceVisualState {
         let Some(border) = self.border else {
             return false;
         };
+        let frame = self.frame_clip.outer_rect;
+        let content = self.content_rect;
         self.border_alpha == u8::MAX
             && border.gradient.start_color.a == u8::MAX
             && border.gradient.end_color.a == u8::MAX
-            && clip.outer_rect == self.content_rect
+            && clip.outer_rect == content
+            && content.x.saturating_sub(frame.x) >= MIN_BORDER_FOR_GROWN_CLIP
+            && content.y.saturating_sub(frame.y) >= MIN_BORDER_FOR_GROWN_CLIP
+            && frame.x2().saturating_sub(content.x2()) >= MIN_BORDER_FOR_GROWN_CLIP
+            && frame.y2().saturating_sub(content.y2()) >= MIN_BORDER_FOR_GROWN_CLIP
     }
 
     /// Clip for the drop shadow. A square shadow when `rounding` is zero, otherwise the outer frame.
@@ -817,6 +830,60 @@ mod tests {
         let shifted =
             RootSurfaceVisualState { content_rect: RectI::new(5, 6, 92, 70).unwrap(), ..visual };
         assert!(!shifted.border_covers_clip_edge());
+    }
+
+    #[test]
+    fn border_covers_clip_edge_needs_a_ring_at_least_two_pixels_thick() {
+        let content_rect = RectI::new(10, 10, 80, 60).unwrap();
+        let opaque_border = BorderVisualStyle {
+            gradient: BorderGradient {
+                start_color: RgbaColor::new(1, 2, 3, 255),
+                end_color: RgbaColor::new(4, 5, 6, 255),
+                angle_degrees: 0,
+            },
+        };
+        let one_pixel_ring = RootSurfaceVisualState {
+            outer_rect: RectI::new(9, 9, 82, 62).unwrap(),
+            content_rect,
+            clip: Some(WindowClip::Frame(RootSurfaceClip::new(
+                content_rect,
+                12,
+                RoundingPower::DEFAULT,
+            ))),
+            frame_clip: RootSurfaceClip::new(
+                RectI::new(9, 9, 82, 62).unwrap(),
+                14,
+                RoundingPower::DEFAULT,
+            ),
+            border: Some(opaque_border),
+            border_alpha: u8::MAX,
+            shadow: None,
+            shadow_alpha: u8::MAX,
+            effects: SurfaceEffectStyle { blur: None, opacity_alpha: u8::MAX, dim_alpha: 0 },
+        };
+        assert!(!one_pixel_ring.border_covers_clip_edge());
+
+        let two_pixel_ring = RootSurfaceVisualState {
+            outer_rect: RectI::new(8, 8, 84, 64).unwrap(),
+            frame_clip: RootSurfaceClip::new(
+                RectI::new(8, 8, 84, 64).unwrap(),
+                14,
+                RoundingPower::DEFAULT,
+            ),
+            ..one_pixel_ring
+        };
+        assert!(two_pixel_ring.border_covers_clip_edge());
+
+        let uneven_ring = RootSurfaceVisualState {
+            outer_rect: RectI::new(8, 8, 83, 64).unwrap(),
+            frame_clip: RootSurfaceClip::new(
+                RectI::new(8, 8, 83, 64).unwrap(),
+                14,
+                RoundingPower::DEFAULT,
+            ),
+            ..one_pixel_ring
+        };
+        assert!(!uneven_ring.border_covers_clip_edge());
     }
 
     #[test]
