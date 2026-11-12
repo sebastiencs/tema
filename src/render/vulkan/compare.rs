@@ -703,6 +703,41 @@ fn rounded_border_fades_its_outer_and_inner_curves() {
 }
 
 #[test]
+fn rounded_shadow_fades_its_cutout() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping vulkan rounded shadow: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let shadow = FrameElement::Effect {
+        phase: FramePhase::UnderWindow,
+        element: EffectElement::WindowShadow {
+            clip: RootSurfaceClip::new(
+                RectI::new(2, 2, 4, 4).expect("shadow"),
+                2,
+                RoundingPower::default(),
+            ),
+            style: ShadowVisualStyle {
+                radius: 2,
+                offset_x: 0,
+                offset_y: 0,
+                color: RgbaColor::new(0, 0, 0, 255),
+                power: ShadowPower::default(),
+            },
+            alpha: u8::MAX,
+        },
+    };
+    let gles = paint_elements(&mut *pair.gl, vec![shadow.clone()], 8, 8);
+    // Window corner pixel: falloff 0.882 times (1 - 0.379) uncovered.
+    assert_close(pixel(&gles, 8, 2, 2), &[0, 0, 0, 140], 2);
+    // Mostly covered by the window: (1 - 0.919) remains.
+    assert_close(pixel(&gles, 8, 2, 3), &[0, 0, 0, 21], 2);
+    // Fully inside the window.
+    assert_eq!(pixel(&gles, 8, 3, 3), &[0, 0, 0, 0]);
+    assert_close(&gles, &paint_elements(&mut *pair.vulkan, vec![shadow], 8, 8), 2);
+}
+
+#[test]
 fn vulkan_matches_gles_blur_and_keeps_later_textures_on_top() {
     let Some(mut pair) = pair() else {
         eprintln!("skipping vulkan blur comparison: no matching DRM node");
