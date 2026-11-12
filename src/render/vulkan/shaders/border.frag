@@ -17,6 +17,7 @@ layout(std140, set = 0, binding = 0) uniform Border {
     vec4 gradient_start;
     vec4 gradient_end;
 } draw;
+#include "rounded_rect.glsl"
 bool pointInRect(vec2 point, vec4 rect) {
     return point.x >= rect.x
         && point.x < (rect.x + rect.z)

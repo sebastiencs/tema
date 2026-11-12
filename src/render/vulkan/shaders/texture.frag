@@ -74,6 +74,7 @@ const int NEEDS_COLOR_PATH =
 #define u_tonemap_from_lms_1 draw.tonemap_from_lms_1
 #define u_tonemap_from_lms_2 draw.tonemap_from_lms_2
 #include "color.glsl"
+#include "rounded_rect.glsl"
 bool pointInRect(vec2 point, vec4 rect) {
     return point.x >= rect.x
         && point.x < (rect.x + rect.z)

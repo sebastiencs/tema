@@ -6,6 +6,7 @@ uniform float u_corner_radius;
 uniform float u_rounding_power;
 uniform float u_shadow_range;
 uniform float u_shadow_power;
+#include "rounded_rect.glsl"
 bool pointInRect(vec2 point, vec4 rect) {
     return point.x >= rect.x
         && point.x < (rect.x + rect.z)

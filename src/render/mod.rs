@@ -4,6 +4,7 @@ mod color_pipeline;
 mod factory;
 pub mod gles;
 pub mod recipe;
+mod shader_source;
 pub mod visual;
 mod vulkan;
 

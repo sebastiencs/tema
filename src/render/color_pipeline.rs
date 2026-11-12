@@ -156,7 +156,7 @@ pub fn shader_tf(tf: TransferFunction) -> u32 {
 /// defines, then `color.glsl`, then the clip shader without a second precision line.
 pub fn gles_fragment_source(key: TexturePipelineKey) -> String {
     if key.selects_current_shader() {
-        return TEXTURE_CLIP_FRAG.to_string();
+        return crate::render::shader_source::expand_gles_includes(TEXTURE_CLIP_FRAG);
     }
     let mut source = String::from("precision highp float;\n");
     source.push_str(&format!("#define SRC_TF {}\n", key.src_tf));
@@ -177,7 +177,7 @@ pub fn gles_fragment_source(key: TexturePipelineKey) -> String {
             .strip_prefix("precision highp float;\n")
             .unwrap_or(TEXTURE_CLIP_FRAG),
     );
-    source
+    crate::render::shader_source::expand_gles_includes(&source)
 }
 
 /// Values uploaded with a color transform. Identity draws leave these unread.
@@ -267,7 +267,14 @@ mod tests {
     #[test]
     fn identity_key_compiles_the_current_fragment_shader() {
         let source = gles_fragment_source(TexturePipelineKey::identity());
-        assert_eq!(source, include_str!("../shaders/texture_clip.frag"));
+        assert_eq!(
+            source,
+            crate::render::shader_source::expand_gles_includes(include_str!(
+                "../shaders/texture_clip.frag"
+            ))
+        );
+        assert!(source.contains("float roundedRectCoverage("));
+        assert!(!source.contains("#include"));
         assert!(!source.contains("#define SRC_TF"));
         assert!(!source.contains("decode_tf"));
         assert!(TexturePipelineKey::identity()
@@ -287,6 +294,8 @@ mod tests {
         assert!(source.contains("#define HAS_MATRIX 1\n"));
         assert!(source.contains("#define NEEDS_COLOR_PATH 1\n"));
         assert!(source.contains("#define COLOR_LOOSE_UNIFORMS 1\n"));
+        assert!(source.contains("float roundedRectCoverage("));
+        assert!(!source.contains("#include"));
         assert!(source.contains("uniform vec4 u_color_matrix_0;"));
         assert!(source.contains("vec3 decode_tf(int tf, vec3 value)"));
         assert!(source.contains("vec3 encode_tf(int tf, vec3 value)"));
@@ -417,6 +426,11 @@ mod tests {
         let key = TexturePipelineKey::from_color(None, true);
         assert!(key.selects_current_shader());
         assert!(key.specialization_constants().is_empty());
-        assert_eq!(gles_fragment_source(key), include_str!("../shaders/texture_clip.frag"));
+        assert_eq!(
+            gles_fragment_source(key),
+            crate::render::shader_source::expand_gles_includes(include_str!(
+                "../shaders/texture_clip.frag"
+            ))
+        );
     }
 }

@@ -9,6 +9,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/render/vulkan/shaders");
     println!("cargo:rerun-if-changed=src/render/shaders_common/color.glsl");
     println!("cargo:rerun-if-changed=src/shaders/texture_clip.frag");
+    println!("cargo:rerun-if-changed=src/render/shaders_common/rounded_rect.glsl");
+    println!("cargo:rerun-if-changed=src/shaders/border.frag");
+    println!("cargo:rerun-if-changed=src/shaders/shadow.frag");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let shaders = shader_sources(shader_dir);
     let generated =
@@ -127,6 +130,7 @@ void main() {
         "color.vulkan.frag",
     );
     verify_es_snippet();
+    verify_gles_shaders();
 }
 
 /// shaderc emits SPIR-V, which cannot represent `#version 100`.
@@ -150,6 +154,51 @@ fn verify_es_snippet() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+/// Validates the GLES fragment shaders as GLSL ES 1.00, with the shared
+/// snippet pasted in the way `render::shader_source::expand_gles_includes`
+/// does it at runtime.
+fn verify_gles_shaders() {
+    let snippet = fs::read_to_string("src/render/shaders_common/rounded_rect.glsl")
+        .expect("read rounded_rect.glsl");
+    let color =
+        fs::read_to_string("src/render/shaders_common/color.glsl").expect("read color.glsl");
+    let expand = |source: &str| source.replace("#include \"rounded_rect.glsl\"", &snippet);
+    let read = |path: &str| {
+        fs::read_to_string(path).unwrap_or_else(|error| panic!("read {path}: {error}"))
+    };
+    let texture = read("src/shaders/texture_clip.frag");
+    let texture_body = texture
+        .strip_prefix("precision highp float;\n")
+        .unwrap_or(&texture);
+    let color_texture = format!(
+        "precision highp float;\n#define SRC_TF 2\n#define DST_TF 2\n#define HAS_MATRIX 0\n#define ALPHA_MODE 0\n#define YUV_MODE 0\n#define TONEMAP 0\n#define NEEDS_COLOR_PATH 1\n#define COLOR_LOOSE_UNIFORMS 1\n{color}{texture_body}"
+    );
+    let sources = [
+        ("texture_clip.es.frag", expand(&texture)),
+        ("texture_clip_color.es.frag", expand(&color_texture)),
+        ("border.es.frag", expand(&read("src/shaders/border.frag"))),
+        ("shadow.es.frag", expand(&read("src/shaders/shadow.frag"))),
+    ];
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    for (name, source) in sources {
+        let path = out_dir.join(name);
+        fs::write(&path, format!("#version 100\n{source}"))
+            .unwrap_or_else(|error| panic!("write {name}: {error}"));
+        let output = Command::new("glslangValidator")
+            .args(["-S", "frag", "--glsl-version", "100"])
+            .arg(&path)
+            .output()
+            .expect("run glslangValidator for the GLES shaders");
+        if !output.status.success() {
+            panic!(
+                "compile {name}:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 

@@ -1519,9 +1519,11 @@ fn create_texture_program_from(fragment_source: &str) -> Result<TextureProgram, 
 
 fn create_border_program() -> Result<BorderProgram, String> {
     let vertex_source = include_str!("../../shaders/shadow.vert");
-    let fragment_source = include_str!("../../shaders/border.frag");
+    let fragment_source = crate::render::shader_source::expand_gles_includes(include_str!(
+        "../../shaders/border.frag"
+    ));
     let vertex_shader = compile_shader(gl::VERTEX_SHADER as _, vertex_source)?;
-    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER as _, fragment_source)?;
+    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER as _, &fragment_source)?;
     let program = link_program(vertex_shader, fragment_shader, "border program")?;
 
     Ok(BorderProgram {
@@ -1568,9 +1570,11 @@ fn create_border_program() -> Result<BorderProgram, String> {
 
 fn create_shadow_program() -> Result<ShadowProgram, String> {
     let vertex_source = include_str!("../../shaders/shadow.vert");
-    let fragment_source = include_str!("../../shaders/shadow.frag");
+    let fragment_source = crate::render::shader_source::expand_gles_includes(include_str!(
+        "../../shaders/shadow.frag"
+    ));
     let vertex_shader = compile_shader(gl::VERTEX_SHADER as _, vertex_source)?;
-    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER as _, fragment_source)?;
+    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER as _, &fragment_source)?;
     let program = link_program(vertex_shader, fragment_shader, "shadow program")?;
 
     Ok(ShadowProgram {

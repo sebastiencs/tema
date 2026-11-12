@@ -26,6 +26,7 @@ uniform vec4 u_yuv_row0;
 uniform vec4 u_yuv_row1;
 uniform vec4 u_yuv_row2;
 #endif
+#include "rounded_rect.glsl"
 bool pointInRect(vec2 point, vec4 rect) {
     return point.x >= rect.x
         && point.x < (rect.x + rect.z)

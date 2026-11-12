@@ -13,6 +13,7 @@ layout(std140, set = 0, binding = 0) uniform Shadow {
     vec4 shadow_color;
     vec4 inner_rect;
 } draw;
+#include "rounded_rect.glsl"
 bool pointInRect(vec2 point, vec4 rect) {
     return point.x >= rect.x
         && point.x < (rect.x + rect.z)
