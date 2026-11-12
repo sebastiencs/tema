@@ -469,7 +469,12 @@ impl GlesDraw<'_> {
             .to_gl_array();
             let tex_transform = item.tex_transform.to_gl_array();
             unsafe {
-                if item.blend || item.alpha < u8::MAX || item.alpha_multiplier < u32::MAX {
+                // A rounded mask fades its edge pixels, so even an opaque texture blends.
+                if item.blend
+                    || item.alpha < u8::MAX
+                    || item.alpha_multiplier < u32::MAX
+                    || !matches!(item.mask, RenderItemMask::None)
+                {
                     gl::Enable(gl::BLEND as _);
                 } else {
                     gl::Disable(gl::BLEND as _);
@@ -1850,7 +1855,8 @@ mod tests {
         let texture_source = include_str!("../../shaders/texture_clip.frag");
         let border_source = include_str!("../../shaders/border.frag");
 
-        assert!(texture_source.contains("pointInRoundedRect(point, u_clip_inner_rect"));
+        assert!(texture_source.contains("roundedRectCoverage("));
+        assert!(texture_source.contains("u_clip_inner_rect,"));
         assert!(!texture_source.contains("u_dim_amount"));
         assert!(!texture_source.contains("color.rgb *= (1.0 - u_dim_amount)"));
         assert!(border_source.contains("pointInRoundedRect(v_local_position, u_inner_rect"));

@@ -81,64 +81,39 @@ bool pointInRect(vec2 point, vec4 rect) {
         && point.y >= rect.y
         && point.y < (rect.y + rect.w);
 }
-float roundedCornerDistance(vec2 delta, float roundingPower) {
-    vec2 absoluteDelta = abs(delta);
-    return pow(
-        pow(absoluteDelta.x, roundingPower) + pow(absoluteDelta.y, roundingPower),
-        1.0 / roundingPower
-    );
-}
-bool pointInRoundedRect(vec2 point, vec4 rect, float radius, float roundingPower) {
-    if (!pointInRect(point, rect)) {
-        return false;
-    }
-    if (radius <= 0.0) {
-        return true;
-    }
-    float left = rect.x + radius;
-    float top = rect.y + radius;
-    float right = rect.x + rect.z - radius;
-    float bottom = rect.y + rect.w - radius;
-    if (point.x < left && point.y < top) {
-        return roundedCornerDistance(point - vec2(left, top), roundingPower) <= radius;
-    }
-    if (point.x >= right && point.y < top) {
-        return roundedCornerDistance(point - vec2(right, top), roundingPower) <= radius;
-    }
-    if (point.x < left && point.y >= bottom) {
-        return roundedCornerDistance(point - vec2(left, bottom), roundingPower) <= radius;
-    }
-    if (point.x >= right && point.y >= bottom) {
-        return roundedCornerDistance(point - vec2(right, bottom), roundingPower) <= radius;
-    }
-    return true;
-}
 void main() {
     vec2 point = v_local_position;
+    float coverage = 1.0;
     if (draw.clip_mode == 3) {
         // Corner-only rounding: keep pixels outside the window box so that
-        // client-drawn CSD shadows survive; discard only pixels inside the
-        // box that fall outside a rounded corner.
-        float outerRadius = min(draw.outer_radius, min(draw.outer_rect.z, draw.outer_rect.w) * 0.5);
-        float outerRoundingPower = max(draw.outer_power, 0.0001);
-        if (pointInRect(point, draw.outer_rect)
-            && !pointInRoundedRect(point, draw.outer_rect, outerRadius, outerRoundingPower)) {
-            discard;
+        // client-drawn CSD shadows survive; fade only pixels inside the
+        // box near a rounded corner.
+        if (pointInRect(point, draw.outer_rect)) {
+            coverage = roundedRectCoverage(
+                point,
+                draw.outer_rect,
+                draw.outer_radius,
+                draw.outer_power
+            );
         }
     } else if (draw.clip_mode != 0) {
-        float outerRadius = min(draw.outer_radius, min(draw.outer_rect.z, draw.outer_rect.w) * 0.5);
-        float outerRoundingPower = max(draw.outer_power, 0.0001);
-        if (!pointInRoundedRect(point, draw.outer_rect, outerRadius, outerRoundingPower)) {
-            discard;
-        }
+        coverage = roundedRectCoverage(
+            point,
+            draw.outer_rect,
+            draw.outer_radius,
+            draw.outer_power
+        );
         if (draw.clip_mode == 2) {
-            float innerRadius =
-                min(draw.inner_radius, min(draw.inner_rect.z, draw.inner_rect.w) * 0.5);
-            float innerRoundingPower = max(draw.inner_power, 0.0001);
-            if (pointInRoundedRect(point, draw.inner_rect, innerRadius, innerRoundingPower)) {
-                discard;
-            }
+            coverage *= 1.0 - roundedRectCoverage(
+                point,
+                draw.inner_rect,
+                draw.inner_radius,
+                draw.inner_power
+            );
         }
+    }
+    if (coverage <= 0.0) {
+        discard;
     }
     vec4 color;
     if (YUV_MODE != 0) {
@@ -158,6 +133,6 @@ void main() {
         color = texture(u_texture, v_texcoord);
     }
     color = apply_color(color, NEEDS_COLOR_PATH, SRC_TF, DST_TF, HAS_MATRIX, ALPHA_MODE, 1, TONEMAP);
-    color *= draw.alpha;
+    color *= draw.alpha * coverage;
     out_color = color;
 }
