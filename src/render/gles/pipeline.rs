@@ -1859,7 +1859,8 @@ mod tests {
         assert!(texture_source.contains("u_clip_inner_rect,"));
         assert!(!texture_source.contains("u_dim_amount"));
         assert!(!texture_source.contains("color.rgb *= (1.0 - u_dim_amount)"));
-        assert!(border_source.contains("pointInRoundedRect(v_local_position, u_inner_rect"));
+        assert!(border_source.contains("roundedRectCoverage("));
+        assert!(border_source.contains("u_inner_rect,"));
         assert!(!border_source.contains("pointInRect(v_local_position, u_inner_rect)"));
     }
 

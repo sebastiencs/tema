@@ -660,6 +660,49 @@ fn vulkan_matches_gles_dim_border_and_shadow() {
 }
 
 #[test]
+fn rounded_border_fades_its_outer_and_inner_curves() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping vulkan rounded border: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let ring = RoundedRing {
+        outer: RootSurfaceClip::new(
+            RectI::new(0, 0, 8, 8).expect("outer"),
+            4,
+            RoundingPower::default(),
+        ),
+        inner: RootSurfaceClip::new(
+            RectI::new(2, 2, 4, 4).expect("inner"),
+            2,
+            RoundingPower::default(),
+        ),
+    };
+    let border = FrameElement::Effect {
+        phase: FramePhase::OverWindow,
+        element: EffectElement::WindowBorder {
+            ring,
+            gradient: BorderGradient {
+                start_color: RgbaColor::new(255, 255, 255, 255),
+                end_color: RgbaColor::new(255, 255, 255, 255),
+                angle_degrees: 0,
+            },
+            alpha: u8::MAX,
+        },
+    };
+    let gles = paint_elements(&mut *pair.gl, vec![border.clone()], 8, 8);
+    // Outside the outer curve: d = 0.95.
+    assert_eq!(pixel(&gles, 8, 0, 0), &[0, 0, 0, 0]);
+    // Outer curve: d = -0.46, coverage 0.96.
+    assert_close(pixel(&gles, 8, 1, 1), &[246, 246, 246, 246], 1);
+    // Inner curve: the inner coverage is 0.38, so the ring keeps 0.62.
+    assert_close(pixel(&gles, 8, 2, 2), &[158, 158, 158, 158], 1);
+    // Inside the inner rect.
+    assert_eq!(pixel(&gles, 8, 4, 4), &[0, 0, 0, 0]);
+    assert_close(&gles, &paint_elements(&mut *pair.vulkan, vec![border], 8, 8), 1);
+}
+
+#[test]
 fn vulkan_matches_gles_blur_and_keeps_later_textures_on_top() {
     let Some(mut pair) = pair() else {
         eprintln!("skipping vulkan blur comparison: no matching DRM node");
