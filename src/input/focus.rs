@@ -87,6 +87,7 @@ fn set_keyboard_focus_with_snapshot(
 
     let old_focus = state.seat.keyboard_focus;
     state.seat.keyboard_focus = new_focus;
+    reconfigure_activation_roots(state, dispatcher, old_focus, new_focus);
     dispatcher.dispatch(crate::xwayland::XwaylandAction::KeyboardFocus);
     super::ime::keyboard_focus_changed(state, dispatcher, old_focus, new_focus);
     if let Some(new_focus) = new_focus.filter(|_| !state.session_lock.input_gated()) {
@@ -111,6 +112,39 @@ fn set_keyboard_focus_with_snapshot(
     crate::input::pointer_confine::maybe_activate_pointer_confine(state, dispatcher);
     if state.clear_urgency_for_focused_window().is_some() {
         dispatcher.dispatch(crate::clients::ClientManagerAction::WorkspaceStateChanged);
+    }
+}
+
+/// Ask each affected client to reconfigure the toplevel whose `activated` state changed.
+///
+/// A root that has no xdg toplevel (layer surface, X window, destroyed surface)
+/// matches nothing in `ReconfigureToplevelsForRoots`, so it is harmless.
+fn reconfigure_activation_roots(
+    state: &State,
+    dispatcher: &mut Dispatcher,
+    old_focus: Option<SurfaceFocus>,
+    new_focus: Option<SurfaceFocus>,
+) {
+    let mut by_client: std::collections::BTreeMap<ClientId, Vec<Resolved<WlSurfaceId>>> =
+        std::collections::BTreeMap::new();
+    for focus in [old_focus, new_focus].into_iter().flatten() {
+        let root = state
+            .root_surface_for_surface(focus.surface)
+            .unwrap_or(focus.surface);
+        if state.window_for_root(root).is_none() {
+            continue;
+        }
+        let roots = by_client.entry(root.client_id()).or_default();
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    for (client_id, roots) in by_client {
+        crate::seat::dispatch_client_action(
+            dispatcher,
+            client_id,
+            ClientAction::ReconfigureToplevelsForRoots { roots },
+        );
     }
 }
 
@@ -175,6 +209,62 @@ pub(crate) fn refresh_scene_focus(state: &mut State, dispatcher: &mut Dispatcher
     refresh_keyboard_focus(state, dispatcher);
 }
 
+/// Pointer refresh after a fullscreen layout change. Keyboard focus is not touched.
+pub(crate) fn refresh_pointer_focus_only(state: &mut State, dispatcher: &mut Dispatcher) {
+    crate::seat::refresh_pointer_focus(state, dispatcher, monotonic_time_msec(), false);
+}
+
+/// A window that just became fullscreen takes keyboard focus.
+///
+/// Does nothing when: the session lock gates input; the window has no root
+/// surface; the window is no longer fullscreen; the window's workspace is not
+/// active; a popup grab is active; or the window's root already holds keyboard
+/// focus (including through one of its popups).
+pub(crate) fn focus_fullscreen_window(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    window: crate::window::WindowId,
+) {
+    if state.session_lock.input_gated() {
+        return;
+    }
+    let Some(root) = state.window_root_surface(window) else {
+        return;
+    };
+    if !state.window_is_fullscreen(window) {
+        return;
+    }
+    let Some(workspace_id) = state.root_surface_workspace(root) else {
+        return;
+    };
+    if !state.workspace_is_active(workspace_id) {
+        return;
+    }
+    if state.seat.popup_grab_client().is_some() {
+        return;
+    }
+    if state.focused_root_surface() == Some(root) {
+        return;
+    }
+    set_keyboard_focus(state, dispatcher, Some(SurfaceFocus::new(root)));
+}
+
+/// Runs `focus_fullscreen_window` after the request handler releases its object.
+pub(crate) struct FocusFullscreenWindow {
+    pub window: crate::window::WindowId,
+}
+
+impl PostAction for FocusFullscreenWindow {
+    fn execute(
+        self: Box<Self>,
+        _client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+    ) {
+        focus_fullscreen_window(state, dispatcher, self.window);
+    }
+}
+
 /// Runs after the committing surface is released. Picking it while it is grabbed panics.
 pub(crate) struct RefreshLockFocus;
 
@@ -200,6 +290,83 @@ pub(crate) fn restore_keyboard_focus_after_unlock(
         return;
     }
     focus_after_client_disconnect(state, dispatcher);
+}
+
+/// Keep keyboard focus when it is still usable, otherwise restore it on a visible workspace.
+///
+/// "Usable" means: the focus surface still exists and is mapped
+/// (`keyboard_focus_is_restorable`), and
+/// - for a managed window root: its workspace is active;
+/// - for a layer-shell root: its keyboard interactivity is not `none`.
+/// Any other root kind (popup child, unmanaged X root) only needs to be restorable.
+///
+/// Usable focus is re-applied through `set_keyboard_focus`, so normalization still lets an
+/// exclusive layer take over. Otherwise the target workspace is the active workspace of the
+/// output that showed the old focused window, or of `State::active_output_id()` when the old
+/// focus was not a window. On it: history (MRU), then topmost, then the window under the
+/// pointer. With no candidate, `refresh_keyboard_focus` keeps today's behaviour.
+pub(crate) fn keep_or_restore_keyboard_focus(state: &mut State, dispatcher: &mut Dispatcher) {
+    if state.session_lock.input_gated() {
+        refresh_keyboard_focus(state, dispatcher);
+        return;
+    }
+    let current = state.seat.keyboard_focus();
+    if let Some(focus) = current.filter(|focus| keyboard_focus_is_usable(state, *focus)) {
+        set_keyboard_focus(state, dispatcher, Some(focus));
+        return;
+    }
+    let old_window_workspace = current.and_then(|focus| {
+        let root = state
+            .root_surface_for_surface(focus.surface)
+            .unwrap_or(focus.surface);
+        state.window_for_root(root)?;
+        state.root_surface_workspace(root)
+    });
+    let output_id = old_window_workspace
+        .and_then(|workspace_id| state.workspace_output_ids(workspace_id).into_iter().next())
+        .or_else(|| state.active_output_id());
+    let Some(workspace_id) =
+        output_id.and_then(|output_id| state.active_workspace_for_output(output_id))
+    else {
+        refresh_keyboard_focus(state, dispatcher);
+        return;
+    };
+    if let Some(candidate) = mru_focus_candidate_for_workspace(state, workspace_id, None)
+        .or_else(|| topmost_focus_candidate_for_workspace(state, workspace_id, None))
+        .or_else(|| pointer_focus_candidate_for_workspace(state, workspace_id, None))
+    {
+        set_keyboard_focus(state, dispatcher, Some(candidate));
+        return;
+    }
+    refresh_keyboard_focus(state, dispatcher);
+}
+
+/// Unlike `keyboard_focus_is_restorable`, an unmanaged X root (an override-redirect menu) is
+/// usable: workspace and layout publications must not pull focus off an open X menu.
+fn keyboard_focus_is_usable(state: &State, focus: SurfaceFocus) -> bool {
+    let Some(surface) = focus.surface.try_ref(state) else {
+        return false;
+    };
+    if surface.has_lock_surface_role()
+        || surface.has_cursor_role()
+        || surface.has_dnd_icon_role()
+        || surface.has_input_popup_role()
+        || surface.logical_size().is_none()
+    {
+        return false;
+    }
+    let root = state
+        .root_surface_for_surface(focus.surface)
+        .unwrap_or(focus.surface);
+    if state.window_for_root(root).is_some() {
+        return state
+            .root_surface_workspace(root)
+            .is_some_and(|workspace_id| state.workspace_is_active(workspace_id));
+    }
+    !matches!(
+        layer_surface_keyboard_focus_with_snapshot(state, root, None),
+        Some(LayerKeyboardFocus::None)
+    )
 }
 
 fn keyboard_focus_is_restorable(state: &State, focus: SurfaceFocus) -> bool {
@@ -933,7 +1100,8 @@ mod tests {
 
     use {
         super::{
-            refocus_after_surface_destroy, set_keyboard_focus,
+            focus_fullscreen_window, keep_or_restore_keyboard_focus, refocus_after_surface_destroy,
+            refresh_pointer_focus_only, refresh_scene_focus, set_keyboard_focus,
             topmost_focus_candidate_for_workspace, ClosedWindowFocus,
         },
         crate::{input::SurfaceFocus, runner::Dispatcher},
@@ -1096,6 +1264,270 @@ mod tests {
         assert!(!state.managed_window_state(window).unwrap().urgent);
         assert!(!state.workspace_is_urgent(workspace_id));
         assert_eq!(workspace_state_changed(&dispatcher), 1);
+    }
+
+    #[test]
+    fn focus_fullscreen_window_ignores_a_non_fullscreen_window() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let windows = three_windows(&mut state);
+        let window_b = state.window_for_root(windows.under_pointer).unwrap();
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.older)));
+
+        focus_fullscreen_window(&mut state, &mut dispatcher, window_b);
+
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(windows.older));
+    }
+
+    /// The `focus.rs` fixtures have no xdg toplevel, so `set_window_fullscreen` cannot sync the
+    /// layout. `focus_fullscreen_window` only reads `layout.fullscreen`, so set it directly.
+    fn mark_fullscreen(
+        state: &mut crate::state::State,
+        workspace_id: crate::state::WorkspaceId,
+        window: crate::window::WindowId,
+    ) {
+        state
+            .workspaces
+            .try_get_mut(workspace_id)
+            .unwrap()
+            .layout
+            .set_fullscreen(Some(window));
+        assert!(state.window_is_fullscreen(window));
+    }
+
+    #[test]
+    fn fullscreen_window_takes_keyboard_focus() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let windows = three_windows(&mut state);
+        let window_b = state.window_for_root(windows.under_pointer).unwrap();
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.older)));
+        mark_fullscreen(&mut state, windows.workspace_id, window_b);
+
+        focus_fullscreen_window(&mut state, &mut dispatcher, window_b);
+
+        assert_eq!(
+            state.seat.keyboard_focus().map(|focus| focus.surface),
+            Some(windows.under_pointer)
+        );
+    }
+
+    #[test]
+    fn focus_fullscreen_window_keeps_focus_already_on_the_window() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let windows = three_windows(&mut state);
+        let window_b = state.window_for_root(windows.under_pointer).unwrap();
+        set_keyboard_focus(
+            &mut state,
+            &mut dispatcher,
+            Some(SurfaceFocus::new(windows.under_pointer)),
+        );
+        mark_fullscreen(&mut state, windows.workspace_id, window_b);
+
+        focus_fullscreen_window(&mut state, &mut dispatcher, window_b);
+
+        assert_eq!(
+            state.seat.keyboard_focus().map(|focus| focus.surface),
+            Some(windows.under_pointer)
+        );
+    }
+
+    #[test]
+    fn pointer_only_refresh_keeps_keyboard_focus() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let windows = three_windows(&mut state);
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.older)));
+        state.seat.pointer_pos = (90.0, 90.0);
+
+        refresh_pointer_focus_only(&mut state, &mut dispatcher);
+
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(windows.older));
+
+        // The old behaviour: the same pointer position drops keyboard focus.
+        refresh_scene_focus(&mut state, &mut dispatcher);
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), None);
+    }
+
+    /// Like `place_window`, but the root belongs to `client_id`, so two roots can
+    /// belong to different clients.
+    fn place_window_for_client(
+        state: &mut crate::state::State,
+        raw: u32,
+        client_id: ClientId,
+        workspace_id: crate::state::WorkspaceId,
+        x: i32,
+        y: i32,
+    ) -> crate::clients::Resolved<WlSurfaceId> {
+        let (_, oid) = state.insert_object(WlSurface::new(WlSurfaceId::from(raw), client_id, 6));
+        let surface = crate::clients::Resolved::new(client_id, WlSurfaceId::from(raw), oid);
+        state.register_root_surface(surface);
+        crate::test_support::insert_window(state, surface);
+        state
+            .objects
+            .get_mut(surface.object_id())
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .test_map(crate::state::ObjectId::from(raw as usize), x, y, 30, 30);
+        let _ = state.assign_root_surface_to_workspace(surface, workspace_id);
+        state.managed_window_mut(surface).unwrap().mapped = true;
+        surface
+    }
+
+    fn reconfigure_roots_queued_for(
+        dispatcher: &Dispatcher,
+        client_id: ClientId,
+        root: crate::clients::Resolved<WlSurfaceId>,
+    ) -> bool {
+        dispatcher.test_has_queued_action_for::<crate::clients::ClientAction, ClientId>(
+            client_id,
+            |action| {
+                matches!(
+                    action,
+                    crate::clients::ClientAction::ReconfigureToplevelsForRoots { roots }
+                        if roots.as_slice() == [root]
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn keyboard_focus_change_reconfigures_old_and_new_roots() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let output_id = state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 100, 100));
+        let workspace_id = state.active_workspace_for_output(output_id).unwrap();
+        let client_a = ClientId::from_raw(1);
+        let client_b = ClientId::from_raw(2);
+        let root_a = place_window_for_client(&mut state, 91, client_a, workspace_id, 0, 0);
+        let root_b = place_window_for_client(&mut state, 92, client_b, workspace_id, 40, 0);
+        let mut dispatcher = Dispatcher::default();
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(root_a)));
+        dispatcher = Dispatcher::default();
+
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(root_b)));
+
+        assert!(reconfigure_roots_queued_for(&dispatcher, client_a, root_a));
+        assert!(reconfigure_roots_queued_for(&dispatcher, client_b, root_b));
+    }
+
+    #[test]
+    fn unchanged_keyboard_focus_queues_no_reconfigure() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let windows = three_windows(&mut state);
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.older)));
+        dispatcher = Dispatcher::default();
+
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.older)));
+
+        assert!(!dispatcher.test_has_queued_action::<crate::clients::ClientAction>(|action| {
+            matches!(action, crate::clients::ClientAction::ReconfigureToplevelsForRoots { .. })
+        }));
+    }
+
+    /// Two workspaces in one group on one output; the first one is active.
+    fn two_workspaces(
+        state: &mut crate::state::State,
+    ) -> (crate::state::WorkspaceId, crate::state::WorkspaceId) {
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let output_id = state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 100, 100));
+        let group_id = state.workspace_group_for_output(output_id).unwrap();
+        let first = state.active_workspace_for_output(output_id).unwrap();
+        let second = state.create_workspace(Some(group_id), Some("2".to_string()));
+        (first, second)
+    }
+
+    #[test]
+    fn workspace_switch_restores_the_target_workspace_history() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (first, second) = two_workspaces(&mut state);
+        let window_a = place_window(&mut state, 101, first, 0, 0);
+        let window_b = place_window(&mut state, 102, second, 0, 0);
+        let window_c = place_window(&mut state, 103, second, 40, 0);
+        assert!(state.activate_workspace(second));
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(window_b)));
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(window_c)));
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(window_b)));
+        assert!(state.activate_workspace(first));
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(window_a)));
+        assert!(state.activate_workspace(second));
+        state.seat.pointer_pos = (50.0, 10.0);
+        refresh_pointer_focus_only(&mut state, &mut dispatcher);
+
+        keep_or_restore_keyboard_focus(&mut state, &mut dispatcher);
+
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(window_b));
+    }
+
+    #[test]
+    fn workspace_switch_uses_topmost_without_history() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (first, second) = two_workspaces(&mut state);
+        let window_a = place_window(&mut state, 111, first, 0, 0);
+        let window_b = place_window(&mut state, 112, second, 0, 0);
+        let window_c = place_window(&mut state, 113, second, 40, 0);
+        let window_b_handle = state.window_for_root(window_b).unwrap();
+        let window_c_handle = state.window_for_root(window_c).unwrap();
+        state
+            .workspaces
+            .try_get_mut(second)
+            .unwrap()
+            .layout
+            .floating
+            .stack = vec![window_b_handle, window_c_handle];
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(window_a)));
+        assert!(state.activate_workspace(second));
+        state.seat.pointer_pos = (90.0, 90.0);
+        refresh_pointer_focus_only(&mut state, &mut dispatcher);
+
+        keep_or_restore_keyboard_focus(&mut state, &mut dispatcher);
+
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(window_c));
+    }
+
+    #[test]
+    fn usable_focus_is_kept() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let windows = three_windows(&mut state);
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.older)));
+        state.seat.pointer_pos = (50.0, 10.0);
+        refresh_pointer_focus_only(&mut state, &mut dispatcher);
+
+        keep_or_restore_keyboard_focus(&mut state, &mut dispatcher);
+
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(windows.older));
+    }
+
+    #[test]
+    fn focus_on_an_unmanaged_x_root_is_kept() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let windows = three_windows(&mut state);
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(windows.older)));
+        let (_, oid) =
+            state.insert_object(WlSurface::new(WlSurfaceId::from(95), ClientId::from_raw(2), 6));
+        let menu = crate::clients::Resolved::new(ClientId::from_raw(2), WlSurfaceId::from(95), oid);
+        state.register_root_surface(menu);
+        {
+            let surface = state
+                .objects
+                .get_mut(oid)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            assert!(surface.assign_xwayland_role());
+            surface.test_map(crate::state::ObjectId::from(95usize), 60, 60, 20, 20);
+        }
+        assert!(state.window_for_root(menu).is_none());
+        state.seat.keyboard_focus = Some(SurfaceFocus::new(menu));
+
+        keep_or_restore_keyboard_focus(&mut state, &mut dispatcher);
+
+        assert_eq!(state.seat.keyboard_focus().map(|focus| focus.surface), Some(menu));
     }
 
     fn workspace_state_changed(dispatcher: &Dispatcher) -> usize {

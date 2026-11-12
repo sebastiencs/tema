@@ -2626,6 +2626,7 @@ impl Client {
             return;
         }
         let window = toplevel_ref.window();
+        let activated = state.focused_window() == Some(window);
         let tiled_geometry = state.tiled_window_geometry(window);
         let resizing = tiled_resize_surfaces.contains(&root_surface);
         let surface_configure_bounds = state.configure_bounds_for_surface(wl_surface, None);
@@ -2641,6 +2642,7 @@ impl Client {
         {
             let mut xdg_surface = xdg_surface.grab(state);
             let mut toplevel = toplevel.grab(state);
+            toplevel.set_activated(activated);
             if let Some(mode) = desired_decoration_mode {
                 toplevel.schedule_decoration_mode(mode);
             }

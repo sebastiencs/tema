@@ -218,6 +218,12 @@ impl XdgSurface {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_latest_toplevel_configure_states(&self) -> Option<Vec<u32>> {
+        self.latest_toplevel_configure()
+            .map(|configure| configure.states.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_latest_toplevel_configure_size(&self) -> Option<(i32, i32)> {
         self.pending_configures
             .back()
@@ -1029,6 +1035,8 @@ pub mod xdg_toplevel {
         current_width: i32,
         current_height: i32,
         current_states: BTreeSet<proto_xdg_toplevel::State>,
+        /// Compositor-side activation: this toplevel's root holds keyboard focus.
+        activated: bool,
         decoration_mode: ToplevelDecorationMode,
         pending_decoration_mode: Option<ToplevelDecorationMode>,
         window_geometry: Option<RectI>,
@@ -1095,6 +1103,7 @@ pub mod xdg_toplevel {
                 current_width: 0,
                 current_height: 0,
                 current_states: BTreeSet::default(),
+                activated: false,
                 decoration_mode: ToplevelDecorationMode::ClientSide,
                 pending_decoration_mode: None,
                 window_geometry: None,
@@ -1151,11 +1160,11 @@ pub mod xdg_toplevel {
             if resizing {
                 states.insert(proto_xdg_toplevel::State::Resizing);
             }
+            if self.activated {
+                states.insert(proto_xdg_toplevel::State::Activated);
+            }
             for state in self.current_states.iter().cloned() {
-                if matches!(
-                    state,
-                    proto_xdg_toplevel::State::Activated | proto_xdg_toplevel::State::Suspended
-                ) {
+                if matches!(state, proto_xdg_toplevel::State::Suspended) {
                     states.insert(state);
                 }
             }
@@ -1917,9 +1926,15 @@ pub mod xdg_toplevel {
             self.current_width = 0;
             self.current_height = 0;
             self.current_states.clear();
+            self.activated = false;
             self.decoration_mode = ToplevelDecorationMode::ClientSide;
             self.pending_decoration_mode = None;
             self.window_geometry = None;
+        }
+
+        /// Set the compositor activation flag. The next configure carries it.
+        pub(crate) fn set_activated(&mut self, activated: bool) {
+            self.activated = activated;
         }
 
         /// `wm_capabilities` exists only since xdg_wm_base version 5; older clients (e.g. wev) must
@@ -2422,8 +2437,11 @@ pub mod xdg_toplevel {
                         if !affected_outputs.is_empty() {
                             request_outputs(state, affected_outputs.into_iter(), dispatcher);
                         }
-                        crate::seat::refresh_scene_focus(state, dispatcher);
+                        crate::input::focus::refresh_pointer_focus_only(state, dispatcher);
                         dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
+                        dispatcher.dispatch_post_action(
+                            crate::input::focus::FocusFullscreenWindow { window },
+                        );
                     }
                 }
                 UnsetFullscreen => {
@@ -2443,7 +2461,7 @@ pub mod xdg_toplevel {
                         if !affected_outputs.is_empty() {
                             request_outputs(state, affected_outputs.into_iter(), dispatcher);
                         }
-                        crate::seat::refresh_scene_focus(state, dispatcher);
+                        crate::input::focus::refresh_pointer_focus_only(state, dispatcher);
                         dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
                     }
                 }
@@ -2717,6 +2735,7 @@ pub mod xdg_toplevel {
                 ],
                 ToplevelDecorationMode::ClientSide,
             );
+            toplevel.set_activated(true);
 
             let states = toplevel.effective_states();
 
@@ -2724,6 +2743,61 @@ pub mod xdg_toplevel {
             assert!(!states.contains(&(proto_xdg_toplevel::State::Fullscreen as u32)));
             assert!(!states.contains(&(proto_xdg_toplevel::State::Maximized as u32)));
             assert_tiled_states(&states);
+        }
+
+        fn fresh_toplevel_for_activation_tests() -> XdgToplevel {
+            XdgToplevel::new(
+                XdgToplevelId::from(17),
+                Resolved::new(
+                    crate::clients::ClientId::from_raw(1),
+                    super::super::XdgSurfaceId::from(18),
+                    ObjectId::from(18usize),
+                ),
+                7,
+                WindowId::for_tests(u64::MAX - 1),
+            )
+        }
+
+        #[test]
+        fn acked_activated_is_not_copied_without_the_flag() {
+            let mut toplevel = fresh_toplevel_for_activation_tests();
+            toplevel.apply_acked_configure(
+                800,
+                600,
+                vec![proto_xdg_toplevel::State::Activated as u32],
+                ToplevelDecorationMode::ClientSide,
+            );
+
+            let states = toplevel.effective_states();
+
+            assert!(!states.contains(&(proto_xdg_toplevel::State::Activated as u32)));
+        }
+
+        #[test]
+        fn activated_flag_adds_the_state() {
+            let mut toplevel = fresh_toplevel_for_activation_tests();
+
+            toplevel.set_activated(true);
+            assert!(toplevel
+                .effective_states()
+                .contains(&(proto_xdg_toplevel::State::Activated as u32)));
+
+            toplevel.set_activated(false);
+            assert!(!toplevel
+                .effective_states()
+                .contains(&(proto_xdg_toplevel::State::Activated as u32)));
+        }
+
+        #[test]
+        fn reset_on_unmap_clears_activated() {
+            let mut toplevel = fresh_toplevel_for_activation_tests();
+            toplevel.set_activated(true);
+
+            toplevel.reset_on_unmap();
+
+            assert!(!toplevel
+                .effective_states()
+                .contains(&(proto_xdg_toplevel::State::Activated as u32)));
         }
 
         #[test]

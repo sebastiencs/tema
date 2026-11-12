@@ -5568,6 +5568,54 @@ mod tests {
         assert_eq!(pending_toplevel_configures(&state, &client, xdg_surface_id), before + 1);
     }
 
+    /// `xdg_toplevel.state` value of `activated`.
+    const XDG_TOPLEVEL_STATE_ACTIVATED: u32 = 4;
+
+    fn latest_toplevel_configure_states(
+        state: &State,
+        client: &Client,
+        xdg_surface_id: XdgSurfaceId,
+    ) -> Vec<u32> {
+        state
+            .objects
+            .try_ref_object::<XdgSurface>(client.object_id(xdg_surface_id))
+            .unwrap()
+            .test_latest_toplevel_configure_states()
+            .expect("toplevel configure")
+    }
+
+    #[test]
+    fn reconfigure_sends_activated_for_the_focused_toplevel() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(44usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = mapped_xdg_toplevel(&mut state, &mut client, &mut dispatcher, 450);
+        let xdg_surface_id = XdgSurfaceId::from(451);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        let before = pending_toplevel_configures(&state, &client, xdg_surface_id);
+        let root_surface = root(&state, surface_object_id);
+        set_keyboard_focus(&mut state, &mut dispatcher, Some(SurfaceFocus::new(root_surface)));
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        assert_eq!(pending_toplevel_configures(&state, &client, xdg_surface_id), before + 1);
+        assert!(latest_toplevel_configure_states(&state, &client, xdg_surface_id)
+            .contains(&XDG_TOPLEVEL_STATE_ACTIVATED));
+
+        let after_focus = pending_toplevel_configures(&state, &client, xdg_surface_id);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            client.test_reconfigure_mapped_toplevels(&mut state, &mut client_dispatcher);
+        }
+        assert_eq!(pending_toplevel_configures(&state, &client, xdg_surface_id), after_focus);
+    }
+
     #[test]
     fn reconfigure_toplevels_for_roots_configures_only_the_given_root() {
         let mut state = state_for_tests();

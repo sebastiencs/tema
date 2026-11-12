@@ -201,8 +201,12 @@ impl ZwlrForeignToplevelHandleV1 {
             if !affected_outputs.is_empty() {
                 request_outputs(state, affected_outputs.into_iter(), dispatcher);
             }
-            crate::seat::refresh_scene_focus(state, dispatcher);
+            crate::input::focus::refresh_pointer_focus_only(state, dispatcher);
             dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
+            if fullscreen {
+                dispatcher
+                    .dispatch_post_action(crate::input::focus::FocusFullscreenWindow { window });
+            }
         }
     }
 

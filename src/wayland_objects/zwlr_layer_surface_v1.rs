@@ -8,7 +8,7 @@ use crate::{
         XdgPopupId, ZwlrLayerShellV1Id, ZwlrLayerSurfaceV1Id,
     },
     region::RectI,
-    seat::{refresh_keyboard_focus, refresh_keyboard_focus_with_snapshot},
+    seat::refresh_keyboard_focus_with_snapshot,
     state::{GrabbedObject, ObjectId, OutputId, State},
     wayland_objects::{
         wl_display::WlDisplay,
@@ -657,7 +657,7 @@ impl ZwlrLayerSurfaceV1 {
         self.unregister_from_manager(state);
         client.delete_id(&WlDisplay::default(), state, dispatcher, self.id.into());
         dispatcher.dispatch(crate::clients::ClientManagerAction::LayerShellLayoutChanged);
-        refresh_keyboard_focus(state, dispatcher);
+        crate::input::focus::keep_or_restore_keyboard_focus(state, dispatcher);
     }
 
     fn apply_layout(
@@ -678,7 +678,7 @@ impl ZwlrLayerSurfaceV1 {
             }
             self.send_closed(dispatcher);
             dispatcher.dispatch(crate::clients::ClientManagerAction::LayerShellLayoutChanged);
-            refresh_keyboard_focus(state, dispatcher);
+            crate::input::focus::keep_or_restore_keyboard_focus(state, dispatcher);
             return;
         }
 
@@ -1337,7 +1337,7 @@ impl Object for ZwlrLayerSurfaceV1 {
         state.unregister_layer_surface_object(this);
         self.unregister_from_manager(state);
         dispatcher.dispatch(crate::clients::ClientManagerAction::LayerShellLayoutChanged);
-        refresh_keyboard_focus(state, dispatcher);
+        crate::input::focus::keep_or_restore_keyboard_focus(state, dispatcher);
     }
 }
 
@@ -1990,6 +1990,99 @@ mod tests {
             state.seat.keyboard_focus(),
             Some(crate::input::SurfaceFocus::new(surface_resolved))
         );
+    }
+
+    #[test]
+    fn destroying_a_focused_layer_restores_the_previous_window() {
+        let mut state = state_for_tests();
+        let output_id = state.insert_output(test_output_drm1_crtc(1, 0, 0, 1280, 800));
+        let workspace_id = state.active_workspace_for_output(output_id).unwrap();
+        let mut client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+
+        let window_surface_id = WlSurfaceId::from(20u32);
+        let (window_root, _) = client
+            .insert_object(&mut state, WlSurface::new(window_surface_id, client.client_id(), 6));
+        state.register_root_surface(window_root);
+        crate::test_support::insert_window(&mut state, window_root);
+        state
+            .objects
+            .get_mut(window_root.object_id())
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .test_map(ObjectId::from(20usize), 0, 0, 30, 30);
+        let _ = state.assign_root_surface_to_workspace(window_root, workspace_id);
+        state.managed_window_mut(window_root).unwrap().mapped = true;
+        // Focus the window before the exclusive layer exists: normalization prefers a mapped
+        // exclusive layer over any requested focus.
+        crate::input::focus::set_keyboard_focus(
+            &mut state,
+            &mut dispatcher,
+            Some(crate::input::SurfaceFocus::new(window_root)),
+        );
+        assert_eq!(state.seat.keyboard_focus(), Some(crate::input::SurfaceFocus::new(window_root)));
+
+        let layer_surface_root_id = WlSurfaceId::from(21u32);
+        let (layer_root, _) = client.insert_object(
+            &mut state,
+            WlSurface::new(layer_surface_root_id, client.client_id(), 6),
+        );
+        state.register_root_surface(layer_root);
+        state
+            .objects
+            .get_mut(layer_root.object_id())
+            .downcast_mut::<WlSurface>()
+            .unwrap()
+            .test_map(ObjectId::from(21usize), 0, 700, 200, 40);
+        let layer_id = ZwlrLayerSurfaceV1Id::from(10u32);
+        let mut layer = ZwlrLayerSurfaceV1::new(
+            layer_id,
+            fake_layer_manager(9_999),
+            4,
+            layer_root,
+            Some(output_id),
+            LayerShellLayer::Overlay,
+            "launcher".to_string(),
+        );
+        layer.assigned_output_id = Some(output_id);
+        layer.initial_commit_complete = true;
+        layer.mapped = true;
+        layer.current.keyboard_interactivity =
+            zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+        let (layer_resolved, _) = client.insert_object(&mut state, layer);
+        state.register_layer_surface_object(layer_resolved);
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            let mut surface = layer_root.ref_mut(&mut state);
+            surface
+                .set_role(
+                    crate::wayland_objects::wl_surface::Role::LayerSurface,
+                    &mut client_dispatcher,
+                )
+                .unwrap();
+            surface.set_layer_surface_impl(layer_resolved);
+        }
+
+        crate::input::focus::set_keyboard_focus(
+            &mut state,
+            &mut dispatcher,
+            Some(crate::input::SurfaceFocus::new(layer_root)),
+        );
+        state.seat.pointer_pos = (900.0, 700.0);
+        crate::input::focus::refresh_pointer_focus_only(&mut state, &mut dispatcher);
+        assert_eq!(state.seat.keyboard_focus(), Some(crate::input::SurfaceFocus::new(layer_root)));
+
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            {
+                let mut layer_surface = client.grab_object(layer_id, &mut state);
+                layer_surface.destroy_impl(&mut client, &mut state, &mut client_dispatcher);
+            }
+            drop(client_dispatcher);
+        }
+
+        assert!(!client.contains_object(layer_id, &state));
+        assert_eq!(state.seat.keyboard_focus(), Some(crate::input::SurfaceFocus::new(window_root)));
     }
 
     #[test]

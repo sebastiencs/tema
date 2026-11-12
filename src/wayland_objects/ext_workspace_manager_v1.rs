@@ -10,7 +10,6 @@ use crate::{
         ExtWorkspaceManagerV1Id, NewId, WaylandId,
     },
     runner::Dispatcher,
-    seat,
     state::{GrabbedObject, OutputId, State, WorkspaceGroupId, WorkspaceId},
     wayland_objects::{
         ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
@@ -44,7 +43,8 @@ pub fn publish_workspace_state_changed(
     if !affected_outputs.is_empty() {
         request_outputs(state, affected_outputs.iter().copied(), dispatcher);
     }
-    seat::refresh_scene_focus(state, dispatcher);
+    crate::input::focus::refresh_pointer_focus_only(state, dispatcher);
+    crate::input::focus::keep_or_restore_keyboard_focus(state, dispatcher);
     dispatcher.dispatch(ClientManagerAction::WorkspaceStateChanged);
 }
 
