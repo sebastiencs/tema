@@ -943,6 +943,15 @@ fn clip_uniforms(mask: &TextureMask) -> ClipUniforms {
             inner_radius: 0.0,
             inner_power: 0.0001,
         },
+        TextureMask::RoundedClipUnderBorder { clip } => ClipUniforms {
+            mode: 4,
+            outer: rect_vec(clip.outer_rect),
+            inner: [0.0; 4],
+            outer_radius: clip.corner_radius.max(0) as f32,
+            outer_power: clip.rounding_power.get().max(0.0001),
+            inner_radius: 0.0,
+            inner_power: 0.0001,
+        },
         // Corner-only rounding: pixels outside the window box are kept, so
         // client-drawn CSD shadows survive.
         TextureMask::CornerRoundedClip { clip } => ClipUniforms {

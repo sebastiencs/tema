@@ -539,6 +539,24 @@ fn round_to_i32(value: f64) -> i32 {
 }
 
 impl RootSurfaceVisualState {
+    /// True when an opaque border is drawn over the edge of the client clip.
+    ///
+    /// The ring's inner shape is the content clip's shape
+    /// (`push_root_surface_effect_elements`), so the clip can fade 1px further
+    /// out and stay hidden under the border.
+    pub fn border_covers_clip_edge(self) -> bool {
+        let Some(WindowClip::Frame(clip)) = self.clip else {
+            return false;
+        };
+        let Some(border) = self.border else {
+            return false;
+        };
+        self.border_alpha == u8::MAX
+            && border.gradient.start_color.a == u8::MAX
+            && border.gradient.end_color.a == u8::MAX
+            && clip.outer_rect == self.content_rect
+    }
+
     /// Clip for the drop shadow. A square shadow when `rounding` is zero, otherwise the outer frame.
     pub fn shadow_clip(self) -> RootSurfaceClip {
         if self.clip.is_some() {
@@ -574,8 +592,9 @@ impl RootSurfaceVisualState {
 mod tests {
     use {
         super::{
-            border_outer_radius, rounded_ring, shadow_geometry, BlurVisualStyle,
-            RootSurfaceVisualState, RoundedRing, ShadowVisualStyle, SurfaceEffectStyle, WindowClip,
+            border_outer_radius, rounded_ring, shadow_geometry, BlurVisualStyle, BorderGradient,
+            BorderVisualStyle, RootSurfaceVisualState, RoundedRing, ShadowVisualStyle,
+            SurfaceEffectStyle, WindowClip,
         },
         crate::{
             config::{RgbaColor, RoundingPower, ShadowPower},
@@ -740,6 +759,64 @@ mod tests {
             visual.frame_clip,
             RootSurfaceClip::new(RectI::new(10, 20, 40, 30).unwrap(), 16, RoundingPower::DEFAULT,)
         );
+    }
+
+    #[test]
+    fn border_covers_clip_edge_needs_an_opaque_border_over_a_frame_clip() {
+        let content_rect = RectI::new(4, 6, 92, 70).unwrap();
+        let opaque_border = BorderVisualStyle {
+            gradient: BorderGradient {
+                start_color: RgbaColor::new(1, 2, 3, 255),
+                end_color: RgbaColor::new(4, 5, 6, 255),
+                angle_degrees: 0,
+            },
+        };
+        let visual = RootSurfaceVisualState {
+            outer_rect: RectI::new(0, 0, 100, 80).unwrap(),
+            content_rect,
+            clip: Some(WindowClip::Frame(RootSurfaceClip::new(
+                content_rect,
+                12,
+                RoundingPower::DEFAULT,
+            ))),
+            frame_clip: RootSurfaceClip::new(
+                RectI::new(0, 0, 100, 80).unwrap(),
+                16,
+                RoundingPower::DEFAULT,
+            ),
+            border: Some(opaque_border),
+            border_alpha: u8::MAX,
+            shadow: None,
+            shadow_alpha: u8::MAX,
+            effects: SurfaceEffectStyle { blur: None, opacity_alpha: u8::MAX, dim_alpha: 0 },
+        };
+        assert!(visual.border_covers_clip_edge());
+
+        let translucent_border = RootSurfaceVisualState { border_alpha: 200, ..visual };
+        assert!(!translucent_border.border_covers_clip_edge());
+
+        let mut half_transparent_end = opaque_border;
+        half_transparent_end.gradient.end_color = RgbaColor::new(4, 5, 6, 128);
+        let transparent_end =
+            RootSurfaceVisualState { border: Some(half_transparent_end), ..visual };
+        assert!(!transparent_end.border_covers_clip_edge());
+
+        let no_border = RootSurfaceVisualState { border: None, ..visual };
+        assert!(!no_border.border_covers_clip_edge());
+
+        let corners = RootSurfaceVisualState {
+            clip: Some(WindowClip::Corners(RootSurfaceClip::new(
+                content_rect,
+                12,
+                RoundingPower::DEFAULT,
+            ))),
+            ..visual
+        };
+        assert!(!corners.border_covers_clip_edge());
+
+        let shifted =
+            RootSurfaceVisualState { content_rect: RectI::new(5, 6, 92, 70).unwrap(), ..visual };
+        assert!(!shifted.border_covers_clip_edge());
     }
 
     #[test]

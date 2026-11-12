@@ -683,6 +683,7 @@ struct SceneItemState {
 enum SceneItemMask {
     None,
     RoundedClip { clip: RootSurfaceClip },
+    RoundedClipUnderBorder { clip: RootSurfaceClip },
     CornerRoundedClip { clip: RootSurfaceClip },
     FrameRing { ring: RoundedRing },
 }
@@ -6356,6 +6357,8 @@ fn render_prepared_toplevels(
                 item.snapshots.clone(),
                 false,
                 item.visual.and_then(|visual| visual.clip),
+                item.visual
+                    .is_some_and(|visual| visual.border_covers_clip_edge()),
                 alpha,
                 None,
                 item.scale,
@@ -7382,6 +7385,7 @@ fn collect_protected_scene(
             snapshots,
             false,
             None,
+            false,
             u8::MAX,
             None,
             output_scale,
@@ -7919,6 +7923,7 @@ fn push_scene_items_from_snapshots(
     snapshots: Vec<crate::wayland_objects::wl_surface::SurfaceRenderState>,
     allow_direct_scanout: bool,
     root_clip: Option<WindowClip>,
+    root_clip_under_border: bool,
     alpha: u8,
     content_mapping: Option<crate::render::RectMapping>,
     output_scale: crate::state::FractionalScale,
@@ -8013,6 +8018,9 @@ fn push_scene_items_from_snapshots(
         let (mask, opaque_region, opaque) = if surface_state.inherit_root_clip {
             if let Some(window_clip) = root_clip {
                 let mask = match window_clip {
+                    WindowClip::Frame(clip) if root_clip_under_border => {
+                        SceneItemMask::RoundedClipUnderBorder { clip }
+                    }
                     WindowClip::Frame(clip) => SceneItemMask::RoundedClip { clip },
                     WindowClip::Corners(clip) => SceneItemMask::CornerRoundedClip { clip },
                 };
@@ -8301,6 +8309,7 @@ fn collect_software_cursor_items(
         cursor_snapshots,
         false,
         None,
+        false,
         u8::MAX,
         None,
         output_scale,
@@ -8539,6 +8548,7 @@ pub(crate) struct ClosingCapturePlan {
     pub blur: Option<FrozenClosingBlur>,
     pub content_alpha: u8,
     pub root_clip: Option<WindowClip>,
+    pub root_clip_under_border: bool,
 }
 
 pub(crate) fn begin_managed_toplevel_close_surface(
@@ -8715,6 +8725,7 @@ fn plan_closing_from_peek(
         .map(|visual| visual.effects.opacity_alpha)
         .unwrap_or(u8::MAX);
     let root_clip = visual.and_then(|visual| visual.clip);
+    let root_clip_under_border = visual.is_some_and(|visual| visual.border_covers_clip_edge());
     let surfaces = renders
         .into_iter()
         .map(|render| PlannedClosingSurface {
@@ -8741,6 +8752,7 @@ fn plan_closing_from_peek(
         blur,
         content_alpha,
         root_clip,
+        root_clip_under_border,
     })
 }
 
@@ -9019,6 +9031,11 @@ fn closing_capture_elements(
                     )
                     .scaled(scale)?;
                     Some(match window_clip {
+                        WindowClip::Frame(_) if plan.root_clip_under_border => {
+                            TextureMask::RoundedClipUnderBorder {
+                                clip: localize_clip(clip, bounds),
+                            }
+                        }
                         WindowClip::Frame(_) => {
                             TextureMask::RoundedClip { clip: localize_clip(clip, bounds) }
                         }
@@ -9392,6 +9409,7 @@ fn collect_input_popup_render_items(
             snapshots,
             false,
             None,
+            false,
             u8::MAX,
             None,
             output_scale,
@@ -9462,6 +9480,7 @@ fn collect_dnd_render_items(
         snapshots,
         false,
         None,
+        false,
         u8::MAX,
         None,
         output_scale,
@@ -9497,6 +9516,9 @@ fn scene_item_to_texture_element(item: &SceneItem) -> TextureElement {
             SceneItemMask::None => TextureMask::None,
             SceneItemMask::RoundedClip { clip } => {
                 TextureMask::RoundedClip { clip: localize_clip(clip, item.state.bounds) }
+            }
+            SceneItemMask::RoundedClipUnderBorder { clip } => {
+                TextureMask::RoundedClipUnderBorder { clip: localize_clip(clip, item.state.bounds) }
             }
             SceneItemMask::CornerRoundedClip { clip } => {
                 TextureMask::CornerRoundedClip { clip: localize_clip(clip, item.state.bounds) }
@@ -9638,7 +9660,9 @@ fn translate_scene_items(items: &mut [SceneItem], dx: i32, dy: i32) {
 fn translate_scene_item_mask(mask: &mut SceneItemMask, dx: i32, dy: i32) {
     match mask {
         SceneItemMask::None => {}
-        SceneItemMask::RoundedClip { clip } | SceneItemMask::CornerRoundedClip { clip } => {
+        SceneItemMask::RoundedClip { clip }
+        | SceneItemMask::RoundedClipUnderBorder { clip }
+        | SceneItemMask::CornerRoundedClip { clip } => {
             clip.outer_rect = clip.outer_rect.translate(dx, dy);
         }
         SceneItemMask::FrameRing { ring } => {
@@ -9674,7 +9698,9 @@ fn scale_scene_items(items: &mut [SceneItem], scale: crate::state::FractionalSca
 fn scale_scene_item_mask(mask: &mut SceneItemMask, scale: crate::state::FractionalScale) {
     match mask {
         SceneItemMask::None => {}
-        SceneItemMask::RoundedClip { clip } | SceneItemMask::CornerRoundedClip { clip } => {
+        SceneItemMask::RoundedClip { clip }
+        | SceneItemMask::RoundedClipUnderBorder { clip }
+        | SceneItemMask::CornerRoundedClip { clip } => {
             if let Some(scaled) = clip.scaled(scale) {
                 *clip = scaled;
             }
@@ -9911,6 +9937,7 @@ fn render_composed_entry(
         snapshots,
         allow_direct_scanout,
         root_clip,
+        visual_state.is_some_and(|visual| visual.border_covers_clip_edge()),
         visual_state
             .map(|visual| visual.effects.opacity_alpha)
             .unwrap_or(u8::MAX),
@@ -11629,6 +11656,59 @@ mod render_recipe_tests {
             }
         );
         assert!(render_item.color.is_none());
+    }
+
+    #[test]
+    fn scene_items_to_texture_elements_keep_the_under_border_clip() {
+        let item_bounds = RectI::new(40, 50, 120, 80).unwrap();
+        let clip = RootSurfaceClip::new(
+            RectI::new(34, 38, 130, 96).unwrap(),
+            18,
+            crate::config::RoundingPower::DEFAULT,
+        );
+        let items = vec![SceneItem {
+            state: SceneItemState {
+                key: SceneItemKey::Cursor,
+                surface_key: None,
+                content_key: SceneItemContentKey::NamedCursor(
+                    crate::cursor::CursorImageContentKey { width: 1, height: 2, fingerprint: 3 },
+                ),
+                bounds: item_bounds,
+                tex_transform: transform::Mat3::identity(),
+                alpha: u8::MAX,
+                alpha_multiplier: u32::MAX,
+                mask: SceneItemMask::RoundedClipUnderBorder { clip },
+                color_description_id: 0,
+                render_intent: crate::color::RenderIntent::Perceptual,
+                representation: crate::color::ColorRepresentation::default(),
+            },
+            mask: SceneItemMask::RoundedClipUnderBorder { clip },
+            texture: crate::render::inert_texture(),
+            damage: DamageRegion::from_rect(item_bounds),
+            sample_damage_padding: 0,
+            state_has_alpha: false,
+            alpha: u8::MAX,
+            alpha_multiplier: u32::MAX,
+            opaque_region: DamageRegion::new(),
+            opaque: false,
+            sync: crate::sync::SurfaceSyncState::default(),
+            direct_scanout: None,
+            color: None,
+            scanout_candidate: false,
+            presentation_feedbacks: Vec::new(),
+        }];
+
+        let render_item = scene_item_to_texture_element(&items[0]);
+        assert_eq!(
+            render_item.mask,
+            crate::render::gles::RenderItemMask::RoundedClipUnderBorder {
+                clip: RootSurfaceClip::new(
+                    RectI::new(-6, -12, 130, 96).unwrap(),
+                    18,
+                    crate::config::RoundingPower::DEFAULT,
+                ),
+            }
+        );
     }
 
     #[test]

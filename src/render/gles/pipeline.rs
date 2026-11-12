@@ -561,6 +561,27 @@ impl GlesDraw<'_> {
                     RenderItemMask::None => {
                         gl::Uniform1i(program.clip_mode_location, 0);
                     }
+                    RenderItemMask::RoundedClipUnderBorder { clip } => {
+                        gl::Uniform1i(program.clip_mode_location, 4);
+                        gl::Uniform4f(
+                            program.clip_outer_rect_location,
+                            clip.outer_rect.x as f32,
+                            clip.outer_rect.y as f32,
+                            clip.outer_rect.width as f32,
+                            clip.outer_rect.height as f32,
+                        );
+                        gl::Uniform4f(program.clip_inner_rect_location, 0.0, 0.0, 0.0, 0.0);
+                        gl::Uniform1f(
+                            program.outer_corner_radius_location,
+                            clip.corner_radius.max(0) as f32,
+                        );
+                        gl::Uniform1f(
+                            program.outer_rounding_power_location,
+                            clip.rounding_power.get().max(0.0001),
+                        );
+                        gl::Uniform1f(program.inner_corner_radius_location, 0.0);
+                        gl::Uniform1f(program.inner_rounding_power_location, 0.0001);
+                    }
                     RenderItemMask::RoundedClip { clip } => {
                         gl::Uniform1i(program.clip_mode_location, 1);
                         gl::Uniform4f(

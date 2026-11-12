@@ -96,6 +96,21 @@ void main() {
                 draw.outer_power
             );
         }
+    } else if (draw.clip_mode == 4) {
+        // Frame clip under an opaque border: fade 1px further out, so the
+        // border's inner fade always sits over fully covered window pixels.
+        // The exact box still bounds it.
+        if (pointInRect(point, draw.outer_rect)) {
+            coverage = roundedRectCoverageGrown(
+                point,
+                draw.outer_rect,
+                draw.outer_radius,
+                draw.outer_power,
+                1.0
+            );
+        } else {
+            coverage = 0.0;
+        }
     } else if (draw.clip_mode != 0) {
         coverage = roundedRectCoverage(
             point,

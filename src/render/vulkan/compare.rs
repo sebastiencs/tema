@@ -738,6 +738,35 @@ fn rounded_shadow_fades_its_cutout() {
 }
 
 #[test]
+fn under_border_clip_fades_one_pixel_further_out_inside_the_box() {
+    let Some(mut pair) = pair() else {
+        eprintln!("skipping vulkan under-border clip: no matching DRM node");
+        return;
+    };
+    let _ = pair.gbm;
+    let green = [0, 255, 0, 255];
+    let bytes = solid(green, 8, 8);
+    let gl_texture = shm(&mut *pair.gl, &bytes, 8, 8);
+    let vk_texture = shm(&mut *pair.vulkan, &bytes, 8, 8);
+    let clip =
+        RootSurfaceClip::new(RectI::new(1, 1, 6, 6).expect("clip"), 3, RoundingPower::default());
+    let plain = TextureMask::RoundedClip { clip };
+    let grown = TextureMask::RoundedClipUnderBorder { clip };
+    let gles_plain =
+        paint(&mut *pair.gl, element(gl_texture.clone(), 0, 0, 8, 8, u8::MAX, plain), 8, 8);
+    let gles_grown =
+        paint(&mut *pair.gl, element(gl_texture, 0, 0, 8, 8, u8::MAX, grown.clone()), 8, 8);
+    let vulkan_grown =
+        paint(&mut *pair.vulkan, element(vk_texture, 0, 0, 8, 8, u8::MAX, grown), 8, 8);
+    // (1, 1): d = 0.54. The plain clip drops it; the grown clip keeps 0.96.
+    assert_eq!(pixel(&gles_plain, 8, 1, 1), &[0, 0, 0, 0]);
+    assert_close(pixel(&gles_grown, 8, 1, 1), &[0, 246, 0, 246], 1);
+    // (0, 3) is outside the box. The grown fade must not leak there.
+    assert_eq!(pixel(&gles_grown, 8, 0, 3), &[0, 0, 0, 0]);
+    assert_close(&gles_grown, &vulkan_grown, 1);
+}
+
+#[test]
 fn vulkan_matches_gles_blur_and_keeps_later_textures_on_top() {
     let Some(mut pair) = pair() else {
         eprintln!("skipping vulkan blur comparison: no matching DRM node");
