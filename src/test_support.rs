@@ -190,7 +190,7 @@ pub fn test_client_and_dispatcher(raw: u64) -> (Client, Dispatcher) {
 /// Minimal ARGB8888 SHM buffer (`stride = 4 * width`).
 pub fn insert_test_shm_buffer(
     state: &mut State,
-    client_id: ClientId,
+    _client_id: ClientId,
     buffer_id: WlBufferId,
     width: i32,
     height: i32,

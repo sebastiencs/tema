@@ -69,7 +69,7 @@ pub(crate) struct TextInputRelayChanges {
 
 /// `zwp_text_input_v3` events produced by focus changes and by the input method.
 #[derive(Clone, Debug)]
-pub(crate) enum TextInputClientEvent {
+pub enum TextInputClientEvent {
     Enter {
         surface: Resolved<WlSurfaceId>,
     },
@@ -88,7 +88,7 @@ pub(crate) enum TextInputClientEvent {
 /// One `zwp_input_method_v2` event. A batch is applied together, and `Done` is
 /// the serial the input method must echo.
 #[derive(Clone, Debug)]
-pub(crate) enum ImEvent {
+pub enum ImEvent {
     Activate,
     Deactivate,
     SurroundingText { text: String, cursor: u32, anchor: u32 },
@@ -464,7 +464,7 @@ fn dispatch_grab(
 /// Events for `zwp_input_method_keyboard_grab_v2`. `Initial` is the hardware
 /// keymap, the modifiers at grab time, and the repeat settings.
 #[derive(Clone, Debug)]
-pub(crate) enum KeyboardGrabClientEvent {
+pub enum KeyboardGrabClientEvent {
     Initial { modifiers: crate::xkb::KeyboardModifiers },
     Key { serial: u32, time: u32, key: u32, state: u32 },
     Modifiers { serial: u32, modifiers: crate::xkb::KeyboardModifiers },

@@ -504,7 +504,7 @@ mod tests {
 
     fn install_icon(state: &mut State, window: WindowId, icon: crate::toplevel_icon::ToplevelIcon) {
         let role = state.window_role_object(window).unwrap();
-        let mut toplevel = state
+        let toplevel = state
             .objects
             .try_ref_object_mut::<XdgToplevel>(role)
             .unwrap();

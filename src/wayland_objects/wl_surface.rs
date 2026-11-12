@@ -5664,7 +5664,6 @@ mod tests {
         let serial = xdg_surface
             .test_latest_pending_serial()
             .expect("pending configure");
-        drop(xdg_surface);
         state
             .objects
             .get_mut(client.object_id(xdg_surface_id))

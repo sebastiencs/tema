@@ -7,13 +7,13 @@ use std::{
 
 use crate::{
     clients::{Client, ClientAction, ClientId, ClientManagerAction, Resolved},
-    protocol_generated::{Constants, XdgSessionV1Id, XdgToplevelSessionV1Id},
+    protocol_generated::{XdgSessionV1Id, XdgToplevelSessionV1Id},
     region::RectI,
     root_geometry::{project_configure_geometry, CommittedRootGeometry},
     runner::Dispatcher,
     session_store::{FloatingRecord, ToplevelRecord},
     state::{ManagedWindowMode, OutputId, RememberedFloatingState, State},
-    wayland_objects::xdg_session_manager_v1::{XdgSessionManagerV1, XdgSessionManagerV1Global},
+    wayland_objects::xdg_session_manager_v1::XdgSessionManagerV1Global,
     window::{Toplevel, WindowId},
 };
 
@@ -393,8 +393,8 @@ mod tests {
             io_uring::model::IoUringAction,
             object::Object,
             protocol_generated::{
-                xdg_toplevel, WaylandId, WlSurfaceId, XdgSessionV1Id, XdgSurfaceId, XdgToplevelId,
-                XdgToplevelSessionV1Id, XdgWmBaseId,
+                xdg_toplevel, Constants, WaylandId, WlSurfaceId, XdgSessionV1Id, XdgSurfaceId,
+                XdgToplevelId, XdgToplevelSessionV1Id, XdgWmBaseId,
             },
             region::RectI,
             root_geometry::{CommittedRootGeometry, WindowTargetGeometry},
@@ -406,6 +406,7 @@ mod tests {
             },
             wayland_objects::{
                 wl_surface::{test_commit_new_buffer, Role, WlSurface},
+                xdg_session_manager_v1::XdgSessionManagerV1,
                 xdg_session_v1,
                 xdg_surface::XdgSurface,
                 xdg_toplevel_session_v1::XdgToplevelSessionV1,

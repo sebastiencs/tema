@@ -32,7 +32,7 @@ pub(crate) use {
     },
     pick::{
         build_protocol_move_target, build_protocol_resize_target, rect_contains_point,
-        resize_edges_for_pointer, scene_pick_at, scene_pick_for_pointer, surface_focus_pick_at,
+        resize_edges_for_pointer, scene_pick_at, scene_pick_for_pointer,
         surface_focus_pick_at_excluding,
     },
     types::{
@@ -42,3 +42,6 @@ pub(crate) use {
         PROTOCOL_INTERACTION_START_OPTIONS,
     },
 };
+
+#[cfg(test)]
+pub(crate) use pick::surface_focus_pick_at;

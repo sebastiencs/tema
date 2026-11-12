@@ -1129,7 +1129,7 @@ pub struct State {
     pub scanout_candidates: std::collections::BTreeMap<OutputId, Resolved<WlSurfaceId>>,
     /// Replaces `drm` for linux-dmabuf import tests. `None` uses the real devices.
     #[cfg(test)]
-    pub dmabuf_importers: Option<Vec<crate::render::mock::MockDmabufImporter>>,
+    pub(crate) dmabuf_importers: Option<Vec<crate::render::mock::MockDmabufImporter>>,
     /// Live `zwp_idle_inhibitor_v1` objects, including ones left inert after surface destruction.
     pub idle_inhibitors: Vec<Resolved<ZwpIdleInhibitorV1Id>>,
     /// Last result of the visibility policy. Inhibitor-aware notifications follow this bit.

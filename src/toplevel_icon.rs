@@ -22,7 +22,7 @@ impl ToplevelIcon {
         self.name.is_none() && self.pixmaps.is_empty()
     }
 
-    pub fn summary(&self) -> IconSummary {
+    pub(crate) fn summary(&self) -> IconSummary {
         IconSummary {
             name: self.name.clone(),
             sizes: self

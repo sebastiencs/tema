@@ -1,9 +1,6 @@
 //! Floating-window resize zones. No [`crate::state::State`] access.
 
-use crate::{
-    config::RoundingPower, protocol_generated::xdg_toplevel::ResizeEdge, region::RectI,
-    state::RootSurfaceClip,
-};
+use crate::{protocol_generated::xdg_toplevel::ResizeEdge, region::RectI, state::RootSurfaceClip};
 
 /// Extra length added to `rounding + border` for a floating corner zone.
 pub(crate) const RESIZE_CORNER_LEEWAY: i32 = 10;
@@ -92,7 +89,7 @@ fn edge_bits(top: bool, bottom: bool, left: bool, right: bool) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, crate::config::RoundingPower};
 
     fn params(extent: i32, corner_len: i32, clip: Option<RootSurfaceClip>) -> FrameZoneParams {
         FrameZoneParams {

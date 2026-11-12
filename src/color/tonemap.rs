@@ -9,7 +9,7 @@
 //! the source reference white onto the destination reference white. The LMS
 //! matrices use the same column-major constants as `tonemap.glsl`.
 
-use super::{description::ImageDescription, primaries::Primaries, tf::TransferFunction, Matrix3x4};
+use super::{description::ImageDescription, Matrix3x4};
 
 const PQ_M1: f32 = 0.1593017578125;
 const PQ_M2: f32 = 78.84375;
