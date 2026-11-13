@@ -158,6 +158,26 @@ pub struct ClientManager {
     accept_op_id: Option<RingId>,
     accepting: bool,
     unlinked: bool,
+    security_listeners: BTreeMap<SecurityListenerId, SecurityListener>,
+    next_security_listener: u64,
+    /// Listener each live sandboxed client came from.
+    security_client_listener: BTreeMap<ClientId, SecurityListenerId>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SecurityListenerId(u64);
+
+/// A committed `wp_security_context_v1` whose listener is accepting clients.
+struct SecurityListener {
+    listen_fd: Rc<OwnedFd>,
+    close_fd: Rc<OwnedFd>,
+    metadata: Rc<SecurityContextMetadata>,
+    accept_op_id: Option<RingId>,
+    close_poll_id: RingId,
+    /// Live clients accepted on this listener.
+    clients: BTreeSet<ClientId>,
+    /// Accept not re-armed: client cap reached, or `EMFILE`/`ENFILE`.
+    paused: bool,
 }
 
 /// How an adopted client differs from one accepted on the Wayland socket.
@@ -199,6 +219,24 @@ pub enum ClientManagerAction {
         origin: ClientOrigin,
         adopted: Redispatcher<ClientId>,
         closed: Redispatcher<ClientId>,
+    },
+    /// A committed `wp_security_context_v1`. Start accepting sandboxed clients.
+    AddSecurityListener {
+        listen_fd: Rc<OwnedFd>,
+        close_fd: Rc<OwnedFd>,
+        metadata: Rc<SecurityContextMetadata>,
+    },
+    SecurityClientAccepted {
+        listener: SecurityListenerId,
+        new_client: RawFd,
+    },
+    SecurityAcceptFailed {
+        listener: SecurityListenerId,
+        errno: Option<i32>,
+    },
+    /// `close_fd` hung up (or the poll failed). Stop that listener.
+    SecurityListenerClosed {
+        listener: SecurityListenerId,
     },
     LibinputEvent,
     UdevEvent,
@@ -274,6 +312,9 @@ impl ClientManager {
             accept_op_id: None,
             accepting: true,
             unlinked: false,
+            security_listeners: BTreeMap::new(),
+            next_security_listener: 0,
+            security_client_listener: BTreeMap::new(),
         })
     }
 
@@ -315,6 +356,7 @@ impl ClientManager {
         if let Some(closed) = self.closed.remove(&id) {
             dispatcher.redispatch_to(closed, id);
         }
+        self.security_client_closed(dispatcher, id);
     }
 
     fn unlink_socket(&mut self) {
@@ -334,6 +376,9 @@ impl ClientManager {
         if let Some(accept_op_id) = self.accept_op_id.take() {
             dispatcher.dispatch(IoUringAction::Cancel { target: accept_op_id });
         }
+        for listener in self.security_listeners.keys().copied().collect::<Vec<_>>() {
+            self.remove_security_listener(dispatcher, listener);
+        }
         for id in self.set.iter().copied().collect::<Vec<_>>() {
             self.close_client(dispatcher, id);
         }
@@ -350,6 +395,131 @@ impl ClientManager {
         let Some(scale) = state.refresh_xwayland_wire_scale() else { return };
         let Some(client_id) = self.xwayland_client else { return };
         dispatcher.dispatch_to(client_id, ClientAction::SetWireScale { scale });
+    }
+
+    fn add_security_listener(
+        &mut self,
+        dispatcher: &mut Dispatcher,
+        listen_fd: Rc<OwnedFd>,
+        close_fd: Rc<OwnedFd>,
+        metadata: Rc<SecurityContextMetadata>,
+    ) {
+        if !self.accepting {
+            return; // dropping the Rcs closes the fds
+        }
+        if self.security_listeners.len() >= crate::security_context::MAX_SECURITY_LISTENERS {
+            log::warn!("security context listener refused, limit reached: {metadata:?}");
+            return;
+        }
+        let listener = SecurityListenerId(self.next_security_listener);
+        self.next_security_listener += 1;
+        let close_poll_id = RingId::fresh();
+        let keep_close_fd = close_fd.clone();
+        dispatcher.dispatch(IoUringAction::Poll {
+            id: Some(close_poll_id),
+            fd: close_fd.as_raw_fd(),
+            dispatch_to: Redispatcher::to::<Self>(move |_result| {
+                let _keep_open = &keep_close_fd;
+                ClientManagerAction::SecurityListenerClosed { listener }
+            }),
+        });
+        log::info!("security context listener {listener:?} started: {metadata:?}");
+        self.security_listeners.insert(
+            listener,
+            SecurityListener {
+                listen_fd,
+                close_fd,
+                metadata,
+                accept_op_id: None,
+                close_poll_id,
+                clients: BTreeSet::new(),
+                paused: false,
+            },
+        );
+        self.dispatch_security_accept(dispatcher, listener);
+    }
+
+    fn dispatch_security_accept(
+        &mut self,
+        dispatcher: &mut Dispatcher,
+        listener: SecurityListenerId,
+    ) {
+        if !self.accepting {
+            return;
+        }
+        let Some(entry) = self.security_listeners.get_mut(&listener) else {
+            return;
+        };
+        if entry.paused || entry.accept_op_id.is_some() {
+            return;
+        }
+        let accept_op_id = RingId::fresh();
+        entry.accept_op_id = Some(accept_op_id);
+        let keep_listen_fd = entry.listen_fd.clone();
+        dispatcher.dispatch(IoUringAction::Accept {
+            id: Some(accept_op_id),
+            fd: entry.listen_fd.as_raw_fd(),
+            dispatch_to: Redispatcher::to::<Self>(
+                move |result: std::io::Result<AcceptCompleted>| {
+                    let _keep_open = &keep_listen_fd;
+                    match result {
+                        Ok(AcceptCompleted { fd: _, new_client }) => {
+                            ClientManagerAction::SecurityClientAccepted { listener, new_client }
+                        }
+                        Err(error) => ClientManagerAction::SecurityAcceptFailed {
+                            listener,
+                            errno: error.raw_os_error(),
+                        },
+                    }
+                },
+            ),
+        });
+    }
+
+    fn remove_security_listener(
+        &mut self,
+        dispatcher: &mut Dispatcher,
+        listener: SecurityListenerId,
+    ) {
+        let Some(entry) = self.security_listeners.remove(&listener) else {
+            return;
+        };
+        if let Some(target) = entry.accept_op_id {
+            dispatcher.dispatch(IoUringAction::Cancel { target });
+        }
+        dispatcher.dispatch(IoUringAction::PollRemove { target: entry.close_poll_id });
+        // Its clients stay connected; they just no longer count against a listener.
+        for client_id in &entry.clients {
+            self.security_client_listener.remove(client_id);
+        }
+        log::info!("security context listener {listener:?} stopped: {:?}", entry.metadata);
+        // `entry` drops here; the io_uring callbacks still hold the fds until their ops end.
+    }
+
+    /// A client went away: forget it, then un-pause every paused listener that is
+    /// below its client cap (the close also freed an fd, which ends `EMFILE`).
+    fn security_client_closed(&mut self, dispatcher: &mut Dispatcher, id: ClientId) {
+        if let Some(listener) = self.security_client_listener.remove(&id) {
+            if let Some(entry) = self.security_listeners.get_mut(&listener) {
+                entry.clients.remove(&id);
+            }
+        }
+        let resumable = self
+            .security_listeners
+            .iter_mut()
+            .filter(|(_, entry)| {
+                entry.paused
+                    && entry.clients.len()
+                        < crate::security_context::MAX_CLIENTS_PER_SECURITY_LISTENER
+            })
+            .map(|(listener, entry)| {
+                entry.paused = false;
+                *listener
+            })
+            .collect::<Vec<_>>();
+        for listener in resumable {
+            self.dispatch_security_accept(dispatcher, listener);
+        }
     }
 }
 
@@ -416,6 +586,71 @@ impl Model for ClientManager {
                 dispatcher.start_model(client_id, client);
                 dispatcher.redispatch_to(adopted, client_id);
                 log::trace!("adopted client id={:?} xwayland={}", client_id, origin.xwayland);
+            }
+            AddSecurityListener { listen_fd, close_fd, metadata } => {
+                self.add_security_listener(dispatcher, listen_fd, close_fd, metadata);
+            }
+            SecurityClientAccepted { listener, new_client } => {
+                let fd = unsafe { OwnedFd::from_raw_fd(new_client) };
+                let metadata = match self.security_listeners.get_mut(&listener) {
+                    Some(entry) => {
+                        entry.accept_op_id = None;
+                        entry.metadata.clone()
+                    }
+                    None => return Ok(()), // listener already stopped: `fd` drops, closed
+                };
+                if !self.accepting {
+                    return Ok(());
+                }
+                let client_id = self.next_id();
+                self.set.insert(client_id);
+                self.security_client_listener.insert(client_id, listener);
+                let entry = self
+                    .security_listeners
+                    .get_mut(&listener)
+                    .expect("listener checked above");
+                entry.clients.insert(client_id);
+                if entry.clients.len() >= crate::security_context::MAX_CLIENTS_PER_SECURITY_LISTENER
+                {
+                    entry.paused = true;
+                    log::warn!(
+                        "security context listener {listener:?} paused: client limit reached"
+                    );
+                }
+                self.dispatch_security_accept(dispatcher, listener); // no-op when paused
+                dispatcher
+                    .start_model(client_id, client_for_security_context(client_id, fd, metadata));
+                log::trace!("sandboxed client id={client_id:?} listener={listener:?}");
+            }
+            SecurityAcceptFailed { listener, errno } => {
+                let Some(entry) = self.security_listeners.get_mut(&listener) else {
+                    return Ok(());
+                };
+                entry.accept_op_id = None;
+                match errno {
+                    Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP) => {
+                        log::warn!(
+                            "security context listener {listener:?} accept failed: errno {errno:?}"
+                        );
+                        self.remove_security_listener(dispatcher, listener);
+                    }
+                    Some(libc::EMFILE | libc::ENFILE) => {
+                        // Re-arming would fail again at once; wait for a client to close.
+                        entry.paused = true;
+                        log::warn!(
+                            "security context listener {listener:?} paused: errno {errno:?}"
+                        );
+                    }
+                    _ => {
+                        log::error!(
+                            "security context listener {listener:?} accept failed: errno {errno:?}"
+                        );
+                        self.dispatch_security_accept(dispatcher, listener);
+                    }
+                }
+            }
+            SecurityListenerClosed { listener } => {
+                self.remove_security_listener(dispatcher, listener)
             }
             LibinputEvent => {
                 // self.libinput.dispatch();
@@ -573,6 +808,16 @@ fn client_for_adoption(
         client.wire_scale = state.xwayland_wire_scale;
     }
     client
+}
+
+/// A client accepted on a security-context listener.
+fn client_for_security_context(
+    client_id: ClientId,
+    fd: OwnedFd,
+    metadata: Rc<SecurityContextMetadata>,
+) -> Client {
+    Client::new(client_id, fd, ClientOrigin { xwayland: false, pid: None })
+        .with_security_context(metadata)
 }
 
 #[derive(Debug)]
@@ -3342,11 +3587,13 @@ impl Model for Client {
             Start => {
                 self.read_process_info();
                 state.set_client_process_info(self.id, self.info.clone());
+                state.set_client_security_context(self.id, self.security_context.clone());
                 log::info!(
-                    "new client_id={:?} command={:?} xwayland={}",
+                    "new client_id={:?} command={:?} xwayland={} sandbox={:?}",
                     self.id,
                     self.info.as_ref().map(|p| &p.command),
-                    self.xwayland
+                    self.xwayland,
+                    self.security_context.as_deref()
                 );
 
                 let display: WlDisplay = WlDisplay::default();
@@ -3735,6 +3982,7 @@ impl Model for Client {
                     dispatcher.stop_model(id);
                 };
                 state.clear_client_process_info(self.id);
+                state.set_client_security_context(self.id, None);
                 state.activation_tokens.remove_client(self.id);
                 let client_objects: Vec<(WaylandId, ObjectId)> = self
                     .objects
@@ -4900,6 +5148,466 @@ mod socket_shutdown_tests {
             Err(error) => assert!(error.to_string().contains("bind Wayland socket")),
             Ok(_manager) => panic!("bind succeeded"),
         }
+    }
+
+    fn listening_unix_socket() -> (mktemp::Temp, Rc<OwnedFd>) {
+        let (dir, path) = temp_socket();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        (dir, Rc::new(OwnedFd::from(listener)))
+    }
+
+    fn close_pair() -> (Rc<OwnedFd>, UnixStream) {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        (Rc::new(OwnedFd::from(ours)), peer)
+    }
+
+    fn metadata() -> Rc<SecurityContextMetadata> {
+        Rc::new(SecurityContextMetadata {
+            sandbox_engine: Some("org.flatpak".into()),
+            app_id: Some("org.example.App".into()),
+            instance_id: Some("42".into()),
+        })
+    }
+
+    fn poll_id_of(actions: &[IoUringAction]) -> RingId {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                IoUringAction::Poll { id: Some(id), .. } => Some(*id),
+                _ => None,
+            })
+            .expect("a close poll")
+    }
+
+    fn accept_id_of(actions: &[IoUringAction]) -> RingId {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                IoUringAction::Accept { id: Some(id), .. } => Some(*id),
+                _ => None,
+            })
+            .expect("an accept")
+    }
+
+    fn accepts_in(actions: &[IoUringAction]) -> usize {
+        actions
+            .iter()
+            .filter(|action| matches!(action, IoUringAction::Accept { .. }))
+            .count()
+    }
+
+    #[test]
+    fn adding_a_security_listener_polls_close_fd_and_accepts() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        let (listen_raw, close_raw) = (listen.as_raw_fd(), close.as_raw_fd());
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AddSecurityListener {
+                    listen_fd: listen,
+                    close_fd: close,
+                    metadata: metadata(),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        let actions = dispatcher.test_take_queued_actions::<IoUringAction>();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(&actions[0], IoUringAction::Poll { fd, .. } if *fd == close_raw));
+        assert!(matches!(&actions[1], IoUringAction::Accept { fd, .. } if *fd == listen_raw));
+    }
+
+    #[test]
+    fn a_security_accept_starts_a_sandboxed_client_and_rearms() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AddSecurityListener {
+                    listen_fd: listen,
+                    close_fd: close,
+                    metadata: metadata(),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        dispatcher.test_take_queued_actions::<IoUringAction>();
+
+        let (new_client, _peer) = socket_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::SecurityClientAccepted {
+                    listener: SecurityListenerId(0),
+                    new_client,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+
+        assert!(dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId(0),
+            |action| matches!(action, ClientAction::Start)
+        ));
+        let actions = dispatcher.test_take_queued_actions::<IoUringAction>();
+        assert_eq!(accepts_in(&actions), 1);
+    }
+
+    #[test]
+    fn a_security_client_carries_the_metadata() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let client = client_for_security_context(ClientId::from_raw(5), socket.into(), metadata());
+
+        assert_eq!(client.security_context(), Some(&metadata()));
+        assert_eq!(client.global_class(), ClientClass { xwayland: false, sandboxed: true });
+    }
+
+    #[test]
+    fn closing_the_close_fd_stops_the_listener_and_keeps_its_clients() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AddSecurityListener {
+                    listen_fd: listen,
+                    close_fd: close,
+                    metadata: metadata(),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let added = dispatcher.test_take_queued_actions::<IoUringAction>();
+        let poll_id = poll_id_of(&added);
+
+        let (first, _first_peer) = socket_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::SecurityClientAccepted {
+                    listener: SecurityListenerId(0),
+                    new_client: first,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let rearmed = dispatcher.test_take_queued_actions::<IoUringAction>();
+        let accept_id = accept_id_of(&rearmed);
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::SecurityListenerClosed { listener: SecurityListenerId(0) },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let stopped = dispatcher.test_take_queued_actions::<IoUringAction>();
+        assert_eq!(stopped.len(), 2);
+        assert!(matches!(&stopped[0], IoUringAction::Cancel { target } if *target == accept_id));
+        assert!(matches!(&stopped[1], IoUringAction::PollRemove { target } if *target == poll_id));
+
+        let (second, mut second_peer) = socket_pair();
+        second_peer.set_nonblocking(true).unwrap();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::SecurityClientAccepted {
+                    listener: SecurityListenerId(0),
+                    new_client: second,
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let mut buffer = [0u8; 1];
+        assert_eq!(second_peer.read(&mut buffer).unwrap(), 0);
+        assert!(!dispatcher.test_has_queued_action_for::<ClientAction, ClientId>(
+            ClientId(1),
+            |action| matches!(action, ClientAction::Start)
+        ));
+        assert!(!dispatcher.test_stop_queued(ClientId(0)));
+    }
+
+    #[test]
+    fn fatal_accept_errors_stop_the_listener_others_rearm() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AddSecurityListener {
+                    listen_fd: listen,
+                    close_fd: close,
+                    metadata: metadata(),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        dispatcher.test_take_queued_actions::<IoUringAction>();
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::SecurityAcceptFailed {
+                    listener: SecurityListenerId(0),
+                    errno: Some(libc::ECONNABORTED),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let rearmed = dispatcher.test_take_queued_actions::<IoUringAction>();
+        assert_eq!(rearmed.len(), 1);
+        assert_eq!(accepts_in(&rearmed), 1);
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::SecurityAcceptFailed {
+                    listener: SecurityListenerId(0),
+                    errno: Some(libc::EINVAL),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let removed = dispatcher.test_take_queued_actions::<IoUringAction>();
+        assert_eq!(removed.len(), 1);
+        assert!(matches!(&removed[0], IoUringAction::PollRemove { .. }));
+
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::SecurityListenerClosed { listener: SecurityListenerId(0) },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(dispatcher
+            .test_take_queued_actions::<IoUringAction>()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_listener_at_its_client_cap_stops_accepting_until_one_closes() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AddSecurityListener {
+                    listen_fd: listen,
+                    close_fd: close,
+                    metadata: metadata(),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        dispatcher.test_take_queued_actions::<IoUringAction>();
+
+        let mut peers = Vec::new();
+        for _ in 0..crate::security_context::MAX_CLIENTS_PER_SECURITY_LISTENER {
+            let (new_client, peer) = socket_pair();
+            peers.push(peer);
+            manager
+                .process(
+                    &mut state,
+                    ClientManagerAction::SecurityClientAccepted {
+                        listener: SecurityListenerId(0),
+                        new_client,
+                    },
+                    &mut dispatcher,
+                )
+                .unwrap();
+            let actions = dispatcher.test_take_queued_actions::<IoUringAction>();
+            if peers.len() < crate::security_context::MAX_CLIENTS_PER_SECURITY_LISTENER {
+                assert_eq!(accepts_in(&actions), 1);
+            } else {
+                assert_eq!(accepts_in(&actions), 0);
+            }
+        }
+
+        manager
+            .process(&mut state, ClientManagerAction::Close { id: ClientId(0) }, &mut dispatcher)
+            .unwrap();
+        let actions = dispatcher.test_take_queued_actions::<IoUringAction>();
+        assert_eq!(accepts_in(&actions), 1);
+    }
+
+    #[test]
+    fn emfile_pauses_the_listener_until_a_client_closes() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let (_dir, path) = temp_socket();
+            let mut manager = ClientManager::bind(&path).unwrap();
+            let mut state = state_for_tests();
+            let mut dispatcher = Dispatcher::default();
+            let (_listen_dir, listen) = listening_unix_socket();
+            let (close, _close_peer) = close_pair();
+            manager
+                .process(
+                    &mut state,
+                    ClientManagerAction::AddSecurityListener {
+                        listen_fd: listen,
+                        close_fd: close,
+                        metadata: metadata(),
+                    },
+                    &mut dispatcher,
+                )
+                .unwrap();
+            dispatcher.test_take_queued_actions::<IoUringAction>();
+            let (first, _first_peer) = socket_pair();
+            manager
+                .process(
+                    &mut state,
+                    ClientManagerAction::SecurityClientAccepted {
+                        listener: SecurityListenerId(0),
+                        new_client: first,
+                    },
+                    &mut dispatcher,
+                )
+                .unwrap();
+            dispatcher.test_take_queued_actions::<IoUringAction>();
+
+            manager
+                .process(
+                    &mut state,
+                    ClientManagerAction::SecurityAcceptFailed {
+                        listener: SecurityListenerId(0),
+                        errno: Some(errno),
+                    },
+                    &mut dispatcher,
+                )
+                .unwrap();
+            assert!(dispatcher
+                .test_take_queued_actions::<IoUringAction>()
+                .is_empty());
+
+            manager
+                .process(
+                    &mut state,
+                    ClientManagerAction::Close { id: ClientId(0) },
+                    &mut dispatcher,
+                )
+                .unwrap();
+            let actions = dispatcher.test_take_queued_actions::<IoUringAction>();
+            assert_eq!(accepts_in(&actions), 1);
+        }
+    }
+
+    #[test]
+    fn the_listener_limit_drops_extra_contexts() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        for _ in 0..=crate::security_context::MAX_SECURITY_LISTENERS {
+            manager
+                .process(
+                    &mut state,
+                    ClientManagerAction::AddSecurityListener {
+                        listen_fd: listen.clone(),
+                        close_fd: close.clone(),
+                        metadata: metadata(),
+                    },
+                    &mut dispatcher,
+                )
+                .unwrap();
+        }
+
+        let actions = dispatcher.test_take_queued_actions::<IoUringAction>();
+        let polls = actions
+            .iter()
+            .filter(|action| matches!(action, IoUringAction::Poll { .. }))
+            .count();
+        assert_eq!(polls, crate::security_context::MAX_SECURITY_LISTENERS);
+    }
+
+    #[test]
+    fn stopping_the_manager_stops_security_listeners() {
+        let (_dir, path) = temp_socket();
+        let mut manager = ClientManager::bind(&path).unwrap();
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AddSecurityListener {
+                    listen_fd: listen,
+                    close_fd: close,
+                    metadata: metadata(),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        let added = dispatcher.test_take_queued_actions::<IoUringAction>();
+        let poll_id = poll_id_of(&added);
+
+        manager
+            .process(&mut state, ClientManagerAction::Stop, &mut dispatcher)
+            .unwrap();
+        let stopped = dispatcher.test_take_queued_actions::<IoUringAction>();
+        assert!(stopped.iter().any(
+            |action| matches!(action, IoUringAction::PollRemove { target } if *target == poll_id)
+        ));
+
+        let (_listen_dir, listen) = listening_unix_socket();
+        let (close, _close_peer) = close_pair();
+        manager
+            .process(
+                &mut state,
+                ClientManagerAction::AddSecurityListener {
+                    listen_fd: listen,
+                    close_fd: close,
+                    metadata: metadata(),
+                },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert!(dispatcher
+            .test_take_queued_actions::<IoUringAction>()
+            .is_empty());
+    }
+
+    #[test]
+    fn client_start_and_close_mirror_the_security_context() {
+        let id = ClientId::from_raw(9);
+        let mut client = Client::new_sandboxed_for_tests(id, (*metadata()).clone());
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+
+        client
+            .process(&mut state, ClientAction::Start, &mut dispatcher)
+            .unwrap();
+        assert_eq!(state.client_security_context(id), Some(&metadata()));
+
+        client
+            .process(&mut state, ClientAction::Close, &mut dispatcher)
+            .unwrap();
+        assert!(state.client_security_context(id).is_none());
     }
 
     fn record_ids() -> (Rc<RefCell<Vec<ClientId>>>, Redispatcher<ClientId>) {

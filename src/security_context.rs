@@ -12,6 +12,9 @@ pub(crate) struct SecurityContextMetadata {
 /// Live security-context listeners allowed in the compositor at once.
 pub(crate) const MAX_SECURITY_LISTENERS: usize = 128;
 
+/// Live clients one security-context listener may have at once.
+pub(crate) const MAX_CLIENTS_PER_SECURITY_LISTENER: usize = 256;
+
 /// The only globals a sandboxed client may see and bind. Everything else,
 /// including globals added later, is hidden (fail closed). A new global is
 /// hidden from sandboxed clients until its interface is added here.

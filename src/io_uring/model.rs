@@ -430,6 +430,12 @@ impl IoUringState {
         // A cancelled or late completion must not call back into a model that
         // shutdown has already stopped.
         if self.draining || self.ignored_completions.remove(&id) {
+            if let Operation::Accept { .. } = op {
+                if result >= 0 {
+                    // Nobody will adopt this connection; close it instead of leaking it.
+                    drop(unsafe { OwnedFd::from_raw_fd(result) });
+                }
+            }
             return;
         }
 
@@ -1094,5 +1100,27 @@ mod write_fds_tests {
             },
             probe.len() as isize
         );
+    }
+
+    #[test]
+    fn an_ignored_accept_completion_closes_the_accepted_fd() {
+        use std::os::{fd::IntoRawFd, unix::net::UnixStream};
+
+        let Ok(mut ring) = IoUringState::try_new() else {
+            return;
+        };
+        let (accepted, peer) = UnixStream::pair().unwrap();
+        let raw = accepted.into_raw_fd();
+        let id = RingId::fresh();
+        ring.pending
+            .insert(id, Operation::Accept { id, fd: -1, dispatch_to: Redispatcher::None });
+        ring.ignored_completions.insert(id);
+        let mut dispatcher = Dispatcher::default();
+
+        ring.process_completed(Completed { user_data: 0, id, result: raw }, &mut dispatcher);
+
+        let mut poll_fd = libc::pollfd { fd: peer.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut poll_fd, 1, 0) }, 1);
+        assert_ne!(poll_fd.revents & libc::POLLHUP, 0);
     }
 }

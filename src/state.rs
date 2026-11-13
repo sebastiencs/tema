@@ -1105,6 +1105,9 @@ pub struct State {
     pub(crate) next_closing_snapshot_id: u64,
     pub root_geometry_cache: BTreeMap<Resolved<WlSurfaceId>, Cell<RootGeometryCacheEntry>>,
     pub(crate) client_process_info: BTreeMap<ClientId, Option<Rc<ProcessInfo>>>,
+    /// Security-context metadata of live sandboxed clients, for IPC.
+    pub(crate) client_security_contexts:
+        BTreeMap<ClientId, Rc<crate::security_context::SecurityContextMetadata>>,
     /// Live toplevels, allocated in `xdg_surface.get_toplevel` and released with that role.
     pub(crate) windows: BTreeMap<WindowId, WindowEntry>,
     pub(crate) window_by_root: BTreeMap<Resolved<WlSurfaceId>, WindowId>,
@@ -1269,6 +1272,7 @@ impl State {
             next_closing_snapshot_id: 1,
             root_geometry_cache: Default::default(),
             client_process_info: Default::default(),
+            client_security_contexts: Default::default(),
             windows: Default::default(),
             window_by_root: Default::default(),
             next_window_id: 1,
@@ -4369,6 +4373,28 @@ impl State {
         {
             self.root_surface_process_info.insert(surface, info.clone());
         }
+    }
+
+    pub(crate) fn set_client_security_context(
+        &mut self,
+        client_id: ClientId,
+        metadata: Option<Rc<crate::security_context::SecurityContextMetadata>>,
+    ) {
+        match metadata {
+            Some(metadata) => {
+                self.client_security_contexts.insert(client_id, metadata);
+            }
+            None => {
+                self.client_security_contexts.remove(&client_id);
+            }
+        }
+    }
+
+    pub(crate) fn client_security_context(
+        &self,
+        client_id: ClientId,
+    ) -> Option<&Rc<crate::security_context::SecurityContextMetadata>> {
+        self.client_security_contexts.get(&client_id)
     }
 
     pub fn clear_client_process_info(&mut self, client_id: ClientId) {
