@@ -300,7 +300,12 @@ mod tests {
                 &mut state,
                 crate::commit_gate::CommitGateAction::OutputLatched {
                     output_id: out,
-                    latched: vec![(s, first, crate::commit_gate::LatchKind::Hard)],
+                    kind: crate::commit_gate::LatchKind::Hard,
+                    barriers: vec![crate::commit_gate::NotedBarrier {
+                        surface: s,
+                        seq: first,
+                        in_frame: true,
+                    }],
                 },
                 &mut dispatcher,
             )

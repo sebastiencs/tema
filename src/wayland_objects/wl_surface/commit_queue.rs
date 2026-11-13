@@ -108,6 +108,7 @@ pub(super) enum Readiness {
 
 /// Whether `update` of `surface` may be applied now. `applied_seq` is the
 /// surface's `applied_update_seq`; `forced` skips the waits that can be skipped.
+/// The children carried by `update` must not be grabbed (see `flush_client`).
 pub(super) fn readiness(
     state: &State,
     surface: Resolved<WlSurfaceId>,
@@ -138,9 +139,6 @@ pub(super) fn readiness(
     for child in &update.children {
         if !child.surface.exists(state) {
             continue; // destroyed: discarded at apply
-        }
-        if state.objects.is_grabbed(child.surface.object_id()) {
-            return Readiness::WaitSequence; // grabbed: try again later
         }
         let Some(c) = child.surface.try_ref(state) else {
             continue;
@@ -237,6 +235,11 @@ pub(super) fn submit(
 
 /// Applies every queued update of `client` that is now ready, in order per
 /// surface, until no more can be applied.
+///
+/// No `wl_surface` may be grabbed when this runs: it reads every queued
+/// surface and the children their updates carry, and reading a grabbed object
+/// panics. `submit` calls it only after releasing its own surface, and the
+/// client actions call it at the top of the event loop.
 pub(crate) fn flush_client(
     client: &mut Client,
     state: &mut State,
@@ -268,10 +271,6 @@ fn try_apply_head(
         return false;
     }
     let next = {
-        // A grabbed surface keeps its queue; it is tried again on a later flush.
-        if state.objects.is_grabbed(surface.object_id()) {
-            return false;
-        }
         let Some(wl) = surface.try_ref(state) else {
             return false;
         };

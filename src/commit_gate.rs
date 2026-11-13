@@ -13,13 +13,10 @@ use nix::sys::timerfd::{self, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags
 
 use crate::{
     clients::{ClientAction, ClientId, Resolved},
-    indexmap::IndexMap,
     io_uring::{model::IoUringAction, ring::RingId},
-    object::Object,
     protocol_generated::WlSurfaceId,
     runner::{Dispatcher, Model, ModelFailure, Redispatcher},
-    state::{ObjectId, OutputId, State},
-    wayland_objects::wl_surface::WlSurface,
+    state::{OutputId, State},
 };
 
 pub(crate) const FIFO_FALLBACK_SHORT: Duration = Duration::from_millis(25);
@@ -36,6 +33,15 @@ pub(crate) struct FifoBarrier {
 pub(crate) enum LatchKind {
     Hard,
     Soft,
+}
+
+/// A barrier as it was when a frame latched. `in_frame` tells whether the
+/// barrier's surface was one of the frame's callback surfaces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NotedBarrier {
+    pub(crate) surface: Resolved<WlSurfaceId>,
+    pub(crate) seq: u64,
+    pub(crate) in_frame: bool,
 }
 
 #[derive(Debug, Default)]
@@ -271,11 +277,13 @@ pub(crate) fn wait_until(
     dispatcher.dispatch(CommitGateAction::Arm);
 }
 
-/// Called right after a frame was submitted or ended without presenting.
-/// `gate` and `objects` are fields of `State` disjoint from the live `&mut Drm`.
+/// Called right after a frame was submitted or ended without presenting. It
+/// runs inside the DRM submit path, so it reads only the gate: the barriers'
+/// surfaces are read later, by the `OutputLatched` action. Each barrier's
+/// sequence number is recorded now, so a barrier set after this latch is not
+/// cleared by it.
 pub(crate) fn note_latched(
     gate: &CommitGate,
-    objects: &IndexMap<ObjectId, Box<dyn Object>>,
     output_id: OutputId,
     surfaces: &[Resolved<WlSurfaceId>],
     kind: LatchKind,
@@ -284,26 +292,44 @@ pub(crate) fn note_latched(
     if !gate.has_any_barrier() {
         return;
     }
-    let mut latched = Vec::new();
-    for (surface, barrier) in gate.barriers() {
-        // A grabbed surface cannot be read; its barrier keeps its fallback deadline.
-        if objects.is_grabbed(surface.object_id()) {
-            continue;
-        }
-        let in_frame = surfaces.contains(&surface);
-        let active = objects
-            .try_ref_object::<WlSurface>(surface.object_id())
-            .and_then(|s| s.active_output_id());
-        let on_this_output = active == Some(output_id);
-        if in_frame && (on_this_output || active.is_none()) {
-            latched.push((surface, barrier.seq, kind));
-        } else if on_this_output {
-            latched.push((surface, barrier.seq, LatchKind::Soft)); // occluded
-        }
-    }
-    if !latched.is_empty() {
-        dispatcher.dispatch(CommitGateAction::OutputLatched { output_id, latched });
-    }
+    let barriers = gate
+        .barriers()
+        .map(|(surface, barrier)| NotedBarrier {
+            surface,
+            seq: barrier.seq,
+            in_frame: surfaces.contains(&surface),
+        })
+        .collect();
+    dispatcher.dispatch(CommitGateAction::OutputLatched { output_id, kind, barriers });
+}
+
+/// Which noted barriers this latch acts on, and how. A barrier whose surface is
+/// in the frame latches with `kind` when the surface's active output is this
+/// output or it has none. A barrier whose surface is on this output but not in
+/// the frame (occluded) latches softly. Others are left alone.
+fn classify_latch(
+    state: &State,
+    output_id: OutputId,
+    kind: LatchKind,
+    barriers: &[NotedBarrier],
+) -> Vec<(Resolved<WlSurfaceId>, u64, LatchKind)> {
+    barriers
+        .iter()
+        .filter_map(|noted| {
+            let active = noted
+                .surface
+                .try_ref(state)
+                .and_then(|surface| surface.active_output_id());
+            let on_this_output = active == Some(output_id);
+            if noted.in_frame && (on_this_output || active.is_none()) {
+                Some((noted.surface, noted.seq, kind))
+            } else if on_this_output {
+                Some((noted.surface, noted.seq, LatchKind::Soft))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn on_output_latched(
@@ -337,7 +363,7 @@ pub(crate) struct CommitGateModel {
 pub(crate) enum CommitGateAction {
     Arm,
     Fired,
-    OutputLatched { output_id: OutputId, latched: Vec<(Resolved<WlSurfaceId>, u64, LatchKind)> },
+    OutputLatched { output_id: OutputId, kind: LatchKind, barriers: Vec<NotedBarrier> },
     Stop,
 }
 
@@ -411,8 +437,9 @@ impl Model for CommitGateModel {
                 self.read = None;
                 self.service(state, dispatcher);
             }
-            CommitGateAction::OutputLatched { output_id, latched } => {
+            CommitGateAction::OutputLatched { output_id, kind, barriers } => {
                 let now = state.commit_gate.now();
+                let latched = classify_latch(state, output_id, kind, &barriers);
                 on_output_latched(state, dispatcher, output_id, latched, now);
                 self.service(state, dispatcher);
             }
@@ -437,7 +464,7 @@ mod tests {
                 frame_clock::{FrameClock, FrameClockMode, PresentFlags, PresentSample},
                 output_scheduler::OutputSchedulerSnapshot,
             },
-            state::{BackendOutputRef, DrmId},
+            state::{BackendOutputRef, DrmId, ObjectId},
             test_support::{
                 insert_root_surface, resolved_wl_surface, state_for_tests, test_output,
             },
@@ -610,12 +637,19 @@ mod tests {
             .commit_gate
             .insert_barrier(s, now + Duration::from_secs(1));
         let mut d = Dispatcher::default();
-        note_latched(&state.commit_gate, &state.objects, out, &[s], LatchKind::Hard, &mut d);
+        note_latched(&state.commit_gate, out, &[s], LatchKind::Hard, &mut d);
         assert!(d.test_has_queued_action::<CommitGateAction>(|a| {
-            matches!(a, CommitGateAction::OutputLatched { latched, .. }
-                if latched.as_slice() == [(s, seq, LatchKind::Hard)])
+            matches!(a, CommitGateAction::OutputLatched { kind: LatchKind::Hard, barriers, .. }
+                if barriers.as_slice() == [NotedBarrier { surface: s, seq, in_frame: true }])
         }));
-        on_output_latched(&mut state, &mut d, out, vec![(s, seq, LatchKind::Hard)], now);
+        let latched = classify_latch(
+            &state,
+            out,
+            LatchKind::Hard,
+            &[NotedBarrier { surface: s, seq, in_frame: true }],
+        );
+        assert_eq!(latched, vec![(s, seq, LatchKind::Hard)]);
+        on_output_latched(&mut state, &mut d, out, latched, now);
         assert!(state.commit_gate.barrier(s).is_none());
         assert!(d
             .test_has_queued_action_for::<ClientAction, _>(s.client_id(), |a: &ClientAction| {
@@ -650,12 +684,18 @@ mod tests {
             .commit_gate
             .insert_barrier(s, now + Duration::from_secs(1));
         let mut d = Dispatcher::default();
-        note_latched(&state.commit_gate, &state.objects, out, &[s], LatchKind::Soft, &mut d);
+        note_latched(&state.commit_gate, out, &[s], LatchKind::Soft, &mut d);
         assert!(d.test_has_queued_action::<CommitGateAction>(|a| {
-            matches!(a, CommitGateAction::OutputLatched { latched, .. }
-                if latched.as_slice() == [(s, seq, LatchKind::Soft)])
+            matches!(a, CommitGateAction::OutputLatched { kind: LatchKind::Soft, barriers, .. }
+                if barriers.as_slice() == [NotedBarrier { surface: s, seq, in_frame: true }])
         }));
-        let latched = vec![(s, seq, LatchKind::Soft)];
+        let latched = classify_latch(
+            &state,
+            out,
+            LatchKind::Soft,
+            &[NotedBarrier { surface: s, seq, in_frame: true }],
+        );
+        assert_eq!(latched, vec![(s, seq, LatchKind::Soft)]);
         on_output_latched(&mut state, &mut d, out, latched, now);
         assert!(state.commit_gate.has_barrier(s));
     }
@@ -669,11 +709,18 @@ mod tests {
             .commit_gate
             .insert_barrier(s, state.commit_gate.now() + ms(500));
         let mut d = Dispatcher::default();
-        note_latched(&state.commit_gate, &state.objects, out, &[], LatchKind::Hard, &mut d);
+        note_latched(&state.commit_gate, out, &[], LatchKind::Hard, &mut d);
         assert!(d.test_has_queued_action::<CommitGateAction>(|a| {
-            matches!(a, CommitGateAction::OutputLatched { latched, .. }
-                if latched.as_slice() == [(s, seq, LatchKind::Soft)])
+            matches!(a, CommitGateAction::OutputLatched { barriers, .. }
+                if barriers.as_slice() == [NotedBarrier { surface: s, seq, in_frame: false }])
         }));
+        let latched = classify_latch(
+            &state,
+            out,
+            LatchKind::Hard,
+            &[NotedBarrier { surface: s, seq, in_frame: false }],
+        );
+        assert_eq!(latched, vec![(s, seq, LatchKind::Soft)]);
     }
 
     #[test]
@@ -686,8 +733,15 @@ mod tests {
             .commit_gate
             .insert_barrier(s, state.commit_gate.now() + ms(500));
         let mut d = Dispatcher::default();
-        note_latched(&state.commit_gate, &state.objects, other, &[s], LatchKind::Hard, &mut d);
-        assert!(!d.test_has_queued_action::<CommitGateAction>(|_| true));
+        note_latched(&state.commit_gate, other, &[s], LatchKind::Hard, &mut d);
+        let seq = state.commit_gate.barrier(s).unwrap().seq;
+        let latched = classify_latch(
+            &state,
+            other,
+            LatchKind::Hard,
+            &[NotedBarrier { surface: s, seq, in_frame: true }],
+        );
+        assert!(latched.is_empty());
         assert!(state.commit_gate.has_barrier(s));
     }
 
@@ -711,7 +765,7 @@ mod tests {
         let out = test_out(&mut state, 1, 60_000);
         let s = surface_on(&mut state, out, 5);
         let mut d = Dispatcher::default();
-        note_latched(&state.commit_gate, &state.objects, out, &[s], LatchKind::Hard, &mut d);
+        note_latched(&state.commit_gate, out, &[s], LatchKind::Hard, &mut d);
         assert!(!d.test_has_queued_action::<CommitGateAction>(|_| true));
     }
 
@@ -909,5 +963,28 @@ mod tests {
         let (state, out) = ready_fixture(240_000, FrameClockMode::Fixed, false, Some((b, good())));
         let target = b + p * 2 + Duration::from_nanos(1);
         assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), b + p * 2 + margin);
+    }
+
+    #[test]
+    fn a_barrier_set_after_the_latch_survives_it() {
+        let mut state = state_for_tests();
+        let out = test_out(&mut state, 1, 60_000);
+        let s = surface_on(&mut state, out, 5);
+        let now = state.commit_gate.now();
+        state.commit_gate.insert_barrier(s, now + ms(500));
+        let mut d = Dispatcher::default();
+        note_latched(&state.commit_gate, out, &[s], LatchKind::Hard, &mut d);
+        let newer = state.commit_gate.insert_barrier(s, now + ms(500));
+        let barriers = d
+            .test_take_queued_actions::<CommitGateAction>()
+            .into_iter()
+            .find_map(|a| match a {
+                CommitGateAction::OutputLatched { barriers, .. } => Some(barriers),
+                _ => None,
+            })
+            .unwrap();
+        let latched = classify_latch(&state, out, LatchKind::Hard, &barriers);
+        on_output_latched(&mut state, &mut d, out, latched, now);
+        assert_eq!(state.commit_gate.barrier(s).unwrap().seq, newer);
     }
 }

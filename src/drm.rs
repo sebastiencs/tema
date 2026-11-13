@@ -6641,7 +6641,6 @@ impl DrmOutputModel {
                         );
                         crate::commit_gate::note_latched(
                             &state.commit_gate,
-                            &state.objects,
                             self.output_id,
                             &registration.callback_surfaces,
                             if registration.async_flip {
@@ -6718,7 +6717,6 @@ impl DrmOutputModel {
                 );
                 crate::commit_gate::note_latched(
                     &state.commit_gate,
-                    &state.objects,
                     self.output_id,
                     &frame_callback_surfaces,
                     crate::commit_gate::LatchKind::Soft,
@@ -6890,7 +6888,6 @@ impl DrmOutputModel {
                                     );
                                     crate::commit_gate::note_latched(
                                         &state.commit_gate,
-                                        &state.objects,
                                         self.output_id,
                                         &registration.callback_surfaces,
                                         if registration.async_flip {
@@ -7075,7 +7072,6 @@ impl DrmOutputModel {
                     );
                     crate::commit_gate::note_latched(
                         &state.commit_gate,
-                        &state.objects,
                         self.output_id,
                         &registration.callback_surfaces,
                         if registration.async_flip {

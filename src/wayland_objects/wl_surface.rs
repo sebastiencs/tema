@@ -888,18 +888,16 @@ impl WlSurface {
     /// which is being deleted. They stay alive and report `surface_destroyed` on their
     /// requests.
     fn detach_timing_objects(&mut self, state: &mut State) {
+        // Only this surface is grabbed here: the fifo and timer handlers never
+        // delete a surface.
         if let Some(fifo) = self.fifo_object.take() {
-            if !state.objects.is_grabbed(fifo.object_id()) {
-                if let Some(fifo) = fifo.try_ref_mut(state) {
-                    fifo.mark_surface_destroyed();
-                }
+            if let Some(fifo) = fifo.try_ref_mut(state) {
+                fifo.mark_surface_destroyed();
             }
         }
         if let Some(timer) = self.commit_timer_object.take() {
-            if !state.objects.is_grabbed(timer.object_id()) {
-                if let Some(timer) = timer.try_ref_mut(state) {
-                    timer.mark_surface_destroyed();
-                }
+            if let Some(timer) = timer.try_ref_mut(state) {
+                timer.mark_surface_destroyed();
             }
         }
     }
@@ -10321,27 +10319,6 @@ mod tests {
         assert_eq!(pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60)), 0);
         assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
         assert_eq!(surface.rref(&state).test_queue_len(), 0);
-    }
-
-    #[test]
-    fn grabbed_surface_is_not_forgotten() {
-        let mut state = state_for_tests();
-        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
-        let surface = insert_plain_root(&mut client, &mut state, 1);
-        let update = ContentUpdate::test_new(WlSurface::test_payload(None), Vec::new(), Vec::new());
-        {
-            let mut grabbed = surface.grab(&mut state);
-            WlSurface::test_enqueue(&mut grabbed, &mut state, surface, update);
-            // While grabbed, the flush cannot reach the queue and keeps it.
-            flush_queued_commits(&mut client, &mut state, &mut dispatcher);
-            assert_eq!(grabbed.test_queue_len(), 1);
-            assert!(state.commit_queues.has_queued(client.client_id()));
-        }
-
-        flush_queued_commits(&mut client, &mut state, &mut dispatcher);
-        assert_eq!(surface.rref(&state).test_queue_len(), 0);
-        assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
-        assert!(!state.commit_queues.has_queued(client.client_id()));
     }
 
     /// A pipe whose read end is an explicit-sync acquire point: it is readable

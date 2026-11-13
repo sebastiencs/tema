@@ -23,10 +23,11 @@ impl WpCommitTimerV1 {
         self.surface = None;
     }
 
-    /// The surface, while it is alive and not grabbed (a grabbed surface cannot be read here).
+    /// The surface, while it is alive. Only this object is grabbed in its
+    /// handlers, so the surface can be read.
     fn live_surface(&self, state: &State) -> Option<Resolved<WlSurfaceId>> {
         let surface = self.surface?;
-        (!state.objects.is_grabbed(surface.object_id()) && surface.exists(state)).then_some(surface)
+        surface.exists(state).then_some(surface)
     }
 
     fn surface_destroyed(&self, client: &mut Client, dispatcher: &mut ClientDispatcher) {
