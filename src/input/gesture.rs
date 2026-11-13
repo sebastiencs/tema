@@ -99,14 +99,37 @@ pub enum PointerGestureKind {
     Hold,
 }
 
+/// Travel needed before a bound swipe runs its action, in logical px.
+pub(crate) const GESTURE_TRIGGER_DISTANCE: f64 = 64.0;
+
+/// A swipe tema owns through `[gestures]`. It never reaches clients.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OwnedSwipe {
+    pub(crate) fingers: u32,
+    /// Accumulated libinput deltas since `begin`, logical px.
+    pub(crate) dx: f64,
+    pub(crate) dy: f64,
+    pub(crate) mode: OwnedSwipeMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum OwnedSwipeMode {
+    /// The direction is decided when the fingers lift.
+    Trigger,
+    /// The gesture ends without running anything.
+    Aborted,
+}
+
 /// The libinput gesture in progress on the seat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ActivePointerGesture {
     pub(crate) kind: PointerGestureKind,
     /// Surface whose client was sent `begin`. Only its client matters after
     /// `begin`. `None` when the gesture was swallowed or has been cancelled:
     /// later updates and the end from libinput are dropped.
     pub(crate) target: Option<Resolved<WlSurfaceId>>,
+    /// Set when tema owns the swipe through a `[gestures]` binding.
+    pub(crate) owned: Option<OwnedSwipe>,
 }
 
 /// Surface a client gesture starting now would go to.
@@ -124,9 +147,21 @@ pub(crate) fn handle_pointer_gesture_begin(
     time: u32,
     fingers: u32,
 ) {
+    abort_owned_swipe(state, dispatcher);
     cancel_pointer_gesture(state, dispatcher, time);
+    if kind == PointerGestureKind::Swipe
+        && !state.session_lock.input_gated()
+        && state.config.swipe_fingers_bound(fingers)
+    {
+        state.seat.active_pointer_gesture = Some(ActivePointerGesture {
+            kind,
+            target: None,
+            owned: Some(OwnedSwipe { fingers, dx: 0.0, dy: 0.0, mode: OwnedSwipeMode::Trigger }),
+        });
+        return;
+    }
     let target = gesture_target(state);
-    state.seat.active_pointer_gesture = Some(ActivePointerGesture { kind, target });
+    state.seat.active_pointer_gesture = Some(ActivePointerGesture { kind, target, owned: None });
     let Some(surface) = target else {
         return;
     };
@@ -165,6 +200,17 @@ pub(crate) fn handle_pointer_gesture_swipe_update(
     dx: f64,
     dy: f64,
 ) {
+    if let Some(owned) = state
+        .seat
+        .active_pointer_gesture
+        .as_mut()
+        .filter(|active| active.kind == PointerGestureKind::Swipe)
+        .and_then(|active| active.owned.as_mut())
+    {
+        owned.dx += dx;
+        owned.dy += dy;
+        return;
+    }
     let Some(client_id) = live_target(state, dispatcher, PointerGestureKind::Swipe, time) else {
         return;
     };
@@ -213,6 +259,13 @@ pub(crate) fn handle_pointer_gesture_end(
     if active.kind != kind {
         return;
     }
+    if let Some(owned) = active.owned {
+        state.seat.active_pointer_gesture = None;
+        if !cancelled && owned.mode == OwnedSwipeMode::Trigger {
+            run_swipe_binding(state, dispatcher, owned);
+        }
+        return;
+    }
     let client_id = live_target(state, dispatcher, kind, time);
     state.seat.active_pointer_gesture = None;
     let Some(client_id) = client_id else {
@@ -244,6 +297,52 @@ pub(crate) fn cancel_pointer_gesture(state: &mut State, dispatcher: &mut Dispatc
     );
 }
 
+fn swipe_direction(dx: f64, dy: f64) -> Option<crate::config::SwipeDirection> {
+    use crate::config::SwipeDirection;
+    if dx.abs().max(dy.abs()) < GESTURE_TRIGGER_DISTANCE {
+        return None;
+    }
+    Some(if dx.abs() >= dy.abs() {
+        if dx < 0.0 {
+            SwipeDirection::Left
+        } else {
+            SwipeDirection::Right
+        }
+    } else if dy < 0.0 {
+        SwipeDirection::Up
+    } else {
+        SwipeDirection::Down
+    })
+}
+
+fn run_swipe_binding(state: &mut State, dispatcher: &mut Dispatcher, owned: OwnedSwipe) {
+    let Some(direction) = swipe_direction(owned.dx, owned.dy) else {
+        return;
+    };
+    let Some(action) = state.config.binding_for_swipe(owned.fingers, direction) else {
+        return;
+    };
+    log::info!(
+        "seat executing gesture binding fingers={} direction={direction:?} action={action:?}",
+        owned.fingers
+    );
+    crate::config::execute_action(state, dispatcher, action);
+}
+
+/// Stop an owned swipe: it ends without running anything. Phase 4 also
+/// cancels a tracked workspace slide here.
+pub(crate) fn abort_owned_swipe(state: &mut State, dispatcher: &mut Dispatcher) {
+    let _ = dispatcher;
+    if let Some(owned) = state
+        .seat
+        .active_pointer_gesture
+        .as_mut()
+        .and_then(|active| active.owned.as_mut())
+    {
+        owned.mode = OwnedSwipeMode::Aborted;
+    }
+}
+
 /// Pointer focus is about to change to `new_client` (`None`: no focus). Cancel
 /// unless the gesture's client keeps pointer focus.
 pub(crate) fn cancel_pointer_gesture_unless_client(
@@ -266,11 +365,14 @@ pub(crate) fn cancel_pointer_gesture_unless_client(
 mod tests {
     use crate::{
         clients::{ClientAction, ClientId, Resolved},
+        config::{CompositorAction, GestureBinding, SwipeDirection},
         input::types::{PointerFocus, SurfaceRect},
-        protocol_generated::WlSurfaceId,
+        process::ProcessManagerAction,
+        protocol_generated::{ExtSessionLockV1Id, WlSurfaceId},
         runner::Dispatcher,
         seat::SeatClientEvent,
-        state::{DragPhase, DragSource, DragState, ObjectId, State},
+        session_lock::PreLockFocus,
+        state::{DragPhase, DragSource, DragState, ObjectId, OutputId, State},
         test_support::{fake_focus, state_for_tests, test_client_and_dispatcher},
         wayland_objects::wl_surface::WlSurface,
     };
@@ -350,7 +452,11 @@ mod tests {
         assert_eq!((kind, time, begun, fingers), (PointerGestureKind::Swipe, 10, surface, 3));
         assert_eq!(
             state.seat.active_pointer_gesture,
-            Some(ActivePointerGesture { kind: PointerGestureKind::Swipe, target: Some(surface) })
+            Some(ActivePointerGesture {
+                kind: PointerGestureKind::Swipe,
+                target: Some(surface),
+                owned: None,
+            })
         );
     }
 
@@ -633,5 +739,132 @@ mod tests {
             Some(SeatClientEvent::PointerGestureEnd { cancelled: true, .. })
         ));
         assert!(state.seat.pointer_focus.is_none());
+    }
+
+    fn bind_swipe(state: &mut State, fingers: u32, direction: SwipeDirection) {
+        state.config.gesture_bindings.push(GestureBinding {
+            description: format!("swipe:{fingers}:{direction:?}"),
+            fingers,
+            direction,
+            action: CompositorAction::Spawn { command: "true".to_string() },
+        });
+    }
+
+    fn spawned(dispatcher: &Dispatcher) -> bool {
+        dispatcher.test_has_queued_action(|action: &ProcessManagerAction| {
+            matches!(action, ProcessManagerAction::Spawn(_))
+        })
+    }
+
+    #[test]
+    fn bound_finger_count_is_owned_and_never_reaches_clients() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        bind_swipe(&mut state, 3, SwipeDirection::Left);
+        focus(&mut state, 7, 50);
+
+        begin_swipe(&mut state, &mut dispatcher, 10, 3);
+        swipe_update(&mut state, &mut dispatcher, 11, -40.0);
+        swipe_update(&mut state, &mut dispatcher, 12, -40.0);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+
+        assert!(gesture_events(&mut dispatcher, 7).is_empty());
+        assert!(spawned(&dispatcher));
+        assert!(state.seat.active_pointer_gesture.is_none());
+    }
+
+    #[test]
+    fn short_or_unbound_direction_runs_nothing() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        bind_swipe(&mut state, 3, SwipeDirection::Left);
+        focus(&mut state, 7, 50);
+
+        begin_swipe(&mut state, &mut dispatcher, 10, 3);
+        swipe_update(&mut state, &mut dispatcher, 11, -50.0);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+        assert!(!spawned(&dispatcher));
+
+        begin_swipe(&mut state, &mut dispatcher, 20, 3);
+        swipe_update(&mut state, &mut dispatcher, 21, 100.0);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+        assert!(!spawned(&dispatcher));
+        assert!(gesture_events(&mut dispatcher, 7).is_empty());
+    }
+
+    #[test]
+    fn vertical_dominant_swipe_uses_the_vertical_binding() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        bind_swipe(&mut state, 3, SwipeDirection::Down);
+
+        begin_swipe(&mut state, &mut dispatcher, 10, 3);
+        handle_pointer_gesture_swipe_update(&mut state, &mut dispatcher, 11, 30.0, 80.0);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+
+        assert!(spawned(&dispatcher));
+    }
+
+    #[test]
+    fn unbound_finger_count_goes_to_clients() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        bind_swipe(&mut state, 3, SwipeDirection::Left);
+        focus(&mut state, 7, 50);
+
+        begin_swipe(&mut state, &mut dispatcher, 10, 4);
+
+        assert!(matches!(
+            gesture_events(&mut dispatcher, 7).as_slice(),
+            [SeatClientEvent::PointerGestureBegin {
+                kind: PointerGestureKind::Swipe,
+                fingers: 4,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn cancelled_or_aborted_owned_swipe_runs_nothing() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        bind_swipe(&mut state, 3, SwipeDirection::Left);
+
+        begin_swipe(&mut state, &mut dispatcher, 10, 3);
+        swipe_update(&mut state, &mut dispatcher, 11, -100.0);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, true);
+        assert!(!spawned(&dispatcher));
+
+        begin_swipe(&mut state, &mut dispatcher, 20, 3);
+        swipe_update(&mut state, &mut dispatcher, 21, -100.0);
+        abort_owned_swipe(&mut state, &mut dispatcher);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+        assert!(!spawned(&dispatcher));
+    }
+
+    #[test]
+    fn session_lock_never_owns_a_swipe() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        bind_swipe(&mut state, 3, SwipeDirection::Left);
+        state.session_lock.install(
+            ClientId::from_raw(7),
+            Resolved::new(
+                ClientId::from_raw(7),
+                ExtSessionLockV1Id::from(9),
+                ObjectId::from(9usize),
+            ),
+            false,
+            PreLockFocus::default(),
+            std::iter::empty::<OutputId>(),
+        );
+        focus(&mut state, 7, 50);
+
+        begin_swipe(&mut state, &mut dispatcher, 10, 3);
+
+        assert!(matches!(
+            gesture_events(&mut dispatcher, 7).as_slice(),
+            [SeatClientEvent::PointerGestureBegin { .. }]
+        ));
     }
 }

@@ -1882,6 +1882,7 @@ pub fn handle_pointer_motion_absolute(
 
 /// Release stuck keys, buttons, focus, and grabs before a device pause.
 pub fn gate_for_session_lock(state: &mut State, dispatcher: &mut Dispatcher) {
+    crate::input::gesture::abort_owned_swipe(state, dispatcher);
     cancel_active_drag(state, dispatcher, None);
     if let Some((client_id, popups)) = state.seat.dismiss_popup_grab() {
         dispatcher.dispatch_to(client_id, ClientAction::DismissPopupGrab { popups });
@@ -1906,6 +1907,7 @@ pub fn gate_for_session_lock(state: &mut State, dispatcher: &mut Dispatcher) {
 }
 
 pub fn quiesce_for_session_pause(state: &mut State, dispatcher: &mut Dispatcher) {
+    crate::input::gesture::abort_owned_swipe(state, dispatcher);
     // Cancel before replaying buttons. A release would otherwise complete a drop.
     cancel_active_drag(state, dispatcher, None);
     let time = monotonic_time_msec();

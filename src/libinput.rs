@@ -399,6 +399,7 @@ impl Model for Libinput {
                 self.add_device(state, dispatcher, devnode, devnum);
             }
             Quiesce { devnum } => {
+                crate::input::gesture::abort_owned_swipe(state, dispatcher);
                 crate::input::gesture::cancel_pointer_gesture(
                     state,
                     dispatcher,
@@ -453,6 +454,7 @@ impl Model for Libinput {
                     dispatcher,
                     crate::input::ToplevelDragEnd::Cancelled,
                 );
+                crate::input::gesture::abort_owned_swipe(state, dispatcher);
                 state.seat.clear_device_state();
             }
             CloseSessionFds => {
