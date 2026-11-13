@@ -130,6 +130,8 @@ wayland_id! {
   WpImageDescriptionReferenceV1Id,
   WpColorRepresentationManagerV1Id,
   WpColorRepresentationSurfaceV1Id,
+  WpCommitTimingManagerV1Id,
+  WpCommitTimerV1Id,
   WpContentTypeManagerV1Id,
   WpContentTypeV1Id,
   WpDrmLeaseDeviceV1Id,
@@ -156,13 +158,19 @@ wayland_id! {
   ExtSessionLockManagerV1Id,
   ExtSessionLockV1Id,
   ExtSessionLockSurfaceV1Id,
+  WpFifoManagerV1Id,
+  WpFifoV1Id,
   WpFractionalScaleManagerV1Id,
   WpFractionalScaleV1Id,
+  WpSecurityContextManagerV1Id,
+  WpSecurityContextV1Id,
   WpSinglePixelBufferManagerV1Id,
   WpTearingControlManagerV1Id,
   WpTearingControlV1Id,
   XdgActivationV1Id,
   XdgActivationTokenV1Id,
+  XdgWmDialogV1Id,
+  XdgDialogV1Id,
   XdgSessionManagerV1Id,
   XdgSessionV1Id,
   XdgToplevelSessionV1Id,
@@ -179,12 +187,18 @@ wayland_id! {
   WpLinuxDrmSyncobjSurfaceV1Id,
   ZwpIdleInhibitManagerV1Id,
   ZwpIdleInhibitorV1Id,
+  ZwpKeyboardShortcutsInhibitManagerV1Id,
+  ZwpKeyboardShortcutsInhibitorV1Id,
   ZwpLinuxExplicitSynchronizationV1Id,
   ZwpLinuxSurfaceSynchronizationV1Id,
   ZwpLinuxBufferReleaseV1Id,
   ZwpPointerConstraintsV1Id,
   ZwpLockedPointerV1Id,
   ZwpConfinedPointerV1Id,
+  ZwpPointerGesturesV1Id,
+  ZwpPointerGestureSwipeV1Id,
+  ZwpPointerGesturePinchV1Id,
+  ZwpPointerGestureHoldV1Id,
   ZwpPrimarySelectionDeviceManagerV1Id,
   ZwpPrimarySelectionDeviceV1Id,
   ZwpPrimarySelectionOfferV1Id,
@@ -5606,7 +5620,7 @@ pub mod zwp_linux_buffer_params_v1 {
         /// Upon receiving this event, the client should destroy the
         /// zwp_linux_buffer_params_v1 object.
         Created {
-            /// Id for the the newly created wl_buffer,
+            /// Id for the newly created wl_buffer,
             buffer: WlBufferId,
         },
         /// Buffer creation failed
@@ -5702,6 +5716,11 @@ pub mod zwp_linux_buffer_params_v1 {
 ///
 /// With version 6 and above, the compositor must always advertise at least
 /// one tranche with the sampling flag set.
+///
+/// The compositor sends a format_table event at least once for each dmabuf
+/// parameters feedback object, before any tranche events. Unless the format
+/// table contents change later, the compositor is free not to send another
+/// format_table event for the same dmabuf parameters feedback object.
 pub mod zwp_linux_dmabuf_feedback_v1 {
     use super::*;
     impl Constants for crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1 {
@@ -7791,7 +7810,7 @@ pub mod wp_presentation {
     use super::*;
     impl Constants for crate::wayland_objects::wp_presentation::WpPresentation {
         const INTERFACE_NAME: &'static str = "wp_presentation";
-        const INTERFACE_VERSION: u32 = 2;
+        const INTERFACE_VERSION: u32 = 3;
     }
     impl crate::object::IdToObject for WpPresentationId {
         type Object = crate::wayland_objects::wp_presentation::WpPresentation;
@@ -7920,7 +7939,7 @@ pub mod wp_presentation_feedback {
     use super::*;
     impl Constants for crate::wayland_objects::wp_presentation_feedback::WpPresentationFeedback {
         const INTERFACE_NAME: &'static str = "wp_presentation_feedback";
-        const INTERFACE_VERSION: u32 = 2;
+        const INTERFACE_VERSION: u32 = 3;
     }
     impl crate::object::IdToObject for WpPresentationFeedbackId {
         type Object = crate::wayland_objects::wp_presentation_feedback::WpPresentationFeedback;
@@ -7979,6 +7998,11 @@ pub mod wp_presentation_feedback {
         /// compositor (e.g. fastest rate), or 0 if no such rate exists.
         /// For version 1, if the output does not have a constant refresh rate,
         /// the refresh argument must be zero.
+        ///
+        /// If the 'fixed_rate' flag is set, then the refresh argument is
+        /// the output's constant refresh rate. If the 'variable_rate' flag
+        /// is set, then the refresh argument is the output's fastest refresh
+        /// rate.
         ///
         /// The 64-bit value combined from seq_hi and seq_lo is the value
         /// of the output's vertical retrace counter when the content
@@ -8092,6 +8116,27 @@ pub mod wp_presentation_feedback {
         /// Possible zero-copy cases include direct scanout of a
         /// fullscreen surface and a surface on a hardware overlay.
         ZeroCopy = 8,
+        /// Presentation is at a fixed refresh rate
+        ///
+        /// The display hardware is operating at a fixed refresh rate.
+        /// The presentation was aligned to a multiple of this event's
+        /// 'refresh' argument.
+        /// If this is set, the refresh argument must not be 0.
+        FixedRate = 16,
+        /// Presentation is at a variable refresh rate
+        ///
+        /// The display hardware is operating at a variable refresh rate, with
+        /// updates to this surface consistently determining the display refresh
+        /// timing. The definition of 'consistent' is compositor policy.
+        ///
+        /// The content update was displayed as soon as possible after it became
+        /// ready, but no sooner than 'refresh' nanoseconds after the previous
+        /// presentation on this surface. In other words, the presentation time
+        /// was determined by when this surface's content became ready, not by
+        /// a periodic display refresh or by updates to other surfaces.
+        ///
+        /// If this is set, the refresh argument must not be 0.
+        VariableRate = 32,
     }
 }
 
@@ -8347,7 +8392,7 @@ pub mod xdg_wm_base {
         /// While xdg_surface itself is not a role, the corresponding surface may
         /// only be assigned a role extending xdg_surface, such as xdg_toplevel or
         /// xdg_popup. It is illegal to create an xdg_surface for a wl_surface which
-        /// already has anassigned role and this will result in a role error.
+        /// already has an assigned role and this will result in a role error.
         ///
         /// See the documentation of xdg_surface for more details about what an
         /// xdg_surface is and how it is used.
@@ -10906,7 +10951,7 @@ pub mod wp_color_management_surface_feedback_v1 {
         /// wl_surface only if the image description is an exact match with the
         /// client content. Particularly if everything else matches, but the target
         /// color volume is greater than what the client needs, the client should
-        /// create its own parameric image description with its exact parameters.
+        /// create its own parametric image description with its exact parameters.
         ///
         /// If the interface version is inadequate for the preferred image
         /// description, meaning that the client does not support all the
@@ -10963,7 +11008,7 @@ pub mod wp_color_management_surface_feedback_v1 {
         ///
         /// This event sends the identity of the new preferred state as the argument,
         /// so clients who are aware of the image description already can reuse it.
-        /// Otherwise, if the client client wants to know what the preferred image
+        /// Otherwise, if the client wants to know what the preferred image
         /// description is, it shall use the get_preferred request.
         ///
         /// The preferred image description is not automatically used for anything.
@@ -12584,6 +12629,154 @@ pub mod wp_color_representation_surface_v1 {
         ///
         /// Equivalent to H.273 Chroma420SampleLocType 5.
         Type5 = 6,
+    }
+}
+
+/// Commit timing
+///
+/// When a compositor latches on to new content updates it will check for
+/// any number of requirements of the available content updates (such as
+/// fences of all buffers being signalled) to consider the update ready.
+///
+/// This protocol provides a method for adding a time constraint to surface
+/// content. This constraint indicates to the compositor that a content
+/// update should be presented as closely as possible to, but not before,
+/// a specified time.
+///
+/// This protocol does not change the Wayland property that content
+/// updates are applied in the order they are received, even when some
+/// content updates contain timestamps and others do not.
+///
+/// To provide timestamps, this global factory interface must be used to
+/// acquire a wp_commit_timing_v1 object for a surface, which may then be
+/// used to provide timestamp information for commits.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod wp_commit_timing_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_commit_timing_manager_v1::WpCommitTimingManagerV1 {
+        const INTERFACE_NAME: &'static str = "wp_commit_timing_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpCommitTimingManagerV1Id {
+        type Object = crate::wayland_objects::wp_commit_timing_manager_v1::WpCommitTimingManagerV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_commit_timing_manager_v1::WpCommitTimingManagerV1
+    {
+        type Id = WpCommitTimingManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Unbind from the commit timing interface
+        ///
+        /// Informs the server that the client will no longer be using
+        /// this protocol object. Existing objects created by this object
+        /// are not affected.
+        Destroy,
+        /// Request commit timer interface for surface
+        ///
+        /// Establish a timing controller for a surface.
+        ///
+        /// Only one commit timer can be created for a surface, or a
+        /// commit_timer_exists protocol error will be generated.
+        GetTimer { id: WpCommitTimerV1Id, surface: WlSurfaceId },
+    }
+    impl Parser for crate::wayland_objects::wp_commit_timing_manager_v1::WpCommitTimingManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetTimer { id: req.id()?, surface: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Commit timer already exists for surface,
+        CommitTimerExists = 0,
+    }
+}
+
+/// Surface commit timer
+///
+/// An object to set a time constraint for a content update on a surface.
+pub mod wp_commit_timer_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_commit_timer_v1::WpCommitTimerV1 {
+        const INTERFACE_NAME: &'static str = "wp_commit_timer_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpCommitTimerV1Id {
+        type Object = crate::wayland_objects::wp_commit_timer_v1::WpCommitTimerV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_commit_timer_v1::WpCommitTimerV1 {
+        type Id = WpCommitTimerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Specify time the following commit takes effect
+        ///
+        /// Provide a timing constraint for a surface content update.
+        ///
+        /// A set_timestamp request may be made before a wl_surface.commit to
+        /// tell the compositor that the content is intended to be presented
+        /// as closely as possible to, but not before, the specified time.
+        /// The time is in the domain of the compositor's presentation clock.
+        ///
+        /// An invalid_timestamp error will be generated for invalid tv_nsec.
+        ///
+        /// If a timestamp already exists on the surface, a timestamp_exists
+        /// error is generated.
+        ///
+        /// Requesting set_timestamp after the commit_timer object's surface is
+        /// destroyed will generate a "surface_destroyed" error.
+        SetTimestamp {
+            /// High 32 bits of the seconds part of target time,
+            tv_sec_hi: u32,
+            /// Low 32 bits of the seconds part of target time,
+            tv_sec_lo: u32,
+            /// Nanoseconds part of target time,
+            tv_nsec: u32,
+        },
+        /// Destroy the timer
+        ///
+        /// Informs the server that the client will no longer be using
+        /// this protocol object.
+        ///
+        /// Existing timing constraints are not affected by the destruction.
+        Destroy,
+    }
+    impl Parser for crate::wayland_objects::wp_commit_timer_v1::WpCommitTimerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => SetTimestamp {
+                    tv_sec_hi: req.uint()?,
+                    tv_sec_lo: req.uint()?,
+                    tv_nsec: req.uint()?,
+                },
+                1 => Destroy,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Timestamp contains an invalid value,
+        InvalidTimestamp = 0,
+        /// Timestamp exists,
+        TimestampExists = 1,
+        /// The associated surface no longer exists,
+        SurfaceDestroyed = 2,
     }
 }
 
@@ -15408,6 +15601,165 @@ pub mod ext_session_lock_surface_v1 {
     }
 }
 
+/// Protocol for fifo constraints
+///
+/// When a Wayland compositor considers applying a content update,
+/// it must ensure all the update's readiness constraints (fences, etc)
+/// are met.
+///
+/// This protocol provides a way to use the completion of a display refresh
+/// cycle as an additional readiness constraint.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod wp_fifo_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_fifo_manager_v1::WpFifoManagerV1 {
+        const INTERFACE_NAME: &'static str = "wp_fifo_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpFifoManagerV1Id {
+        type Object = crate::wayland_objects::wp_fifo_manager_v1::WpFifoManagerV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_fifo_manager_v1::WpFifoManagerV1 {
+        type Id = WpFifoManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Unbind from the manager interface
+        ///
+        /// Informs the server that the client will no longer be using
+        /// this protocol object. Existing objects created by this object
+        /// are not affected.
+        Destroy,
+        /// Request fifo interface for surface
+        ///
+        /// Establish a fifo object for a surface that may be used to add
+        /// display refresh constraints to content updates.
+        ///
+        /// Only one such object may exist for a surface and attempting
+        /// to create more than one will result in an already_exists
+        /// protocol error. If a surface is acted on by multiple software
+        /// components, general best practice is that only the component
+        /// performing wl_surface.attach operations should use this protocol.
+        GetFifo { id: WpFifoV1Id, surface: WlSurfaceId },
+    }
+    impl Parser for crate::wayland_objects::wp_fifo_manager_v1::WpFifoManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetFifo { id: req.id()?, surface: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    /// Fatal presentation error
+    ///
+    /// These fatal protocol errors may be emitted in response to
+    /// illegal requests.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Fifo manager already exists for surface,
+        AlreadyExists = 0,
+    }
+}
+
+/// Fifo interface
+///
+/// A fifo object for a surface that may be used to add
+/// display refresh constraints to content updates.
+pub mod wp_fifo_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_fifo_v1::WpFifoV1 {
+        const INTERFACE_NAME: &'static str = "wp_fifo_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpFifoV1Id {
+        type Object = crate::wayland_objects::wp_fifo_v1::WpFifoV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::wp_fifo_v1::WpFifoV1 {
+        type Id = WpFifoV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Sets the start point for a fifo constraint
+        ///
+        /// When the content update containing the "set_barrier" is applied,
+        /// it sets a "fifo_barrier" condition on the surface associated with
+        /// the fifo object. The condition is cleared immediately after the
+        /// following latching deadline for non-tearing presentation.
+        ///
+        /// The compositor may clear the condition early if it must do so to
+        /// ensure client forward progress assumptions.
+        ///
+        /// To wait for this condition to clear, use the "wait_barrier" request.
+        ///
+        /// "set_barrier" is double-buffered state, see wl_surface.commit.
+        ///
+        /// Requesting set_barrier after the fifo object's surface is
+        /// destroyed will generate a "surface_destroyed" error.
+        SetBarrier,
+        /// Adds a fifo constraint to a content update
+        ///
+        /// Indicate that this content update is not ready while a
+        /// "fifo_barrier" condition is present on the surface.
+        ///
+        /// This means that when the content update containing "set_barrier"
+        /// was made active at a latching deadline, it will be active for
+        /// at least one refresh cycle. A content update which is allowed to
+        /// tear might become active after a latching deadline if no content
+        /// update became active at the deadline.
+        ///
+        /// The constraint must be ignored if the surface is a subsurface in
+        /// synchronized mode. If the surface is not being updated by the
+        /// compositor (off-screen, occluded) the compositor may ignore the
+        /// constraint. Clients must use an additional mechanism such as
+        /// frame callbacks or timestamps to ensure throttling occurs under
+        /// all conditions.
+        ///
+        /// "wait_barrier" is double-buffered state, see wl_surface.commit.
+        ///
+        /// Requesting "wait_barrier" after the fifo object's surface is
+        /// destroyed will generate a "surface_destroyed" error.
+        WaitBarrier,
+        /// Destroy the fifo interface
+        ///
+        /// Informs the server that the client will no longer be using
+        /// this protocol object.
+        ///
+        /// Surface state changes previously made by this protocol are
+        /// unaffected by this object's destruction.
+        Destroy,
+    }
+    impl Parser for crate::wayland_objects::wp_fifo_v1::WpFifoV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => SetBarrier,
+                1 => WaitBarrier,
+                2 => Destroy,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    /// Fatal error
+    ///
+    /// These fatal protocol errors may be emitted in response to
+    /// illegal requests.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// The associated surface no longer exists,
+        SurfaceDestroyed = 0,
+    }
+}
+
 /// Fractional surface scale information
 ///
 /// A global interface for requesting surfaces to use fractional scales.
@@ -15438,7 +15790,7 @@ pub mod wp_fractional_scale_manager_v1 {
         Destroy,
         /// Extend surface interface for scale information
         ///
-        /// Create an add-on object for the the wl_surface to let the compositor
+        /// Create an add-on object for the wl_surface to let the compositor
         /// request fractional scales. If the given wl_surface already has a
         /// wp_fractional_scale_v1 object associated, the fractional_scale_exists
         /// protocol error is raised.
@@ -15534,6 +15886,218 @@ pub mod wp_fractional_scale_v1 {
                 }
             }
         }
+    }
+}
+
+/// Client security context manager
+///
+/// This interface allows a client to register a new Wayland connection to
+/// the compositor and attach a security context to it.
+///
+/// This is intended to be used by sandboxes. Sandbox engines attach a
+/// security context to all connections coming from inside the sandbox. The
+/// compositor can then restrict the features that the sandboxed connections
+/// can use.
+///
+/// Compositors should forbid nesting multiple security contexts by not
+/// exposing wp_security_context_manager_v1 global to clients with a security
+/// context attached, or by sending the nested protocol error. Nested
+/// security contexts are dangerous because they can potentially allow
+/// privilege escalation of a sandboxed client.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod wp_security_context_manager_v1 {
+    use super::*;
+    impl Constants
+        for crate::wayland_objects::wp_security_context_manager_v1::WpSecurityContextManagerV1
+    {
+        const INTERFACE_NAME: &'static str = "wp_security_context_manager_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpSecurityContextManagerV1Id {
+        type Object =
+            crate::wayland_objects::wp_security_context_manager_v1::WpSecurityContextManagerV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_security_context_manager_v1::WpSecurityContextManagerV1
+    {
+        type Id = WpSecurityContextManagerV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the manager object
+        ///
+        /// Destroy the manager. This doesn't destroy objects created with the
+        /// manager.
+        Destroy,
+        /// Create a new security context
+        ///
+        /// Creates a new security context with a socket listening FD.
+        ///
+        /// The compositor will accept new client connections on listen_fd.
+        /// listen_fd must be ready to accept new connections when this request is
+        /// sent by the client. In other words, the client must call bind(2) and
+        /// listen(2) before sending the FD.
+        ///
+        /// close_fd is a FD that will signal hangup when the compositor should stop
+        /// accepting new connections on listen_fd.
+        ///
+        /// The compositor must continue to accept connections on listen_fd when
+        /// the Wayland client which created the security context disconnects.
+        ///
+        /// After sending this request, closing listen_fd and close_fd remains the
+        /// only valid operation on them.
+        CreateListener {
+            id: WpSecurityContextV1Id,
+            /// Listening socket FD,
+            listen_fd: Rc<OwnedFd>,
+            /// FD signaling when done,
+            close_fd: Rc<OwnedFd>,
+        },
+    }
+    impl Parser for crate::wayland_objects::wp_security_context_manager_v1::WpSecurityContextManagerV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => CreateListener { id: req.id()?, listen_fd: req.fd()?, close_fd: req.fd()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Listening socket FD is invalid,
+        InvalidListenFd = 1,
+        /// Nested security contexts are forbidden,
+        Nested = 2,
+    }
+}
+
+/// Client security context
+///
+/// The security context allows a client to register a new client and attach
+/// security context metadata to the connections.
+///
+/// When both are set, the combination of the application ID and the sandbox
+/// engine must uniquely identify an application. The same application ID
+/// will be used across instances (e.g. if the application is restarted, or
+/// if the application is started multiple times).
+///
+/// When both are set, the combination of the instance ID and the sandbox
+/// engine must uniquely identify a running instance of an application.
+pub mod wp_security_context_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::wp_security_context_v1::WpSecurityContextV1 {
+        const INTERFACE_NAME: &'static str = "wp_security_context_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for WpSecurityContextV1Id {
+        type Object = crate::wayland_objects::wp_security_context_v1::WpSecurityContextV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::wp_security_context_v1::WpSecurityContextV1
+    {
+        type Id = WpSecurityContextV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the security context object
+        ///
+        /// Destroy the security context object.
+        Destroy,
+        /// Set the sandbox engine
+        ///
+        /// Attach a unique sandbox engine name to the security context. The name
+        /// should follow the reverse-DNS style (e.g. "org.flatpak").
+        ///
+        /// A list of well-known engines is maintained at:
+        /// https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/security-context/engines.md
+        ///
+        /// It is a protocol error to call this request twice. The already_set
+        /// error is sent in this case.
+        SetSandboxEngine {
+            /// The sandbox engine name,
+            name: String,
+        },
+        /// Set the application ID
+        ///
+        /// Attach an application ID to the security context.
+        ///
+        /// The application ID is an opaque, sandbox-specific identifier for an
+        /// application. See the well-known engines document for more details:
+        /// https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/security-context/engines.md
+        ///
+        /// The compositor may use the application ID to group clients belonging to
+        /// the same security context application.
+        ///
+        /// Whether this request is optional or not depends on the sandbox engine used.
+        ///
+        /// It is a protocol error to call this request twice. The already_set
+        /// error is sent in this case.
+        SetAppId {
+            /// The application ID,
+            app_id: String,
+        },
+        /// Set the instance ID
+        ///
+        /// Attach an instance ID to the security context.
+        ///
+        /// The instance ID is an opaque, sandbox-specific identifier for a running
+        /// instance of an application. See the well-known engines document for
+        /// more details:
+        /// https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/security-context/engines.md
+        ///
+        /// Whether this request is optional or not depends on the sandbox engine used.
+        ///
+        /// It is a protocol error to call this request twice. The already_set
+        /// error is sent in this case.
+        SetInstanceId {
+            /// The instance ID,
+            instance_id: String,
+        },
+        /// Register the security context
+        ///
+        /// Atomically register the new client and attach the security context
+        /// metadata.
+        ///
+        /// If the provided metadata is inconsistent or does not match with out of
+        /// band metadata (see
+        /// https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/security-context/engines.md),
+        /// the invalid_metadata error may be sent eventually.
+        ///
+        /// It's a protocol error to send any request other than "destroy" after
+        /// this request. In this case, the already_used error is sent.
+        Commit,
+    }
+    impl Parser for crate::wayland_objects::wp_security_context_v1::WpSecurityContextV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => SetSandboxEngine { name: req.string()? },
+                2 => SetAppId { app_id: req.string()? },
+                3 => SetInstanceId { instance_id: req.string()? },
+                4 => Commit,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// Security context has already been committed,
+        AlreadyUsed = 1,
+        /// Metadata has already been set,
+        AlreadySet = 2,
+        /// Metadata is invalid,
+        InvalidMetadata = 3,
     }
 }
 
@@ -15955,6 +16519,132 @@ pub mod xdg_activation_token_v1 {
     }
 }
 
+/// Create dialogs related to other toplevels
+///
+/// The xdg_wm_dialog_v1 interface is exposed as a global object allowing
+/// to register surfaces with a xdg_toplevel role as "dialogs" relative to
+/// another toplevel.
+///
+/// The compositor may let this relation influence how the surface is
+/// placed, displayed or interacted with.
+///
+/// Warning! The protocol described in this file is currently in the testing
+/// phase. Backward compatible changes may be added together with the
+/// corresponding interface version bump. Backward incompatible changes can
+/// only be done by creating a new major version of the extension.
+pub mod xdg_wm_dialog_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_wm_dialog_v1::XdgWmDialogV1 {
+        const INTERFACE_NAME: &'static str = "xdg_wm_dialog_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgWmDialogV1Id {
+        type Object = crate::wayland_objects::xdg_wm_dialog_v1::XdgWmDialogV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::xdg_wm_dialog_v1::XdgWmDialogV1 {
+        type Id = XdgWmDialogV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the dialog manager object
+        ///
+        /// Destroys the xdg_wm_dialog_v1 object. This does not affect
+        /// the xdg_dialog_v1 objects generated through it.
+        Destroy,
+        /// Create a dialog object
+        ///
+        /// Creates a xdg_dialog_v1 object for the given toplevel. See the interface
+        /// description for more details.
+        ///
+        /// Compositors must raise an already_used error if clients attempt to
+        /// create multiple xdg_dialog_v1 objects for the same xdg_toplevel.
+        GetXdgDialog { id: XdgDialogV1Id, toplevel: XdgToplevelId },
+    }
+    impl Parser for crate::wayland_objects::xdg_wm_dialog_v1::XdgWmDialogV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => GetXdgDialog { id: req.id()?, toplevel: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// The xdg_toplevel object has already been used to create a xdg_dialog_v1,
+        AlreadyUsed = 0,
+    }
+}
+
+/// Dialog object
+///
+/// A xdg_dialog_v1 object is an ancillary object tied to a xdg_toplevel. Its
+/// purpose is hinting the compositor that the toplevel is a "dialog" (e.g. a
+/// temporary window) relative to another toplevel (see
+/// xdg_toplevel.set_parent). If the xdg_toplevel is destroyed, the xdg_dialog_v1
+/// becomes inert.
+///
+/// Through this object, the client may provide additional hints about
+/// the purpose of the secondary toplevel. This interface has no effect
+/// on toplevels that are not attached to a parent toplevel.
+pub mod xdg_dialog_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::xdg_dialog_v1::XdgDialogV1 {
+        const INTERFACE_NAME: &'static str = "xdg_dialog_v1";
+        const INTERFACE_VERSION: u32 = 1;
+    }
+    impl crate::object::IdToObject for XdgDialogV1Id {
+        type Object = crate::wayland_objects::xdg_dialog_v1::XdgDialogV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::xdg_dialog_v1::XdgDialogV1 {
+        type Id = XdgDialogV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the dialog object
+        ///
+        /// Destroys the xdg_dialog_v1 object. If this object is destroyed
+        /// before the related xdg_toplevel, the compositor should unapply its
+        /// effects.
+        Destroy,
+        /// Mark dialog as modal
+        ///
+        /// Hints that the dialog has "modal" behavior. Modal dialogs typically
+        /// require to be fully addressed by the user (i.e. closed) before resuming
+        /// interaction with the parent toplevel, and may require a distinct
+        /// presentation.
+        ///
+        /// Clients must implement the logic to filter events in the parent
+        /// toplevel on their own.
+        ///
+        /// Compositors may choose any policy in event delivery to the parent
+        /// toplevel, from delivering all events unfiltered to using them for
+        /// internal consumption.
+        SetModal,
+        /// Mark dialog as not modal
+        ///
+        /// Drops the hint that this dialog has "modal" behavior. See
+        /// xdg_dialog_v1.set_modal for more details.
+        UnsetModal,
+    }
+    impl Parser for crate::wayland_objects::xdg_dialog_v1::XdgDialogV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                1 => SetModal,
+                2 => UnsetModal,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+}
+
 /// Manage sessions for applications
 ///
 /// The xdg_session_manager_v1 interface defines base requests for creating and
@@ -15996,7 +16686,7 @@ pub mod xdg_session_manager_v1 {
         /// use".
         ///
         /// If an identifier string represents a session that is currently actively
-        /// in use by the the same client, an 'in_use' error is raised. If some
+        /// in use by the same client, an 'in_use' error is raised. If some
         /// other client is currently using the same session, the new session will
         /// replace managing the associated state.
         ///
@@ -17497,6 +18187,175 @@ pub mod zwp_idle_inhibitor_v1 {
     }
 }
 
+/// Context object for keyboard grab_manager
+///
+/// A global interface used for inhibiting the compositor keyboard shortcuts.
+pub mod zwp_keyboard_shortcuts_inhibit_manager_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1 {
+    const INTERFACE_NAME: &'static str = "zwp_keyboard_shortcuts_inhibit_manager_v1";
+    const INTERFACE_VERSION: u32 = 1;
+  }
+    impl crate::object::IdToObject for ZwpKeyboardShortcutsInhibitManagerV1Id {
+        type Object = crate::wayland_objects::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1 {
+    type Id = ZwpKeyboardShortcutsInhibitManagerV1Id;
+  }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the keyboard shortcuts inhibitor object
+        ///
+        /// Destroy the keyboard shortcuts inhibitor manager.
+        Destroy,
+        /// Create a new keyboard shortcuts inhibitor object
+        ///
+        /// Create a new keyboard shortcuts inhibitor object associated with
+        /// the given surface for the given seat.
+        ///
+        /// If shortcuts are already inhibited for the specified seat and surface,
+        /// a protocol error "already_inhibited" is raised by the compositor.
+        InhibitShortcuts {
+            id: ZwpKeyboardShortcutsInhibitorV1Id,
+            /// The surface that inhibits the keyboard shortcuts behavior,
+            surface: WlSurfaceId,
+            /// The wl_seat for which keyboard shortcuts should be disabled,
+            seat: WlSeatId,
+        },
+    }
+    impl Parser for crate::wayland_objects::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1 {
+    type Request = Request;
+    fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+      use Request::*;
+      let request = match req.request_id {
+        0 => Destroy,
+        1 => InhibitShortcuts {
+          id: req.id()?,
+          surface: req.id()?,
+          seat: req.id()?,
+        },
+        _ => return Err(ParserError::InvalidRequest),
+      };
+      Ok(request)
+    }
+  }
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+    pub enum Error {
+        /// The shortcuts are already inhibited for this surface,
+        AlreadyInhibited = 0,
+    }
+}
+
+/// Context object for keyboard shortcuts inhibitor
+///
+/// A keyboard shortcuts inhibitor instructs the compositor to ignore
+/// its own keyboard shortcuts when the associated surface has keyboard
+/// focus. As a result, when the surface has keyboard focus on the given
+/// seat, it will receive all key events originating from the specified
+/// seat, even those which would normally be caught by the compositor for
+/// its own shortcuts.
+///
+/// The Wayland compositor is however under no obligation to disable
+/// all of its shortcuts, and may keep some special key combo for its own
+/// use, including but not limited to one allowing the user to forcibly
+/// restore normal keyboard events routing in the case of an unwilling
+/// client. The compositor may also use the same key combo to reactivate
+/// an existing shortcut inhibitor that was previously deactivated on
+/// user request.
+///
+/// When the compositor restores its own keyboard shortcuts, an
+/// "inactive" event is emitted to notify the client that the keyboard
+/// shortcuts inhibitor is not effectively active for the surface and
+/// seat any more, and the client should not expect to receive all
+/// keyboard events.
+///
+/// When the keyboard shortcuts inhibitor is inactive, the client has
+/// no way to forcibly reactivate the keyboard shortcuts inhibitor.
+///
+/// The user can choose to re-enable a previously deactivated keyboard
+/// shortcuts inhibitor using any mechanism the compositor may offer,
+/// in which case the compositor will send an "active" event to notify
+/// the client.
+///
+/// If the surface is destroyed, unmapped, or loses the seat's keyboard
+/// focus, the keyboard shortcuts inhibitor becomes irrelevant and the
+/// compositor will restore its own keyboard shortcuts but no "inactive"
+/// event is emitted in this case.
+pub mod zwp_keyboard_shortcuts_inhibitor_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1 {
+    const INTERFACE_NAME: &'static str = "zwp_keyboard_shortcuts_inhibitor_v1";
+    const INTERFACE_VERSION: u32 = 1;
+  }
+    impl crate::object::IdToObject for ZwpKeyboardShortcutsInhibitorV1Id {
+        type Object = crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1;
+    }
+    impl crate::object::ObjectWithId for crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1 {
+    type Id = ZwpKeyboardShortcutsInhibitorV1Id;
+  }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the keyboard shortcuts inhibitor object
+        ///
+        /// Remove the keyboard shortcuts inhibitor from the associated wl_surface.
+        Destroy,
+    }
+    impl Parser for crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1 {
+    type Request = Request;
+    fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+      use Request::*;
+      let request = match req.request_id {
+        0 => Destroy,
+        _ => return Err(ParserError::InvalidRequest),
+      };
+      Ok(request)
+    }
+  }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Shortcuts are inhibited
+        ///
+        /// This event indicates that the shortcut inhibitor is active.
+        ///
+        /// The compositor sends this event every time compositor shortcuts
+        /// are inhibited on behalf of the surface. When active, the client
+        /// may receive input events normally reserved by the compositor
+        /// (see zwp_keyboard_shortcuts_inhibitor_v1).
+        ///
+        /// This occurs typically when the initial request "inhibit_shortcuts"
+        /// first becomes active or when the user instructs the compositor to
+        /// re-enable and existing shortcuts inhibitor using any mechanism
+        /// offered by the compositor.
+        Active,
+        /// Shortcuts are restored
+        ///
+        /// This event indicates that the shortcuts inhibitor is inactive,
+        /// normal shortcuts processing is restored by the compositor.
+        Inactive,
+    }
+    impl EventWriter for crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1 {
+    type Event = Event;
+    fn object_id(&self) -> WaylandId {
+      use crate::object::Object;
+      self.id()
+    }
+    fn to_raw_event(&self, event: Event) -> RawEvent {
+      use Event::*;
+      use crate::object::Object;
+      match event {
+        Active {  } => {
+          let mut raw = RawEvent::new(self.id(), 0, 0);
+        raw
+        },
+        Inactive {  } => {
+          let mut raw = RawEvent::new(self.id(), 1, 0);
+        raw
+        },
+      }
+    }
+  }
+}
+
 /// Protocol for providing explicit synchronization
 ///
 /// This global is a factory interface, allowing clients to request
@@ -17878,7 +18737,7 @@ pub mod zwp_pointer_constraints_v1 {
         ///
         /// The request creates a new object wp_locked_pointer which is used to
         /// interact with the lock as well as receive updates about its state. See
-        /// the the description of wp_locked_pointer for further information.
+        /// the description of wp_locked_pointer for further information.
         ///
         /// Note that while a pointer is locked, the wl_pointer objects of the
         /// corresponding seat will not emit any wl_pointer.motion events, but
@@ -17913,7 +18772,7 @@ pub mod zwp_pointer_constraints_v1 {
         ///
         /// The request will create a new object wp_confined_pointer which is used
         /// to interact with the confinement as well as receive updates about its
-        /// state. See the the description of wp_confined_pointer for further
+        /// state. See the description of wp_confined_pointer for further
         /// information.
         ConfinePointer {
             id: ZwpConfinedPointerV1Id,
@@ -18216,6 +19075,480 @@ pub mod zwp_confined_pointer_v1 {
                 }
                 Unconfined {} => {
                     let mut raw = RawEvent::new(self.id(), 1, 0);
+                    raw
+                }
+            }
+        }
+    }
+}
+
+/// Touchpad gestures
+///
+/// A global interface to provide semantic touchpad gestures for a given
+/// pointer.
+///
+/// Three gestures are currently supported: swipe, pinch, and hold.
+/// Pinch and swipe gestures follow a three-stage cycle: begin, update,
+/// end. Hold gestures follow a two-stage cycle: begin and end. All
+/// gestures are identified by a unique id.
+///
+/// Warning! The protocol described in this file is experimental and
+/// backward incompatible changes may be made. Backward compatible changes
+/// may be added together with the corresponding interface version bump.
+/// Backward incompatible changes are done by bumping the version number in
+/// the protocol and interface names and resetting the interface version.
+/// Once the protocol is to be declared stable, the 'z' prefix and the
+/// version number in the protocol and interface names are removed and the
+/// interface version number is reset.
+pub mod zwp_pointer_gestures_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::zwp_pointer_gestures_v1::ZwpPointerGesturesV1 {
+        const INTERFACE_NAME: &'static str = "zwp_pointer_gestures_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for ZwpPointerGesturesV1Id {
+        type Object = crate::wayland_objects::zwp_pointer_gestures_v1::ZwpPointerGesturesV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::zwp_pointer_gestures_v1::ZwpPointerGesturesV1
+    {
+        type Id = ZwpPointerGesturesV1Id;
+    }
+    /// Minimum interface version for the `release` message (XML `since` / `version`).
+    pub const RELEASE_SINCE: u32 = 2;
+    /// Minimum interface version for the `get_hold_gesture` message (XML `since` / `version`).
+    pub const GET_HOLD_GESTURE_SINCE: u32 = 3;
+    #[derive(Debug)]
+    pub enum Request {
+        /// Get swipe gesture
+        ///
+        /// Create a swipe gesture object. See the
+        /// wl_pointer_gesture_swipe interface for details.
+        GetSwipeGesture { id: ZwpPointerGestureSwipeV1Id, pointer: WlPointerId },
+        /// Get pinch gesture
+        ///
+        /// Create a pinch gesture object. See the
+        /// wl_pointer_gesture_pinch interface for details.
+        GetPinchGesture { id: ZwpPointerGesturePinchV1Id, pointer: WlPointerId },
+        /// Destroy the pointer gesture object
+        ///
+        /// Destroy the pointer gesture object. Swipe, pinch and hold objects
+        /// created via this gesture object remain valid.
+        Release,
+        /// Get hold gesture
+        ///
+        /// Create a hold gesture object. See the
+        /// wl_pointer_gesture_hold interface for details.
+        GetHoldGesture { id: ZwpPointerGestureHoldV1Id, pointer: WlPointerId },
+    }
+    impl Parser for crate::wayland_objects::zwp_pointer_gestures_v1::ZwpPointerGesturesV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => GetSwipeGesture { id: req.id()?, pointer: req.id()? },
+                1 => GetPinchGesture { id: req.id()?, pointer: req.id()? },
+                2 => Release,
+                3 => GetHoldGesture { id: req.id()?, pointer: req.id()? },
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+}
+
+/// A swipe gesture object
+///
+/// A swipe gesture object notifies a client about a multi-finger swipe
+/// gesture detected on an indirect input device such as a touchpad.
+/// The gesture is usually initiated by multiple fingers moving in the
+/// same direction but once initiated the direction may change.
+/// The precise conditions of when such a gesture is detected are
+/// implementation-dependent.
+///
+/// A gesture consists of three stages: begin, update (optional) and end.
+/// There cannot be multiple simultaneous hold, pinch or swipe gestures on a
+/// same pointer/seat, how compositors prevent these situations is
+/// implementation-dependent.
+///
+/// A gesture may be cancelled by the compositor or the hardware.
+/// Clients should not consider performing permanent or irreversible
+/// actions until the end of a gesture has been received.
+pub mod zwp_pointer_gesture_swipe_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1 {
+        const INTERFACE_NAME: &'static str = "zwp_pointer_gesture_swipe_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for ZwpPointerGestureSwipeV1Id {
+        type Object =
+            crate::wayland_objects::zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1
+    {
+        type Id = ZwpPointerGestureSwipeV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the pointer swipe gesture object
+        ///
+        ///
+        Destroy,
+    }
+    impl Parser for crate::wayland_objects::zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Multi-finger swipe begin
+        ///
+        /// This event is sent when a multi-finger swipe gesture is detected
+        /// on the device.
+        Begin {
+            serial: u32,
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            surface: WlSurfaceId,
+            /// Number of fingers,
+            fingers: u32,
+        },
+        /// Multi-finger swipe motion
+        ///
+        /// This event is sent when a multi-finger swipe gesture changes the
+        /// position of the logical center.
+        ///
+        /// The dx and dy coordinates are relative coordinates of the logical
+        /// center of the gesture compared to the previous event.
+        Update {
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            /// Delta x coordinate in surface coordinate space,
+            dx: f32,
+            /// Delta y coordinate in surface coordinate space,
+            dy: f32,
+        },
+        /// Multi-finger swipe end
+        ///
+        /// This event is sent when a multi-finger swipe gesture ceases to
+        /// be valid. This may happen when one or more fingers are lifted or
+        /// the gesture is cancelled.
+        ///
+        /// When a gesture is cancelled, the client should undo state changes
+        /// caused by this gesture. What causes a gesture to be cancelled is
+        /// implementation-dependent.
+        End {
+            serial: u32,
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            /// 1 if the gesture was cancelled, 0 otherwise,
+            cancelled: i32,
+        },
+    }
+    impl EventWriter
+        for crate::wayland_objects::zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1
+    {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Begin { serial, time, surface, fingers } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 4);
+                    raw.uint(serial);
+                    raw.uint(time);
+                    raw.id(surface);
+                    raw.uint(fingers);
+                    raw
+                }
+                Update { time, dx, dy } => {
+                    let mut raw = RawEvent::new(self.id(), 1, 3);
+                    raw.uint(time);
+                    raw.fixed(dx);
+                    raw.fixed(dy);
+                    raw
+                }
+                End { serial, time, cancelled } => {
+                    let mut raw = RawEvent::new(self.id(), 2, 3);
+                    raw.uint(serial);
+                    raw.uint(time);
+                    raw.int(cancelled);
+                    raw
+                }
+            }
+        }
+    }
+}
+
+/// A pinch gesture object
+///
+/// A pinch gesture object notifies a client about a multi-finger pinch
+/// gesture detected on an indirect input device such as a touchpad.
+/// The gesture is usually initiated by multiple fingers moving towards
+/// each other or away from each other, or by two or more fingers rotating
+/// around a logical center of gravity. The precise conditions of when
+/// such a gesture is detected are implementation-dependent.
+///
+/// A gesture consists of three stages: begin, update (optional) and end.
+/// There cannot be multiple simultaneous hold, pinch or swipe gestures on a
+/// same pointer/seat, how compositors prevent these situations is
+/// implementation-dependent.
+///
+/// A gesture may be cancelled by the compositor or the hardware.
+/// Clients should not consider performing permanent or irreversible
+/// actions until the end of a gesture has been received.
+pub mod zwp_pointer_gesture_pinch_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1 {
+        const INTERFACE_NAME: &'static str = "zwp_pointer_gesture_pinch_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for ZwpPointerGesturePinchV1Id {
+        type Object =
+            crate::wayland_objects::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1
+    {
+        type Id = ZwpPointerGesturePinchV1Id;
+    }
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the pinch gesture object
+        ///
+        ///
+        Destroy,
+    }
+    impl Parser for crate::wayland_objects::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    #[derive(Debug)]
+    pub enum Event {
+        /// Multi-finger pinch begin
+        ///
+        /// This event is sent when a multi-finger pinch gesture is detected
+        /// on the device.
+        Begin {
+            serial: u32,
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            surface: WlSurfaceId,
+            /// Number of fingers,
+            fingers: u32,
+        },
+        /// Multi-finger pinch motion
+        ///
+        /// This event is sent when a multi-finger pinch gesture changes the
+        /// position of the logical center, the rotation or the relative scale.
+        ///
+        /// The dx and dy coordinates are relative coordinates in the
+        /// surface coordinate space of the logical center of the gesture.
+        ///
+        /// The scale factor is an absolute scale compared to the
+        /// pointer_gesture_pinch.begin event, e.g. a scale of 2 means the fingers
+        /// are now twice as far apart as on pointer_gesture_pinch.begin.
+        ///
+        /// The rotation is the relative angle in degrees clockwise compared to the previous
+        /// pointer_gesture_pinch.begin or pointer_gesture_pinch.update event.
+        Update {
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            /// Delta x coordinate in surface coordinate space,
+            dx: f32,
+            /// Delta y coordinate in surface coordinate space,
+            dy: f32,
+            /// Scale relative to the initial finger position,
+            scale: f32,
+            /// Angle in degrees cw relative to the previous event,
+            rotation: f32,
+        },
+        /// Multi-finger pinch end
+        ///
+        /// This event is sent when a multi-finger pinch gesture ceases to
+        /// be valid. This may happen when one or more fingers are lifted or
+        /// the gesture is cancelled.
+        ///
+        /// When a gesture is cancelled, the client should undo state changes
+        /// caused by this gesture. What causes a gesture to be cancelled is
+        /// implementation-dependent.
+        End {
+            serial: u32,
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            /// 1 if the gesture was cancelled, 0 otherwise,
+            cancelled: i32,
+        },
+    }
+    impl EventWriter
+        for crate::wayland_objects::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1
+    {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Begin { serial, time, surface, fingers } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 4);
+                    raw.uint(serial);
+                    raw.uint(time);
+                    raw.id(surface);
+                    raw.uint(fingers);
+                    raw
+                }
+                Update { time, dx, dy, scale, rotation } => {
+                    let mut raw = RawEvent::new(self.id(), 1, 5);
+                    raw.uint(time);
+                    raw.fixed(dx);
+                    raw.fixed(dy);
+                    raw.fixed(scale);
+                    raw.fixed(rotation);
+                    raw
+                }
+                End { serial, time, cancelled } => {
+                    let mut raw = RawEvent::new(self.id(), 2, 3);
+                    raw.uint(serial);
+                    raw.uint(time);
+                    raw.int(cancelled);
+                    raw
+                }
+            }
+        }
+    }
+}
+
+/// A hold gesture object
+///
+/// A hold gesture object notifies a client about a single- or
+/// multi-finger hold gesture detected on an indirect input device such as
+/// a touchpad. The gesture is usually initiated by one or more fingers
+/// being held down without significant movement. The precise conditions
+/// of when such a gesture is detected are implementation-dependent.
+///
+/// In particular, this gesture may be used to cancel kinetic scrolling.
+///
+/// A hold gesture consists of two stages: begin and end. Unlike pinch and
+/// swipe there is no update stage.
+/// There cannot be multiple simultaneous hold, pinch or swipe gestures on a
+/// same pointer/seat, how compositors prevent these situations is
+/// implementation-dependent.
+///
+/// A gesture may be cancelled by the compositor or the hardware.
+/// Clients should not consider performing permanent or irreversible
+/// actions until the end of a gesture has been received.
+pub mod zwp_pointer_gesture_hold_v1 {
+    use super::*;
+    impl Constants for crate::wayland_objects::zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1 {
+        const INTERFACE_NAME: &'static str = "zwp_pointer_gesture_hold_v1";
+        const INTERFACE_VERSION: u32 = 3;
+    }
+    impl crate::object::IdToObject for ZwpPointerGestureHoldV1Id {
+        type Object = crate::wayland_objects::zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1;
+    }
+    impl crate::object::ObjectWithId
+        for crate::wayland_objects::zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1
+    {
+        type Id = ZwpPointerGestureHoldV1Id;
+    }
+    /// Minimum interface version for the `destroy` message (XML `since` / `version`).
+    pub const DESTROY_SINCE: u32 = 3;
+    #[derive(Debug)]
+    pub enum Request {
+        /// Destroy the hold gesture object
+        ///
+        ///
+        Destroy,
+    }
+    impl Parser for crate::wayland_objects::zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1 {
+        type Request = Request;
+        fn parse_request(mut req: RawRequest) -> Result<Self::Request, ParserError> {
+            use Request::*;
+            let request = match req.request_id {
+                0 => Destroy,
+                _ => return Err(ParserError::InvalidRequest),
+            };
+            Ok(request)
+        }
+    }
+    /// Minimum interface version for the `begin` message (XML `since` / `version`).
+    pub const BEGIN_SINCE: u32 = 3;
+    /// Minimum interface version for the `end` message (XML `since` / `version`).
+    pub const END_SINCE: u32 = 3;
+    #[derive(Debug)]
+    pub enum Event {
+        /// Multi-finger hold begin
+        ///
+        /// This event is sent when a hold gesture is detected on the device.
+        Begin {
+            serial: u32,
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            surface: WlSurfaceId,
+            /// Number of fingers,
+            fingers: u32,
+        },
+        /// Multi-finger hold end
+        ///
+        /// This event is sent when a hold gesture ceases to
+        /// be valid. This may happen when the holding fingers are lifted or
+        /// the gesture is cancelled, for example if the fingers move past an
+        /// implementation-defined threshold, the finger count changes or the hold
+        /// gesture changes into a different type of gesture.
+        ///
+        /// When a gesture is cancelled, the client may need to undo state changes
+        /// caused by this gesture. What causes a gesture to be cancelled is
+        /// implementation-dependent.
+        End {
+            serial: u32,
+            /// Timestamp with millisecond granularity,
+            time: u32,
+            /// 1 if the gesture was cancelled, 0 otherwise,
+            cancelled: i32,
+        },
+    }
+    impl EventWriter for crate::wayland_objects::zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1 {
+        type Event = Event;
+        fn object_id(&self) -> WaylandId {
+            use crate::object::Object;
+            self.id()
+        }
+        fn to_raw_event(&self, event: Event) -> RawEvent {
+            use {crate::object::Object, Event::*};
+            match event {
+                Begin { serial, time, surface, fingers } => {
+                    let mut raw = RawEvent::new(self.id(), 0, 4);
+                    raw.uint(serial);
+                    raw.uint(time);
+                    raw.id(surface);
+                    raw.uint(fingers);
+                    raw
+                }
+                End { serial, time, cancelled } => {
+                    let mut raw = RawEvent::new(self.id(), 1, 3);
+                    raw.uint(serial);
+                    raw.uint(time);
+                    raw.int(cancelled);
                     raw
                 }
             }
@@ -18840,7 +20173,7 @@ pub mod zwp_text_input_v3 {
         /// Tells the compositor why the text surrounding the cursor changed.
         ///
         /// Whenever the client detects an external change in text, cursor, or
-        /// anchor posision, it must issue this request to the compositor. This
+        /// anchor position, it must issue this request to the compositor. This
         /// request is intended to give the input method a chance to update the
         /// preedit text in an appropriate way, e.g. by removing it when the user
         /// starts typing with a keyboard.
@@ -19231,7 +20564,7 @@ pub mod zwp_text_input_v3 {
     }
     /// Text change reason
     ///
-    /// Reason for the change of surrounding text or cursor posision.
+    /// Reason for the change of surrounding text or cursor position.
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
     pub enum ChangeCause {
         /// Input method caused the change,
