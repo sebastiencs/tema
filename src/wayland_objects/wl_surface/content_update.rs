@@ -20,6 +20,16 @@ pub(crate) struct ContentUpdate {
     /// The role part of the commit, applied only while the role object of
     /// `role_epoch` is still the surface's role.
     pub(super) role: RoleUpdate,
+    /// The subsurface stack and child positions at capture.
+    pub(super) tree: TreeUpdate,
+}
+
+/// The subsurface tree as it was pending when the commit was captured.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TreeUpdate {
+    pub(super) stack: Vec<StackEntry>,
+    /// (child surface, its `wl_subsurface` at capture, pending position).
+    pub(super) positions: Vec<(Resolved<WlSurfaceId>, Resolved<WlSubsurfaceId>, (i32, i32))>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +73,7 @@ impl ContentUpdate {
             xwayland_serial: None,
             acquire_forced: false,
             role: RoleUpdate::None,
+            tree: TreeUpdate::default(),
         }
     }
 
@@ -136,6 +147,7 @@ impl ContentUpdate {
         }
         self.acquire_forced |= next.acquire_forced;
         self.role = next.role;
+        self.tree = next.tree;
         std::mem::replace(&mut self.presentation_feedbacks, next.presentation_feedbacks)
     }
 }

@@ -51,7 +51,7 @@ use {super::wl_buffer::WlBuffer, crate::protocol_generated::wl_display};
 
 mod content_update;
 use content_update::PointerConstraintUpdate;
-pub(crate) use content_update::{ContentUpdate, RoleUpdate};
+pub(crate) use content_update::{ContentUpdate, RoleUpdate, TreeUpdate};
 
 fn monotonic_time_msec() -> u32 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -2530,28 +2530,72 @@ impl WlSurface {
         }
     }
 
-    pub(crate) fn apply_pending_tree_state(&mut self, state: &mut State) -> bool {
-        let order_changed = self.tree.pending_stack != self.tree.current_stack;
-        let child_ids = self.child_surface_ids();
-        self.tree.current_stack = self.tree.pending_stack.clone();
+    /// Request-time capture of the subsurface tree: the pending stack and the
+    /// pending position of every child in it that has a `wl_subsurface`.
+    fn capture_tree(&self, state: &State) -> TreeUpdate {
+        let mut positions = Vec::new();
+        for entry in &self.tree.pending_stack {
+            let StackEntry::Child(child_id) = *entry else {
+                continue;
+            };
+            let Some(child) = child_id.try_ref(state) else {
+                continue;
+            };
+            let Some(subsurface) = child.subsurface_object() else {
+                continue;
+            };
+            positions.push((child_id, subsurface, child.pending_subsurface_position()));
+        }
+        TreeUpdate { stack: self.tree.pending_stack.clone(), positions }
+    }
+
+    /// Applies a captured subsurface tree. Children no longer in the pending
+    /// stack, and children whose `wl_subsurface` changed since the capture, are
+    /// skipped. Returns whether the order or a position changed.
+    fn apply_tree(&mut self, state: &mut State, tree: &TreeUpdate) -> bool {
+        let current_stack: Vec<StackEntry> = tree
+            .stack
+            .iter()
+            .copied()
+            .filter(|entry| match entry {
+                StackEntry::Parent => true,
+                StackEntry::Child(_) => self.tree.pending_stack.contains(entry),
+            })
+            .collect();
+        let order_changed = current_stack != self.tree.current_stack;
+        self.tree.current_stack = current_stack;
         self.ensure_current_stack_parent();
 
         let mut position_changed = false;
-        for child_surface_id in child_ids {
-            let Some(mut child_surface) = child_surface_id.try_grab(state) else {
+        for (child_id, subsurface, position) in &tree.positions {
+            if !self
+                .tree
+                .pending_stack
+                .contains(&StackEntry::Child(*child_id))
+            {
+                continue;
+            }
+            let Some(mut child) = child_id.try_grab(state) else {
                 continue;
             };
-            let old_position = child_surface.current_subsurface_position();
-            let new_position = child_surface.pending_subsurface_position();
-            if old_position != new_position {
+            if child.subsurface_object() != Some(*subsurface) {
+                continue;
+            }
+            if child.current_subsurface_position() != *position {
                 position_changed = true;
             }
-            if let Some(subsurface) = child_surface.subsurface.as_mut() {
-                subsurface.current_position = subsurface.pending_position;
+            if let Some(sub) = child.subsurface.as_mut() {
+                sub.current_position = *position;
             }
         }
 
         order_changed || position_changed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_pending_tree_state(&mut self, state: &mut State) -> bool {
+        let tree = self.capture_tree(state);
+        self.apply_tree(state, &tree)
     }
 
     pub(super) fn complete_frame_callbacks(
@@ -2849,7 +2893,7 @@ impl WlSurface {
         changed |= state
             .seat
             .apply_cursor_surface_offset(this, payload.offset.0, payload.offset.1);
-        changed |= self.apply_pending_tree_state(state);
+        changed |= self.apply_tree(state, &update.tree);
         changed |= self.release_synchronized_children(
             client,
             state,
@@ -2968,7 +3012,7 @@ impl WlSurface {
             (None, None) => RoleUpdate::None,
         };
 
-        let mut update = this.capture_commit(dispatcher);
+        let mut update = this.capture_commit(state, dispatcher);
         update.role = role;
 
         if this.behaves_synchronized(state) {
@@ -2989,7 +3033,11 @@ impl WlSurface {
 
     /// Request-time half of a commit, after every check passed: moves the
     /// pending state into one `ContentUpdate`.
-    fn capture_commit(&mut self, dispatcher: &mut ClientDispatcher) -> ContentUpdate {
+    fn capture_commit(
+        &mut self,
+        state: &State,
+        dispatcher: &mut ClientDispatcher,
+    ) -> ContentUpdate {
         self.next_update_seq += 1;
         let seq = self.next_update_seq;
         // The payload of a wire-scaled client is normalized to logical units
@@ -3016,6 +3064,7 @@ impl WlSurface {
         if update.xwayland_serial.is_some() {
             self.latest_xwayland_serial = update.xwayland_serial;
         }
+        update.tree = self.capture_tree(state);
         update
     }
 
@@ -4762,7 +4811,7 @@ mod tests {
         fn capture(&mut self) -> ContentUpdate {
             let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
             let mut surface = self.surface.grab(&mut self.state);
-            surface.capture_commit(&mut client_dispatcher)
+            surface.capture_commit(&self.state, &mut client_dispatcher)
         }
 
         fn surface_events(&self) -> usize {
@@ -5031,7 +5080,7 @@ mod tests {
     ) -> ContentUpdate {
         let mut client_dispatcher = client.test_dispatcher(dispatcher);
         let mut wl_surface = surface.grab(state);
-        wl_surface.capture_commit(&mut client_dispatcher)
+        wl_surface.capture_commit(state, &mut client_dispatcher)
     }
 
     fn apply_captured(
@@ -8302,6 +8351,105 @@ mod tests {
             .unwrap();
         assert_eq!(child_a.current_subsurface_position(), (20, 30));
         assert_eq!(child_b.current_subsurface_position(), (-5, 7));
+    }
+
+    /// A root with two subsurface children `a` and `b`, both in the pending
+    /// stack and applied, so pending and current order agree.
+    fn parent_with_two_children(
+        state: &mut State,
+    ) -> (ObjectId, Resolved<WlSurfaceId>, Resolved<WlSurfaceId>, Resolved<WlSurfaceId>) {
+        let parent_object_id =
+            insert_surface(state, WlSurface::new(WlSurfaceId::from(1), ClientId::from_raw(1), 6));
+        let a_object_id =
+            insert_surface(state, WlSurface::new(WlSurfaceId::from(2), ClientId::from_raw(1), 6));
+        let b_object_id =
+            insert_surface(state, WlSurface::new(WlSurfaceId::from(3), ClientId::from_raw(1), 6));
+        let parent = root(state, parent_object_id);
+        let a = root(state, a_object_id);
+        let b = root(state, b_object_id);
+        let a_subsurface = insert_subsurface_object(state, WlSubsurfaceId::from(10), a, parent);
+        let b_subsurface = insert_subsurface_object(state, WlSubsurfaceId::from(11), b, parent);
+        {
+            let parent_surface = state
+                .objects
+                .get_mut(parent_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            parent_surface.add_pending_child(a);
+            parent_surface.add_pending_child(b);
+        }
+        for (child_object_id, subsurface) in
+            [(a_object_id, a_subsurface), (b_object_id, b_subsurface)]
+        {
+            let child = state
+                .objects
+                .get_mut(child_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            child.assign_subsurface(subsurface, parent);
+        }
+        {
+            let mut parent_surface = state.objects.grab_object::<WlSurface>(parent_object_id);
+            assert!(parent_surface.apply_pending_tree_state(state));
+        }
+        (parent_object_id, parent, a, b)
+    }
+
+    #[test]
+    fn stack_order_is_the_one_at_commit() {
+        let mut state = state_for_tests();
+        let (parent_object_id, _parent, a, _b) = parent_with_two_children(&mut state);
+
+        let first = {
+            let parent = state.objects.grab_object::<WlSurface>(parent_object_id);
+            parent.capture_tree(&state)
+        };
+        {
+            let parent = state
+                .objects
+                .get_mut(parent_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            assert!(parent.restack_child_relative(a, None, true));
+        }
+        let second = {
+            let parent = state.objects.grab_object::<WlSurface>(parent_object_id);
+            parent.capture_tree(&state)
+        };
+        assert_ne!(first.stack, second.stack);
+
+        let mut parent = state.objects.grab_object::<WlSurface>(parent_object_id);
+        parent.apply_tree(&mut state, &first);
+        assert_eq!(parent.current_stack(), first.stack.as_slice());
+        assert_ne!(parent.current_stack(), second.stack.as_slice());
+
+        parent.apply_tree(&mut state, &second);
+        assert_eq!(parent.current_stack(), second.stack.as_slice());
+    }
+
+    #[test]
+    fn removed_child_is_not_restacked_by_an_older_tree_update() {
+        let mut state = state_for_tests();
+        let (parent_object_id, _parent, a, _b) = parent_with_two_children(&mut state);
+
+        let older = {
+            let parent = state.objects.grab_object::<WlSurface>(parent_object_id);
+            parent.capture_tree(&state)
+        };
+        {
+            let parent = state
+                .objects
+                .get_mut(parent_object_id)
+                .downcast_mut::<WlSurface>()
+                .unwrap();
+            parent.remove_child_from_tree(a);
+        }
+
+        let mut parent = state.objects.grab_object::<WlSurface>(parent_object_id);
+        parent.apply_tree(&mut state, &older);
+        assert!(!parent
+            .current_stack()
+            .contains(&super::StackEntry::Child(a)));
     }
 
     #[test]
