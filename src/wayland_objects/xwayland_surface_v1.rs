@@ -38,7 +38,7 @@ impl Object for XwaylandSurfaceV1 {
                 let Some(mut surface) = self.surface.try_ref_mut(state) else {
                     return Ok(());
                 };
-                if surface.xwayland_serial().is_some() {
+                if surface.latest_xwayland_serial().is_some() {
                     client.protocol_violation_disconnect(
                         dispatcher,
                         self.id.into(),

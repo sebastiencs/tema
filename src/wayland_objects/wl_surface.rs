@@ -51,6 +51,7 @@ use {super::wl_buffer::WlBuffer, crate::protocol_generated::wl_display};
 
 mod content_update;
 pub(crate) use content_update::ContentUpdate;
+use content_update::PointerConstraintUpdate;
 
 fn monotonic_time_msec() -> u32 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -300,6 +301,8 @@ pub struct WlSurface {
     applied_update_seq: u64,
     /// Changes whenever this surface's role object changes.
     role_epoch: u64,
+    /// Serial of the newest captured commit. `xwayland_serial` is the applied one.
+    latest_xwayland_serial: Option<u64>,
     subsurface: Option<SubsurfaceState>,
     tree: SurfaceTreeState,
     output_membership: BTreeSet<OutputId>,
@@ -722,6 +725,7 @@ impl WlSurface {
             next_update_seq: 0,
             applied_update_seq: 0,
             role_epoch: 0,
+            latest_xwayland_serial: None,
             subsurface: None,
             tree: SurfaceTreeState::default(),
             output_membership: BTreeSet::new(),
@@ -1022,6 +1026,10 @@ impl WlSurface {
         self.xwayland_serial
     }
 
+    pub(crate) fn latest_xwayland_serial(&self) -> Option<u64> {
+        self.latest_xwayland_serial
+    }
+
     #[cfg(test)]
     pub(crate) fn test_set_xwayland_serial(&mut self, serial: u64) {
         self.xwayland_serial = Some(serial);
@@ -1039,9 +1047,10 @@ impl WlSurface {
         &mut self,
         client: &Client,
         surface: Resolved<WlSurfaceId>,
+        serial: Option<u64>,
         dispatcher: &mut ClientDispatcher,
     ) {
-        let Some(serial) = self.pending.xwayland_serial.take() else {
+        let Some(serial) = serial else {
             return;
         };
         self.xwayland_serial = Some(serial);
@@ -2771,17 +2780,8 @@ impl WlSurface {
         let Some(cached) = self.cached_update.take() else {
             return false;
         };
-        let last_seq = cached.last_seq;
-        let (changed, needs_frame) = self.apply_surface_update(
-            client,
-            state,
-            dispatcher,
-            cached.payload,
-            cached.frame_callbacks,
-            cached.presentation_feedbacks,
-            surface_behaves_synchronized,
-        );
-        self.applied_update_seq = self.applied_update_seq.max(last_seq);
+        let (changed, needs_frame) =
+            self.apply_content(client, state, dispatcher, cached, surface_behaves_synchronized);
         changed || needs_frame
     }
 
@@ -2821,18 +2821,31 @@ impl WlSurface {
         changed
     }
 
-    fn apply_surface_update(
+    fn apply_content(
         &mut self,
         client: &mut Client,
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
-        payload: SurfaceCommitPayload,
-        frame_callbacks: Vec<Resolved<WlCallbackId>>,
-        presentation_feedbacks: Vec<SurfacePresentationFeedback>,
+        update: ContentUpdate,
         surface_behaves_synchronized: bool,
     ) -> (bool, bool) {
-        let mut changed = self.apply_surface_payload(client, state, dispatcher, &payload);
         let this = client.resolve(self.id, state).unwrap();
+        self.apply_xwayland_serial(client, this, update.xwayland_serial, dispatcher);
+        if let Some(pointer_constraint) = &update.pointer_constraint {
+            apply_pointer_constraint_commit(
+                self,
+                pointer_constraint.constraint,
+                state,
+                pointer_constraint.region.clone(),
+                pointer_constraint.hint,
+            );
+        }
+        if self.pointer_constraint().is_some() {
+            dispatcher.dispatch_post_action(crate::input::pointer_lock::RecheckPointerLock);
+        }
+        let last_seq = update.last_seq;
+        let payload = update.payload;
+        let mut changed = self.apply_surface_payload(client, state, dispatcher, &payload);
         changed |= state
             .seat
             .apply_cursor_surface_offset(this, payload.offset.0, payload.offset.1);
@@ -2844,10 +2857,11 @@ impl WlSurface {
             surface_behaves_synchronized,
         );
         let (discarded_feedbacks, needs_presentation_frame) =
-            self.route_presentation_feedbacks(presentation_feedbacks);
+            self.route_presentation_feedbacks(update.presentation_feedbacks);
         Self::discard_feedbacks(client, state, dispatcher, discarded_feedbacks);
-        let (immediate_callbacks, needs_frame) = self.route_frame_callbacks(frame_callbacks);
+        let (immediate_callbacks, needs_frame) = self.route_frame_callbacks(update.frame_callbacks);
         Self::complete_frame_callbacks(client, state, dispatcher, immediate_callbacks);
+        self.applied_update_seq = self.applied_update_seq.max(last_seq);
         (changed, needs_frame || needs_presentation_frame)
     }
 
@@ -2947,68 +2961,15 @@ impl WlSurface {
             return;
         }
 
-        if !this.validate_pending_mapping(client, state, dispatcher) {
-            this.clear_failed_surface_commit();
+        let Some(update) = this.capture_commit(client, state, dispatcher) else {
             return;
-        }
-
-        if !this.validate_pending_sync(client, state, dispatcher) {
-            this.clear_failed_surface_commit();
-            return;
-        }
-
-        if !this.validate_pending_representation(client, state, dispatcher) {
-            this.clear_failed_surface_commit();
-            return;
-        }
-
-        this.apply_xwayland_serial(client, resolved_surface, dispatcher);
-
-        this.next_update_seq += 1;
-        let seq = this.next_update_seq;
-        let constraint_region = this.pending.pointer_constraint_region.take();
-        let constraint_hint = this.pending.pointer_constraint_hint.take();
-        // The payload of a wire-scaled client is normalized to logical units
-        // here, once, before it is cached or applied, so synchronized
-        // subsurfaces and the on-screen state both work in logical units.
-        // The pending state above was validated in the client's own wire
-        // units, exactly as the client sent it.
-        let wire_scale = dispatcher.wire_scale();
-        let payload =
-            WlSurface::normalize_commit_payload(this.build_commit_payload(wire_scale), wire_scale);
-        apply_pointer_constraint_commit(&this, state, constraint_region, constraint_hint);
-        if this.pointer_constraint().is_some() {
-            dispatcher.dispatch_post_action(crate::input::pointer_lock::RecheckPointerLock);
-        }
-        let frame_callbacks = std::mem::take(&mut this.pending_frame_callbacks);
-        let presentation_feedbacks = std::mem::take(&mut this.pending_presentation_feedbacks);
-        let update = ContentUpdate::new(
-            seq,
-            this.role_epoch,
-            payload,
-            frame_callbacks,
-            presentation_feedbacks,
-        );
+        };
 
         if this.behaves_synchronized(state) {
             let discarded = this.merge_cached_update(update);
             Self::discard_feedbacks(client, state, dispatcher, discarded);
             return;
         }
-        let lock_output = if this.role == Role::LockSurface {
-            this.lock_surface
-                .and_then(|lock_surface| lock_surface.try_ref(state))
-                .map(|lock_surface| lock_surface.output_id())
-        } else {
-            None
-        };
-        let mapped = this.note_lock_surface_mapped(state);
-        if let Some(output_id) = lock_output {
-            crate::drm::request_output(state, output_id, dispatcher);
-        }
-
-        let (mut this, old_blur_bounds) = client
-            .with_ungrabbed(this, state, |state| state.client_blur_padded_bounds(resolved_surface));
         let update = match this.cached_update.take() {
             Some(mut cached) => {
                 let discarded = cached.merge(update, &mut this.retired_buffers);
@@ -3017,17 +2978,94 @@ impl WlSurface {
             }
             None => update,
         };
-        let last_seq = update.last_seq;
-        let (changed, needs_frame) = this.apply_surface_update(
+        WlSurface::apply_update(
+            this,
             client,
             state,
             dispatcher,
-            update.payload,
-            update.frame_callbacks,
-            update.presentation_feedbacks,
-            false,
+            update,
+            ApplyContext { was_mapped, old_effective_insets, pending_xdg_role_changes },
         );
-        this.applied_update_seq = this.applied_update_seq.max(last_seq);
+    }
+
+    /// Request-time half of a commit, after the xdg and layer checks: validates
+    /// the wl_surface state and moves the pending state into one `ContentUpdate`.
+    /// Returns `None`, with the pending state cleared, when a check fails.
+    fn capture_commit(
+        &mut self,
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+    ) -> Option<ContentUpdate> {
+        if !self.validate_pending_mapping(client, state, dispatcher) {
+            self.clear_failed_surface_commit();
+            return None;
+        }
+
+        if !self.validate_pending_sync(client, state, dispatcher) {
+            self.clear_failed_surface_commit();
+            return None;
+        }
+
+        if !self.validate_pending_representation(client, state, dispatcher) {
+            self.clear_failed_surface_commit();
+            return None;
+        }
+
+        self.next_update_seq += 1;
+        let seq = self.next_update_seq;
+        // The payload of a wire-scaled client is normalized to logical units
+        // here, once, before it is cached or applied, so synchronized
+        // subsurfaces and the on-screen state both work in logical units.
+        // The pending state above was validated in the client's own wire
+        // units, exactly as the client sent it.
+        let wire_scale = dispatcher.wire_scale();
+        let payload =
+            WlSurface::normalize_commit_payload(self.build_commit_payload(wire_scale), wire_scale);
+        let mut update = ContentUpdate::new(
+            seq,
+            self.role_epoch,
+            payload,
+            std::mem::take(&mut self.pending_frame_callbacks),
+            std::mem::take(&mut self.pending_presentation_feedbacks),
+        );
+        let region = self.pending.pointer_constraint_region.take();
+        let hint = self.pending.pointer_constraint_hint.take();
+        update.pointer_constraint = self
+            .pointer_constraint()
+            .map(|constraint| PointerConstraintUpdate { constraint, region, hint });
+        update.xwayland_serial = self.pending.xwayland_serial.take();
+        if update.xwayland_serial.is_some() {
+            self.latest_xwayland_serial = update.xwayland_serial;
+        }
+        Some(update)
+    }
+
+    fn apply_update(
+        mut this: GrabbedObject<Self>,
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        update: ContentUpdate,
+        cx: ApplyContext,
+    ) {
+        let resolved_surface = client.resolve_this(&this, state);
+        let role_current = update.role_epoch == this.role_epoch;
+        let lock_output = if role_current && this.role == Role::LockSurface {
+            this.lock_surface
+                .and_then(|lock_surface| lock_surface.try_ref(state))
+                .map(|lock_surface| lock_surface.output_id())
+        } else {
+            None
+        };
+        let mapped = role_current && this.note_lock_surface_mapped(state);
+        if let Some(output_id) = lock_output {
+            crate::drm::request_output(state, output_id, dispatcher);
+        }
+
+        let (mut this, old_blur_bounds) = client
+            .with_ungrabbed(this, state, |state| state.client_blur_padded_bounds(resolved_surface));
+        let (changed, needs_frame) = this.apply_content(client, state, dispatcher, update, false);
         let (mut this, new_blur_bounds) = client
             .with_ungrabbed(this, state, |state| state.client_blur_padded_bounds(resolved_surface));
         if old_blur_bounds != new_blur_bounds {
@@ -3042,7 +3080,7 @@ impl WlSurface {
             dispatcher.dispatch_post_action(crate::input::focus::RefreshLockFocus);
         }
 
-        if let Some((xdg_surface_id, role_changes)) = pending_xdg_role_changes {
+        if let Some((xdg_surface_id, role_changes)) = cx.pending_xdg_role_changes {
             let mut xdg_surface = xdg_surface_id.grab(state);
             (this, _) = client.with_ungrabbed_mut(this, state, |state, client| {
                 xdg_surface.apply_commit_role_changes(client, state, dispatcher, role_changes);
@@ -3082,7 +3120,7 @@ impl WlSurface {
                 }
             }
         }
-        if let Some(old_effective_insets) = old_effective_insets {
+        if let Some(old_effective_insets) = cx.old_effective_insets {
             let new_effective_insets =
                 crate::root_geometry::effective_decoration_insets_for_surface(
                     state,
@@ -3173,7 +3211,7 @@ impl WlSurface {
         }
         let is_mapped = this.global_logical_bounds().is_some();
         let mut bounds_after_first_map_relayout = None;
-        if was_mapped != is_mapped {
+        if cx.was_mapped != is_mapped {
             if let Some(ShellSurfaceObject::XdgSurface(xdg_surface_id)) = this.shell_surface {
                 if xdg_surface_id
                     .try_ref(state)
@@ -4296,6 +4334,14 @@ pub(crate) fn test_commit_new_buffer(
     client_dispatcher.drain_post_actions(client, state);
 }
 
+/// Request-time results of the commit prologue that `apply_update` needs.
+struct ApplyContext {
+    was_mapped: bool,
+    old_effective_insets: Option<crate::config::DecorationInsets>,
+    pending_xdg_role_changes:
+        Option<(Resolved<XdgSurfaceId>, crate::wayland_objects::xdg_surface::CommitRoleChanges)>,
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -4317,7 +4363,7 @@ mod tests {
                 xdg_wm_base, WaylandId, WlBufferId, WlCallbackId, WlKeyboardId, WlPointerId,
                 WlSubsurfaceId, WlSurfaceId, WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id,
                 WpPresentationFeedbackId, WpViewportId, XdgSurfaceId, XdgToplevelId, XdgWmBaseId,
-                XwaylandSurfaceV1Id,
+                XwaylandSurfaceV1Id, ZwpLockedPointerV1Id,
             },
             region::{DamageRegion, RectI, RegionSpec, RegionValue},
             runner::{Dispatcher, Model},
@@ -4334,6 +4380,7 @@ mod tests {
             transform::{self, BufferTransform, SizeI, SurfaceViewport},
             visual_animation::WindowLifecycleAnim,
             wayland_objects::{
+                pointer_constraint::{ConstraintLifetime, SurfacePointerConstraint},
                 wl_buffer::WlBuffer,
                 wl_callback::WlCallback,
                 wl_keyboard::WlKeyboard,
@@ -4346,6 +4393,7 @@ mod tests {
                     xdg_toplevel::{ToplevelDecorationMode, XdgToplevel},
                     XdgSurface,
                 },
+                zwp_locked_pointer_v1::ZwpLockedPointerV1,
             },
             wire_scale::WireScale,
             xwayland::{SurfaceEvent, XwaylandAction},
@@ -4684,6 +4732,15 @@ mod tests {
             surface.on_commit(&mut self.client, &mut self.state, &mut client_dispatcher);
         }
 
+        /// Captures the pending commit without applying it.
+        fn capture(&mut self) -> ContentUpdate {
+            let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
+            let mut surface = self.surface.grab(&mut self.state);
+            surface
+                .capture_commit(&mut self.client, &mut self.state, &mut client_dispatcher)
+                .expect("the pending commit is captured")
+        }
+
         fn surface_events(&self) -> usize {
             self.dispatcher
                 .test_count_queued_action(|action: &XwaylandAction| {
@@ -4751,6 +4808,220 @@ mod tests {
 
         xwayland.commit();
         assert_eq!(xwayland.surface_events(), 1);
+    }
+
+    #[test]
+    fn capture_numbers_commits_in_order() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.commit();
+        xwayland.commit();
+        assert_eq!(
+            xwayland
+                .surface
+                .rref(&xwayland.state)
+                .test_applied_update_seq(),
+            2
+        );
+    }
+
+    #[test]
+    fn xwayland_serial_applies_after_the_role_object_is_destroyed() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.set_serial(7, 0);
+        let update = xwayland.capture();
+        assert_eq!(update.xwayland_serial, Some(7));
+        assert!(xwayland
+            .surface
+            .rref(&xwayland.state)
+            .xwayland_serial()
+            .is_none());
+
+        let object = xwayland
+            .surface
+            .rref(&xwayland.state)
+            .xwayland_surface_object()
+            .expect("the role object is associated");
+        xwayland
+            .surface
+            .grab(&mut xwayland.state)
+            .clear_xwayland_surface_object(object);
+
+        let client_id = xwayland.client.client_id();
+        let surface = xwayland.surface;
+        {
+            let mut client_dispatcher = xwayland.client.test_dispatcher(&mut xwayland.dispatcher);
+            let mut wl_surface = surface.grab(&mut xwayland.state);
+            wl_surface.apply_content(
+                &mut xwayland.client,
+                &mut xwayland.state,
+                &mut client_dispatcher,
+                update,
+                false,
+            );
+        }
+
+        assert_eq!(xwayland.surface.rref(&xwayland.state).xwayland_serial(), Some(7));
+        assert_eq!(xwayland.surface_events(), 1);
+        assert!(xwayland
+            .dispatcher
+            .test_has_queued_action(|action: &XwaylandAction| {
+                matches!(
+                    action,
+                    XwaylandAction::Surface {
+                        client,
+                        event: SurfaceEvent::SerialAssigned { serial: 7, surface: assigned },
+                    } if *client == client_id && *assigned == surface
+                )
+            }));
+    }
+
+    #[test]
+    fn already_associated_uses_the_latest_committed_serial() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland.set_serial(7, 0);
+        let _update = xwayland.capture();
+        {
+            let surface = xwayland.surface.rref(&xwayland.state);
+            assert_eq!(surface.latest_xwayland_serial(), Some(7));
+            assert!(surface.xwayland_serial().is_none());
+        }
+
+        let client_id = xwayland.client.client_id();
+        xwayland.set_serial(8, 0);
+        assert!(xwayland
+            .dispatcher
+            .test_has_queued_action(|action: &ClientManagerAction| {
+                matches!(action, ClientManagerAction::Close { id } if *id == client_id)
+            }));
+    }
+
+    #[test]
+    fn pointer_constraint_region_of_a_replaced_constraint_is_dropped() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(3);
+        let (surface, _) = client.insert_object(
+            &mut state,
+            WlSurface::new(WlSurfaceId::from(4), ClientId::from_raw(3), 6),
+        );
+        let (pointer, _) =
+            client.insert_object(&mut state, WlPointer::new(WlPointerId::from(5), 9));
+        let (lock_a, _) = client.insert_object(
+            &mut state,
+            ZwpLockedPointerV1::new(
+                ZwpLockedPointerV1Id::from(9),
+                surface,
+                pointer,
+                ConstraintLifetime::Persistent,
+                None,
+            ),
+        );
+        let (lock_b, _) = client.insert_object(
+            &mut state,
+            ZwpLockedPointerV1::new(
+                ZwpLockedPointerV1Id::from(10),
+                surface,
+                pointer,
+                ConstraintLifetime::Persistent,
+                None,
+            ),
+        );
+
+        // Captured for lock A, applied after the surface switched to lock B.
+        surface
+            .grab(&mut state)
+            .set_pointer_constraint(SurfacePointerConstraint::Lock(lock_a));
+        surface
+            .grab(&mut state)
+            .set_pending_pointer_constraint_region(Some(region_value(1, 1, 5, 5)));
+        let update = capture_update(&mut client, &mut state, &mut dispatcher, surface);
+        surface
+            .grab(&mut state)
+            .set_pointer_constraint(SurfacePointerConstraint::Lock(lock_b));
+        apply_captured(&mut client, &mut state, &mut dispatcher, surface, update);
+        assert!(lock_a.try_ref(&state).unwrap().region().is_none());
+        assert!(lock_b.try_ref(&state).unwrap().region().is_none());
+
+        // The same constraint at apply time takes the region.
+        surface
+            .grab(&mut state)
+            .set_pointer_constraint(SurfacePointerConstraint::Lock(lock_b));
+        surface
+            .grab(&mut state)
+            .set_pending_pointer_constraint_region(Some(region_value(2, 2, 3, 3)));
+        let update = capture_update(&mut client, &mut state, &mut dispatcher, surface);
+        apply_captured(&mut client, &mut state, &mut dispatcher, surface, update);
+        assert!(lock_b.try_ref(&state).unwrap().region().is_some());
+    }
+
+    #[test]
+    fn sync_child_pointer_region_applies_with_parent() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(3);
+        let (parent, _) = client.insert_object(
+            &mut state,
+            WlSurface::new(WlSurfaceId::from(4), ClientId::from_raw(3), 6),
+        );
+        let (child, _) = client.insert_object(
+            &mut state,
+            WlSurface::new(WlSurfaceId::from(5), ClientId::from_raw(3), 6),
+        );
+        let (pointer, _) =
+            client.insert_object(&mut state, WlPointer::new(WlPointerId::from(6), 9));
+        let (subsurface, _) = client
+            .insert_object(&mut state, WlSubsurface::new(WlSubsurfaceId::from(20), child, parent));
+        let (lock, _) = client.insert_object(
+            &mut state,
+            ZwpLockedPointerV1::new(
+                ZwpLockedPointerV1Id::from(9),
+                child,
+                pointer,
+                ConstraintLifetime::Persistent,
+                None,
+            ),
+        );
+        state.register_root_surface(parent);
+        parent.grab(&mut state).add_pending_child(child);
+        child.grab(&mut state).assign_subsurface(subsurface, parent);
+        child.grab(&mut state).set_subsurface_sync_mode(true);
+        child
+            .grab(&mut state)
+            .set_pointer_constraint(SurfacePointerConstraint::Lock(lock));
+        child
+            .grab(&mut state)
+            .set_pending_pointer_constraint_region(Some(region_value(1, 1, 5, 5)));
+
+        // A synchronized child's commit is cached, so the lock is untouched.
+        commit_surface(&mut client, &mut state, &mut dispatcher, child);
+        assert!(lock.try_ref(&state).unwrap().region().is_none());
+
+        // The parent's commit applies the child's cached region.
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert!(lock.try_ref(&state).unwrap().region().is_some());
+    }
+
+    fn capture_update(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        surface: Resolved<WlSurfaceId>,
+    ) -> ContentUpdate {
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        let mut wl_surface = surface.grab(state);
+        wl_surface
+            .capture_commit(client, state, &mut client_dispatcher)
+            .expect("the pending commit is captured")
+    }
+
+    fn apply_captured(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        surface: Resolved<WlSurfaceId>,
+        update: ContentUpdate,
+    ) {
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        let mut wl_surface = surface.grab(state);
+        wl_surface.apply_content(client, state, &mut client_dispatcher, update, false);
     }
 
     #[test]

@@ -159,13 +159,15 @@ impl Object for ZwpPointerConstraintsV1 {
 
 pub(crate) fn apply_pointer_constraint_commit(
     surface: &WlSurface,
+    expected: SurfacePointerConstraint,
     state: &mut State,
     region: Option<Option<RegionValue>>,
     hint: Option<(f32, f32)>,
 ) {
-    let Some(constraint) = surface.pointer_constraint() else {
+    if surface.pointer_constraint() != Some(expected) {
         return;
-    };
+    }
+    let constraint = expected;
     match constraint {
         SurfacePointerConstraint::Lock(id) => {
             let Some(mut lock) = id.try_ref_mut(state) else {
