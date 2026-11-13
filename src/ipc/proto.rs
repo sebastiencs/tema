@@ -111,6 +111,9 @@ pub struct Window {
     /// Absent on older clients.
     #[serde(default)]
     pub icon: Option<WindowIconInfo>,
+    /// Modal xdg dialog (`xdg_dialog_v1.set_modal` with a live parent). Absent on older clients.
+    #[serde(default)]
+    pub modal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,6 +357,7 @@ mod tests {
             tag: None,
             description: None,
             icon: None,
+            modal: false,
         }
     }
 
@@ -430,7 +434,7 @@ mod tests {
         );
         assert_json(
             &Reply::Ok(Response::FocusedWindow(Some(window()))),
-            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null}}}"#,
+            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false}}}"#,
         );
         assert_json(&Reply::Ok(Response::FocusedWindow(None)), r#"{"ok":{"focused_window":null}}"#);
         assert_json(&Reply::Ok(Response::Subscribed), r#"{"ok":"subscribed"}"#);
@@ -452,7 +456,7 @@ mod tests {
 
         assert_json(
             &Event::FocusedWindow { window: Some(window()) },
-            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null}}"#,
+            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false}}"#,
         );
         assert_json(
             &Event::FocusedWindow { window: None },
@@ -480,7 +484,7 @@ mod tests {
         nulls.output = None;
         assert_json(
             &nulls,
-            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null}"#,
+            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false}"#,
         );
         let mut disabled = output();
         disabled.active_workspace = None;

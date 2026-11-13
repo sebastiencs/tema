@@ -1574,6 +1574,8 @@ The calls are in `ClientManager`, on `WorkspaceStateChanged`, `OutputStateChange
 
 `Window.tag`, `Window.description`, and `Window.icon` come from the xdg toplevel. An empty tag or description is stored as absent. `icon` is a name plus the copied sizes, and is absent when the toplevel has none. `note_window_metadata` marks the snapshot dirty after a tag, description, or icon change.
 
+`Window.modal` is true when the focused window is an xdg dialog with `set_modal` and a parent that still exists. `xdg_dialog_v1` requests and every `xdg_toplevel.destroy` mark the snapshot dirty.
+
 `bell` is a topic with no snapshot field. `ipc::bell` sends `IpcServerAction::Bell` at once. The event is `{"event":"bell","window":N}`, or `"window":null` when the ring names no window. Subscribers of `bell`, and subscribers whose topic set is empty, receive it. The initial subscribe dump does not include one, because the snapshot has no bell. The same window, and a ring with no surface, are each limited to one event per 100 ms. `destroy_window` drops that window's throttle entry. There is no sound and no urgency hint.
 
 `window_icon` is a request. `size` defaults to 32 and `scale` to 1. The reply picks the pixmap whose `size * scale` equals the request, else the next larger product, else the largest smaller one, and among those the scale closest to the request. `data` is standard base64 of little-endian premultiplied BGRA. No pixmap leaves `data`, `size`, and `scale` null and still returns the name. An unknown id is `{"error":"no such window"}`. `temactl window-icon` is this request. `--size` and `--scale` select the pixmap, `-o FILE` writes a PNG, and `-j` prints the ok value.
@@ -1593,7 +1595,7 @@ Programs tema starts have `TEMA_SOCK` set. `socat` is the wire. `temactl` is `ta
 
 ## 27. xdg staging protocols
 
-Five version-1 globals from wayland-protocols staging. The interfaces are generated from the host XML and are not vendored. Bell, tag, icon, and toplevel drag are registered in `src/globals.rs`. The session manager is added and removed on its own, as described below. X windows do not implement any of them. A protocol error uses the spec's own code and disconnects the client.
+Six version-1 globals from wayland-protocols staging. The interfaces are generated from the host XML and are not vendored. Bell, tag, icon, toplevel drag, and dialog are registered in `src/globals.rs`. The session manager is added and removed on its own, as described below. X windows do not implement any of them. A protocol error uses the spec's own code and disconnects the client.
 
 ### `xdg-system-bell-v1`
 
@@ -1655,3 +1657,7 @@ This path does not take the compositor pointer grab and does not change the curs
 
 1. Drag a tab out of a tiled browser window onto another tile. The new window tiles there. Drag a tab out of a floating window. The new window floats where it was dropped.
 2. Start the drag, then lock the session. A window that was already tiled is back in its old split. A window that appeared during the drag is still floating.
+
+### `xdg-dialog-v1`
+
+`xdg_wm_dialog_v1` and `xdg_dialog_v1` are `src/wayland_objects/xdg_dialog_v1.rs`. `get_xdg_dialog` attaches a dialog to an `xdg_toplevel`. A second dialog for a toplevel that still has one fails with `already_used`. After the dialog is destroyed, a new one may be created. Modal is a stored hint, exposed as IPC `Window.modal` (section 26). It has no focus, stacking, or input effect. A never-mapped toplevel with a dialog and a parent floats at its initial commit, and is centered over its parent (or over its output when the parent is not on the same workspace) on the next map. Remaps and later requests never change floating.

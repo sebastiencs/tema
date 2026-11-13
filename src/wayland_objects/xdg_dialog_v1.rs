@@ -269,7 +269,13 @@ mod tests {
         window::{Toplevel, WindowId},
     };
 
-    use super::{XdgDialogV1, XdgWmDialogV1, XdgWmDialogV1Global};
+    use {
+        super::{XdgDialogV1, XdgWmDialogV1, XdgWmDialogV1Global},
+        crate::{
+            input::SurfaceFocus,
+            ipc::{snapshot, IpcServerAction},
+        },
+    };
 
     const MANAGER: u32 = 6;
 
@@ -577,6 +583,62 @@ mod tests {
         let mut fixture = Fixture::new();
         assert!(fixture.get_dialog(40, 99).is_err());
         assert!(fixture.closed());
+    }
+
+    fn take_refreshes(fixture: &mut Fixture) -> usize {
+        fixture
+            .dispatcher
+            .test_take_queued_actions::<IpcServerAction>()
+            .into_iter()
+            .filter(|action| matches!(action, IpcServerAction::Refresh))
+            .count()
+    }
+
+    /// The `modal` value of the window that `focus` gives keyboard focus to.
+    fn focused_modal(fixture: &mut Fixture, focus: Resolved<WlSurfaceId>) -> Option<bool> {
+        fixture.state.seat.keyboard_focus = Some(SurfaceFocus::new(focus));
+        snapshot::build(&fixture.state)
+            .focused_window
+            .map(|window| window.modal)
+    }
+
+    #[test]
+    fn the_snapshot_reports_a_focused_modal_dialog() {
+        let mut fixture = Fixture::new();
+        assert!(fixture.set_parent(32, 22).is_ok());
+        assert!(fixture.get_dialog(40, 32).is_ok());
+        assert!(fixture.set_modal(40).is_ok());
+        let (parent_window, child_window) = (fixture.parent.window, fixture.child.window);
+        crate::capture::map_window(&mut fixture.state, &mut fixture.dispatcher, parent_window);
+        crate::capture::map_window(&mut fixture.state, &mut fixture.dispatcher, child_window);
+        let (parent_root, child_root) = (fixture.parent.root, fixture.child.root);
+
+        assert_eq!(focused_modal(&mut fixture, child_root), Some(true));
+        assert_eq!(focused_modal(&mut fixture, parent_root), Some(false));
+
+        // Destroying the parent leaves the dialog without a live parent.
+        assert!(fixture.destroy_toplevel(22).is_ok());
+        assert_eq!(focused_modal(&mut fixture, child_root), Some(false));
+    }
+
+    #[test]
+    fn a_modal_change_marks_dirty_and_a_repeat_does_not() {
+        let mut fixture = Fixture::new();
+        assert!(fixture.set_parent(32, 22).is_ok());
+        assert!(fixture.get_dialog(40, 32).is_ok());
+        assert!(fixture.set_modal(40).is_ok());
+        let child_window = fixture.child.window;
+        crate::capture::map_window(&mut fixture.state, &mut fixture.dispatcher, child_window);
+        fixture.state.ipc_enabled = true;
+        take_refreshes(&mut fixture);
+        fixture.state.ipc_dirty = false;
+
+        assert!(fixture.unset_modal(40).is_ok());
+        assert_eq!(take_refreshes(&mut fixture), 1);
+        fixture.state.ipc_dirty = false;
+
+        assert!(fixture.unset_modal(40).is_ok());
+        assert_eq!(take_refreshes(&mut fixture), 0);
     }
 
     /// Trimmed copy of the drag fixture: one child toplevel (wire 13) that maps

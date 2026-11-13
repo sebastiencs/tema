@@ -61,6 +61,10 @@ fn focused_window(state: &State) -> Option<proto::Window> {
                 .map(|&(size, scale)| proto::IconSize { size, scale })
                 .collect(),
         }),
+        modal: state
+            .toplevel(window)
+            .and_then(|toplevel| toplevel.modal_parent())
+            .is_some_and(|parent| state.windows.contains_key(&parent)),
     })
 }
 

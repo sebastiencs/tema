@@ -349,6 +349,9 @@ fn format_focused_window(window: Option<&proto::Window>) -> String {
         yes_no(window.floating),
         yes_no(window.fullscreen)
     );
+    if window.modal {
+        text.push_str("  Modal: yes\n");
+    }
     if let Some(tag) = &window.tag {
         text.push_str(&format!("  Tag: {tag}\n"));
     }
@@ -911,6 +914,7 @@ mod tests {
             tag: None,
             description: None,
             icon: None,
+            modal: false,
         }
     }
 
@@ -1251,6 +1255,11 @@ Window 12: nvim — ~/src
         bare.fullscreen = true;
         assert!(format_focused_window(Some(&bare))
             .contains("  Workspace: none\n  Output: none\n  Floating: yes\n  Fullscreen: yes\n"));
+
+        let mut modal = window();
+        modal.modal = true;
+        assert!(format_focused_window(Some(&modal)).ends_with("  Fullscreen: no\n  Modal: yes\n"));
+        assert!(!format_focused_window(Some(&window())).contains("Modal"));
 
         let named = proto::WindowIcon {
             id: 12,
