@@ -886,7 +886,7 @@ fn start_interactive_resize(
         edges,
         initial_geometry,
     );
-    state.note_floating_resize_anchor(window, edges, initial_geometry);
+    state.note_floating_resize_anchor(window, edges);
     true
 }
 

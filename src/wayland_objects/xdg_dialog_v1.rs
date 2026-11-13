@@ -1054,6 +1054,71 @@ mod tests {
     }
 
     #[test]
+    fn a_left_resize_keeps_the_right_frame_edge_when_the_shadow_is_dropped() {
+        let mut fixture = MapFixture::new();
+        let (parent, parent_window) = fixture.setup();
+        fixture.state.set_window_floating(parent_window, true);
+        crate::input::grab::place_grabbed_root(
+            &mut fixture.state,
+            &mut fixture.dispatcher,
+            parent,
+            (40, 50),
+        );
+        fixture.refresh_geometry(parent);
+        fixture.set_parent(41);
+        fixture.make_dialog();
+        fixture.initial_configure_size();
+
+        let set_geometry = |fixture: &mut MapFixture, x: i32, y: i32, w: i32, h: i32| {
+            let xdg = fixture.xdg();
+            let mut request = RawEvent::new(WaylandId::from(80), 3, 4);
+            request.int(x);
+            request.int(y);
+            request.int(w);
+            request.int(h);
+            fixture
+                .dispatch(xdg.object_id(), 80, raw_request_from_event(request))
+                .unwrap();
+        };
+        let xdg = fixture.xdg();
+        let mut ack = RawEvent::new(WaylandId::from(80), 4, 1);
+        ack.uint(1);
+        fixture
+            .dispatch(xdg.object_id(), 80, raw_request_from_event(ack))
+            .unwrap();
+        set_geometry(&mut fixture, 20, 20, 80, 60);
+        crate::wayland_objects::wl_surface::test_commit_new_buffer(
+            &mut fixture.client,
+            &mut fixture.state,
+            &mut fixture.dispatcher,
+            fixture.surface,
+            120,
+            100,
+        );
+        fixture.refresh_geometry(fixture.surface);
+        let centered = fixture.child_geometry();
+
+        fixture.state.note_floating_resize_anchor(
+            fixture.window,
+            crate::protocol_generated::xdg_toplevel::ResizeEdge::Left as u32,
+        );
+        set_geometry(&mut fixture, 0, 0, 60, 60);
+        crate::wayland_objects::wl_surface::test_commit_new_buffer(
+            &mut fixture.client,
+            &mut fixture.state,
+            &mut fixture.dispatcher,
+            fixture.surface,
+            60,
+            60,
+        );
+        fixture.refresh_geometry(fixture.surface);
+        let resized = fixture.child_geometry();
+        assert_eq!(resized.x2(), centered.x2());
+        assert_eq!(resized.y, centered.y);
+        assert_eq!(resized.width, centered.width - 20);
+    }
+
+    #[test]
     fn a_mapped_floating_dialog_adopts_its_frame_origin() {
         let mut fixture = MapFixture::new();
         fixture.setup();

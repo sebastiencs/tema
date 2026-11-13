@@ -4050,7 +4050,7 @@ mod tests {
             EDGE_LEFT,
             target,
         );
-        state.note_floating_resize_anchor(window, EDGE_LEFT, target);
+        state.note_floating_resize_anchor(window, EDGE_LEFT);
         state.seat.pointer_pos = (70.0, 90.0);
         let mut dispatcher = Dispatcher::default();
         assert!(crate::input::apply_pointer_interactive_grab(&mut state, &mut dispatcher));
@@ -4089,7 +4089,7 @@ mod tests {
             .resize_anchor
             .is_none());
 
-        state.note_floating_resize_anchor(window, EDGE_LEFT, target);
+        state.note_floating_resize_anchor(window, EDGE_LEFT);
         {
             let xdg_surface = surface.try_ref(&state).unwrap().xdg_surface().unwrap();
             xdg_surface.grab(&mut state).test_arm_deferred_resize(7);

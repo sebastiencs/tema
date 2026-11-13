@@ -603,8 +603,8 @@ pub struct ManagedWindowState {
     /// Layout passes also run for the active workspace, and the fullscreen buffer is still
     /// attached then. Sampling it would park the fullscreen size on the floating origin.
     pub hold_floating_layout: bool,
-    /// Fixed edges of a floating resize, in root-position space, kept until
-    /// the client commits the final size.
+    /// Fixed frame edges of a floating resize, in global coordinates, kept until the
+    /// client commits the final size.
     pub resize_anchor: Option<ResizeAnchor>,
     /// Global origin of the outer frame of a floating xdg window.
     ///
@@ -627,7 +627,7 @@ pub struct ManagedWindowState {
     pub geometry_animation: WindowGeometryAnimation,
 }
 
-/// Opposite edge of a floating left or top resize, kept until the client commits.
+/// Opposite frame edges of a floating left or top resize, in global coordinates, kept until the client commits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResizeAnchor {
     pub edges: u32,
@@ -2392,28 +2392,28 @@ impl State {
         true
     }
 
-    /// Remember the right and bottom edges when a floating resize drags the left or top.
-    pub(crate) fn note_floating_resize_anchor(
-        &mut self,
-        window: WindowId,
-        edges: u32,
-        initial_geometry: root_geometry::WindowTargetGeometry,
-    ) {
-        let Some(managed) = self.managed_window_state_mut(window) else {
-            return;
-        };
+    /// Remember the frame's right and bottom edges when a floating resize drags the left or top.
+    pub(crate) fn note_floating_resize_anchor(&mut self, window: WindowId, edges: u32) {
         let left_or_top = edges
             & (crate::protocol_generated::xdg_toplevel::ResizeEdge::Left as u32
                 | crate::protocol_generated::xdg_toplevel::ResizeEdge::Top as u32);
+        // Read the frame before borrowing the managed state mutably.
+        let frame = self
+            .window_root_surface(window)
+            .and_then(|root| self.committed_root_geometry(root))
+            .map(|geometry| geometry.layout_rect_global);
+        let Some(managed) = self.managed_window_state_mut(window) else {
+            return;
+        };
         if left_or_top == 0 {
             managed.resize_anchor = None;
             return;
         }
-        managed.resize_anchor = Some(ResizeAnchor {
-            edges,
-            right: initial_geometry.root_pos.0 + initial_geometry.resize_size.0,
-            bottom: initial_geometry.root_pos.1 + initial_geometry.resize_size.1,
-        });
+        let Some(frame) = frame else {
+            managed.resize_anchor = None;
+            return;
+        };
+        managed.resize_anchor = Some(ResizeAnchor { edges, right: frame.x2(), bottom: frame.y2() });
     }
 
     pub(crate) fn clear_resize_anchor(&mut self, window: WindowId) {
@@ -2422,9 +2422,8 @@ impl State {
         }
     }
 
-    /// Move a floating window so a left or top resize keeps the opposite edge fixed.
-    ///
-    /// Returns true when the root position changed.
+    /// Move a floating window so a left or top resize keeps the opposite frame edge
+    /// fixed. Returns true when the window moved.
     pub(crate) fn apply_resize_anchor(&mut self, root: Resolved<WlSurfaceId>) -> bool {
         let Some(window) = self.window_for_root(root) else {
             return false;
@@ -2438,19 +2437,19 @@ impl State {
         let Some(geometry) = self.ensure_root_geometry_fresh(root) else {
             return false;
         };
-        let content = geometry.content_rect_global();
-        let mut x = geometry.root_pos.0;
-        let mut y = geometry.root_pos.1;
+        let frame = geometry.layout_rect_global;
+        let mut dx = 0;
+        let mut dy = 0;
         if anchor.edges & crate::protocol_generated::xdg_toplevel::ResizeEdge::Left as u32 != 0 {
-            x = anchor.right - content.width;
+            dx = anchor.right - frame.width - frame.x;
         }
         if anchor.edges & crate::protocol_generated::xdg_toplevel::ResizeEdge::Top as u32 != 0 {
-            y = anchor.bottom - content.height;
+            dy = anchor.bottom - frame.height - frame.y;
         }
-        if (x, y) == geometry.root_pos {
+        if (dx, dy) == (0, 0) {
             return false;
         }
-        self.set_root_surface_position(root, (x, y))
+        self.translate_root_surface(root, dx, dy)
     }
 
     /// Floating, non-fullscreen window with an xdg role: positioned by
