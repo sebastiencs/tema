@@ -4450,10 +4450,11 @@ mod tests {
             io_uring::model::IoUringAction,
             object::{Object, RequestResult},
             protocol_generated::{
-                xdg_wm_base, WaylandId, WlBufferId, WlCallbackId, WlKeyboardId, WlPointerId,
-                WlSubsurfaceId, WlSurfaceId, WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id,
-                WpPresentationFeedbackId, WpViewportId, XdgSurfaceId, XdgToplevelId, XdgWmBaseId,
-                XwaylandSurfaceV1Id, ZwpLockedPointerV1Id,
+                xdg_wm_base, ExtSessionLockSurfaceV1Id, ExtSessionLockV1Id, WaylandId, WlBufferId,
+                WlCallbackId, WlKeyboardId, WlPointerId, WlSubsurfaceId, WlSurfaceId,
+                WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId,
+                WpViewportId, XdgSurfaceId, XdgToplevelId, XdgWmBaseId, XwaylandSurfaceV1Id,
+                ZwlrLayerShellV1Id, ZwlrLayerSurfaceV1Id, ZwpLockedPointerV1Id,
             },
             region::{DamageRegion, RectI, RegionSpec, RegionValue},
             runner::{Dispatcher, Model},
@@ -4470,6 +4471,7 @@ mod tests {
             transform::{self, BufferTransform, SizeI, SurfaceViewport},
             visual_animation::WindowLifecycleAnim,
             wayland_objects::{
+                ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
                 pointer_constraint::{ConstraintLifetime, SurfacePointerConstraint},
                 wl_buffer::WlBuffer,
                 wl_callback::WlCallback,
@@ -4478,11 +4480,13 @@ mod tests {
                 wl_subsurface::WlSubsurface,
                 wp_fractional_scale_v1::WpFractionalScaleV1,
                 wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+                wp_presentation_feedback::WpPresentationFeedback,
                 wp_viewport::WpViewport,
                 xdg_surface::{
                     xdg_toplevel::{ToplevelDecorationMode, XdgToplevel},
                     XdgSurface,
                 },
+                zwlr_layer_surface_v1::{LayerShellLayer, ZwlrLayerSurfaceV1},
                 zwp_locked_pointer_v1::ZwpLockedPointerV1,
             },
             wire_scale::WireScale,
@@ -10480,5 +10484,421 @@ mod tests {
         assert!(retired
             .iter()
             .any(|c| c.buffer.wayland_id() == WlBufferId::from(90)));
+    }
+
+    /// Sends one request with `u32` arguments to `object` as a client would.
+    fn object_request<K>(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        object: K,
+        opcode: u16,
+        args: &[u32],
+    ) where
+        K: crate::object::IdToObject + Into<crate::protocol_generated::WaylandId> + Copy,
+    {
+        let mut event = RawEvent::new(object.into(), opcode, args.len());
+        for arg in args {
+            event.uint(*arg);
+        }
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        client_dispatcher.set_requester_object_id_for_tests(object.into());
+        let mut grabbed = client.grab_object(object, state);
+        grabbed
+            .on(client, state, raw_request_from_event(event), &mut client_dispatcher)
+            .unwrap();
+    }
+
+    /// Lets the held head of `surface` become ready, then flushes the client.
+    fn release_held_head(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        surface: Resolved<WlSurfaceId>,
+    ) {
+        surface.grab(state).test_release_head();
+        flush_queued_commits(client, state, dispatcher);
+    }
+
+    #[test]
+    fn carried_update_of_a_destroyed_subsurface_role_is_discarded() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (parent, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+        insert_request_buffer(&mut client, &mut state, 20);
+        parent.grab(&mut state).test_hold_next_commit();
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(2),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        // The child's commit is cached; the held parent commit carries it.
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(parent.rref(&state).test_queue_len(), 1);
+        assert!(!buffer_release_was_sent(&dispatcher, 20));
+
+        destroy_subsurface(&mut client, &mut state, &mut dispatcher, WlSubsurfaceId::from(61));
+        assert!(child.exists(&state));
+        assert!(!buffer_release_was_sent(&dispatcher, 20));
+
+        release_held_head(&mut client, &mut state, &mut dispatcher, parent);
+        assert!(buffer_release_was_sent(&dispatcher, 20));
+        assert!(child.rref(&state).on_screen.buffer.is_none());
+        assert!(!child.rref(&state).test_latest_buffer_is_some());
+
+        // The child is a root now: its next commit applies at once.
+        insert_request_buffer(&mut client, &mut state, 21);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(2),
+            1,
+            &[21, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        assert!(child.rref(&state).on_screen.buffer.is_some());
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 2);
+    }
+
+    #[test]
+    fn queued_cursor_offset_applies_with_its_update() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface.grab(&mut state).test_hold_next_commit();
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(1),
+            1,
+            &[20, 0, 0],
+        );
+        surface.grab(&mut state).pending.offset = (3, 5);
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(1), 6, &[]);
+        assert_eq!(surface.rref(&state).test_queue_len(), 1);
+        assert_eq!((surface.rref(&state).on_screen.x, surface.rref(&state).on_screen.y), (0, 0));
+
+        release_held_head(&mut client, &mut state, &mut dispatcher, surface);
+        assert_eq!((surface.rref(&state).on_screen.x, surface.rref(&state).on_screen.y), (3, 5));
+    }
+
+    #[test]
+    fn queued_xwayland_serial_applies_once_with_its_update() {
+        let mut xwayland = XwaylandCommit::new();
+        xwayland
+            .surface
+            .grab(&mut xwayland.state)
+            .test_hold_next_commit();
+        xwayland.set_serial(7, 0);
+        xwayland.commit();
+        assert_eq!(xwayland.surface.rref(&xwayland.state).test_queue_len(), 1);
+        assert!(xwayland
+            .surface
+            .rref(&xwayland.state)
+            .xwayland_serial()
+            .is_none());
+        assert_eq!(xwayland.surface_events(), 0);
+
+        xwayland
+            .surface
+            .grab(&mut xwayland.state)
+            .test_release_head();
+        xwayland
+            .client
+            .process(&mut xwayland.state, ClientAction::FlushCommitQueues, &mut xwayland.dispatcher)
+            .unwrap();
+        assert_eq!(xwayland.surface.rref(&xwayland.state).xwayland_serial(), Some(7));
+        assert_eq!(xwayland.surface_events(), 1);
+
+        // Nothing is queued any more, so a second flush does not assign it again.
+        xwayland
+            .client
+            .process(&mut xwayland.state, ClientAction::FlushCommitQueues, &mut xwayland.dispatcher)
+            .unwrap();
+        assert_eq!(xwayland.surface_events(), 1);
+    }
+
+    #[test]
+    fn queued_pointer_constraint_region_survives_unless_the_constraint_changes() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(3);
+        let (surface, _) = client.insert_object(
+            &mut state,
+            WlSurface::new(WlSurfaceId::from(4), ClientId::from_raw(3), 6),
+        );
+        state.register_root_surface(surface);
+        let (pointer, _) =
+            client.insert_object(&mut state, WlPointer::new(WlPointerId::from(5), 9));
+        let (lock_a, _) = client.insert_object(
+            &mut state,
+            ZwpLockedPointerV1::new(
+                ZwpLockedPointerV1Id::from(9),
+                surface,
+                pointer,
+                ConstraintLifetime::Persistent,
+                None,
+            ),
+        );
+        let (lock_b, _) = client.insert_object(
+            &mut state,
+            ZwpLockedPointerV1::new(
+                ZwpLockedPointerV1Id::from(10),
+                surface,
+                pointer,
+                ConstraintLifetime::Persistent,
+                None,
+            ),
+        );
+
+        // Held for lock A: the region is taken at capture and applied at release.
+        surface.grab(&mut state).test_hold_next_commit();
+        surface
+            .grab(&mut state)
+            .set_pointer_constraint(SurfacePointerConstraint::Lock(lock_a));
+        surface
+            .grab(&mut state)
+            .set_pending_pointer_constraint_region(Some(region_value(1, 1, 5, 5)));
+        commit_surface(&mut client, &mut state, &mut dispatcher, surface);
+        assert!(lock_a.try_ref(&state).unwrap().region().is_none());
+        release_held_head(&mut client, &mut state, &mut dispatcher, surface);
+        assert!(lock_a.try_ref(&state).unwrap().region().is_some());
+
+        // Held for lock A, but the surface switches to lock B before release.
+        surface.grab(&mut state).test_hold_next_commit();
+        surface
+            .grab(&mut state)
+            .set_pending_pointer_constraint_region(Some(region_value(2, 2, 3, 3)));
+        commit_surface(&mut client, &mut state, &mut dispatcher, surface);
+        surface
+            .grab(&mut state)
+            .set_pointer_constraint(SurfacePointerConstraint::Lock(lock_b));
+        release_held_head(&mut client, &mut state, &mut dispatcher, surface);
+        assert!(lock_b.try_ref(&state).unwrap().region().is_none());
+    }
+
+    #[test]
+    fn queued_lock_surface_commit_marks_mapped_on_apply() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        let lock =
+            Resolved::new(client.client_id(), ExtSessionLockV1Id::from(3), ObjectId::from(3usize));
+        let (lock_surface, _) = client.insert_object(
+            &mut state,
+            ExtSessionLockSurfaceV1::new(
+                ExtSessionLockSurfaceV1Id::from(40),
+                lock,
+                surface,
+                OutputId::from(0usize),
+            ),
+        );
+        surface.grab(&mut state).set_lock_surface(lock_surface);
+        assert!(surface.grab(&mut state).assign_lock_surface_role());
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            lock_surface
+                .grab(&mut state)
+                .configure(1, 2, 2, &mut client_dispatcher);
+        }
+        object_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            ExtSessionLockSurfaceV1Id::from(40),
+            1,
+            &[1],
+        );
+        assert!(!lock_surface.rref(&state).is_mapped());
+
+        surface.grab(&mut state).test_hold_next_commit();
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(1),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(1), 6, &[]);
+        assert_eq!(surface.rref(&state).test_queue_len(), 1);
+        assert!(!lock_surface.rref(&state).is_mapped());
+
+        release_held_head(&mut client, &mut state, &mut dispatcher, surface);
+        assert!(lock_surface.rref(&state).is_mapped());
+    }
+
+    #[test]
+    fn queued_layer_surface_commit_maps_on_apply() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        let manager = Resolved::new(
+            client.client_id(),
+            ZwlrLayerShellV1Id::from(31),
+            ObjectId::from(31usize),
+        );
+        let (layer, _) = client.insert_object(
+            &mut state,
+            ZwlrLayerSurfaceV1::new(
+                ZwlrLayerSurfaceV1Id::from(30),
+                manager,
+                5,
+                surface,
+                None,
+                LayerShellLayer::Top,
+                "panel".to_string(),
+            ),
+        );
+        surface.grab(&mut state).set_layer_surface_impl(layer);
+        state.register_layer_surface_object(layer);
+        object_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            ZwlrLayerSurfaceV1Id::from(30),
+            0,
+            &[2, 2],
+        );
+        // Initial commit without a buffer.
+        commit_surface(&mut client, &mut state, &mut dispatcher, surface);
+        // Layout then sends the first configure, now that the initial commit is applied.
+        {
+            let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+            crate::wayland_objects::zwlr_layer_surface_v1::relayout_client_layer_surfaces(
+                &mut client,
+                &mut state,
+                &mut client_dispatcher,
+            );
+        }
+        object_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            ZwlrLayerSurfaceV1Id::from(30),
+            6,
+            &[1],
+        );
+        assert!(!layer.rref(&state).is_mapped());
+
+        surface.grab(&mut state).test_hold_next_commit();
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(1),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(1), 6, &[]);
+        assert_eq!(surface.rref(&state).test_queue_len(), 1);
+        assert!(!layer.rref(&state).is_mapped());
+
+        release_held_head(&mut client, &mut state, &mut dispatcher, surface);
+        assert!(layer.rref(&state).is_mapped());
+    }
+
+    #[test]
+    fn queued_xdg_initial_commit_sends_the_configure_on_apply() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = create_root_xdg_toplevel(
+            &mut state,
+            &mut client,
+            &mut dispatcher,
+            WlSurfaceId::from(50),
+            XdgSurfaceId::from(60),
+            XdgToplevelId::from(70),
+        );
+        let surface = root(&state, surface_object_id);
+        let before = pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60));
+
+        surface.grab(&mut state).test_hold_next_commit();
+        commit_surface(&mut client, &mut state, &mut dispatcher, surface);
+        assert_eq!(surface.rref(&state).test_queue_len(), 1);
+        assert_eq!(pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60)), before);
+
+        release_held_head(&mut client, &mut state, &mut dispatcher, surface);
+        assert!(pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60)) > before);
+        assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+    }
+
+    #[test]
+    fn frame_callbacks_of_a_queued_update_fire_after_it_is_shown() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        insert_request_buffer(&mut client, &mut state, 20);
+        let (callback, _) =
+            client.insert_object(&mut state, WlCallback::new(WlCallbackId::from(30)));
+        surface
+            .grab(&mut state)
+            .pending_frame_callbacks
+            .push(callback);
+        surface.grab(&mut state).test_hold_next_commit();
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(1),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(1), 6, &[]);
+        assert_eq!(surface.rref(&state).test_queue_len(), 1);
+        assert!(!done_event_was_sent(&dispatcher, 30));
+
+        release_held_head(&mut client, &mut state, &mut dispatcher, surface);
+        // Shown with its buffer: the callback waits for the next frame, it is not completed early.
+        assert_eq!(surface.rref(&state).test_frame_callback_count(), 1);
+        assert!(!done_event_was_sent(&dispatcher, 30));
+    }
+
+    #[test]
+    fn presentation_feedback_of_a_destroyed_surface_queue_is_discarded() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        insert_request_buffer(&mut client, &mut state, 20);
+        let (feedback, _) = client.insert_object(
+            &mut state,
+            WpPresentationFeedback::new(WpPresentationFeedbackId::from(40), 1),
+        );
+        surface
+            .grab(&mut state)
+            .pending_presentation_feedbacks
+            .push(SurfacePresentationFeedback { feedback, version: 1, output_id: None });
+        surface.grab(&mut state).test_hold_next_commit();
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(1),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(1), 6, &[]);
+        assert_eq!(surface.rref(&state).test_queue_len(), 1);
+        assert!(!delete_id_was_sent(&dispatcher, 40));
+
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(1), 0, &[]);
+        assert!(!surface.exists(&state));
+        assert!(buffer_release_was_sent(&dispatcher, 20));
+        assert!(delete_id_was_sent(&dispatcher, 40));
+        assert!(!feedback.exists(&state));
     }
 }

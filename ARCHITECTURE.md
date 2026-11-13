@@ -1677,3 +1677,70 @@ This path does not take the compositor pointer grab and does not change the curs
 ### `xdg-dialog-v1`
 
 `xdg_wm_dialog_v1` and `xdg_dialog_v1` are `src/wayland_objects/xdg_dialog_v1.rs`. `get_xdg_dialog` attaches a dialog to an `xdg_toplevel`. A second dialog for a toplevel that still has one fails with `already_used`. After the dialog is destroyed, a new one may be created. Modal is a stored hint, exposed as IPC `Window.modal` (section 26). It has no focus, stacking, or input effect. A never-mapped toplevel with a dialog and a parent floats at its initial commit, and is centered over its parent (or over its output when the parent is not on the same workspace) on the next map. Remaps and later requests never change floating.
+
+## 28. Commit queue
+
+A `wl_surface.commit` runs in three steps. The check runs at request time and changes nothing. The capture moves everything the commit changes into one `ContentUpdate`. The apply puts that update on screen. An update whose apply is not yet allowed waits in its surface's queue. The surface's own state is in `src/wayland_objects/wl_surface.rs`. The update type is `wl_surface/content_update.rs`, and the queue is `wl_surface/commit_queue.rs`. The xdg and layer roles split their parts the same way in `xdg_surface.rs` and `zwlr_layer_surface_v1.rs`.
+
+### Check, capture, apply
+
+`WlSurface::on_commit` runs the role prologue first. The xdg check (`XdgSurface::check_commit`) and the layer check (`ZwlrLayerSurfaceV1::check_commit`) are read-only. They send their protocol errors there. Then the wl_surface checks run for mapping, explicit sync and representation. Only when all of them pass does the role capture (`take_commit_capture`) run, followed by `capture_commit`. A rejected commit leaves the xdg and layer state untouched.
+
+`capture_commit` builds the payload from the pending state. It takes the pending frame callbacks, presentation feedback, pointer constraint region and hint, and the xwayland serial. It takes the `cached_update` of each synchronized child in the pending stack, and the pending stack and child positions. These go into `ContentUpdate.children` and `ContentUpdate.tree`. It also numbers the commit with `next_update_seq`.
+
+Request-time checks read only state the capture maintains: `WlSurface.latest` (the newest committed buffer, color representation and regions, `LatestCommitted`), `latest_xwayland_serial`, the xdg surface's `initial_commit_requested`, a popup's `map_requested`, and a layer surface's `committed` and `initial_commit_requested`. They never read applied state. A null-buffer commit resets the role's `last_acked` configure at capture. The reset that happens at apply does not touch `last_acked`, so a buffer attached right after an unmap is checked against the reset state.
+
+`apply_update` runs the role part first when the update's role epoch still matches the surface's. It then runs `apply_content`. That applies the xwayland serial and the pointer constraint, then the captured subsurface tree, then the carried children (`apply_children`), then the surface content, in the order of the commit tail before this change.
+
+### Sequence and discard
+
+`next_update_seq` numbers commits from 1. An update covers `first_seq..=last_seq`, which spans more than one commit only after synchronized commits are merged. `applied_update_seq` is the highest `last_seq` that was applied or discarded for the surface.
+
+An update is ready only when `applied_update_seq + 1 >= first_seq`. The same check applies to every child update it carries. So a surface's updates apply in commit order, whether they sit in its own queue or inside a parent's update. A parent update waits for an earlier own update of a child, and a child's own update waits for the parent update that carries its earlier state. Surfaces with no subsurface relation do not depend on each other.
+
+Every path that drops an update calls `discard_update`. It raises `applied_update_seq` to the update's `last_seq`, releases the buffer, completes the release callbacks, discards the presentation feedback, and completes the frame callbacks with `done` and `delete_id`. The buffer's pixels stay valid, because the attached buffer holds its content by `Rc`. Discarding a parent also discards the children it carries.
+
+`dropped_through_seq` is set to `next_update_seq` by `drop_queued_updates`. That runs on destroy, on parent loss (which includes `wl_subsurface.destroy`), on role dismissal, and on detach of a subsurface tree. The surface's queue is emptied, its `cached_update` is discarded, its acquire waiter is stopped, and `latest.buffer` becomes `None`. A carried child update whose `last_seq` is at or below `dropped_through_seq` is discarded at apply and never applied. So an older parent update cannot map a subsurface whose role was destroyed.
+
+### Synchronized subsurfaces
+
+A commit on an effectively synchronized surface is captured and merged into `cached_update` by `merge_cached_update`. A merge keeps the newest payload, frame callbacks, presentation feedback, pointer constraint region and hint. It records the last sequence number and the role epoch of the newest commit. It always retires the buffer it replaces, so that buffer gets its `wl_buffer.release` and its explicit-sync release point signals.
+
+A parent's next commit carries each child's cached update, and `apply_children` applies them after the parent's tree. A grandchild's cached state is captured by the child's commit. A grandchild commit made after the child's last commit waits for the child's next commit. A child destroyed while its update is carried is discarded and its buffer is released.
+
+`wl_subsurface.set_desync` submits a released cached update as a normal update of the child, through `submit_cached_if_parent_desynchronized`. That runs the full commit tail for the released state, including the output refresh and the root geometry update.
+
+### Role epoch
+
+`WlSurface.role_epoch` changes whenever the role object changes. The role setters call `bump_role_epoch` on success. So do `destroy_toplevel_role` and `destroy_popup_role` when the role matched. `set_xwayland_surface_object` and `clear_xwayland_surface_object` do not change it. An update captured under another epoch applies its surface content and skips its xdg or layer part. A destroyed toplevel therefore does not receive a configure from an update captured before it was destroyed.
+
+The xwayland serial is not gated by the epoch. It applies with its update, and destroying the `xwayland_surface_v1` object leaves an association that was already made alone. A pointer constraint update records the constraint it was captured for. At apply, a different constraint drops the region and the hint.
+
+### Explicit sync
+
+An update waits while its acquire point (`payload.sync.acquire`, or that of a carried child) is not signaled. The xdg, layer and lock parts of that commit wait with it. Each surface has at most one acquire waiter, for the first unsignaled point of its queue head (`WlSurface.acquire_waiter`). When the waiter fires, it sends `ClientAction::AcquireWaitDone`. That clears the waiter and flushes the client. A `SyncFile` acquire has no waiter, so the queue head is checked again on every flush.
+
+If the waiter cannot be created, or it reports a failure, the head update is applied with `acquire_forced` set, and a warning is logged. The renderer still waits on the fence before scanout. A newer commit never drops a queued update, so the single blocked-buffer slot of the earlier design is gone.
+
+### Limits
+
+A client may have at most 256 updates queued across all its surfaces (`MAX_QUEUED_UPDATES_PER_CLIENT`). The 257th is discarded. The client receives `wl_display.error` with `no_memory` on that surface and is disconnected. Queued updates hold no file descriptors. A waiter exists only per surface whose queue head waits on a timeline point. `ClientAction::FlushCommitQueues` flushes one client's queues. Closing the client removes its queue index.
+
+### Behavior changes
+
+1. Explicit sync: an update is no longer dropped when a newer commit arrives before its fence signals. Updates apply in order.
+2. Explicit sync: the xdg, layer and lock parts of a commit wait for the fence together with the buffer.
+3. `wl_subsurface.set_desync` runs the full commit tail for the released cached state, not only the content apply.
+4. The xwayland serial association is sent when its update is applied.
+5. Nested synchronized subsurfaces: a grandchild's cached state is captured by the child's commit, not by the parent's. A grandchild commit made after the child's last commit waits for the child's next commit.
+6. A synchronized subsurface's pointer constraint region and hint apply when its cached state is applied with the parent, not at the child's commit.
+7. Unchanged: `xdg_surface.ack_configure` still applies its configure effects at request time. With a queued buffer, the configure can take effect before the buffer is shown.
+8. Merging synchronized commits always retires the replaced cached buffer. Before, only a buffer with release callbacks was retired.
+
+### Tests
+
+The queue regression tests are in `wl_surface.rs` `mod tests`. They keep an update queued with `test_hold_next_commit`, and apply it with `test_release_head` followed by `ClientAction::FlushCommitQueues`. They cover a carried update of a destroyed subsurface, cursor offsets, the xwayland serial, pointer constraints, lock, layer and xdg surfaces, frame callbacks and presentation feedback.
+
+### Manual check
+
+1. Run a Vulkan application with explicit sync, such as `vkcube`, and resize its window while it runs. Frames are neither dropped nor shown out of order, and the log has no new warnings.
