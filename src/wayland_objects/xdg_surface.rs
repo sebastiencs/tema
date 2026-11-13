@@ -983,7 +983,7 @@ pub mod xdg_toplevel {
         object::{Object, Parser, PostAction, RequestResult},
         protocol_generated::{
             xdg_toplevel as proto_xdg_toplevel, zxdg_toplevel_decoration_v1, Array, WaylandId,
-            WlOutputId, WlSeatId, WlSurfaceId, XdgToplevelDragV1Id, XdgToplevelId,
+            WlOutputId, WlSeatId, WlSurfaceId, XdgDialogV1Id, XdgToplevelDragV1Id, XdgToplevelId,
             XdgToplevelSessionV1Id, ZxdgToplevelDecorationV1Id,
         },
         region::RectI,
@@ -1019,6 +1019,10 @@ pub mod xdg_toplevel {
         session: Option<Resolved<XdgToplevelSessionV1Id>>,
         pending_session_restore: Option<(String, crate::session_store::ToplevelRecord)>,
         toplevel_drag: Option<Resolved<XdgToplevelDragV1Id>>,
+        /// Live `xdg_dialog_v1` for this toplevel.
+        dialog: Option<Resolved<XdgDialogV1Id>>,
+        /// The last request on that dialog was `set_modal`.
+        dialog_modal: bool,
         parent: Option<Resolved<XdgToplevelId>>,
         parent_window: Option<WindowId>,
         min_size: Option<(i32, i32)>,
@@ -1091,6 +1095,8 @@ pub mod xdg_toplevel {
                 session: None,
                 pending_session_restore: None,
                 toplevel_drag: None,
+                dialog: None,
+                dialog_modal: false,
                 parent: None,
                 parent_window: None,
                 min_size: None,
@@ -1605,6 +1611,33 @@ pub mod xdg_toplevel {
             self.parent_window.is_some()
         }
 
+        pub(crate) fn dialog(&self) -> Option<Resolved<XdgDialogV1Id>> {
+            self.dialog
+        }
+
+        pub(crate) fn attach_dialog(&mut self, dialog: Resolved<XdgDialogV1Id>) {
+            self.dialog = Some(dialog);
+            self.dialog_modal = false;
+        }
+
+        pub(crate) fn detach_dialog(&mut self) {
+            self.dialog = None;
+            self.dialog_modal = false;
+        }
+
+        pub(crate) fn set_dialog_modal(&mut self, modal: bool) {
+            self.dialog_modal = modal;
+        }
+
+        /// Parent window while this toplevel is a modal dialog.
+        pub(crate) fn dialog_modal_parent(&self) -> Option<WindowId> {
+            if self.dialog.is_some() && self.dialog_modal && self.parent.is_some() {
+                self.parent_window
+            } else {
+                None
+            }
+        }
+
         pub(crate) fn set_description(&mut self, description: Option<String>) -> bool {
             if self.description == description {
                 return false;
@@ -2089,6 +2122,10 @@ pub mod xdg_toplevel {
             self.icon.as_ref()
         }
 
+        fn modal_parent(&self) -> Option<WindowId> {
+            self.dialog_modal_parent()
+        }
+
         fn size_constraints(&self) -> InteractiveSizeConstraints {
             self.interactive_size_constraints()
         }
@@ -2233,6 +2270,14 @@ pub mod xdg_toplevel {
                         self.id,
                         self.client_id,
                     );
+                    if let Some(dialog) = self.dialog.take() {
+                        if let Some(dialog) = dialog.try_ref_mut(state) {
+                            dialog.toplevel_destroyed();
+                        }
+                    }
+                    self.dialog_modal = false;
+                    // A dialog of this window may have been modal; IPC re-reads it.
+                    crate::ipc::mark_dirty(state, dispatcher);
                     crate::capture::unmap_window(state, dispatcher, self.window);
                     state.destroy_window(self.window);
                     if let Some(affected_outputs) = affected_outputs {
@@ -2260,6 +2305,7 @@ pub mod xdg_toplevel {
                     self.delete_self(client, state, dispatcher);
                 }
                 SetParent { parent } => {
+                    let modal_before = self.dialog_modal_parent();
                     let parent = match parent.to_opt() {
                         None => None,
                         Some(parent) => {
@@ -2284,6 +2330,9 @@ pub mod xdg_toplevel {
                         self.window,
                         self.parent_window,
                     );
+                    if self.dialog_modal_parent() != modal_before {
+                        crate::ipc::mark_dirty(state, dispatcher);
+                    }
                 }
                 SetTitle { title } => {
                     self.title = title;

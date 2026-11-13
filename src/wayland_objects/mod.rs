@@ -66,6 +66,7 @@ pub mod wp_viewport;
 pub mod wp_viewporter;
 pub mod xdg_activation_token_v1;
 pub mod xdg_activation_v1;
+pub mod xdg_dialog_v1;
 pub mod xdg_popup;
 pub mod xdg_positioner;
 pub mod xdg_session_manager_v1;
@@ -225,6 +226,8 @@ fake_obj! {
     { wp_commit_timer_v1, WpCommitTimerV1 },
     { wp_security_context_manager_v1, WpSecurityContextManagerV1 },
     { wp_security_context_v1, WpSecurityContextV1 },
-    { xdg_wm_dialog_v1, XdgWmDialogV1 },
-    { xdg_dialog_v1, XdgDialogV1 },
+}
+
+pub mod xdg_wm_dialog_v1 {
+    pub use super::xdg_dialog_v1::XdgWmDialogV1;
 }

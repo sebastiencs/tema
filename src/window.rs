@@ -101,6 +101,11 @@ pub trait Toplevel {
     fn icon(&self) -> Option<&std::rc::Rc<crate::toplevel_icon::ToplevelIcon>> {
         None
     }
+    /// Parent window while this toplevel is a modal dialog (`xdg_dialog_v1`).
+    /// The parent may already be destroyed; callers check `State::windows`.
+    fn modal_parent(&self) -> Option<WindowId> {
+        None
+    }
     /// Minimum and maximum size for interactive resize.
     fn size_constraints(&self) -> InteractiveSizeConstraints;
     /// Minimum size the layout uses when tiling.
