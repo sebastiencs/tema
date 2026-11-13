@@ -110,6 +110,8 @@ where
         flags: PresentFlags {
             zero_copy: completed_submission.zero_copy,
             refresh_is_constant: present.refresh_is_constant,
+            async_flip: presented.as_ref().is_some_and(|p| p.async_flip),
+            kernel_timestamp: presented.as_ref().is_some_and(|p| p.kernel_timestamp),
         },
         timing: Some(PresentTiming {
             path: if completed_submission.zero_copy {

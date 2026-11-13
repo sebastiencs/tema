@@ -51,6 +51,8 @@ pub mod wp_alpha_modifier_surface_v1;
 pub mod wp_alpha_modifier_v1;
 pub mod wp_color_representation_manager_v1;
 pub mod wp_color_representation_surface_v1;
+pub mod wp_commit_timer_v1;
+pub mod wp_commit_timing_manager_v1;
 pub mod wp_cursor_shape_device_v1;
 pub mod wp_cursor_shape_manager_v1;
 pub mod wp_fifo_manager_v1;
@@ -222,8 +224,6 @@ fake_obj! {
     { zwp_pointer_gesture_hold_v1, ZwpPointerGestureHoldV1 },
     { zwp_keyboard_shortcuts_inhibit_manager_v1, ZwpKeyboardShortcutsInhibitManagerV1 },
     { zwp_keyboard_shortcuts_inhibitor_v1, ZwpKeyboardShortcutsInhibitorV1 },
-            { wp_commit_timing_manager_v1, WpCommitTimingManagerV1 },
-    { wp_commit_timer_v1, WpCommitTimerV1 },
     { wp_security_context_manager_v1, WpSecurityContextManagerV1 },
     { wp_security_context_v1, WpSecurityContextV1 },
 }

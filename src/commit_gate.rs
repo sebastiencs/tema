@@ -210,16 +210,55 @@ pub(crate) fn set_barrier(
     dispatcher.dispatch(CommitGateAction::Arm);
 }
 
-/// The time at which an update with `target` may apply. Until the prediction
-/// lands, it is the target itself.
+const MAX_PREDICTION_PERIODS: u32 = 8;
+const MAX_VBLANK_MARGIN: Duration = Duration::from_millis(2);
+
+/// The time at which an update with `target` may apply. It is the target itself
+/// unless the output's last present is trustworthy and on a fixed grid; then it
+/// is the first predicted vblank at or after `target + margin`, plus `margin`.
+/// Late is allowed, early is not.
 pub(crate) fn ready_at_with_now(
-    _state: &State,
-    _output: Option<OutputId>,
-    _output_count: usize,
+    state: &State,
+    output: Option<OutputId>,
+    output_count: usize,
     target: Instant,
-    _now: Instant,
+    now: Instant,
 ) -> Instant {
-    target
+    if output_count > 1 {
+        return target;
+    }
+    let Some(snapshot) = output.and_then(|o| state.frame_scheduler.get(&o)) else {
+        return target;
+    };
+    let clock = &snapshot.clock;
+    if clock.mode != crate::scheduler::frame_clock::FrameClockMode::Fixed || clock.tearing {
+        return target;
+    }
+    let (Some(last), Some(period)) =
+        (clock.last_present, refresh_period(clock.nominal_refresh_millihz))
+    else {
+        return target;
+    };
+    if !(last.flags.refresh_is_constant && !last.flags.async_flip && last.flags.kernel_timestamp) {
+        return target;
+    }
+    let base = last.present_time;
+    if now.saturating_duration_since(base) > period * MAX_PREDICTION_PERIODS {
+        return target;
+    }
+    let margin = (period / 4).min(MAX_VBLANK_MARGIN);
+    let Some(goal) = target.checked_add(margin) else {
+        return target;
+    };
+    if goal <= base {
+        return base;
+    }
+    let period_ns = period.as_nanos();
+    let k = (goal - base).as_nanos().div_ceil(period_ns); // >= 1
+    let previous_ns = u64::try_from((k - 1) * period_ns).unwrap_or(u64::MAX);
+    base.checked_add(Duration::from_nanos(previous_ns))
+        .and_then(|vblank| vblank.checked_add(margin))
+        .unwrap_or(target)
 }
 
 pub(crate) fn wait_until(
@@ -395,7 +434,7 @@ mod tests {
         super::*,
         crate::{
             scheduler::{
-                frame_clock::{FrameClock, FrameClockMode},
+                frame_clock::{FrameClock, FrameClockMode, PresentFlags, PresentSample},
                 output_scheduler::OutputSchedulerSnapshot,
             },
             state::{BackendOutputRef, DrmId},
@@ -417,9 +456,23 @@ mod tests {
         )
     }
 
-    fn snapshot(mode: FrameClockMode, millihz: u32) -> OutputSchedulerSnapshot {
+    fn snapshot(
+        mode: FrameClockMode,
+        millihz: u32,
+        tearing: bool,
+        last: Option<(Instant, PresentFlags)>,
+    ) -> OutputSchedulerSnapshot {
         let mut clock = FrameClock::new();
         clock.update_mode(mode, millihz);
+        clock.set_tearing(tearing);
+        if let Some((present_time, flags)) = last {
+            clock.notify_presented(PresentSample {
+                present_time,
+                sequence: 1,
+                flags,
+                timing: None,
+            });
+        }
         OutputSchedulerSnapshot {
             clock: clock.snapshot(),
             blocked_on_pipeline: false,
@@ -486,7 +539,7 @@ mod tests {
         let now = Instant::now();
         state
             .frame_scheduler
-            .insert(out, snapshot(FrameClockMode::Fixed, 60_000));
+            .insert(out, snapshot(FrameClockMode::Fixed, 60_000, false, None));
         assert_eq!(fallback_deadline(&state, Some(out), now), now + ms(100));
     }
 
@@ -499,12 +552,12 @@ mod tests {
 
         state
             .frame_scheduler
-            .insert(out, snapshot(FrameClockMode::Passive, 60_000));
+            .insert(out, snapshot(FrameClockMode::Passive, 60_000, false, None));
         assert_eq!(fallback_deadline(&state, Some(out), now), now + FIFO_FALLBACK_SHORT);
 
         state
             .frame_scheduler
-            .insert(out, snapshot(FrameClockMode::Fixed, 60_000));
+            .insert(out, snapshot(FrameClockMode::Fixed, 60_000, false, None));
         state.session_active = false;
         assert_eq!(fallback_deadline(&state, Some(out), now), now + FIFO_FALLBACK_SHORT);
     }
@@ -515,7 +568,7 @@ mod tests {
         let out = test_out(&mut state, 1, 24_000);
         state
             .frame_scheduler
-            .insert(out, snapshot(FrameClockMode::Fixed, 24_000));
+            .insert(out, snapshot(FrameClockMode::Fixed, 24_000, false, None));
         let now = Instant::now();
         assert_eq!(
             fallback_deadline(&state, Some(out), now),
@@ -697,5 +750,164 @@ mod tests {
         assert!(gate.has_barrier(kept));
         assert!(!gate.has_barrier(gone));
         assert_eq!(gate.next_deadline(), Some(t0 + ms(10)));
+    }
+
+    const P: Duration = Duration::from_nanos(16_666_666);
+    const M: Duration = Duration::from_millis(2);
+
+    fn good() -> PresentFlags {
+        PresentFlags {
+            zero_copy: false,
+            refresh_is_constant: true,
+            async_flip: false,
+            kernel_timestamp: true,
+        }
+    }
+
+    /// An output with a snapshot whose last present is at `last`, and the state holding it.
+    fn ready_fixture(
+        millihz: u32,
+        mode: FrameClockMode,
+        tearing: bool,
+        last: Option<(Instant, PresentFlags)>,
+    ) -> (State, OutputId) {
+        let mut state = state_for_tests();
+        let out = test_out(&mut state, 1, millihz as i32);
+        state
+            .frame_scheduler
+            .insert(out, snapshot(mode, millihz, tearing, last));
+        (state, out)
+    }
+
+    #[test]
+    fn target_between_vblanks() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, good())));
+        let target = b + P * 5 + P / 2;
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), b + P * 5 + M);
+    }
+
+    #[test]
+    fn target_just_before_a_vblank() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, good())));
+        let target = b + P * 6 - ms(1);
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), b + P * 6 + M);
+    }
+
+    #[test]
+    fn target_well_before_a_vblank() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, good())));
+        let target = b + P * 6 - ms(3);
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), b + P * 5 + M);
+    }
+
+    #[test]
+    fn grid_late_by_one_ms_still_not_early() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, good())));
+        // The real vblanks are 1 ms after the sampled present time.
+        let real_vblank = b + ms(1) + P * 6;
+        let result = ready_at_with_now(&state, Some(out), 1, real_vblank, t0);
+        assert_eq!(result, b + P * 6 + M);
+        assert!(result > real_vblank);
+    }
+
+    #[test]
+    fn target_before_last_present_is_base() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, good())));
+        // target + margin <= base: the last present is already late enough.
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, b - ms(3), t0), b);
+        // target + margin = base + 1 ms: one margin after the last vblank, never before it.
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, b - ms(1), t0), b + M);
+    }
+
+    #[test]
+    fn stale_history_returns_the_target() {
+        let t0 = Instant::now();
+        let b = t0 - P * 9;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, good())));
+        let target = t0 + ms(50);
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), target);
+    }
+
+    #[test]
+    fn async_last_sample_returns_the_target() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let flags = PresentFlags { async_flip: true, ..good() };
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, flags)));
+        let target = b + P * 5 + P / 2;
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), target);
+    }
+
+    #[test]
+    fn non_kernel_timestamp_returns_the_target() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let flags = PresentFlags { kernel_timestamp: false, ..good() };
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, flags)));
+        let target = b + P * 5 + P / 2;
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), target);
+    }
+
+    #[test]
+    fn variable_refresh_returns_the_target() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) =
+            ready_fixture(60_000, FrameClockMode::Variable, false, Some((b, good())));
+        let target = b + P * 5 + P / 2;
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), target);
+    }
+
+    #[test]
+    fn tearing_returns_the_target() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, true, Some((b, good())));
+        let target = b + P * 5 + P / 2;
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), target);
+    }
+
+    #[test]
+    fn two_outputs_return_the_target() {
+        let t0 = Instant::now();
+        let b = t0 - P * 3;
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, Some((b, good())));
+        let target = b + P * 5 + P / 2;
+        assert_eq!(ready_at_with_now(&state, Some(out), 2, target, t0), target);
+    }
+
+    #[test]
+    fn no_present_no_snapshot_no_output_return_the_target() {
+        let t0 = Instant::now();
+        let target = t0 + ms(40);
+        let (state, out) = ready_fixture(60_000, FrameClockMode::Fixed, false, None);
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), target);
+
+        let empty = state_for_tests();
+        assert_eq!(ready_at_with_now(&empty, None, 1, target, t0), target);
+        let mut unscheduled = state_for_tests();
+        let out = test_out(&mut unscheduled, 1, 60_000);
+        assert_eq!(ready_at_with_now(&unscheduled, Some(out), 1, target, t0), target);
+    }
+
+    #[test]
+    fn a_240hz_output_uses_a_quarter_period_margin() {
+        let t0 = Instant::now();
+        let p = Duration::from_nanos(4_166_666);
+        let margin = Duration::from_nanos(1_041_666);
+        let b = t0 - p;
+        let (state, out) = ready_fixture(240_000, FrameClockMode::Fixed, false, Some((b, good())));
+        let target = b + p * 2 + Duration::from_nanos(1);
+        assert_eq!(ready_at_with_now(&state, Some(out), 1, target, t0), b + p * 2 + margin);
     }
 }

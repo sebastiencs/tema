@@ -23,8 +23,8 @@ use crate::{
         wp_viewport, xdg_wm_base, ExtBackgroundEffectSurfaceV1Id, ExtSessionLockSurfaceV1Id,
         WaylandId, WlBufferId, WlCallbackId, WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId,
         WpAlphaModifierSurfaceV1Id, WpColorManagementSurfaceFeedbackV1Id,
-        WpColorManagementSurfaceV1Id, WpColorRepresentationSurfaceV1Id, WpFifoV1Id,
-        WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId,
+        WpColorManagementSurfaceV1Id, WpColorRepresentationSurfaceV1Id, WpCommitTimerV1Id,
+        WpFifoV1Id, WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId,
         WpTearingControlV1Id, WpViewportId, XdgSurfaceId, XwaylandSurfaceV1Id,
         ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id, ZwpInputPopupSurfaceV2Id,
     },
@@ -286,6 +286,7 @@ pub struct WlSurface {
     fractional_scale_object: Option<Resolved<WpFractionalScaleV1Id>>,
     tearing_control_object: Option<Resolved<WpTearingControlV1Id>>,
     fifo_object: Option<Resolved<WpFifoV1Id>>,
+    commit_timer_object: Option<Resolved<WpCommitTimerV1Id>>,
     alpha_modifier_object: Option<Resolved<WpAlphaModifierSurfaceV1Id>>,
     background_effect_object: Option<Resolved<ExtBackgroundEffectSurfaceV1Id>>,
     color_management_surface: Option<Resolved<WpColorManagementSurfaceV1Id>>,
@@ -754,6 +755,7 @@ impl WlSurface {
             fractional_scale_object: None,
             tearing_control_object: None,
             fifo_object: None,
+            commit_timer_object: None,
             alpha_modifier_object: None,
             background_effect_object: None,
             color_management_surface: None,
@@ -882,17 +884,23 @@ impl WlSurface {
         self.fractional_scale_object.is_some()
     }
 
-    /// Detaches the `wp_fifo_v1` object from this surface, which is being deleted.
-    /// The object stays alive and reports `surface_destroyed` on its requests.
+    /// Detaches the `wp_fifo_v1` and `wp_commit_timer_v1` objects from this surface,
+    /// which is being deleted. They stay alive and report `surface_destroyed` on their
+    /// requests.
     fn detach_timing_objects(&mut self, state: &mut State) {
-        let Some(fifo) = self.fifo_object.take() else {
-            return;
-        };
-        if state.objects.is_grabbed(fifo.object_id()) {
-            return;
+        if let Some(fifo) = self.fifo_object.take() {
+            if !state.objects.is_grabbed(fifo.object_id()) {
+                if let Some(fifo) = fifo.try_ref_mut(state) {
+                    fifo.mark_surface_destroyed();
+                }
+            }
         }
-        if let Some(fifo) = fifo.try_ref_mut(state) {
-            fifo.mark_surface_destroyed();
+        if let Some(timer) = self.commit_timer_object.take() {
+            if !state.objects.is_grabbed(timer.object_id()) {
+                if let Some(timer) = timer.try_ref_mut(state) {
+                    timer.mark_surface_destroyed();
+                }
+            }
         }
     }
 
@@ -1633,6 +1641,20 @@ impl WlSurface {
 
     pub(crate) fn has_fifo_object(&self) -> bool {
         self.fifo_object.is_some()
+    }
+
+    pub(crate) fn set_commit_timer_object(&mut self, object: Resolved<WpCommitTimerV1Id>) {
+        self.commit_timer_object = Some(object);
+    }
+
+    pub(crate) fn clear_commit_timer_object(&mut self, object: Resolved<WpCommitTimerV1Id>) {
+        if self.commit_timer_object == Some(object) {
+            self.commit_timer_object = None;
+        }
+    }
+
+    pub(crate) fn has_commit_timer_object(&self) -> bool {
+        self.commit_timer_object.is_some()
     }
 
     pub fn set_alpha_modifier_object(

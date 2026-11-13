@@ -846,6 +846,8 @@ mod tests {
                         flags: crate::scheduler::frame_clock::PresentFlags {
                             zero_copy: false,
                             refresh_is_constant: true,
+                            async_flip: false,
+                            kernel_timestamp: true,
                         },
                         timing: None,
                     },
@@ -974,6 +976,8 @@ mod tests {
                         flags: crate::scheduler::frame_clock::PresentFlags {
                             zero_copy: false,
                             refresh_is_constant: true,
+                            async_flip: false,
+                            kernel_timestamp: true,
                         },
                         timing: None,
                     },
