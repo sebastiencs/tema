@@ -801,6 +801,11 @@ pub enum ClientAction {
     SessionReplaced {
         session: Resolved<crate::protocol_generated::XdgSessionV1Id>,
     },
+    /// `zwp_keyboard_shortcuts_inhibitor_v1.active` / `.inactive` after a user toggle.
+    ShortcutsInhibitorState {
+        inhibitor: Resolved<crate::protocol_generated::ZwpKeyboardShortcutsInhibitorV1Id>,
+        active: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -3669,6 +3674,11 @@ impl Model for Client {
                     state,
                     &mut dispatcher,
                 );
+            }
+            ShortcutsInhibitorState { inhibitor, active } => {
+                if let Some(inhibitor) = inhibitor.try_ref(state) {
+                    inhibitor.send_state(active, &mut dispatcher);
+                }
             }
             SendDmabufFeedback { id } => {
                 let Some(resolved) = self.resolve(id, state) else {
