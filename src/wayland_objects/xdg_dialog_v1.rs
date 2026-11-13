@@ -839,32 +839,20 @@ mod tests {
         fn initial_configure_size(&mut self) -> Option<(i32, i32)> {
             let xdg = self.xdg();
             let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
-            let role_changes = {
+            {
                 let mut xdg = xdg.grab(&mut self.state);
-                xdg.on_commit(
+                xdg.test_commit(
                     &mut self.client,
                     &mut self.state,
                     &mut client_dispatcher,
-                    None,
                     false,
                     false,
                     None,
-                )
-            };
-            let size = xdg
-                .try_ref(&self.state)
-                .unwrap()
-                .test_latest_toplevel_configure_size();
-            if let Some(role_changes) = role_changes {
-                let mut xdg = xdg.grab(&mut self.state);
-                xdg.apply_commit_role_changes(
-                    &mut self.client,
-                    &mut self.state,
-                    &mut client_dispatcher,
-                    role_changes,
                 );
             }
-            size
+            xdg.try_ref(&self.state)
+                .unwrap()
+                .test_latest_toplevel_configure_size()
         }
 
         /// Ack the first configure and commit a 80x60 buffer: the child maps.

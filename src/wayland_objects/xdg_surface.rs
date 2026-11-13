@@ -72,8 +72,27 @@ fn toplevel_size_request(state: &ConfigureState) -> Option<(i32, i32)> {
 pub(crate) struct CommitRoleChanges {
     pub apply_window_geometry: bool,
     pub initial_commit_complete: bool,
-    pub map_popup: bool,
     pub reset_on_unmap: bool,
+}
+
+/// The xdg part of one content update.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct XdgCommitCapture {
+    pub(crate) initial: bool,
+    pub(crate) window_geometry: Option<RectI>,
+    /// Serial of `last_acked` at commit time.
+    pub(crate) acked_serial: Option<u32>,
+    pub(crate) reset_on_unmap: bool,
+    pub(crate) icon: Option<Option<std::rc::Rc<crate::toplevel_icon::ToplevelIcon>>>,
+}
+
+/// Result of the read-only check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum XdgCommitKind {
+    Initial,
+    Map,
+    Unmap,
+    Other,
 }
 
 /// How long a window may sit on a resize configure it has not committed
@@ -96,6 +115,9 @@ pub struct XdgSurface {
     wm_base_version: u32,
     role_kind: Option<RoleKind>,
     role_object: RoleObject,
+    /// Set when the initial commit is captured (request time). Read by
+    /// request-time checks; `initial_commit_complete` is the applied flag.
+    initial_commit_requested: bool,
     initial_commit_complete: bool,
     next_configure_serial: u32,
     pending_configures: VecDeque<PendingConfigure>,
@@ -128,6 +150,7 @@ impl XdgSurface {
             wm_base_version,
             role_kind: None,
             role_object: RoleObject::None,
+            initial_commit_requested: false,
             initial_commit_complete: false,
             next_configure_serial: 1,
             pending_configures: VecDeque::new(),
@@ -155,6 +178,10 @@ impl XdgSurface {
 
     pub(crate) fn initial_commit_complete(&self) -> bool {
         self.initial_commit_complete
+    }
+
+    pub(crate) fn initial_commit_requested(&self) -> bool {
+        self.initial_commit_requested
     }
 
     pub(crate) fn popup_role(&self) -> Option<Resolved<XdgPopupId>> {
@@ -285,6 +312,7 @@ impl XdgSurface {
     #[cfg(test)]
     pub(crate) fn test_set_initial_commit_complete(&mut self, complete: bool) {
         self.initial_commit_complete = complete;
+        self.initial_commit_requested = complete;
     }
 
     #[cfg(test)]
@@ -424,15 +452,23 @@ impl XdgSurface {
         serial
     }
 
+    /// Apply-time reset. The request-time state (`pending_configures`,
+    /// `last_acked`, `pending_window_geometry`) is reset at capture or when the
+    /// role object is destroyed.
     fn reset_configure_state(&mut self) {
         self.initial_commit_complete = false;
-        self.pending_configures.clear();
-        self.last_acked = None;
         self.last_acked_committed = true;
-        self.pending_window_geometry = None;
         self.current_window_geometry = None;
         self.resize_throttle = None;
         self.deferred_resize_configure = false;
+    }
+
+    /// Request-time reset when the role object is destroyed.
+    fn clear_request_state(&mut self) {
+        self.last_acked = None;
+        self.pending_configures.clear();
+        self.pending_window_geometry = None;
+        self.initial_commit_requested = false;
     }
 
     /// A resize configure is in flight or was deferred until the next commit.
@@ -494,11 +530,10 @@ impl XdgSurface {
     /// Called on each commit. Ends the wait once the client has acked the
     /// throttled configure (or a newer one) and committed. Returns true when
     /// a skipped resize configure should now be sent.
-    fn release_resize_throttle_on_commit(&mut self) -> bool {
+    fn release_resize_throttle_on_commit(&mut self, acked: Option<u32>) -> bool {
         let Some(throttle) = self.resize_throttle else {
             return false;
         };
-        let acked = self.last_acked.as_ref().map(|configure| configure.serial);
         if !acked.is_some_and(|serial| serial >= throttle.serial) {
             return false;
         }
@@ -524,9 +559,13 @@ impl XdgSurface {
         true
     }
 
-    fn geometry_after_this_commit(&self) -> Option<RectI> {
-        self.pending_window_geometry
-            .or(self.current_window_geometry)
+    fn geometry_after_this_commit(&self, capture: &XdgCommitCapture) -> Option<RectI> {
+        capture.window_geometry.or(self.current_window_geometry)
+    }
+
+    /// Serial of the newest acked configure, if any.
+    fn acked_serial(&self) -> Option<u32> {
+        self.last_acked.as_ref().map(|configure| configure.serial)
     }
 
     pub(crate) fn effective_window_geometry(
@@ -556,27 +595,26 @@ impl XdgSurface {
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
         role_changes: CommitRoleChanges,
+        capture: &XdgCommitCapture,
     ) {
-        self.last_acked_committed = true;
+        // Committed unless an ack arrived after this commit was captured.
+        self.last_acked_committed = self.acked_serial() == capture.acked_serial;
         if role_changes.apply_window_geometry {
-            let pending_window_geometry = self.pending_window_geometry;
-            if self.pending_window_geometry.is_some() {
-                self.current_window_geometry = self.pending_window_geometry.take();
+            if let Some(geometry) = capture.window_geometry {
+                self.current_window_geometry = Some(geometry);
             }
-            let surface = self.wl_surface();
             if let RoleObject::Toplevel(id) = self.role_object {
                 if let Some(mut toplevel) = id.try_grab(state) {
                     toplevel.set_window_geometry(self.current_window_geometry);
                 }
             }
         }
-        if let RoleObject::Toplevel(id) = self.role_object {
-            let applied = id.try_grab(state).and_then(|mut toplevel| {
-                toplevel.apply_pending_icon().then(|| {
-                    let window = toplevel.window();
-                    let metadata = toplevel.metadata();
-                    (window, metadata)
-                })
+        if let (RoleObject::Toplevel(id), Some(icon)) = (self.role_object, capture.icon.clone()) {
+            let applied = id.try_grab(state).map(|mut toplevel| {
+                toplevel.set_icon(icon);
+                let window = toplevel.window();
+                let metadata = toplevel.metadata();
+                (window, metadata)
             });
             if let Some((window, (tag, description, icon))) = applied {
                 crate::capture::note_window_metadata(
@@ -592,24 +630,14 @@ impl XdgSurface {
         if role_changes.initial_commit_complete {
             self.initial_commit_complete = true;
         }
-        if role_changes.map_popup {
-            if let RoleObject::Popup(id) = self.role_object {
-                let mut popup = id.grab(state);
-                popup.mark_mapped();
-            }
-        }
         if role_changes.reset_on_unmap {
             if let RoleObject::Toplevel(id) = self.role_object {
                 let mut toplevel = id.grab(state);
                 toplevel.reset_on_unmap();
             }
-            if let RoleObject::Popup(id) = self.role_object {
-                let mut popup = id.grab(state);
-                popup.mark_unmapped();
-            }
             self.reset_configure_state();
         }
-        if self.release_resize_throttle_on_commit() {
+        if self.release_resize_throttle_on_commit(capture.acked_serial) {
             if let RoleObject::Toplevel(xdg_toplevel) = self.role_object {
                 dispatcher.dispatch_to(
                     client.client_id(),
@@ -619,23 +647,16 @@ impl XdgSurface {
         }
     }
 
-    pub(crate) fn on_commit(
-        &mut self,
+    /// Request-time check of the xdg part of a commit. Read-only apart from the
+    /// protocol errors it sends; `None` means the commit is rejected.
+    pub(crate) fn check_commit(
+        &self,
         client: &mut Client,
-        state: &mut State,
         dispatcher: &mut ClientDispatcher,
-        _current_logical_size: Option<SizeI>,
         has_pending_buffer_attach: bool,
         is_null_buffer_commit: bool,
-        configure_bounds: Option<(i32, i32)>,
-    ) -> Option<CommitRoleChanges> {
-        let surface_id = self.wl_surface;
-        let mut role_changes = CommitRoleChanges {
-            apply_window_geometry: self.pending_window_geometry.is_some(),
-            ..Default::default()
-        };
-
-        if !self.initial_commit_complete {
+    ) -> Option<XdgCommitKind> {
+        if !self.initial_commit_requested {
             match self.role_object {
                 RoleObject::None => {
                     log::debug!(
@@ -650,7 +671,7 @@ impl XdgSurface {
                     );
                     return None;
                 }
-                RoleObject::Toplevel(id) => {
+                RoleObject::Toplevel(_) => {
                     if has_pending_buffer_attach {
                         self.send_surface_error(
                             client,
@@ -660,6 +681,103 @@ impl XdgSurface {
                         );
                         return None;
                     }
+                }
+                RoleObject::Popup(_) => {
+                    if has_pending_buffer_attach {
+                        self.send_surface_error(
+                            client,
+                            dispatcher,
+                            xdg_surface::Error::UnconfiguredBuffer,
+                            "initial xdg_popup commit must not attach a buffer",
+                        );
+                        return None;
+                    }
+                }
+            }
+            return Some(XdgCommitKind::Initial);
+        }
+
+        if !self.validate_committed_state(client, dispatcher, has_pending_buffer_attach) {
+            return None;
+        }
+        if is_null_buffer_commit {
+            Some(XdgCommitKind::Unmap)
+        } else if has_pending_buffer_attach && matches!(self.role_object, RoleObject::Popup(_)) {
+            Some(XdgCommitKind::Map)
+        } else {
+            Some(XdgCommitKind::Other)
+        }
+    }
+
+    /// Request-time capture of the xdg part of a commit. Runs only after every
+    /// check of the commit passed.
+    pub(crate) fn take_commit_capture(
+        &mut self,
+        state: &mut State,
+        kind: XdgCommitKind,
+    ) -> XdgCommitCapture {
+        let acked_serial = self.acked_serial();
+        match kind {
+            XdgCommitKind::Initial => self.initial_commit_requested = true,
+            XdgCommitKind::Unmap => {
+                self.initial_commit_requested = false;
+                self.last_acked = None;
+                self.pending_configures.clear();
+            }
+            XdgCommitKind::Map | XdgCommitKind::Other => {}
+        }
+        if let RoleObject::Popup(id) = self.role_object {
+            match kind {
+                XdgCommitKind::Map => {
+                    if let Some(mut popup) = id.try_ref_mut(state) {
+                        popup.set_map_requested(true);
+                    }
+                }
+                XdgCommitKind::Unmap => {
+                    if let Some(mut popup) = id.try_ref_mut(state) {
+                        popup.set_map_requested(false);
+                    }
+                }
+                XdgCommitKind::Initial | XdgCommitKind::Other => {}
+            }
+        }
+        let icon = match self.role_object {
+            RoleObject::Toplevel(id) => id
+                .try_grab(state)
+                .and_then(|mut toplevel| toplevel.take_pending_icon()),
+            RoleObject::None | RoleObject::Popup(_) => None,
+        };
+        XdgCommitCapture {
+            initial: kind == XdgCommitKind::Initial,
+            window_geometry: self.pending_window_geometry.take(),
+            acked_serial,
+            reset_on_unmap: kind == XdgCommitKind::Unmap,
+            icon,
+        }
+    }
+
+    /// Apply half of the xdg part of a commit, from its check and capture.
+    pub(crate) fn on_commit(
+        &mut self,
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        capture: &XdgCommitCapture,
+        configure_bounds: Option<(i32, i32)>,
+    ) -> CommitRoleChanges {
+        let surface_id = self.wl_surface;
+        let mut role_changes = CommitRoleChanges {
+            apply_window_geometry: capture.window_geometry.is_some(),
+            reset_on_unmap: capture.reset_on_unmap,
+            ..Default::default()
+        };
+
+        if capture.initial {
+            match self.role_object {
+                RoleObject::None => {
+                    unreachable!("check_commit rejects an initial commit without a role object")
+                }
+                RoleObject::Toplevel(id) => {
                     let desired_decoration_mode = id.try_ref(state).map(|toplevel| {
                         state.xdg_decoration_mode_for_surface(toplevel.has_decoration_object())
                     });
@@ -669,7 +787,7 @@ impl XdgSurface {
                         }
                     }
                     let fallback_decoration_insets = state.frame_insets();
-                    let committed_window_geometry = self.geometry_after_this_commit();
+                    let committed_window_geometry = self.geometry_after_this_commit(capture);
                     let target_min_size = id
                         .try_ref(state)
                         .and_then(|toplevel| toplevel.minimum_size());
@@ -760,36 +878,40 @@ impl XdgSurface {
                         dispatcher,
                     );
                     role_changes.initial_commit_complete = true;
-                    return Some(role_changes);
+                    return role_changes;
                 }
                 RoleObject::Popup(id) => {
-                    if has_pending_buffer_attach {
-                        self.send_surface_error(
-                            client,
-                            dispatcher,
-                            xdg_surface::Error::UnconfiguredBuffer,
-                            "initial xdg_popup commit must not attach a buffer",
-                        );
-                        return None;
-                    }
                     let mut popup = id.grab(state);
                     popup.send_initial_configure(self, client, state, dispatcher);
                     role_changes.initial_commit_complete = true;
-                    return Some(role_changes);
+                    return role_changes;
                 }
             }
         }
 
-        if !self.validate_committed_state(client, dispatcher, has_pending_buffer_attach) {
-            return None;
-        }
+        role_changes
+    }
 
-        if is_null_buffer_commit {
-            role_changes.reset_on_unmap = true;
-        } else if has_pending_buffer_attach && matches!(self.role_object, RoleObject::Popup(_)) {
-            role_changes.map_popup = true;
-        }
-
+    /// Check, capture and apply one commit of the xdg part, back to back.
+    #[cfg(test)]
+    pub(crate) fn test_commit(
+        &mut self,
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        has_pending_buffer_attach: bool,
+        is_null_buffer_commit: bool,
+        configure_bounds: Option<(i32, i32)>,
+    ) -> Option<CommitRoleChanges> {
+        let kind = self.check_commit(
+            client,
+            dispatcher,
+            has_pending_buffer_attach,
+            is_null_buffer_commit,
+        )?;
+        let capture = self.take_commit_capture(state, kind);
+        let role_changes = self.on_commit(client, state, dispatcher, &capture, configure_bounds);
+        self.apply_commit_role_changes(client, state, dispatcher, role_changes, &capture);
         Some(role_changes)
     }
 
@@ -821,6 +943,7 @@ impl XdgSurface {
         if self.role_object == RoleObject::Toplevel(toplevel) {
             self.role_object = RoleObject::None;
             self.reset_configure_state();
+            self.clear_request_state();
             if let Some(surface) = self.wl_surface.try_ref_mut(state) {
                 surface.bump_role_epoch();
             }
@@ -831,6 +954,7 @@ impl XdgSurface {
         if self.role_object == RoleObject::Popup(popup) {
             self.role_object = RoleObject::None;
             self.reset_configure_state();
+            self.clear_request_state();
             if let Some(surface) = self.wl_surface.try_ref_mut(state) {
                 surface.bump_role_epoch();
             }
@@ -1716,12 +1840,14 @@ pub mod xdg_toplevel {
             self.pending_icon = Some(pending);
         }
 
-        pub(crate) fn apply_pending_icon(&mut self) -> bool {
-            let Some(pending) = self.pending_icon.take() else {
-                return false;
-            };
-            self.icon = pending;
-            true
+        pub(crate) fn take_pending_icon(
+            &mut self,
+        ) -> Option<Option<Rc<crate::toplevel_icon::ToplevelIcon>>> {
+            self.pending_icon.take()
+        }
+
+        pub(crate) fn set_icon(&mut self, icon: Option<Rc<crate::toplevel_icon::ToplevelIcon>>) {
+            self.icon = icon;
         }
 
         pub(crate) fn metadata(
@@ -3241,6 +3367,7 @@ mod tests {
             wm_base_version: 7,
             role_kind: Some(RoleKind::Toplevel),
             role_object: RoleObject::None,
+            initial_commit_requested: true,
             initial_commit_complete: true,
             next_configure_serial: 1,
             pending_configures: VecDeque::new(),
@@ -3300,23 +3427,9 @@ mod tests {
 
         {
             let mut xdg_surface = client.grab_object(xdg_surface_id, &mut state);
-            let role_changes = xdg_surface
-                .on_commit(
-                    &mut client,
-                    &mut state,
-                    &mut client_dispatcher,
-                    None,
-                    false,
-                    false,
-                    None,
-                )
+            xdg_surface
+                .test_commit(&mut client, &mut state, &mut client_dispatcher, false, false, None)
                 .expect("geometry-only commit should be accepted");
-            xdg_surface.apply_commit_role_changes(
-                &mut client,
-                &mut state,
-                &mut client_dispatcher,
-                role_changes,
-            );
         }
 
         let toplevel = state
@@ -3339,7 +3452,11 @@ mod tests {
 
         xdg_surface.reset_configure_state();
 
-        assert_eq!(xdg_surface.pending_window_geometry, None);
+        // Request-time state (the pending geometry) is not reset here.
+        assert_eq!(
+            xdg_surface.pending_window_geometry,
+            Some(RectI { x: 1, y: 2, width: 3, height: 4 })
+        );
         assert_eq!(xdg_surface.current_window_geometry, None);
     }
 
@@ -3423,6 +3540,8 @@ mod tests {
         let mut toplevel = test_toplevel();
         let states = queue_test_toplevel_configure(&mut xdg_surface);
         toplevel.test_set_last_configure_bounds(Some((80, 60)));
+        // Role destruction runs the request-time clear as well.
+        xdg_surface.clear_request_state();
         xdg_surface.reset_configure_state();
 
         assert!(!toplevel.configure_is_current(&xdg_surface, 80, 60, &states, Some((80, 60))));
@@ -3466,14 +3585,14 @@ mod tests {
         xdg_surface.note_resize_configure_sent(t0);
         assert!(!xdg_surface.resize_configure_allowed(t0 + std::time::Duration::from_millis(10)));
 
-        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        assert!(!xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
         assert!(xdg_surface.resize_throttle.is_some());
 
         xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
-        assert!(xdg_surface.release_resize_throttle_on_commit());
+        assert!(xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
         assert!(xdg_surface.resize_throttle.is_none());
         assert!(!xdg_surface.deferred_resize_configure);
-        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        assert!(!xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
     }
 
     #[test]
@@ -3486,7 +3605,7 @@ mod tests {
         queue_test_toplevel_configure(&mut xdg_surface);
         xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
 
-        assert!(xdg_surface.release_resize_throttle_on_commit());
+        assert!(xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
         assert!(xdg_surface.resize_throttle.is_none());
         assert!(!xdg_surface.deferred_resize_configure);
     }
@@ -3557,14 +3676,14 @@ mod tests {
         assert!(xdg_surface.size_request_pending((80, 60)));
         ack_newest_configure(&mut xdg_surface);
         assert!(xdg_surface.size_request_pending((80, 60)));
-        assert!(xdg_surface.release_resize_throttle_on_commit());
+        assert!(xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
         xdg_surface.last_acked_committed = true;
         queue_toplevel_size(&mut xdg_surface, 140, 60);
         xdg_surface.note_resize_configure_sent(t0 + std::time::Duration::from_millis(10));
         assert!(xdg_surface.size_request_pending((100, 60)));
         ack_newest_configure(&mut xdg_surface);
         assert!(xdg_surface.size_request_pending((100, 60)));
-        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        assert!(!xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
         xdg_surface.last_acked_committed = true;
         assert!(!xdg_surface.size_request_pending((140, 60)));
     }
@@ -3764,7 +3883,7 @@ mod tests {
 
         xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
         xdg_surface.pending_configures.clear();
-        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        assert!(!xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
         send_tiled_resize(
             &mut toplevel,
             &mut xdg_surface,
@@ -3828,7 +3947,7 @@ mod tests {
 
         xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
         xdg_surface.pending_configures.clear();
-        assert!(!xdg_surface.release_resize_throttle_on_commit());
+        assert!(!xdg_surface.release_resize_throttle_on_commit(xdg_surface.acked_serial()));
         send_floating_resize(
             &mut toplevel,
             &mut xdg_surface,
@@ -3993,6 +4112,7 @@ mod tests {
                 wm_base_version: 7,
                 role_kind: Some(RoleKind::Toplevel),
                 role_object: RoleObject::None,
+                initial_commit_requested: true,
                 initial_commit_complete: true,
                 next_configure_serial: 1,
                 pending_configures: VecDeque::new(),
@@ -4099,6 +4219,7 @@ mod tests {
                 wm_base_version: 7,
                 role_kind: Some(RoleKind::Toplevel),
                 role_object: RoleObject::None,
+                initial_commit_requested: true,
                 initial_commit_complete: true,
                 next_configure_serial: 1,
                 pending_configures: VecDeque::new(),
@@ -4210,6 +4331,7 @@ mod tests {
                 wm_base_version: 7,
                 role_kind: Some(RoleKind::Toplevel),
                 role_object: RoleObject::None,
+                initial_commit_requested: true,
                 initial_commit_complete: true,
                 next_configure_serial: 1,
                 pending_configures: VecDeque::new(),
@@ -4489,5 +4611,194 @@ mod tests {
 
         assert_eq!(state.root_surface_for_surface(popup_wl), Some(layer_root));
         assert_eq!(state.surface_scene_origin(popup_wl), Some((60, 75)));
+    }
+
+    #[test]
+    fn check_rejects_a_buffer_on_the_initial_commit() {
+        let mut client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let mut xdg_surface = test_xdg_surface();
+        xdg_surface.test_assign_toplevel_role(Resolved::new(
+            ClientId::from_raw(1),
+            XdgToplevelId::from(12),
+            ObjectId::from(12usize),
+        ));
+
+        assert_eq!(
+            xdg_surface.check_commit(&mut client, &mut client_dispatcher, true, false),
+            None
+        );
+        assert!(!xdg_surface.initial_commit_requested());
+        assert_eq!(
+            xdg_surface.check_commit(&mut client, &mut client_dispatcher, false, false),
+            Some(XdgCommitKind::Initial)
+        );
+    }
+
+    #[test]
+    fn capture_takes_window_geometry_and_icon() {
+        let mut state = state_for_tests();
+        let client_id = ClientId::from_raw(1);
+        let mut xdg_surface = test_xdg_surface();
+        let geometry = RectI { x: 1, y: 2, width: 30, height: 40 };
+        xdg_surface.test_set_pending_window_geometry(Some(geometry));
+        let (_, toplevel_object) = state.insert_object(test_toplevel());
+        let toplevel = Resolved::new(client_id, XdgToplevelId::from(12), toplevel_object);
+        state
+            .objects
+            .get_mut(toplevel_object)
+            .downcast_mut::<XdgToplevel>()
+            .unwrap()
+            .set_pending_icon(None);
+        xdg_surface.test_assign_toplevel_role(toplevel);
+
+        let capture = xdg_surface.take_commit_capture(&mut state, XdgCommitKind::Other);
+
+        assert_eq!(capture.window_geometry, Some(geometry));
+        assert!(matches!(capture.icon, Some(None)));
+        assert_eq!(xdg_surface.pending_window_geometry, None);
+        let pending_icon = state
+            .objects
+            .get_mut(toplevel_object)
+            .downcast_mut::<XdgToplevel>()
+            .unwrap()
+            .take_pending_icon();
+        assert!(pending_icon.is_none());
+    }
+
+    #[test]
+    fn unmap_capture_resets_last_acked_and_initial_commit_requested() {
+        let mut state = state_for_tests();
+        let mut client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let mut xdg_surface = test_xdg_surface();
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+        let serial = xdg_surface.acked_serial();
+        xdg_surface.test_set_initial_commit_complete(true);
+
+        let kind = xdg_surface.check_commit(&mut client, &mut client_dispatcher, false, true);
+        assert_eq!(kind, Some(XdgCommitKind::Unmap));
+        let capture = xdg_surface.take_commit_capture(&mut state, XdgCommitKind::Unmap);
+
+        assert_eq!(capture.acked_serial, serial);
+        assert!(capture.reset_on_unmap);
+        assert!(xdg_surface.last_acked.is_none());
+        assert!(xdg_surface.pending_configures.is_empty());
+        assert!(!xdg_surface.initial_commit_requested());
+    }
+
+    #[test]
+    fn popup_map_capture_sets_map_requested_before_a_layer_parent_is_assigned() {
+        let mut state = state_for_tests();
+        let client_id = ClientId::from_raw(80);
+        let (_, popup_xdg_surface) = insert_test_xdg_surface(
+            &mut state,
+            client_id,
+            WlSurfaceId::from(42),
+            XdgSurfaceId::from(43),
+        );
+        let popup = insert_test_popup(
+            &mut state,
+            client_id,
+            XdgPopupId::from(44),
+            popup_xdg_surface,
+            None,
+            RectI { x: 0, y: 0, width: 10, height: 10 },
+            RectI { x: 0, y: 0, width: 10, height: 10 },
+        );
+        popup_xdg_surface
+            .grab(&mut state)
+            .take_commit_capture(&mut state, XdgCommitKind::Map);
+        assert!(popup.rref(&state).test_map_requested());
+
+        let layer =
+            Resolved::new(client_id, ZwlrLayerSurfaceV1Id::from(45), ObjectId::from(45usize));
+        assert_eq!(
+            popup.grab(&mut state).assign_layer_parent(layer),
+            Err(crate::wayland_objects::xdg_popup::AssignLayerParentError::AlreadyMapped)
+        );
+    }
+
+    #[test]
+    fn ack_after_capture_leaves_last_acked_committed_false() {
+        let mut state = state_for_tests();
+        let mut client = Client::new_for_tests(ClientId::from_raw(1));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let mut xdg_surface = test_xdg_surface();
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+        let capture = xdg_surface.take_commit_capture(&mut state, XdgCommitKind::Other);
+
+        queue_test_toplevel_configure(&mut xdg_surface);
+        xdg_surface.last_acked = xdg_surface.pending_configures.pop_back();
+        xdg_surface.apply_commit_role_changes(
+            &mut client,
+            &mut state,
+            &mut client_dispatcher,
+            CommitRoleChanges::default(),
+            &capture,
+        );
+
+        assert!(!xdg_surface.last_acked_committed);
+    }
+
+    #[test]
+    fn a_rejected_wl_surface_check_leaves_xdg_state_untouched() {
+        let mut state = state_for_tests();
+        let client_id = ClientId::from_raw(82);
+        let mut client = Client::new_for_tests(client_id);
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let (wl_surface, _) =
+            client.insert_object(&mut state, WlSurface::new(WlSurfaceId::from(46), client_id, 6));
+        wl_surface
+            .grab(&mut state)
+            .set_role(Role::XdgSurface, &mut client_dispatcher)
+            .unwrap();
+        state.register_root_surface(wl_surface);
+        let (xdg_surface, _) = client.insert_object(
+            &mut state,
+            XdgSurface::new(
+                XdgSurfaceId::from(47),
+                Resolved::new(client_id, XdgWmBaseId::from(1), ObjectId::from(1usize)),
+                wl_surface,
+                7,
+            ),
+        );
+        wl_surface
+            .grab(&mut state)
+            .set_xdg_surface_impl(xdg_surface);
+        let geometry = RectI { x: 0, y: 0, width: 50, height: 40 };
+        {
+            let mut xdg = xdg_surface.grab(&mut state);
+            xdg.test_assign_toplevel_role(Resolved::new(
+                client_id,
+                XdgToplevelId::from(48),
+                ObjectId::from(48usize),
+            ));
+            xdg.test_set_initial_commit_complete(true);
+            queue_test_toplevel_configure(&mut xdg);
+            xdg.test_commit_answered_configure();
+            xdg.test_set_pending_window_geometry(Some(geometry));
+        }
+        // A viewport source larger than the 80x60 buffer: rejected by the
+        // wl_surface checks, after the xdg checks passed.
+        wl_surface.grab(&mut state).pending_viewport_mut().src =
+            Some(crate::transform::RectF { x: 0.0, y: 0.0, width: 200.0, height: 200.0 });
+        crate::wayland_objects::wl_surface::test_commit_new_buffer(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            wl_surface,
+            80,
+            60,
+        );
+
+        assert!(!wl_surface.rref(&state).test_latest_buffer_is_some());
+        assert_eq!(xdg_surface.rref(&state).pending_window_geometry, Some(geometry));
     }
 }

@@ -2881,6 +2881,7 @@ impl WlSurface {
         );
         let was_mapped = self.global_logical_bounds().is_some();
         let resolved_surface = client.resolve_this(&self, state);
+        let mut pending_xdg_check = None;
         let mut pending_xdg_role_changes = None;
         let old_effective_insets = (self.is_root()
             && self.role == Role::XdgSurface
@@ -2908,27 +2909,22 @@ impl WlSurface {
                             Some(layout_snapshot),
                         )
                     });
-                    let (logical_size, has_pending_buffer_attach, is_null_buffer_commit) = (
-                        this.logical_size(),
+                    let (has_pending_buffer_attach, is_null_buffer_commit) = (
                         this.has_pending_buffer_attach(),
                         matches!(this.pending.buffer, Some(None)),
                     );
                     drop(this);
-                    let mut xdg_surface = xdg_surface_id.grab(state);
-                    let Some(role_changes) = xdg_surface.on_commit(
+                    let Some(kind) = xdg_surface_id.rref(state).check_commit(
                         client,
-                        state,
                         dispatcher,
-                        logical_size,
                         has_pending_buffer_attach,
                         is_null_buffer_commit,
-                        configure_bounds,
                     ) else {
                         let mut this = resolved_surface.ref_mut(state);
                         this.clear_failed_surface_commit();
                         return;
                     };
-                    pending_xdg_role_changes = Some((xdg_surface_id, role_changes));
+                    pending_xdg_check = Some((xdg_surface_id, kind, configure_bounds));
                     resolved_surface.grab(state)
                 }
                 ShellSurfaceObject::LayerSurface(layer_surface_id) => {
@@ -2960,10 +2956,34 @@ impl WlSurface {
             this.clear_failed_surface_commit();
             return;
         }
-
-        let Some(update) = this.capture_commit(client, state, dispatcher) else {
+        if !this.validate_pending_mapping(client, state, dispatcher) {
+            this.clear_failed_surface_commit();
             return;
-        };
+        }
+        if !this.validate_pending_sync(client, state, dispatcher) {
+            this.clear_failed_surface_commit();
+            return;
+        }
+        if !this.validate_pending_representation(client, state, dispatcher) {
+            this.clear_failed_surface_commit();
+            return;
+        }
+
+        if let Some((xdg_surface_id, kind, configure_bounds)) = pending_xdg_check {
+            let capture = {
+                let mut xdg_surface = xdg_surface_id.grab(state);
+                xdg_surface.take_commit_capture(state, kind)
+            };
+            let (ungrabbed, role_changes) =
+                client.with_ungrabbed_mut(this, state, |state, client| {
+                    let mut xdg_surface = xdg_surface_id.grab(state);
+                    xdg_surface.on_commit(client, state, dispatcher, &capture, configure_bounds)
+                });
+            this = ungrabbed;
+            pending_xdg_role_changes = Some((xdg_surface_id, role_changes, capture));
+        }
+
+        let update = this.capture_commit(dispatcher);
 
         if this.behaves_synchronized(state) {
             let discarded = this.merge_cached_update(update);
@@ -2988,30 +3008,9 @@ impl WlSurface {
         );
     }
 
-    /// Request-time half of a commit, after the xdg and layer checks: validates
-    /// the wl_surface state and moves the pending state into one `ContentUpdate`.
-    /// Returns `None`, with the pending state cleared, when a check fails.
-    fn capture_commit(
-        &mut self,
-        client: &mut Client,
-        state: &mut State,
-        dispatcher: &mut ClientDispatcher,
-    ) -> Option<ContentUpdate> {
-        if !self.validate_pending_mapping(client, state, dispatcher) {
-            self.clear_failed_surface_commit();
-            return None;
-        }
-
-        if !self.validate_pending_sync(client, state, dispatcher) {
-            self.clear_failed_surface_commit();
-            return None;
-        }
-
-        if !self.validate_pending_representation(client, state, dispatcher) {
-            self.clear_failed_surface_commit();
-            return None;
-        }
-
+    /// Request-time half of a commit, after every check passed: moves the
+    /// pending state into one `ContentUpdate`.
+    fn capture_commit(&mut self, dispatcher: &mut ClientDispatcher) -> ContentUpdate {
         self.next_update_seq += 1;
         let seq = self.next_update_seq;
         // The payload of a wire-scaled client is normalized to logical units
@@ -3038,7 +3037,7 @@ impl WlSurface {
         if update.xwayland_serial.is_some() {
             self.latest_xwayland_serial = update.xwayland_serial;
         }
-        Some(update)
+        update
     }
 
     fn apply_update(
@@ -3080,10 +3079,16 @@ impl WlSurface {
             dispatcher.dispatch_post_action(crate::input::focus::RefreshLockFocus);
         }
 
-        if let Some((xdg_surface_id, role_changes)) = cx.pending_xdg_role_changes {
+        if let Some((xdg_surface_id, role_changes, capture)) = cx.pending_xdg_role_changes {
             let mut xdg_surface = xdg_surface_id.grab(state);
             (this, _) = client.with_ungrabbed_mut(this, state, |state, client| {
-                xdg_surface.apply_commit_role_changes(client, state, dispatcher, role_changes);
+                xdg_surface.apply_commit_role_changes(
+                    client,
+                    state,
+                    dispatcher,
+                    role_changes,
+                    &capture,
+                );
             });
         }
 
@@ -4338,8 +4343,11 @@ pub(crate) fn test_commit_new_buffer(
 struct ApplyContext {
     was_mapped: bool,
     old_effective_insets: Option<crate::config::DecorationInsets>,
-    pending_xdg_role_changes:
-        Option<(Resolved<XdgSurfaceId>, crate::wayland_objects::xdg_surface::CommitRoleChanges)>,
+    pending_xdg_role_changes: Option<(
+        Resolved<XdgSurfaceId>,
+        crate::wayland_objects::xdg_surface::CommitRoleChanges,
+        crate::wayland_objects::xdg_surface::XdgCommitCapture,
+    )>,
 }
 
 #[cfg(test)]
@@ -4736,9 +4744,7 @@ mod tests {
         fn capture(&mut self) -> ContentUpdate {
             let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
             let mut surface = self.surface.grab(&mut self.state);
-            surface
-                .capture_commit(&mut self.client, &mut self.state, &mut client_dispatcher)
-                .expect("the pending commit is captured")
+            surface.capture_commit(&mut client_dispatcher)
         }
 
         fn surface_events(&self) -> usize {
@@ -5007,9 +5013,7 @@ mod tests {
     ) -> ContentUpdate {
         let mut client_dispatcher = client.test_dispatcher(dispatcher);
         let mut wl_surface = surface.grab(state);
-        wl_surface
-            .capture_commit(client, state, &mut client_dispatcher)
-            .expect("the pending commit is captured")
+        wl_surface.capture_commit(&mut client_dispatcher)
     }
 
     fn apply_captured(

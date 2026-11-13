@@ -91,7 +91,7 @@ impl XdgSessionV1 {
         }
         if restore {
             let xdg_surface = toplevel.rref(state).xdg_surface();
-            if xdg_surface.rref(state).initial_commit_complete() {
+            if xdg_surface.rref(state).initial_commit_requested() {
                 self.protocol_error(
                     client,
                     dispatcher,

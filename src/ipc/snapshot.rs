@@ -513,7 +513,10 @@ mod tests {
             .try_ref_object_mut::<XdgToplevel>(role)
             .unwrap();
         toplevel.set_pending_icon(Some(std::rc::Rc::new(icon)));
-        assert!(toplevel.apply_pending_icon());
+        assert!(toplevel
+            .take_pending_icon()
+            .map(|icon| toplevel.set_icon(icon))
+            .is_some());
     }
 
     #[test]
