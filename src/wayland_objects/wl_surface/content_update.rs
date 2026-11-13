@@ -17,6 +17,9 @@ pub(crate) struct ContentUpdate {
     pub(super) xwayland_serial: Option<u64>,
     /// The acquire wait failed or could not be set up; apply without it.
     pub(super) acquire_forced: bool,
+    /// The role part of the commit, applied only while the role object of
+    /// `role_epoch` is still the surface's role.
+    pub(super) role: RoleUpdate,
 }
 
 #[derive(Clone, Debug)]
@@ -24,6 +27,17 @@ pub(crate) struct PointerConstraintUpdate {
     pub(super) constraint: SurfacePointerConstraint,
     pub(super) region: Option<Option<RegionValue>>,
     pub(super) hint: Option<(f32, f32)>,
+}
+
+/// The role part of a captured commit.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum RoleUpdate {
+    #[default]
+    None,
+    Xdg {
+        xdg_surface: Resolved<XdgSurfaceId>,
+        capture: crate::wayland_objects::xdg_surface::XdgCommitCapture,
+    },
 }
 
 impl ContentUpdate {
@@ -44,6 +58,7 @@ impl ContentUpdate {
             pointer_constraint: None,
             xwayland_serial: None,
             acquire_forced: false,
+            role: RoleUpdate::None,
         }
     }
 
@@ -116,6 +131,7 @@ impl ContentUpdate {
             }
         }
         self.acquire_forced |= next.acquire_forced;
+        self.role = next.role;
         std::mem::replace(&mut self.presentation_feedbacks, next.presentation_feedbacks)
     }
 }

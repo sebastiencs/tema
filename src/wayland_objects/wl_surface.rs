@@ -50,8 +50,8 @@ use crate::{
 use {super::wl_buffer::WlBuffer, crate::protocol_generated::wl_display};
 
 mod content_update;
-pub(crate) use content_update::ContentUpdate;
 use content_update::PointerConstraintUpdate;
+pub(crate) use content_update::{ContentUpdate, RoleUpdate};
 
 fn monotonic_time_msec() -> u32 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -2879,17 +2879,8 @@ impl WlSurface {
             state,
             dispatcher,
         );
-        let was_mapped = self.global_logical_bounds().is_some();
         let resolved_surface = client.resolve_this(&self, state);
         let mut pending_xdg_check = None;
-        let mut pending_xdg_role_changes = None;
-        let old_effective_insets = (self.is_root()
-            && self.role == Role::XdgSurface
-            && !self.has_cursor_role()
-            && !self.has_dnd_icon_role())
-        .then(|| {
-            crate::root_geometry::effective_decoration_insets_for_surface(state, resolved_surface)
-        });
         let mut this = if let Some(shell_surface) = self.shell_surface {
             let (mut this, preferred_output_id) = client.with_ungrabbed(self, state, |state| {
                 let this = resolved_surface.rref(state);
@@ -2899,16 +2890,6 @@ impl WlSurface {
             this.send_preferred_buffer_state_for_object(state, preferred_output_id, dispatcher);
             match shell_surface {
                 ShellSurfaceObject::XdgSurface(xdg_surface_id) => {
-                    let (this, configure_bounds) = client.with_ungrabbed(this, state, |state| {
-                        let this = resolved_surface.rref(state);
-                        let layout_snapshot =
-                            LayerLayoutObjectSnapshot::for_surface(resolved_surface);
-                        state.configure_bounds_for_surface_with_ref(
-                            resolved_surface,
-                            this,
-                            Some(layout_snapshot),
-                        )
-                    });
                     let (has_pending_buffer_attach, is_null_buffer_commit) = (
                         this.has_pending_buffer_attach(),
                         matches!(this.pending.buffer, Some(None)),
@@ -2924,7 +2905,7 @@ impl WlSurface {
                         this.clear_failed_surface_commit();
                         return;
                     };
-                    pending_xdg_check = Some((xdg_surface_id, kind, configure_bounds));
+                    pending_xdg_check = Some((xdg_surface_id, kind));
                     resolved_surface.grab(state)
                 }
                 ShellSurfaceObject::LayerSurface(layer_surface_id) => {
@@ -2969,21 +2950,19 @@ impl WlSurface {
             return;
         }
 
-        if let Some((xdg_surface_id, kind, configure_bounds)) = pending_xdg_check {
-            let capture = {
-                let mut xdg_surface = xdg_surface_id.grab(state);
-                xdg_surface.take_commit_capture(state, kind)
-            };
-            let (ungrabbed, role_changes) =
-                client.with_ungrabbed_mut(this, state, |state, client| {
+        let role = match pending_xdg_check {
+            Some((xdg_surface_id, kind)) => {
+                let capture = {
                     let mut xdg_surface = xdg_surface_id.grab(state);
-                    xdg_surface.on_commit(client, state, dispatcher, &capture, configure_bounds)
-                });
-            this = ungrabbed;
-            pending_xdg_role_changes = Some((xdg_surface_id, role_changes, capture));
-        }
+                    xdg_surface.take_commit_capture(state, kind)
+                };
+                RoleUpdate::Xdg { xdg_surface: xdg_surface_id, capture }
+            }
+            None => RoleUpdate::None,
+        };
 
-        let update = this.capture_commit(dispatcher);
+        let mut update = this.capture_commit(dispatcher);
+        update.role = role;
 
         if this.behaves_synchronized(state) {
             let discarded = this.merge_cached_update(update);
@@ -2998,14 +2977,7 @@ impl WlSurface {
             }
             None => update,
         };
-        WlSurface::apply_update(
-            this,
-            client,
-            state,
-            dispatcher,
-            update,
-            ApplyContext { was_mapped, old_effective_insets, pending_xdg_role_changes },
-        );
+        WlSurface::apply_update(this, client, state, dispatcher, update);
     }
 
     /// Request-time half of a commit, after every check passed: moves the
@@ -3045,11 +3017,50 @@ impl WlSurface {
         client: &mut Client,
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
-        update: ContentUpdate,
-        cx: ApplyContext,
+        mut update: ContentUpdate,
     ) {
+        // Measured before any part of the commit applies, as the commit prologue did.
+        let was_mapped = this.global_logical_bounds().is_some();
         let resolved_surface = client.resolve_this(&this, state);
+        let old_effective_insets = (this.is_root()
+            && this.role == Role::XdgSurface
+            && !this.has_cursor_role()
+            && !this.has_dnd_icon_role())
+        .then(|| {
+            crate::root_geometry::effective_decoration_insets_for_surface(state, resolved_surface)
+        });
         let role_current = update.role_epoch == this.role_epoch;
+        let mut pending_xdg_role_changes = None;
+        if let RoleUpdate::Xdg { xdg_surface: xdg_surface_id, capture } =
+            std::mem::take(&mut update.role)
+        {
+            // A role object destroyed since the capture leaves its part unapplied.
+            if role_current {
+                let (ungrabbed, configure_bounds) = client.with_ungrabbed(this, state, |state| {
+                    let this = resolved_surface.rref(state);
+                    let layout_snapshot = LayerLayoutObjectSnapshot::for_surface(resolved_surface);
+                    state.configure_bounds_for_surface_with_ref(
+                        resolved_surface,
+                        this,
+                        Some(layout_snapshot),
+                    )
+                });
+                this = ungrabbed;
+                let (ungrabbed, role_changes) =
+                    client.with_ungrabbed_mut(this, state, |state, client| {
+                        let mut xdg_surface = xdg_surface_id.grab(state);
+                        xdg_surface.apply_commit(
+                            client,
+                            state,
+                            dispatcher,
+                            &capture,
+                            configure_bounds,
+                        )
+                    });
+                this = ungrabbed;
+                pending_xdg_role_changes = Some((xdg_surface_id, role_changes, capture));
+            }
+        }
         let lock_output = if role_current && this.role == Role::LockSurface {
             this.lock_surface
                 .and_then(|lock_surface| lock_surface.try_ref(state))
@@ -3079,7 +3090,7 @@ impl WlSurface {
             dispatcher.dispatch_post_action(crate::input::focus::RefreshLockFocus);
         }
 
-        if let Some((xdg_surface_id, role_changes, capture)) = cx.pending_xdg_role_changes {
+        if let Some((xdg_surface_id, role_changes, capture)) = pending_xdg_role_changes {
             let mut xdg_surface = xdg_surface_id.grab(state);
             (this, _) = client.with_ungrabbed_mut(this, state, |state, client| {
                 xdg_surface.apply_commit_role_changes(
@@ -3125,7 +3136,7 @@ impl WlSurface {
                 }
             }
         }
-        if let Some(old_effective_insets) = cx.old_effective_insets {
+        if let Some(old_effective_insets) = old_effective_insets {
             let new_effective_insets =
                 crate::root_geometry::effective_decoration_insets_for_surface(
                     state,
@@ -3216,7 +3227,7 @@ impl WlSurface {
         }
         let is_mapped = this.global_logical_bounds().is_some();
         let mut bounds_after_first_map_relayout = None;
-        if cx.was_mapped != is_mapped {
+        if was_mapped != is_mapped {
             if let Some(ShellSurfaceObject::XdgSurface(xdg_surface_id)) = this.shell_surface {
                 if xdg_surface_id
                     .try_ref(state)
@@ -4339,23 +4350,12 @@ pub(crate) fn test_commit_new_buffer(
     client_dispatcher.drain_post_actions(client, state);
 }
 
-/// Request-time results of the commit prologue that `apply_update` needs.
-struct ApplyContext {
-    was_mapped: bool,
-    old_effective_insets: Option<crate::config::DecorationInsets>,
-    pending_xdg_role_changes: Option<(
-        Resolved<XdgSurfaceId>,
-        crate::wayland_objects::xdg_surface::CommitRoleChanges,
-        crate::wayland_objects::xdg_surface::XdgCommitCapture,
-    )>,
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::{
-            ContentUpdate, DamageRect, OnScreen, PresentationHint, Role, SurfaceCommitPayload,
-            SurfacePresentationFeedback, WlSurface,
+            ContentUpdate, DamageRect, OnScreen, PresentationHint, Role, RoleUpdate,
+            SurfaceCommitPayload, SurfacePresentationFeedback, WlSurface,
         },
         crate::{
             capture::{test_sent_arg, test_sent_opcodes},
@@ -5857,6 +5857,97 @@ mod tests {
             .try_ref_object::<XdgSurface>(client.object_id(xdg_surface_id))
             .unwrap()
             .test_pending_configure_count()
+    }
+
+    /// An update that carries an initial xdg commit for a toplevel, captured
+    /// while the surface's role epoch was `epoch`.
+    fn initial_xdg_update(
+        client: &Client,
+        surface_object_id: ObjectId,
+        xdg_surface_id: XdgSurfaceId,
+        state: &State,
+    ) -> ContentUpdate {
+        let epoch = state
+            .objects
+            .try_ref_object::<WlSurface>(surface_object_id)
+            .unwrap()
+            .test_role_epoch();
+        let mut update =
+            ContentUpdate::test_new(WlSurface::test_payload(None), Vec::new(), Vec::new());
+        update.role_epoch = epoch;
+        update.role = RoleUpdate::Xdg {
+            xdg_surface: Resolved::new(
+                client.client_id(),
+                xdg_surface_id,
+                client.object_id(xdg_surface_id),
+            ),
+            capture: crate::wayland_objects::xdg_surface::XdgCommitCapture {
+                initial: true,
+                ..Default::default()
+            },
+        };
+        update
+    }
+
+    #[test]
+    fn xdg_role_part_applies_while_the_toplevel_is_alive() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = create_root_xdg_toplevel(
+            &mut state,
+            &mut client,
+            &mut dispatcher,
+            WlSurfaceId::from(50),
+            XdgSurfaceId::from(60),
+            XdgToplevelId::from(70),
+        );
+        let update = initial_xdg_update(&client, surface_object_id, XdgSurfaceId::from(60), &state);
+        assert_eq!(pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60)), 0);
+
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+        WlSurface::apply_update(surface, &mut client, &mut state, &mut client_dispatcher, update);
+
+        assert_eq!(pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60)), 1);
+    }
+
+    #[test]
+    fn xdg_role_part_is_skipped_after_the_toplevel_is_destroyed() {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface_object_id = create_root_xdg_toplevel(
+            &mut state,
+            &mut client,
+            &mut dispatcher,
+            WlSurfaceId::from(50),
+            XdgSurfaceId::from(60),
+            XdgToplevelId::from(70),
+        );
+        let update = initial_xdg_update(&client, surface_object_id, XdgSurfaceId::from(60), &state);
+        {
+            let mut xdg_surface = state
+                .objects
+                .grab_object::<XdgSurface>(client.object_id(XdgSurfaceId::from(60)));
+            let toplevel = Resolved::new(
+                client.client_id(),
+                XdgToplevelId::from(70),
+                client.object_id(XdgToplevelId::from(70)),
+            );
+            xdg_surface.destroy_toplevel_role(&mut state, toplevel);
+        }
+        assert_eq!(pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60)), 0);
+
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        let surface = state.objects.grab_object::<WlSurface>(surface_object_id);
+        WlSurface::apply_update(surface, &mut client, &mut state, &mut client_dispatcher, update);
+
+        assert_eq!(pending_toplevel_configures(&state, &client, XdgSurfaceId::from(60)), 0);
     }
 
     #[test]

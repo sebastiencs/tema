@@ -757,7 +757,7 @@ impl XdgSurface {
     }
 
     /// Apply half of the xdg part of a commit, from its check and capture.
-    pub(crate) fn on_commit(
+    pub(crate) fn apply_commit(
         &mut self,
         client: &mut Client,
         state: &mut State,
@@ -910,7 +910,7 @@ impl XdgSurface {
             is_null_buffer_commit,
         )?;
         let capture = self.take_commit_capture(state, kind);
-        let role_changes = self.on_commit(client, state, dispatcher, &capture, configure_bounds);
+        let role_changes = self.apply_commit(client, state, dispatcher, &capture, configure_bounds);
         self.apply_commit_role_changes(client, state, dispatcher, role_changes, &capture);
         Some(role_changes)
     }
