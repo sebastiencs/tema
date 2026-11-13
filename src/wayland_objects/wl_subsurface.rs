@@ -90,7 +90,7 @@ impl Object for WlSubsurface {
                 let old_root_surface = state.root_surface_for_surface(self.parent);
                 if let Some(mut surface) = self.surface.try_grab(state) {
                     surface.unmap_due_to_parent_loss(client, state, dispatcher);
-                    surface.destroy_subsurface_role();
+                    surface.destroy_subsurface_role(client, state, dispatcher);
                 }
                 if let Some(mut parent_surface) = self.parent.try_grab(state) {
                     parent_surface.remove_child_from_tree(self.surface);

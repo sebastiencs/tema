@@ -813,17 +813,27 @@ impl XdgSurface {
         &self.popup_children
     }
 
-    pub(crate) fn destroy_toplevel_role(&mut self, toplevel: Resolved<XdgToplevelId>) {
+    pub(crate) fn destroy_toplevel_role(
+        &mut self,
+        state: &mut State,
+        toplevel: Resolved<XdgToplevelId>,
+    ) {
         if self.role_object == RoleObject::Toplevel(toplevel) {
             self.role_object = RoleObject::None;
             self.reset_configure_state();
+            if let Some(surface) = self.wl_surface.try_ref_mut(state) {
+                surface.bump_role_epoch();
+            }
         }
     }
 
-    pub(crate) fn destroy_popup_role(&mut self, popup: Resolved<XdgPopupId>) {
+    pub(crate) fn destroy_popup_role(&mut self, state: &mut State, popup: Resolved<XdgPopupId>) {
         if self.role_object == RoleObject::Popup(popup) {
             self.role_object = RoleObject::None;
             self.reset_configure_state();
+            if let Some(surface) = self.wl_surface.try_ref_mut(state) {
+                surface.bump_role_epoch();
+            }
         }
     }
 }
@@ -2354,7 +2364,7 @@ pub mod xdg_toplevel {
                     }
                     let mut xdg_surface = self.xdg_surface.grab(state);
                     let this = client.resolve(self.id, state).unwrap();
-                    xdg_surface.destroy_toplevel_role(this);
+                    xdg_surface.destroy_toplevel_role(state, this);
                     self.delete_self(client, state, dispatcher);
                 }
                 SetParent { parent } => {
@@ -3086,6 +3096,46 @@ mod tests {
             },
         },
     };
+
+    #[test]
+    fn toplevel_destroy_bumps_the_role_epoch() {
+        let mut state = state_for_tests();
+        let client_id = ClientId::from_raw(78);
+        let (wl_surface, xdg_surface) = insert_test_xdg_surface(
+            &mut state,
+            client_id,
+            WlSurfaceId::from(12),
+            XdgSurfaceId::from(13),
+        );
+        let toplevel = Resolved::new(client_id, XdgToplevelId::from(14), ObjectId::from(14usize));
+        xdg_surface.grab(&mut state).role_object = RoleObject::Toplevel(toplevel);
+        let epoch = wl_surface.rref(&state).test_role_epoch();
+
+        xdg_surface
+            .grab(&mut state)
+            .destroy_toplevel_role(&mut state, toplevel);
+        assert_eq!(wl_surface.rref(&state).test_role_epoch(), epoch + 1);
+    }
+
+    #[test]
+    fn popup_destroy_bumps_the_role_epoch() {
+        let mut state = state_for_tests();
+        let client_id = ClientId::from_raw(79);
+        let (wl_surface, xdg_surface) = insert_test_xdg_surface(
+            &mut state,
+            client_id,
+            WlSurfaceId::from(16),
+            XdgSurfaceId::from(17),
+        );
+        let popup = Resolved::new(client_id, XdgPopupId::from(18), ObjectId::from(18usize));
+        xdg_surface.grab(&mut state).role_object = RoleObject::Popup(popup);
+        let epoch = wl_surface.rref(&state).test_role_epoch();
+
+        xdg_surface
+            .grab(&mut state)
+            .destroy_popup_role(&mut state, popup);
+        assert_eq!(wl_surface.rref(&state).test_role_epoch(), epoch + 1);
+    }
 
     fn insert_test_xdg_surface(
         state: &mut State,

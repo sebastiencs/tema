@@ -412,7 +412,7 @@ impl PostAction for PostXdgPopup {
                 }
                 if xdg_surface.exists(state) {
                     let mut xdg_surface = xdg_surface.grab(state);
-                    xdg_surface.destroy_popup_role(popup);
+                    xdg_surface.destroy_popup_role(state, popup);
                 }
                 client.delete_id(
                     &WlDisplay::default(),
