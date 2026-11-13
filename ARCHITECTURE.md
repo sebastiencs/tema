@@ -1060,13 +1060,29 @@ The pointer grab is `ResizeSplit` in `src/input/types.rs`. It stores the workspa
 
 ### Tiled content during resize
 
-A tiled window stores the content rect from the last time its buffer had that size. The field is `tiled_content_basis` on `ManagedWindowState`. `State::refresh_tiled_content_basis` updates it on commit and when a relayout moves the frame, and only while the surface is mapped, tiled, and not fullscreen. `anchored_content_origin` in `src/root_geometry.rs` places the current buffer against that rect. On each axis, a buffer that still has the old size stays on the edge that did not move: dragging the top edge keeps the bottom still, and the gap is on the edge that moved. A tile that only translates, or a buffer that already matches the tile, follows the tile. Floating windows keep the position they were given. Fullscreen skips the anchor. Sway's `view_center_and_clip_surface` pins every tiled surface to the content top-left. Tema pins the edge that stayed.
+A tiled window stores the content rect from the last time its buffer had that size. The field is `tiled_content_basis` on `ManagedWindowState`. `State::refresh_tiled_content_basis` updates it on commit and when a relayout moves the frame, and only while the surface is mapped, tiled, and not fullscreen. `anchored_content_origin` in `src/root_geometry.rs` places the current buffer against that rect. On each axis, a buffer that still has the old size stays on the edge that did not move: dragging the top edge keeps the bottom still, and the gap is on the edge that moved. A tile that only translates, or a buffer that already matches the tile, follows the tile. Floating windows keep their frame where it was placed (see Floating position). Fullscreen skips the anchor. Sway's `view_center_and_clip_surface` pins every tiled surface to the content top-left. Tema pins the edge that stayed.
 
 `State::window_render_mapping` is the one logical-to-visual pair for a window. `render_composed_entry` in `src/drm.rs` reads it, and so do `logical_pointer_for_surface` and `visual_pointer_for_surface`. The frame pair moves the border, the shadow, and the rounded clip from the tile frame onto `geometry_animation.visual_rect()`, through `place_visual_frame`. The content pair moves the root's surfaces, including subsurfaces and popups, and maps pointer coordinates back into the buffer. `None` means the two rectangles are the same. A direct floating move reads the frame pair through `window_render_mapping_with_logical_fallback`: the toplevel is grabbed, `State::toplevel` would panic, and an empty geometry cache falls back to the move intent's target rect. `geometry_sample_influence` still places a caller-supplied sample for damage bounds. That sample is the union used by scheduling, and it is separate from the window pair.
 
 While `tiled_size_answer_pending` is true, the content pair stretches the current buffer onto the visual content box, which is the visual frame inset by the border on each edge. The border thickness stays in pixels. The predicate stays true from the size configure until the commit that follows the newest one, including the ack-to-commit gap that an ordinary layout configure does not cover with `resize_throttle`. It is false for a floating window, a fullscreen window, an unmanaged root, and an X window. An X window is placed with the anchor and stays unscaled, because it has no xdg size configure to answer. After the client commits, the stretch ends. A buffer that still differs from the tile is drawn unscaled at the anchor, and the leftover area is empty.
 
 The stretch is what makes `SNAP_TILED_RESIZE` look full. The tile jumps, and the old buffer fills the new content box until the client commits. A keyboard resize keeps the window animation, and the same stretch runs for as long as the size request and the animation overlap. Direct scanout waits until both pairs are `None`. Hyprland draws into its animated `m_realPosition` / `m_realSize` box. Sway does not stretch a tiled buffer.
+
+### Floating position
+
+A floating xdg window stores its frame origin in `floating_frame_origin` on `ManagedWindowState`. The origin is the global top-left of the outer frame. The frame size is the committed window geometry plus the decoration insets. X11 windows never set the field. They keep their root surface origin as their position, because an X window has no window-geometry offset that could move its frame.
+
+`State::sync_floating_root_position` adopts the origin. It runs in the `wl_surface` commit tail and in the relayout pass. The first call for a mapped, floating, non-fullscreen xdg window without an origin stores the frame of the geometry built from the current root, and moves nothing. Later calls copy the derived root onto the surface when it differs.
+
+`set_window_floating(false)`, `float_window_for_drag`, `retile_window_after_drag`, and `set_window_fullscreen(true)` clear the origin. Restoring a remembered floating state, through `restore_root_surface_floating_state`, sets it from `RememberedFloatingState::layout_rect`.
+
+`build_committed_root_geometry` in `src/root_geometry.rs` derives the root when the window is floating and not fullscreen, has an origin, and has an effective window geometry `wg`. The insets are zero when the frame is not reserved, and otherwise the decoration insets. The content rect is the origin plus the left and top insets, sized `wg`. The frame rect is the origin with `wg` plus the insets. The root position is the content origin minus the `wg` offset. A `root_pos` override is ignored in this branch. A window-geometry offset change therefore moves the root and leaves the frame in place.
+
+Every floating move goes through two `State` methods. `set_root_surface_position` takes a root position and shifts the origin by the difference from the current derived root. `translate_root_surface` adds a delta to the origin. Both fall back to moving the root when the window has no origin. `place_grabbed_root` and the tiled-drag pickup call the first method, and `anchored_grab_target` calls the second.
+
+A left or top interactive resize stores the frame's right and bottom edges in `ResizeAnchor`. `State::apply_resize_anchor` runs in the commit tail. It reads the fresh `layout_rect_global` and moves the frame so those edges stay put. The anchor is in frame space, so the edges stay fixed when the client changes its window-geometry offset during the resize.
+
+This follows jay's `update_surface_position`, which places the surface at the desired extents minus the effective geometry position on each geometry change. Hyprland's renderer draws the surface at the window position minus `geometry.box.pos()`.
 
 ## 19. The X11 connection
 
@@ -1301,7 +1317,7 @@ Unmanaged roots are drawn in the content tier after workspace roots, so they sit
 
 `WmEvent::Resize` stores `floating_size`, each side at least 1, and reconfigures that window from its current root position. A left or top edge resize has already moved the root, so one `ConfigureWindow` carries the new origin and the new size.
 
-`position_changed` runs after `set_root_position` in the floating-move correction, in the tiled-drag pickup, and in `place_grabbed_root`. For an X window that dispatches `Reconfigure`, which sends the new x and y. A tiled resize dispatches `WorkspaceStateChanged`. The following `Reconfigure` configures both neighbors.
+`position_changed` runs after `translate_root_surface` in `anchored_grab_target`, and after `set_root_surface_position` in the tiled-drag pickup and in `place_grabbed_root`. For an X window that dispatches `Reconfigure`, which sends the new x and y. A tiled resize dispatches `WorkspaceStateChanged`. The following `Reconfigure` configures both neighbors.
 
 ### Manual check
 
