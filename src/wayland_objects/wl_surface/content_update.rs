@@ -24,6 +24,9 @@ pub(crate) struct ContentUpdate {
     pub(super) tree: TreeUpdate,
     /// The cached updates of synchronized children, taken at capture.
     pub(super) children: Vec<ChildUpdate>,
+    /// Test-only: the readiness check holds this update until it is released.
+    #[cfg(test)]
+    pub(super) test_hold: bool,
 }
 
 /// A synchronized child's cached update, carried by its parent's update.
@@ -84,6 +87,8 @@ impl ContentUpdate {
             role: RoleUpdate::None,
             tree: TreeUpdate::default(),
             children: Vec::new(),
+            #[cfg(test)]
+            test_hold: false,
         }
     }
 
@@ -156,6 +161,10 @@ impl ContentUpdate {
             }
         }
         self.acquire_forced |= next.acquire_forced;
+        #[cfg(test)]
+        {
+            self.test_hold |= next.test_hold;
+        }
         self.role = next.role;
         self.tree = next.tree;
         let mut discarded =

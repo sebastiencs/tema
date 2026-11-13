@@ -767,6 +767,8 @@ pub enum ClientAction {
     DiscardSurfacePresentationFeedbacksForBackend {
         drm_id: DrmId,
     },
+    /// Queued commits of this client may be ready.
+    FlushCommitQueues,
     CancelBlockedSurface {
         surface: Resolved<WlSurfaceId>,
         waiter_id: AcquireReadyWaiterId,
@@ -3551,6 +3553,12 @@ impl Model for Client {
                     drm_id,
                 );
             }
+            FlushCommitQueues => {
+                crate::wayland_objects::wl_surface::flush_client(self, state, &mut dispatcher);
+                while let Some(action) = dispatcher.post_actions.pop_front() {
+                    action.execute(self, state, &mut dispatcher);
+                }
+            }
             CancelBlockedSurface { surface, waiter_id } => {
                 let Some(mut surface) = surface.try_grab(state) else {
                     return Ok(());
@@ -3693,6 +3701,7 @@ impl Model for Client {
                 crate::capture::deliver(self, state, &mut dispatcher);
             }
             Close => {
+                state.commit_queues.remove_client(self.id);
                 log::info!("client_id={:?} closed", self.id);
                 state.capture.drop_client(self.id);
                 if let Some(id) = self.reader_id.take() {

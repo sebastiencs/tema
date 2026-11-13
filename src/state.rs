@@ -1149,6 +1149,7 @@ pub struct State {
     #[cfg(test)]
     pub realize_closing_snapshots_in_tests: bool,
     pub frame_scheduler: BTreeMap<OutputId, OutputSchedulerSnapshot>,
+    pub(crate) commit_queues: crate::wayland_objects::wl_surface::CommitQueues,
     pub presentation: PresentationSubsystem,
     pub globals: Globals,
     pub activation_tokens: ActivationTokenStore,
@@ -1298,6 +1299,7 @@ impl State {
             #[cfg(test)]
             realize_closing_snapshots_in_tests: false,
             frame_scheduler: Default::default(),
+            commit_queues: Default::default(),
             presentation: Default::default(),
             globals,
             activation_tokens: Default::default(),
