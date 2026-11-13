@@ -12,7 +12,7 @@ use {
 
 use crate::{
     clients::{ClientDispatcher, Resolved},
-    drm::{request_active_output, request_outputs_for_rect, DrmFd},
+    drm::DrmFd,
     io_uring::{model::IoUringAction, ring::RingId},
     protocol_generated::{WlBufferId, WlSurfaceId},
     runner::{Dispatcher, Model, Redispatcher},
@@ -67,6 +67,15 @@ impl Default for AcquireSync {
     fn default() -> Self {
         Self::None
     }
+}
+
+/// What an `AcquireReadyWaiter` waits on.
+#[derive(Debug)]
+pub enum AcquireWaitFd {
+    /// An eventfd armed by `syncobj_eventfd`: it is read once.
+    Eventfd(OwnedFd),
+    /// A sync file (a copy of the acquire's fd): it is polled for `POLLIN`.
+    SyncFile(OwnedFd),
 }
 
 #[derive(Debug, Clone)]
@@ -151,10 +160,12 @@ impl AcquireSync {
         }
     }
 
-    pub fn prepare_waiter_fd(&self) -> io::Result<Option<OwnedFd>> {
+    pub fn prepare_waiter_fd(&self) -> io::Result<Option<AcquireWaitFd>> {
         match self {
             Self::None => Ok(None),
-            Self::SyncFile(_) => Ok(None),
+            Self::SyncFile(fd) => dup(fd.as_fd())
+                .map(|fd| Some(AcquireWaitFd::SyncFile(fd)))
+                .map_err(io::Error::from),
             Self::TimelinePoint { timeline, point } => {
                 let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
                 if raw < 0 {
@@ -164,7 +175,7 @@ impl AcquireSync {
                 timeline
                     .drm()
                     .syncobj_eventfd(timeline.handle(), *point, eventfd.as_fd(), true)?;
-                Ok(Some(eventfd))
+                Ok(Some(AcquireWaitFd::Eventfd(eventfd)))
             }
         }
     }
@@ -296,8 +307,9 @@ pub fn fresh_waiter_id() -> AcquireReadyWaiterId {
 pub struct AcquireReadyWaiter {
     waiter_id: AcquireReadyWaiterId,
     surface: Resolved<WlSurfaceId>,
-    poll_fd: OwnedFd,
-    read_op_id: Option<RingId>,
+    wait_fd: AcquireWaitFd,
+    /// The pending read (eventfd) or poll (sync file).
+    op_id: Option<RingId>,
 }
 
 #[derive(Debug)]
@@ -316,72 +328,87 @@ impl Model for AcquireReadyWaiter {
 
     fn process(
         &mut self,
-        state: &mut State,
+        _state: &mut State,
         action: Self::Action,
         dispatcher: &mut Dispatcher,
     ) -> std::result::Result<(), crate::runner::ModelFailure> {
         match action {
             AcquireReadyWaiterAction::Start => {
-                let read_op_id = RingId::fresh();
-                self.read_op_id = Some(read_op_id);
-                dispatcher.dispatch(IoUringAction::Read {
-                    id: Some(read_op_id),
-                    fd: self.poll_fd.as_raw_fd(),
-                    offset: 0,
-                    length: std::mem::size_of::<u64>(),
-                    dispatch_to: Redispatcher::to_instance(self.waiter_id, |result| match result {
-                        Ok(_) => AcquireReadyWaiterAction::Ready,
-                        Err(error) => {
-                            log::warn!("surface acquire waiter poll failed: {:?}", error);
-                            AcquireReadyWaiterAction::Failed
-                        }
+                let op_id = RingId::fresh();
+                self.op_id = Some(op_id);
+                match &self.wait_fd {
+                    AcquireWaitFd::Eventfd(fd) => dispatcher.dispatch(IoUringAction::Read {
+                        id: Some(op_id),
+                        fd: fd.as_raw_fd(),
+                        offset: 0,
+                        length: std::mem::size_of::<u64>(),
+                        dispatch_to: Redispatcher::to_instance(
+                            self.waiter_id,
+                            |result| match result {
+                                Ok(_) => AcquireReadyWaiterAction::Ready,
+                                Err(error) => {
+                                    log::warn!("surface acquire waiter read failed: {:?}", error);
+                                    AcquireReadyWaiterAction::Failed
+                                }
+                            },
+                        ),
                     }),
-                });
+                    AcquireWaitFd::SyncFile(fd) => dispatcher.dispatch(IoUringAction::Poll {
+                        id: Some(op_id),
+                        fd: fd.as_raw_fd(),
+                        dispatch_to: Redispatcher::to_instance(
+                            self.waiter_id,
+                            |result: io::Result<crate::io_uring::ring::PollCompleted>| match result
+                            {
+                                Ok(_) => AcquireReadyWaiterAction::Ready,
+                                Err(error) => {
+                                    log::warn!("surface acquire waiter poll failed: {:?}", error);
+                                    AcquireReadyWaiterAction::Failed
+                                }
+                            },
+                        ),
+                    }),
+                }
             }
             AcquireReadyWaiterAction::Ready => {
-                self.read_op_id = None;
-                let became_active = {
-                    let Some(mut surface) = self.surface.try_grab(state) else {
-                        dispatcher.stop_model(self.waiter_id);
-                        return Ok(());
-                    };
-                    surface.activate_blocked_if_waiter_ready(self.waiter_id)
-                };
-
-                if became_active {
-                    log::debug!(
-                        "surface acquire waiter fired: waiter_id={:?} surface={:?}",
-                        self.waiter_id,
-                        self.surface
-                    );
-                    if let Some(bounds) =
-                        state
-                            .root_surface_for_surface(self.surface)
-                            .and_then(|root_surface| {
-                                state.root_surface_surface_bounds_global(root_surface)
-                            })
-                    {
-                        request_outputs_for_rect(state, bounds, dispatcher);
-                    } else {
-                        request_active_output(state, dispatcher);
-                    }
+                // A poll is multishot: remove it. A read has already completed.
+                if let (Some(op_id), AcquireWaitFd::SyncFile(_)) =
+                    (self.op_id.take(), &self.wait_fd)
+                {
+                    dispatcher.dispatch(IoUringAction::PollRemove { target: op_id });
                 }
+                dispatcher.dispatch_to(
+                    self.surface.client_id(),
+                    crate::clients::ClientAction::AcquireWaitDone {
+                        surface: self.surface,
+                        waiter_id: self.waiter_id,
+                        failed: false,
+                    },
+                );
                 dispatcher.stop_model(self.waiter_id);
             }
             AcquireReadyWaiterAction::Failed => {
-                self.read_op_id = None;
+                self.op_id = None;
                 dispatcher.dispatch_to(
                     self.surface.client_id(),
-                    crate::clients::ClientAction::CancelBlockedSurface {
+                    crate::clients::ClientAction::AcquireWaitDone {
                         surface: self.surface,
                         waiter_id: self.waiter_id,
+                        failed: true,
                     },
                 );
                 dispatcher.stop_model(self.waiter_id);
             }
             AcquireReadyWaiterAction::Stop => {
-                if let Some(read_op_id) = self.read_op_id.take() {
-                    dispatcher.dispatch(IoUringAction::Cancel { target: read_op_id });
+                if let Some(op_id) = self.op_id.take() {
+                    match self.wait_fd {
+                        AcquireWaitFd::Eventfd(_) => {
+                            dispatcher.dispatch(IoUringAction::Cancel { target: op_id })
+                        }
+                        AcquireWaitFd::SyncFile(_) => {
+                            dispatcher.dispatch(IoUringAction::PollRemove { target: op_id })
+                        }
+                    }
                 }
             }
         }
@@ -394,9 +421,9 @@ impl AcquireReadyWaiter {
     pub fn new(
         waiter_id: AcquireReadyWaiterId,
         surface: Resolved<WlSurfaceId>,
-        poll_fd: OwnedFd,
+        wait_fd: AcquireWaitFd,
     ) -> Self {
-        Self { waiter_id, surface, poll_fd, read_op_id: None }
+        Self { waiter_id, surface, wait_fd, op_id: None }
     }
 }
 
@@ -416,5 +443,72 @@ pub fn resolve_unused_candidate_immediately(
             client_id,
             crate::clients::ClientAction::CompleteBufferReleaseCallbacks { callbacks },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::FromRawFd;
+
+    use {
+        super::*,
+        crate::{
+            clients::{ClientAction, ClientId},
+            runner::Model,
+            state::ObjectId,
+            test_support::state_for_tests,
+        },
+    };
+
+    fn pipe_read_end() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    fn surface() -> Resolved<WlSurfaceId> {
+        Resolved::new(ClientId::from_raw(3), WlSurfaceId::from(7), ObjectId::from(7usize))
+    }
+
+    #[test]
+    fn a_sync_file_waiter_polls_and_removes_its_poll() {
+        let mut state = state_for_tests();
+        let mut d = Dispatcher::default();
+        let (read, _write) = pipe_read_end();
+        let id = AcquireReadyWaiterId::from(5u64);
+        let mut waiter = AcquireReadyWaiter::new(id, surface(), AcquireWaitFd::SyncFile(read));
+        waiter
+            .process(&mut state, AcquireReadyWaiterAction::Start, &mut d)
+            .unwrap();
+        assert!(
+            d.test_has_queued_action::<IoUringAction>(|a| matches!(a, IoUringAction::Poll { .. }))
+        );
+        waiter
+            .process(&mut state, AcquireReadyWaiterAction::Ready, &mut d)
+            .unwrap();
+        assert!(d.test_has_queued_action::<IoUringAction>(|a| {
+            matches!(a, IoUringAction::PollRemove { .. })
+        }));
+        assert!(d.test_has_queued_action_for::<ClientAction, _>(ClientId::from_raw(3), |a| {
+            matches!(a, ClientAction::AcquireWaitDone { failed: false, .. })
+        }));
+    }
+
+    #[test]
+    fn a_stopped_sync_file_waiter_removes_its_poll() {
+        let mut state = state_for_tests();
+        let mut d = Dispatcher::default();
+        let (read, _write) = pipe_read_end();
+        let id = AcquireReadyWaiterId::from(6u64);
+        let mut waiter = AcquireReadyWaiter::new(id, surface(), AcquireWaitFd::SyncFile(read));
+        waiter
+            .process(&mut state, AcquireReadyWaiterAction::Start, &mut d)
+            .unwrap();
+        waiter
+            .process(&mut state, AcquireReadyWaiterAction::Stop, &mut d)
+            .unwrap();
+        assert!(d.test_has_queued_action::<IoUringAction>(|a| {
+            matches!(a, IoUringAction::PollRemove { .. })
+        }));
     }
 }

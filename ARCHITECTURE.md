@@ -1677,3 +1677,118 @@ This path does not take the compositor pointer grab and does not change the curs
 ### `xdg-dialog-v1`
 
 `xdg_wm_dialog_v1` and `xdg_dialog_v1` are `src/wayland_objects/xdg_dialog_v1.rs`. `get_xdg_dialog` attaches a dialog to an `xdg_toplevel`. A second dialog for a toplevel that still has one fails with `already_used`. After the dialog is destroyed, a new one may be created. Modal is a stored hint, exposed as IPC `Window.modal` (section 26). It has no focus, stacking, or input effect. A never-mapped toplevel with a dialog and a parent floats at its initial commit, and is centered over its parent (or over its output when the parent is not on the same workspace) on the next map. Remaps and later requests never change floating.
+
+## 28. Commit queue
+
+A `wl_surface.commit` runs in three steps. The check runs at request time and changes nothing. The capture moves everything the commit changes into one `ContentUpdate`. The apply puts that update on screen. An update whose apply is not yet allowed waits in its surface's queue. The surface's own state is in `src/wayland_objects/wl_surface.rs`. The update type is `wl_surface/content_update.rs`, and the queue is `wl_surface/commit_queue.rs`. The xdg and layer roles split their parts the same way in `xdg_surface.rs` and `zwlr_layer_surface_v1.rs`.
+
+### Check, capture, apply
+
+`WlSurface::on_commit` runs the role prologue first. The xdg check (`XdgSurface::check_commit`) and the layer check (`ZwlrLayerSurfaceV1::check_commit`) are read-only. They send their protocol errors there. Then the wl_surface checks run for mapping, explicit sync and representation. Only when all of them pass does the role capture (`take_commit_capture`) run, followed by `capture_commit`. A rejected commit leaves the xdg and layer state untouched.
+
+`capture_commit` builds the payload from the pending state. It takes the pending frame callbacks, presentation feedback, pointer constraint region and hint, and the xwayland serial. It takes the `cached_update` of each synchronized child in the pending stack, and the pending stack and child positions. These go into `ContentUpdate.children` and `ContentUpdate.tree`. It also numbers the commit with `next_update_seq`.
+
+Request-time checks read only state the capture maintains: `WlSurface.latest` (the newest committed buffer, color representation and regions, `LatestCommitted`), `latest_xwayland_serial`, the xdg surface's `initial_commit_requested`, a popup's `map_requested`, and a layer surface's `committed` and `initial_commit_requested`. They never read applied state. A null-buffer commit resets the role's `last_acked` configure at capture. The reset that happens at apply does not touch `last_acked`, so a buffer attached right after an unmap is checked against the reset state.
+
+`apply_update` runs the role part first when the update's role epoch still matches the surface's. It then runs `apply_content`. That applies the xwayland serial and the pointer constraint, then the captured subsurface tree, then the carried children (`apply_children`), then the surface content, in the order of the commit tail before this change.
+
+### Sequence and discard
+
+`next_update_seq` numbers commits from 1. An update covers `first_seq..=last_seq`, which spans more than one commit only after synchronized commits are merged. `applied_update_seq` is the highest `last_seq` that was applied or discarded for the surface.
+
+An update is ready only when `applied_update_seq + 1 >= first_seq`. The same check applies to every child update it carries. So a surface's updates apply in commit order, whether they sit in its own queue or inside a parent's update. A parent update waits for an earlier own update of a child, and a child's own update waits for the parent update that carries its earlier state. Surfaces with no subsurface relation do not depend on each other.
+
+Every path that drops an update calls `discard_update`. It raises `applied_update_seq` to the update's `last_seq`, releases the buffer, completes the release callbacks, discards the presentation feedback, and completes the frame callbacks with `done` and `delete_id`. The buffer's pixels stay valid, because the attached buffer holds its content by `Rc`. Discarding a parent also discards the children it carries.
+
+`dropped_through_seq` is set to `next_update_seq` by `drop_queued_updates`. That runs on destroy, on parent loss (which includes `wl_subsurface.destroy`), on role dismissal, and on detach of a subsurface tree. The surface's queue is emptied, its `cached_update` is discarded, its acquire waiter is stopped, and `latest.buffer` becomes `None`. A carried child update whose `last_seq` is at or below `dropped_through_seq` is discarded at apply and never applied. So an older parent update cannot map a subsurface whose role was destroyed.
+
+### Synchronized subsurfaces
+
+A commit on an effectively synchronized surface is captured and merged into `cached_update` by `merge_cached_update`. A merge keeps the newest payload, frame callbacks, presentation feedback, pointer constraint region and hint. It records the last sequence number and the role epoch of the newest commit. It always retires the buffer it replaces, so that buffer gets its `wl_buffer.release` and its explicit-sync release point signals.
+
+A parent's next commit carries each child's cached update, and `apply_children` applies them after the parent's tree. A grandchild's cached state is captured by the child's commit. A grandchild commit made after the child's last commit waits for the child's next commit. A child destroyed while its update is carried is discarded and its buffer is released.
+
+`wl_subsurface.set_desync` submits a released cached update as a normal update of the child, through `submit_cached_if_parent_desynchronized`. That runs the full commit tail for the released state, including the output refresh and the root geometry update.
+
+### Role epoch
+
+`WlSurface.role_epoch` changes whenever the role object changes. The role setters call `bump_role_epoch` on success. So do `destroy_toplevel_role` and `destroy_popup_role` when the role matched. `set_xwayland_surface_object` and `clear_xwayland_surface_object` do not change it. An update captured under another epoch applies its surface content and skips its xdg or layer part. A destroyed toplevel therefore does not receive a configure from an update captured before it was destroyed.
+
+The xwayland serial is not gated by the epoch. It applies with its update, and destroying the `xwayland_surface_v1` object leaves an association that was already made alone. A pointer constraint update records the constraint it was captured for. At apply, a different constraint drops the region and the hint.
+
+### Explicit sync
+
+An update waits while its acquire point (`payload.sync.acquire`, or that of a carried child) is not signaled. The xdg, layer and lock parts of that commit wait with it. Each surface has at most one acquire waiter, for the first unsignaled point of its queue head (`WlSurface.acquire_waiter`). When the waiter fires, it sends `ClientAction::AcquireWaitDone`. That clears the waiter and flushes the client. A timeline point is waited through an eventfd armed by `syncobj_eventfd`. A sync file is waited with an io_uring poll on a copy of its fd, which the waiter removes when it fires or stops.
+
+If the waiter cannot be created, or it reports a failure, the head update is applied with `acquire_forced` set, and a warning is logged. The renderer still waits on the fence before scanout. A newer commit never drops a queued update, so the single blocked-buffer slot of the earlier design is gone.
+
+### Implicit sync
+
+A commit that attaches a dma-buf without explicit sync takes a snapshot of the buffer's write fences at capture (`content_update::implicit_fences`). Each plane's fences are exported with `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and the read flag, and fences that already signaled are dropped. The rest go into `ContentUpdate.implicit_fences`, not into `payload.sync.acquire`, so the renderer, direct scanout and buffer release see the same state as before.
+
+`readiness` treats an unsignaled implicit fence like an unsignaled acquire point: the update waits, through the same per-surface waiter, and a carried child's fence holds its parent. `acquire_forced` skips the fences too. A merged synchronized commit that attaches a new buffer replaces the fences; one without a buffer keeps them. jay and Hyprland wait the same way.
+
+While a client's fence is pending, its previous buffer stays on screen and tema's frame does not wait for the client. The renderer's own implicit wait is kept; by then the fence has signaled. On a kernel without the export ioctl (before 5.20), no fences are taken, a warning is logged once, and commits apply at once as before.
+
+### Limits
+
+A client may have at most 256 updates queued across all its surfaces (`MAX_QUEUED_UPDATES_PER_CLIENT`). The 257th is discarded. The client receives `wl_display.error` with `no_memory` on that surface and is disconnected. A queued update holds one file descriptor per unsignaled implicit fence of its buffer, and none otherwise. A waiter exists only per surface whose queue head waits on an acquire point or an implicit fence. `ClientAction::FlushCommitQueues` flushes one client's queues. Closing the client removes its queue index.
+
+### Behavior changes
+
+1. Explicit sync: an update is no longer dropped when a newer commit arrives before its fence signals. Updates apply in order.
+2. Explicit sync: the xdg, layer and lock parts of a commit wait for the fence together with the buffer.
+3. `wl_subsurface.set_desync` runs the full commit tail for the released cached state, not only the content apply.
+4. The xwayland serial association is sent when its update is applied.
+5. Nested synchronized subsurfaces: a grandchild's cached state is captured by the child's commit, not by the parent's. A grandchild commit made after the child's last commit waits for the child's next commit.
+6. A synchronized subsurface's pointer constraint region and hint apply when its cached state is applied with the parent, not at the child's commit.
+7. Unchanged: `xdg_surface.ack_configure` still applies its configure effects at request time. With a queued buffer, the configure can take effect before the buffer is shown.
+8. Merging synchronized commits always retires the replaced cached buffer. Before, only a buffer with release callbacks was retired.
+9. Implicit sync: a commit whose dma-buf is still being written waits in the queue instead of making the renderer wait. Until its fence signals, the previous buffer stays on screen.
+
+### Tests
+
+The queue regression tests are in `wl_surface.rs` `mod tests`. They keep an update queued with `test_hold_next_commit`, and apply it with `test_release_head` followed by `ClientAction::FlushCommitQueues`. They cover a carried update of a destroyed subsurface, cursor offsets, the xwayland serial, pointer constraints, lock, layer and xdg surfaces, frame callbacks and presentation feedback.
+
+### Manual check
+
+1. Run a Vulkan application with explicit sync, such as `vkcube`, and resize its window while it runs. Frames are neither dropped nor shown out of order, and the log has no new warnings.
+2. Run a GL client without explicit sync, such as `glxgears` under Xwayland or `weston-simple-egl`, next to a window that keeps tema busy. With `RUST_LOG=debug`, no frame of tema is late because of the client, and the log has no fence export warning on a current kernel.
+
+## 29. Frame pacing: fifo and commit timing
+
+`wp_fifo_v1` and `wp_commit_timer_v1` add two reasons for an update to wait in its surface's queue (section 28). `Readiness::WaitFifo` holds an update that waits for a barrier. `Readiness::WaitTime` holds an update that has a target time. Nothing holds a whole client. The gate state, the timerfd model and the latch hooks are in `src/commit_gate.rs`. The objects are `src/wayland_objects/wp_fifo_v1.rs`, `wp_fifo_manager_v1.rs`, `wp_commit_timer_v1.rs` and `wp_commit_timing_manager_v1.rs`. Both managers are advertised to every client, Xwayland included.
+
+### Barrier lifetime
+
+`wp_fifo_v1.set_barrier` sets a barrier on the surface when its update applies. The barrier is replaced by a newer one on the same surface. Each barrier has a sequence number, and a latch acts only on the barrier it saw. An update with `wait_barrier` waits in the queue while its surface holds a barrier.
+
+A hard latch clears the barrier. A hard latch is a frame submitted to KMS without async flip on the surface's active output (or on any output when the surface has none), with the surface in the frame's callback surfaces. A soft latch shortens the barrier's deadline to `min(deadline, now + one period of that output)`. A soft latch is one of three things: an async (tearing) submission with the surface in the frame; a `NoPresent` frame with the surface in its frame callback surfaces; or any latch of the surface's active output while the surface is not in that frame (occluded). A tearing frame never clears a barrier. `note_latched` runs inside the DRM submit path and reads only the gate: it records each barrier's sequence number and whether its surface was in the frame. The `OutputLatched` action reads the surfaces' active outputs and applies the rules above. So while any barrier exists, every latch of every output queues one `OutputLatched` action, and a surface's active output is the one it has when the action runs.
+
+A barrier also has a fallback deadline, set when the barrier is set. It is 25 ms when the surface has no active output, when that output has no frame scheduler snapshot, when the session is inactive, or when the snapshot's clock mode is `Passive`. Otherwise it is `max(100 ms, 4 × period)`. The long fallback never ends a barrier before a real latch of a visible surface. An occluded surface on the output gets soft latches instead.
+
+Clearing or expiring a barrier sends `ClientAction::FlushCommitQueues` to the surface's client. The commit gate timerfd wakes at the earliest barrier or timed-wait deadline. A destroyed surface, or a closed client, loses its barrier and its timed wait.
+
+### Ready time
+
+A commit with a target time (`wp_commit_timer_v1.set_timestamp`) is ready at `ready_at_with_now`. The target is used as is unless the output's frame clock can predict its vblanks. Prediction needs all of these: the surface is on one output or none, its clock mode is `Fixed` and it is not tearing, the last present has `refresh_is_constant`, is not an async flip and has a kernel timestamp, and that present is no more than 8 periods old. Any other case uses the target.
+
+When prediction applies, the period comes from the nominal refresh and the margin is `min(period / 4, 2 ms)`. Let `base` be the last present's time. If `target + margin <= base`, the update is ready at `base`. Otherwise `k` is the smallest count that makes `base + k × period` at least `target + margin`, and the update is ready at `base + (k − 1) × period + margin`. So the ready time is one margin after the vblank before the target vblank. This holds even when that vblank is the last present. A grid that is late by less than the margin cannot show the update early. Late is allowed, and early is not. No lead is subtracted from the target.
+
+Timestamps are `CLOCK_MONOTONIC` values converted to `Instant`. A timestamp more than 24 h ahead is clamped to 24 h from now, including one that converts successfully. A timestamp that cannot be converted is clamped the same way when it is in the future, and to now when it is in the past. `tv_nsec` above 999 999 999, or `tv_sec_hi` above `0x7fffffff`, is an `invalid_timestamp` error.
+
+The frame clock records what the ready time needs. `PresentFlags` carries `async_flip` and `kernel_timestamp`. `FrameClock::update_mode` forgets the last present when the clock mode or the nominal refresh changes.
+
+### Children's targets
+
+A synchronized child's target time is folded into its parent's update with `max`, and so is each carried child's. The parent update is ready only when the latest of these targets is ready. A child's barrier set flag is carried too: when the parent's update applies, the barrier is set on the child. A synchronized child's wait-barrier flag is cleared before its commit is cached, so the child never waits for a barrier while it is synchronized. The flag stays cleared if the child later becomes desynchronized and its cached state is submitted on its own.
+
+Merging two commits keeps the stronger constraints: set and wait flags are OR-ed, and the later target time wins.
+
+### Xwayland
+
+The two managers are ordinary globals at version 1, advertised to every client, Xwayland included. Xwayland surfaces use the same barrier and target-time paths as other surfaces. Their latches come from the same DRM submit paths.
+
+### Non-goals
+
+tema does not move a variable-refresh output toward the target time. For a variable-refresh output, the target is used as is. Targets are not predicted across more than one output: with two or more outputs the target is used as is. The fallback deadlines are not configurable, and there is no config option for either protocol. A barrier does not make a surface wait for another surface's barrier.

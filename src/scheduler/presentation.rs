@@ -49,6 +49,8 @@ pub(crate) struct PresentedSubmission {
     pub feedbacks: Vec<SubmissionPresentationFeedback>,
     pub zero_copy: bool,
     pub async_flip: bool,
+    /// The present timestamp came from the kernel's monotonic clock.
+    pub kernel_timestamp: bool,
     pub present_time: Instant,
     pub sequence: u64,
     pub tv_sec_hi: u32,
@@ -95,6 +97,7 @@ impl PresentationSubsystem {
             zero_copy: submission.zero_copy,
             async_flip: submission.async_flip,
             present_time: timestamp.present_time,
+            kernel_timestamp: timestamp.kernel_timestamp,
             sequence,
             tv_sec_hi: (timestamp.tv_sec >> 32) as u32,
             tv_sec_lo: timestamp.tv_sec as u32,
@@ -406,6 +409,30 @@ mod tests {
         assert!(timestamp.tv_sec > 0);
         assert!(timestamp.tv_nsec < 1_000_000_000);
     }
+
+    #[test]
+    fn kernel_timestamp_is_false_on_fallback() {
+        let timestamp = sanitize_present_timestamp(1, 2_000_000);
+        assert!(!timestamp.kernel_timestamp);
+    }
+
+    #[test]
+    fn monotonic_to_instant_round_trips_now() {
+        let (_, sec, nsec) = sample_monotonic_now().unwrap();
+        let at = monotonic_to_instant(sec, nsec);
+        let now = Instant::now();
+        let drift = if at > now { at - now } else { now - at };
+        assert!(drift < Duration::from_millis(1));
+    }
+
+    #[test]
+    fn monotonic_to_instant_far_future_is_one_day() {
+        let before = Instant::now();
+        let at = monotonic_to_instant(i64::MAX as u64, 0);
+        let after = Instant::now();
+        assert!(at >= before + FAR_FUTURE - Duration::from_secs(1));
+        assert!(at <= after + FAR_FUTURE);
+    }
 }
 
 pub const WP_PRESENTATION_FEEDBACK_PRESENTED_REFRESH_RELAXED_SINCE: u32 = 2;
@@ -446,6 +473,26 @@ pub(crate) struct SanitizedPresentTimestamp {
     pub tv_sec: u64,
     pub tv_nsec: u32,
     pub present_time: Instant,
+    /// True only when `present_time` was converted from the kernel's timestamp.
+    pub kernel_timestamp: bool,
+}
+
+/// How far ahead of now a timestamp may be before it is treated as far future.
+const FAR_FUTURE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Converts a `CLOCK_MONOTONIC` timestamp to an `Instant`. A timestamp that cannot be
+/// represented is clamped to one day ahead, or to now when it is in the past.
+pub(crate) fn monotonic_to_instant(sec: u64, nsec: u32) -> Instant {
+    let Some((now_instant, now_sec, now_nsec)) = sample_monotonic_now() else {
+        return Instant::now();
+    };
+    // A timestamp far ahead converts successfully (Instant can hold it), so the
+    // 24 h clamp applies to the converted value too, not only to a failed
+    // conversion.
+    let far = now_instant + FAR_FUTURE;
+    monotonic_timestamp_to_instant(now_instant, now_sec, now_nsec, sec, nsec)
+        .map(|at| at.min(far))
+        .unwrap_or_else(|| if sec >= now_sec { far } else { now_instant })
 }
 
 pub(crate) fn sanitize_present_timestamp(tv_sec: u32, tv_usec: u32) -> SanitizedPresentTimestamp {
@@ -453,12 +500,12 @@ pub(crate) fn sanitize_present_timestamp(tv_sec: u32, tv_usec: u32) -> Sanitized
     if tv_usec < 1_000_000 && tv_sec > 2 {
         let tv_sec = u64::from(tv_sec);
         let tv_nsec = tv_usec.saturating_mul(1000);
-        let present_time = sampled_now
-            .and_then(|(now_instant, now_sec, now_nsec)| {
-                monotonic_timestamp_to_instant(now_instant, now_sec, now_nsec, tv_sec, tv_nsec)
-            })
-            .unwrap_or_else(Instant::now);
-        return SanitizedPresentTimestamp { tv_sec, tv_nsec, present_time };
+        let converted = sampled_now.and_then(|(now_instant, now_sec, now_nsec)| {
+            monotonic_timestamp_to_instant(now_instant, now_sec, now_nsec, tv_sec, tv_nsec)
+        });
+        let kernel_timestamp = converted.is_some();
+        let present_time = converted.unwrap_or_else(Instant::now);
+        return SanitizedPresentTimestamp { tv_sec, tv_nsec, present_time, kernel_timestamp };
     }
 
     let Some((present_time, tv_sec, tv_nsec)) = sampled_now else {
@@ -466,12 +513,13 @@ pub(crate) fn sanitize_present_timestamp(tv_sec: u32, tv_usec: u32) -> Sanitized
             tv_sec: u64::from(tv_sec),
             tv_nsec: tv_usec.min(999_999).saturating_mul(1000),
             present_time: Instant::now(),
+            kernel_timestamp: false,
         };
     };
-    SanitizedPresentTimestamp { tv_sec, tv_nsec, present_time }
+    SanitizedPresentTimestamp { tv_sec, tv_nsec, present_time, kernel_timestamp: false }
 }
 
-fn sample_monotonic_now() -> Option<(Instant, u64, u32)> {
+pub(crate) fn sample_monotonic_now() -> Option<(Instant, u64, u32)> {
     let present_time = Instant::now();
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
@@ -484,7 +532,7 @@ fn sample_monotonic_now() -> Option<(Instant, u64, u32)> {
     ))
 }
 
-fn monotonic_timestamp_to_instant(
+pub(crate) fn monotonic_timestamp_to_instant(
     now_instant: Instant,
     now_sec: u64,
     now_nsec: u32,

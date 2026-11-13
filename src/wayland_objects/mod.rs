@@ -51,8 +51,12 @@ pub mod wp_alpha_modifier_surface_v1;
 pub mod wp_alpha_modifier_v1;
 pub mod wp_color_representation_manager_v1;
 pub mod wp_color_representation_surface_v1;
+pub mod wp_commit_timer_v1;
+pub mod wp_commit_timing_manager_v1;
 pub mod wp_cursor_shape_device_v1;
 pub mod wp_cursor_shape_manager_v1;
+pub mod wp_fifo_manager_v1;
+pub mod wp_fifo_v1;
 pub mod wp_fractional_scale_manager_v1;
 pub mod wp_fractional_scale_v1;
 pub mod wp_linux_drm_syncobj_manager_v1;
@@ -222,10 +226,6 @@ fake_obj! {
     { zwp_tablet_v2, ZwpTabletV2 },
     { zwp_tablet_tool_v2, ZwpTabletToolV2 },
     { zwp_tablet_seat_v2, ZwpTabletSeatV2 },
-    { wp_fifo_manager_v1, WpFifoManagerV1 },
-    { wp_fifo_v1, WpFifoV1 },
-    { wp_commit_timing_manager_v1, WpCommitTimingManagerV1 },
-    { wp_commit_timer_v1, WpCommitTimerV1 },
 }
 
 pub mod xdg_wm_dialog_v1 {

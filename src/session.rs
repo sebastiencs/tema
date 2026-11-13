@@ -610,23 +610,15 @@ mod tests {
         let mut xdg = shell
             .client
             .grab_object(XdgSurfaceId::from(21), &mut shell.state);
-        let role_changes = xdg
-            .on_commit(
-                &mut shell.client,
-                &mut shell.state,
-                &mut client_dispatcher,
-                None,
-                false,
-                false,
-                None,
-            )
-            .expect("initial commit");
-        xdg.apply_commit_role_changes(
+        xdg.test_commit(
             &mut shell.client,
             &mut shell.state,
             &mut client_dispatcher,
-            role_changes,
-        );
+            false,
+            false,
+            None,
+        )
+        .expect("initial commit");
     }
 
     fn messages(dispatcher: &Dispatcher) -> Vec<(u32, u32, Vec<u8>)> {

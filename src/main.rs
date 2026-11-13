@@ -172,6 +172,7 @@ mod buffer_content;
 mod capture;
 mod clients;
 mod color;
+mod commit_gate;
 mod config;
 mod cursor;
 mod dbus;
@@ -373,6 +374,7 @@ fn start_compositor(forker: Option<process::ForkerHandle>) -> Result<ExitOutcome
     runner.add_model(udev);
     runner.add_model(libinput);
     runner.add_model(Box::new(scheduler::IdleScheduler::new()));
+    runner.add_model(Box::new(commit_gate::CommitGateModel::new()));
     if start_session_store {
         runner.add_model(Box::new(
             session_store::model::SessionStoreModel::new().map_err(StartupError::SessionStore)?,

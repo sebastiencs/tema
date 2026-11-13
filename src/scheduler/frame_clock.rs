@@ -48,6 +48,10 @@ pub struct TimingHints {
 pub struct PresentFlags {
     pub zero_copy: bool,
     pub refresh_is_constant: bool,
+    /// The flip was an async (tearing) flip.
+    pub async_flip: bool,
+    /// The present timestamp came from the kernel's monotonic clock.
+    pub kernel_timestamp: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +202,13 @@ impl FrameClock {
     }
 
     pub fn update_mode(&mut self, mode: FrameClockMode, nominal_refresh_millihz: u32) {
+        let refresh_changed =
+            nominal_refresh_millihz > 0 && nominal_refresh_millihz != self.nominal_refresh_millihz;
+        if mode != self.mode || refresh_changed {
+            // A present from the old mode or refresh says nothing about the new one.
+            self.last_present = None;
+            self.present_intervals.clear();
+        }
         self.mode = mode;
         if nominal_refresh_millihz > 0 {
             self.nominal_refresh_millihz = nominal_refresh_millihz;
@@ -575,6 +586,46 @@ fn merge_max_present(lhs: Option<Instant>, rhs: Option<Instant>) -> Option<Insta
 mod tests {
     use super::*;
 
+    fn sample_at(present_time: Instant) -> PresentSample {
+        PresentSample {
+            present_time,
+            sequence: 1,
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: true,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
+            timing: None,
+        }
+    }
+
+    #[test]
+    fn mode_or_refresh_change_forgets_the_last_present() {
+        let mut clock = FrameClock::new();
+        clock.update_mode(FrameClockMode::Fixed, 60_000);
+        clock.notify_presented(sample_at(Instant::now()));
+        assert!(clock.snapshot().last_present.is_some());
+
+        clock.update_mode(FrameClockMode::Passive, 60_000);
+        assert!(clock.snapshot().last_present.is_none());
+
+        clock.update_mode(FrameClockMode::Fixed, 60_000);
+        clock.notify_presented(sample_at(Instant::now()));
+        clock.update_mode(FrameClockMode::Fixed, 144_000);
+        assert!(clock.snapshot().last_present.is_none());
+    }
+
+    #[test]
+    fn same_mode_keeps_the_last_present() {
+        let mut clock = FrameClock::new();
+        clock.update_mode(FrameClockMode::Fixed, 60_000);
+        clock.notify_presented(sample_at(Instant::now()));
+        clock.update_mode(FrameClockMode::Fixed, 60_000);
+        clock.update_mode(FrameClockMode::Fixed, 0);
+        assert!(clock.snapshot().last_present.is_some());
+    }
+
     #[test]
     fn fixed_mode_waits_until_render_deadline() {
         let mut clock = FrameClock::new();
@@ -583,7 +634,12 @@ mod tests {
         clock.notify_presented(PresentSample {
             present_time: now,
             sequence: 1,
-            flags: PresentFlags { zero_copy: false, refresh_is_constant: true },
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: true,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
             timing: None,
         });
         clock.request_frame(RequestFrameReason::Damage);
@@ -645,7 +701,12 @@ mod tests {
         clock.notify_presented(PresentSample {
             present_time: Instant::now(),
             sequence: 1,
-            flags: PresentFlags { zero_copy: false, refresh_is_constant: true },
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: true,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
             timing: Some(PresentTiming {
                 path: PresentPath::Composited,
                 scene_build_duration: Duration::from_millis(2),
@@ -671,7 +732,12 @@ mod tests {
             clock.notify_presented(PresentSample {
                 present_time: base,
                 sequence: 1,
-                flags: PresentFlags { zero_copy: false, refresh_is_constant: true },
+                flags: PresentFlags {
+                    zero_copy: false,
+                    refresh_is_constant: true,
+                    async_flip: false,
+                    kernel_timestamp: true,
+                },
                 timing: None,
             });
             clock.request_frame(RequestFrameReason::Damage);
@@ -692,13 +758,23 @@ mod tests {
         clock.notify_presented(PresentSample {
             present_time: base,
             sequence: 1,
-            flags: PresentFlags { zero_copy: false, refresh_is_constant: true },
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: true,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
             timing: None,
         });
         clock.notify_presented(PresentSample {
             present_time: base + Duration::from_secs(1),
             sequence: 2,
-            flags: PresentFlags { zero_copy: false, refresh_is_constant: true },
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: true,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
             timing: None,
         });
         clock.request_frame(RequestFrameReason::Damage);
@@ -720,7 +796,12 @@ mod tests {
         clock.notify_presented(PresentSample {
             present_time: base,
             sequence: 1,
-            flags: PresentFlags { zero_copy: false, refresh_is_constant: false },
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: false,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
             timing: None,
         });
         clock.update_timing_hints(TimingHints {
@@ -739,7 +820,12 @@ mod tests {
         PresentSample {
             present_time,
             sequence: 1,
-            flags: PresentFlags { zero_copy: false, refresh_is_constant: true },
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: true,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
             timing: None,
         }
     }
@@ -826,7 +912,12 @@ mod tests {
         clock.notify_presented(PresentSample {
             present_time: base,
             sequence: 1,
-            flags: PresentFlags { zero_copy: false, refresh_is_constant: true },
+            flags: PresentFlags {
+                zero_copy: false,
+                refresh_is_constant: true,
+                async_flip: false,
+                kernel_timestamp: true,
+            },
             timing: None,
         });
         let before = clock.snapshot().render_budget;

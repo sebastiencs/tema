@@ -201,7 +201,7 @@ pub(super) fn attach_implicit_read_fence(
 }
 
 fn implicit_sync_unsupported(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::ENOTTY) | Some(libc::EINVAL))
+    crate::dmabuf::sync_file_export_unsupported(error)
 }
 
 fn poll_dma_bufs(planes: &[&OwnedFd]) -> Result<(), crate::render::RendererError> {

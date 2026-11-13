@@ -116,7 +116,7 @@ mod tests {
             wl_buffer::{NewDmabufWlBufferParams, NewWlBufferParams, WlBuffer},
             wl_shm_pool::shared_memory_from_bytes,
             wl_surface::{Role, WlSurface},
-            xdg_surface::{CommitRoleChanges, XdgSurface},
+            xdg_surface::{XdgCommitCapture, XdgSurface},
             xdg_toplevel_icon_v1::XdgToplevelIconV1,
         },
     };
@@ -298,11 +298,16 @@ mod tests {
             .objects
             .grab_object::<XdgSurface>(fixture.xdg_surface.object_id());
         let mut client_dispatcher = fixture.client.test_dispatcher(&mut fixture.dispatcher);
+        let icon = xdg_surface
+            .toplevel_role()
+            .and_then(|toplevel| toplevel.try_grab(&mut fixture.state))
+            .and_then(|mut toplevel| toplevel.take_pending_icon());
         xdg_surface.apply_commit_role_changes(
             &mut fixture.client,
             &mut fixture.state,
             &mut client_dispatcher,
-            CommitRoleChanges::default(),
+            Default::default(),
+            &XdgCommitCapture { icon, ..Default::default() },
         );
     }
 

@@ -671,6 +671,9 @@ impl Runner {
                     self.stop_loaded_singleton::<crate::config::ConfigWatcher>(&mut dispatcher);
                     self.stop_loaded_singleton::<crate::drm::VisualAnimationPump>(&mut dispatcher);
                     self.stop_loaded_singleton::<crate::scheduler::IdleScheduler>(&mut dispatcher);
+                    self.stop_loaded_singleton::<crate::commit_gate::CommitGateModel>(
+                        &mut dispatcher,
+                    );
                     self.maybe_remove_models(&mut dispatcher);
                     continue;
                 }

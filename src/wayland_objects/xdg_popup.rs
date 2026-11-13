@@ -38,7 +38,8 @@ pub struct XdgPopup {
     current_geometry: RectI,
     pending_reposition_token: Option<u32>,
     explicit_grab: bool,
-    mapped: bool,
+    /// Set when the popup's map commit is captured (request time).
+    map_requested: bool,
 }
 
 impl XdgPopup {
@@ -64,7 +65,7 @@ impl XdgPopup {
             current_geometry,
             pending_reposition_token: None,
             explicit_grab: false,
-            mapped: false,
+            map_requested: false,
         }
     }
 
@@ -90,12 +91,13 @@ impl XdgPopup {
         }
     }
 
-    pub fn mark_mapped(&mut self) {
-        self.mapped = true;
+    pub(crate) fn set_map_requested(&mut self, value: bool) {
+        self.map_requested = value;
     }
 
-    pub fn mark_unmapped(&mut self) {
-        self.mapped = false;
+    #[cfg(test)]
+    pub(crate) fn test_map_requested(&self) -> bool {
+        self.map_requested
     }
 
     pub fn apply_acked_configure(&mut self, geometry: RectI) {
@@ -117,7 +119,7 @@ impl XdgPopup {
         if !matches!(self.parent, PopupParent::None) {
             return Err(AssignLayerParentError::AlreadyHasParent);
         }
-        if self.mapped {
+        if self.map_requested {
             return Err(AssignLayerParentError::AlreadyMapped);
         }
         self.parent = PopupParent::LayerSurface(layer_surface);
@@ -234,7 +236,7 @@ impl XdgPopup {
     }
 
     pub fn dismiss(&mut self, dispatcher: &mut ClientDispatcher) {
-        self.mapped = false;
+        self.map_requested = false;
         self.explicit_grab = false;
         self.send_event(xdg_popup::Event::PopupDone, dispatcher);
     }
@@ -303,7 +305,7 @@ impl Object for XdgPopup {
                 });
             }
             Grab { seat, serial } => {
-                if self.mapped {
+                if self.map_requested {
                     self.send_error(
                         client,
                         dispatcher,
@@ -412,7 +414,7 @@ impl PostAction for PostXdgPopup {
                 }
                 if xdg_surface.exists(state) {
                     let mut xdg_surface = xdg_surface.grab(state);
-                    xdg_surface.destroy_popup_role(popup);
+                    xdg_surface.destroy_popup_role(state, popup);
                 }
                 client.delete_id(
                     &WlDisplay::default(),
