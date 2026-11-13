@@ -177,7 +177,9 @@ impl Object for WlSubsurface {
                     return Ok(());
                 };
                 surface.set_subsurface_sync_mode(false);
-                surface.apply_cached_if_parent_desynchronized(client, state, dispatcher);
+                WlSurface::submit_cached_if_parent_desynchronized(
+                    surface, client, state, dispatcher,
+                );
             }
         }
         Ok(())

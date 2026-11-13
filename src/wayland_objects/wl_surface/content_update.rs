@@ -22,6 +22,15 @@ pub(crate) struct ContentUpdate {
     pub(super) role: RoleUpdate,
     /// The subsurface stack and child positions at capture.
     pub(super) tree: TreeUpdate,
+    /// The cached updates of synchronized children, taken at capture.
+    pub(super) children: Vec<ChildUpdate>,
+}
+
+/// A synchronized child's cached update, carried by its parent's update.
+#[derive(Debug)]
+pub(crate) struct ChildUpdate {
+    pub(super) surface: Resolved<WlSurfaceId>,
+    pub(super) update: Box<ContentUpdate>,
 }
 
 /// The subsurface tree as it was pending when the commit was captured.
@@ -74,6 +83,7 @@ impl ContentUpdate {
             acquire_forced: false,
             role: RoleUpdate::None,
             tree: TreeUpdate::default(),
+            children: Vec::new(),
         }
     }
 
@@ -148,7 +158,19 @@ impl ContentUpdate {
         self.acquire_forced |= next.acquire_forced;
         self.role = next.role;
         self.tree = next.tree;
-        std::mem::replace(&mut self.presentation_feedbacks, next.presentation_feedbacks)
+        let mut discarded =
+            std::mem::replace(&mut self.presentation_feedbacks, next.presentation_feedbacks);
+        for child in next.children {
+            match self
+                .children
+                .iter_mut()
+                .find(|carried| carried.surface == child.surface)
+            {
+                Some(carried) => discarded.extend(carried.update.merge(*child.update, retired)),
+                None => self.children.push(child),
+            }
+        }
+        discarded
     }
 }
 
@@ -178,4 +200,14 @@ pub(super) fn discard_update(
     }
     WlSurface::discard_feedbacks(client, state, dispatcher, update.presentation_feedbacks);
     WlSurface::complete_frame_callbacks(client, state, dispatcher, update.frame_callbacks);
+    for child in update.children {
+        let mut seq = child
+            .surface
+            .try_ref(state)
+            .map_or(0, |s| s.applied_update_seq);
+        discard_update(client, state, dispatcher, &mut seq, *child.update);
+        if let Some(owner) = child.surface.try_ref_mut(state) {
+            owner.applied_update_seq = owner.applied_update_seq.max(seq);
+        }
+    }
 }

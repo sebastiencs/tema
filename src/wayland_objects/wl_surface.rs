@@ -330,6 +330,20 @@ pub struct WlSurface {
 /// Committed image description. `None` in the outer commit slot means unchanged.
 pub(crate) type SurfaceColor = (Rc<ImageDescription>, RenderIntent);
 
+/// Applies `split` to the feedbacks of an update and of every child update it
+/// carries, returning the discarded ones.
+fn split_update_feedbacks(
+    update: &mut ContentUpdate,
+    split: &impl Fn(&mut Vec<SurfacePresentationFeedback>, &State) -> Vec<SurfacePresentationFeedback>,
+    state: &State,
+) -> Vec<SurfacePresentationFeedback> {
+    let mut discarded = split(&mut update.presentation_feedbacks, state);
+    for child in &mut update.children {
+        discarded.extend(split_update_feedbacks(&mut child.update, split, state));
+    }
+    discarded
+}
+
 fn surface_color_changed(
     current: &Option<SurfaceColor>,
     pending: &Option<Option<SurfaceColor>>,
@@ -2814,53 +2828,28 @@ impl WlSurface {
             || blur_changed
     }
 
-    fn apply_cached_update(
+    /// Applies the carried updates of synchronized children, in stack order.
+    /// A child destroyed since the capture has its update discarded.
+    fn apply_children(
         &mut self,
         client: &mut Client,
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
-        surface_behaves_synchronized: bool,
-    ) -> bool {
-        let Some(cached) = self.cached_update.take() else {
-            return false;
-        };
-        let (changed, needs_frame) =
-            self.apply_content(client, state, dispatcher, cached, surface_behaves_synchronized);
-        changed || needs_frame
-    }
-
-    fn release_synchronized_children(
-        &mut self,
-        client: &mut Client,
-        state: &mut State,
-        dispatcher: &mut ClientDispatcher,
-        surface_behaves_synchronized: bool,
+        children: Vec<content_update::ChildUpdate>,
     ) -> bool {
         let mut changed = false;
-        let stack = self.tree.current_stack.clone();
-        for entry in stack {
-            let StackEntry::Child(child_surface_id) = entry else {
+        for child in children {
+            let Some(mut child_surface) = child.surface.try_grab(state) else {
+                if child.surface.exists(state) {
+                    unreachable!("carried child grabbed during parent apply");
+                }
+                let mut seq = 0;
+                content_update::discard_update(client, state, dispatcher, &mut seq, *child.update);
                 continue;
             };
-            let child_behaves_synchronized = {
-                let Some(child_surface) = child_surface_id.try_ref(state) else {
-                    continue;
-                };
-                surface_behaves_synchronized
-                    || child_surface.sync_mode() == Some(SubsurfaceSyncMode::Sync)
-            };
-            if !child_behaves_synchronized {
-                continue;
-            }
-            let Some(mut child_surface) = child_surface_id.try_grab(state) else {
-                continue;
-            };
-            changed |= child_surface.apply_cached_update(
-                client,
-                state,
-                dispatcher,
-                child_behaves_synchronized,
-            );
+            let (child_changed, child_needs_frame) =
+                child_surface.apply_content(client, state, dispatcher, *child.update);
+            changed |= child_changed || child_needs_frame;
         }
         changed
     }
@@ -2871,7 +2860,6 @@ impl WlSurface {
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
         update: ContentUpdate,
-        surface_behaves_synchronized: bool,
     ) -> (bool, bool) {
         let this = client.resolve(self.id, state).unwrap();
         self.apply_xwayland_serial(client, this, update.xwayland_serial, dispatcher);
@@ -2894,12 +2882,7 @@ impl WlSurface {
             .seat
             .apply_cursor_surface_offset(this, payload.offset.0, payload.offset.1);
         changed |= self.apply_tree(state, &update.tree);
-        changed |= self.release_synchronized_children(
-            client,
-            state,
-            dispatcher,
-            surface_behaves_synchronized,
-        );
+        changed |= self.apply_children(client, state, dispatcher, update.children);
         let (discarded_feedbacks, needs_presentation_frame) =
             self.route_presentation_feedbacks(update.presentation_feedbacks);
         Self::discard_feedbacks(client, state, dispatcher, discarded_feedbacks);
@@ -3033,9 +3016,29 @@ impl WlSurface {
 
     /// Request-time half of a commit, after every check passed: moves the
     /// pending state into one `ContentUpdate`.
+    /// Request-time capture of the cached update of every synchronized child in
+    /// the pending stack. The parent's update carries them.
+    fn capture_children(&self, state: &mut State) -> Vec<content_update::ChildUpdate> {
+        let mut children = Vec::new();
+        for entry in &self.tree.pending_stack {
+            let StackEntry::Child(child_id) = *entry else {
+                continue;
+            };
+            let Some(child) = child_id.try_ref_mut(state) else {
+                continue;
+            };
+            let Some(update) = child.cached_update.take() else {
+                continue;
+            };
+            children
+                .push(content_update::ChildUpdate { surface: child_id, update: Box::new(update) });
+        }
+        children
+    }
+
     fn capture_commit(
         &mut self,
-        state: &State,
+        state: &mut State,
         dispatcher: &mut ClientDispatcher,
     ) -> ContentUpdate {
         self.next_update_seq += 1;
@@ -3065,6 +3068,7 @@ impl WlSurface {
             self.latest_xwayland_serial = update.xwayland_serial;
         }
         update.tree = self.capture_tree(state);
+        update.children = self.capture_children(state);
         update
     }
 
@@ -3142,7 +3146,7 @@ impl WlSurface {
 
         let (mut this, old_blur_bounds) = client
             .with_ungrabbed(this, state, |state| state.client_blur_padded_bounds(resolved_surface));
-        let (changed, needs_frame) = this.apply_content(client, state, dispatcher, update, false);
+        let (changed, needs_frame) = this.apply_content(client, state, dispatcher, update);
         let (mut this, new_blur_bounds) = client
             .with_ungrabbed(this, state, |state| state.client_blur_padded_bounds(resolved_surface));
         if old_blur_bounds != new_blur_bounds {
@@ -3659,7 +3663,7 @@ impl WlSurface {
         let cached_feedbacks = self
             .cached_update
             .as_mut()
-            .map(|cached| split_feedbacks(&mut cached.presentation_feedbacks, state))
+            .map(|cached| split_update_feedbacks(cached, &split_feedbacks, state))
             .unwrap_or_default();
         Self::discard_feedbacks(client, state, dispatcher, cached_feedbacks);
         let on_screen_feedbacks =
@@ -4061,29 +4065,23 @@ impl WlSurface {
         self.cancel_blocked(client, state, dispatcher);
     }
 
-    pub fn apply_cached_if_parent_desynchronized(
-        &mut self,
+    /// Called when a synchronized subsurface turns desynchronized: its cached
+    /// update is applied as a normal update, with the full commit tail.
+    pub fn submit_cached_if_parent_desynchronized(
+        mut this: GrabbedObject<Self>,
         client: &mut Client,
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
-    ) -> bool {
-        if self.sync_mode() != Some(SubsurfaceSyncMode::Desync)
-            || self.parent_behaves_synchronized(state)
+    ) {
+        if this.sync_mode() != Some(SubsurfaceSyncMode::Desync)
+            || this.parent_behaves_synchronized(state)
         {
-            return false;
+            return;
         }
-        let changed = self.apply_cached_update(client, state, dispatcher, false);
-        if changed {
-            let surface = client.resolve(self.id, state).unwrap();
-            if let Some(bounds) = state.surface_scene_bounds_with_ref(surface, self) {
-                request_outputs(state, self.output_membership_ids(), dispatcher);
-                request_outputs_for_rect(state, bounds, dispatcher);
-            } else {
-                request_outputs(state, self.output_membership_ids(), dispatcher);
-                request_active_output(state, dispatcher);
-            }
-        }
-        changed
+        let Some(update) = this.cached_update.take() else {
+            return;
+        };
+        WlSurface::apply_update(this, client, state, dispatcher, update);
     }
 
     fn detach_subsurface_tree(
@@ -4811,7 +4809,7 @@ mod tests {
         fn capture(&mut self) -> ContentUpdate {
             let mut client_dispatcher = self.client.test_dispatcher(&mut self.dispatcher);
             let mut surface = self.surface.grab(&mut self.state);
-            surface.capture_commit(&self.state, &mut client_dispatcher)
+            surface.capture_commit(&mut self.state, &mut client_dispatcher)
         }
 
         fn surface_events(&self) -> usize {
@@ -4929,7 +4927,6 @@ mod tests {
                 &mut xwayland.state,
                 &mut client_dispatcher,
                 update,
-                false,
             );
         }
 
@@ -5092,7 +5089,7 @@ mod tests {
     ) {
         let mut client_dispatcher = client.test_dispatcher(dispatcher);
         let mut wl_surface = surface.grab(state);
-        wl_surface.apply_content(client, state, &mut client_dispatcher, update, false);
+        wl_surface.apply_content(client, state, &mut client_dispatcher, update);
     }
 
     #[test]
@@ -9527,5 +9524,221 @@ mod tests {
             &mut client_dispatcher,
         );
         assert!(!surface.rref(&state).test_latest_buffer_is_some());
+    }
+
+    /// Send one request to a `wl_subsurface` as a client would.
+    fn subsurface_request(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        subsurface: WlSubsurfaceId,
+        opcode: u16,
+    ) {
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        client_dispatcher.set_requester_object_id_for_tests(subsurface.into());
+        let mut object = client.grab_object(subsurface, state);
+        object
+            .on(
+                client,
+                state,
+                raw_request_from_event(RawEvent::new(subsurface.into(), opcode, 0)),
+                &mut client_dispatcher,
+            )
+            .unwrap();
+    }
+
+    /// A synchronized grandchild (surface 3, `wl_subsurface` 62) of the child
+    /// of `synchronized_child_of_root_parent`.
+    fn synchronized_grandchild(
+        client: &mut Client,
+        state: &mut State,
+        child: Resolved<WlSurfaceId>,
+    ) -> Resolved<WlSurfaceId> {
+        let (grandchild, _) = client
+            .insert_object(state, WlSurface::new(WlSurfaceId::from(3), client.client_id(), 6));
+        let subsurface = insert_client_subsurface_object(
+            client,
+            state,
+            WlSubsurfaceId::from(62),
+            grandchild,
+            child,
+        );
+        child.grab(state).add_pending_child(grandchild);
+        grandchild.grab(state).assign_subsurface(subsurface, child);
+        grandchild
+    }
+
+    #[test]
+    fn parent_commit_carries_the_child_cached_update() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (parent, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(2),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 0);
+        assert!(child.rref(&state).cached_update.is_some());
+
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 1);
+        assert!(child.rref(&state).cached_update.is_none());
+        assert!(child.rref(&state).on_screen.buffer.is_some());
+    }
+
+    #[test]
+    fn child_commit_after_the_parent_commit_waits_for_the_next_parent_commit() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (parent, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+        insert_request_buffer(&mut client, &mut state, 20);
+        insert_request_buffer(&mut client, &mut state, 21);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(2),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 1);
+
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(2),
+            1,
+            &[21, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 1);
+        assert!(child.rref(&state).cached_update.is_some());
+
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 2);
+        assert!(child.rref(&state).cached_update.is_none());
+    }
+
+    #[test]
+    fn set_desync_applies_the_cached_update() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (_, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(2),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 0);
+
+        // wl_subsurface.set_desync
+        subsurface_request(&mut client, &mut state, &mut dispatcher, WlSubsurfaceId::from(61), 5);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 1);
+        assert!(child.rref(&state).cached_update.is_none());
+        assert!(child.rref(&state).on_screen.buffer.is_some());
+    }
+
+    #[test]
+    fn nested_sync_grandchild_applies_with_the_childs_captured_state() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (parent, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+        let grandchild = synchronized_grandchild(&mut client, &mut state, child);
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(3),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(3), 6, &[]);
+        // The child's commit captures the grandchild's cached update.
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        assert!(grandchild.rref(&state).cached_update.is_none());
+        assert_eq!(grandchild.rref(&state).test_applied_update_seq(), 0);
+        assert_eq!(
+            child
+                .rref(&state)
+                .cached_update
+                .as_ref()
+                .map(|u| u.children.len()),
+            Some(1)
+        );
+
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(grandchild.rref(&state).test_applied_update_seq(), 1);
+        assert!(grandchild.rref(&state).on_screen.buffer.is_some());
+    }
+
+    #[test]
+    fn grandchild_commit_after_the_childs_commit_waits_for_the_childs_next_commit() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (parent, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+        let grandchild = synchronized_grandchild(&mut client, &mut state, child);
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(3),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(3), 6, &[]);
+
+        // The parent carries the child's first commit, which has no grandchild state.
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(child.rref(&state).test_applied_update_seq(), 1);
+        assert_eq!(grandchild.rref(&state).test_applied_update_seq(), 0);
+        assert!(grandchild.rref(&state).cached_update.is_some());
+
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+        commit_surface(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(grandchild.rref(&state).test_applied_update_seq(), 1);
+        assert!(grandchild.rref(&state).cached_update.is_none());
+    }
+
+    #[test]
+    fn destroyed_child_in_a_parent_update_is_discarded_and_released() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (parent, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+        insert_request_buffer(&mut client, &mut state, 20);
+        surface_request(
+            &mut client,
+            &mut state,
+            &mut dispatcher,
+            WlSurfaceId::from(2),
+            1,
+            &[20, 0, 0],
+        );
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 6, &[]);
+
+        let update = capture_update(&mut client, &mut state, &mut dispatcher, parent);
+        assert_eq!(update.children.len(), 1);
+        surface_request(&mut client, &mut state, &mut dispatcher, WlSurfaceId::from(2), 0, &[]);
+        assert!(!child.exists(&state));
+        assert!(!buffer_release_was_sent(&dispatcher, 20));
+
+        apply_captured(&mut client, &mut state, &mut dispatcher, parent, update);
+        assert!(buffer_release_was_sent(&dispatcher, 20));
     }
 }
