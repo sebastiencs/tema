@@ -1,4 +1,5 @@
 pub(crate) mod focus;
+pub(crate) mod gesture;
 pub(crate) mod grab;
 pub(crate) mod ime;
 pub(crate) mod interaction;

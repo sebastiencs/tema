@@ -154,6 +154,7 @@ pub struct RuntimeConfig {
     pub animations: AnimationsConfig,
     pub bindings: Vec<Binding>,
     pub mouse_bindings: Vec<MouseBinding>,
+    pub gesture_bindings: Vec<GestureBinding>,
     output_scales: BTreeMap<String, OutputScaleSetting>,
     output_tearing: BTreeMap<String, bool>,
     output_color: BTreeMap<String, OutputColorConfig>,
@@ -454,6 +455,24 @@ pub struct MouseBinding {
     pub action: MouseBindingAction,
 }
 
+/// Swipe direction of a `[gestures]` binding. `Up` is toward the top of the touchpad.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SwipeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GestureBinding {
+    /// The key as written in the config, e.g. `swipe:3:left`.
+    pub description: String,
+    pub fingers: u32,
+    pub direction: SwipeDirection,
+    pub action: CompositorAction,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KeyBinding {
     pub description: String,
@@ -553,6 +572,7 @@ struct ConfigFile {
     animations: AnimationsConfigFile,
     bindings: BTreeMap<String, ActionFile>,
     mouse_bindings: BTreeMap<String, MouseBindingAction>,
+    gestures: BTreeMap<String, ActionFile>,
     output: OutputConfigFile,
     color_management: ColorManagementConfigFile,
 }
@@ -883,6 +903,17 @@ impl RuntimeConfig {
             mouse_bindings.push(MouseBinding { trigger, action });
         }
 
+        let mut gesture_bindings = Vec::with_capacity(parsed.gestures.len());
+        let mut seen_gestures = BTreeSet::new();
+        for (description, action) in parsed.gestures {
+            let (fingers, direction) = parse_gesture_binding(&description)?;
+            if !seen_gestures.insert((fingers, direction)) {
+                bail!("duplicate gesture binding for `{description}`");
+            }
+            let action = compositor_action_from_file(&description, action)?;
+            gesture_bindings.push(GestureBinding { description, fingers, direction, action });
+        }
+
         let mut output_scales = BTreeMap::new();
         for (name, value) in parsed.output.scales {
             let setting = output_scale_setting_from_file(value)
@@ -962,6 +993,7 @@ impl RuntimeConfig {
             animations,
             bindings,
             mouse_bindings,
+            gesture_bindings,
             output_scales,
             output_tearing: parsed.output.tearing,
             output_color: output_colors_from_file(parsed.output.color)?,
@@ -989,6 +1021,7 @@ impl RuntimeConfig {
             animations: AnimationsConfig::default(),
             bindings: Vec::new(),
             mouse_bindings: Vec::new(),
+            gesture_bindings: Vec::new(),
             output_scales: BTreeMap::new(),
             output_tearing: BTreeMap::new(),
             output_color: BTreeMap::new(),
@@ -1044,6 +1077,24 @@ impl RuntimeConfig {
             .iter()
             .find(|binding| binding.trigger.matches(button, modifiers))
             .map(|binding| binding.action)
+    }
+
+    /// A swipe with this many fingers is reserved by tema.
+    pub fn swipe_fingers_bound(&self, fingers: u32) -> bool {
+        self.gesture_bindings
+            .iter()
+            .any(|binding| binding.fingers == fingers)
+    }
+
+    pub fn binding_for_swipe(
+        &self,
+        fingers: u32,
+        direction: SwipeDirection,
+    ) -> Option<CompositorAction> {
+        self.gesture_bindings
+            .iter()
+            .find(|binding| binding.fingers == fingers && binding.direction == direction)
+            .map(|binding| binding.action.clone())
     }
 
     #[cfg(test)]
@@ -2119,6 +2170,15 @@ fn activate_adjacent_workspace(
         return;
     };
     log::info!("workspace {direction:?} on group {group_id:?}");
+    finish_workspace_activation(state, dispatcher, group_id);
+}
+
+/// What a workspace switch by binding does after `active_workspace` changed.
+pub(crate) fn finish_workspace_activation(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    group_id: WorkspaceGroupId,
+) {
     crate::input::pointer_lock::release_pointer_capture(state, dispatcher);
     publish_workspace_group(state, dispatcher, group_id);
 }
@@ -2140,6 +2200,34 @@ pub fn default_config_path() -> PathBuf {
         }
     }
     PathBuf::from(CONFIG_FILE_NAME)
+}
+
+fn parse_gesture_binding(description: &str) -> anyhow::Result<(u32, SwipeDirection)> {
+    let parts: Vec<&str> = description.split(':').map(str::trim).collect();
+    let [kind, fingers, direction] = parts.as_slice() else {
+        bail!("gesture binding `{description}` must look like swipe:<fingers>:<direction>");
+    };
+    if kind.eq_ignore_ascii_case("pinch") || kind.eq_ignore_ascii_case("hold") {
+        bail!("gesture binding `{description}`: only swipe gestures can be bound");
+    }
+    if !kind.eq_ignore_ascii_case("swipe") {
+        bail!("gesture binding `{description}` must look like swipe:<fingers>:<direction>");
+    }
+    let fingers = fingers
+        .parse::<u32>()
+        .ok()
+        .filter(|fingers| (3..=5).contains(fingers))
+        .ok_or_else(|| {
+            anyhow::anyhow!("gesture binding `{description}`: finger count must be 3, 4 or 5")
+        })?;
+    let direction = match direction.to_ascii_lowercase().as_str() {
+        "left" => SwipeDirection::Left,
+        "right" => SwipeDirection::Right,
+        "up" => SwipeDirection::Up,
+        "down" => SwipeDirection::Down,
+        _ => bail!("gesture binding `{description}`: direction must be left, right, up or down"),
+    };
+    Ok((fingers, direction))
 }
 
 fn parse_binding(description: &str, keymap: &xkb::Keymap) -> anyhow::Result<KeyBinding> {
@@ -2708,6 +2796,116 @@ mod tests {
 
         let error = config.unwrap_err();
         assert!(error.to_string().contains("duplicate mouse binding"));
+    }
+
+    #[test]
+    fn parses_swipe_gesture_bindings() {
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::parse_for_test(
+            r#"
+            [gestures]
+            "swipe:3:left" = { action = "workspace-next" }
+            " Swipe : 4 : UP " = { action = "spawn", command = "foo" }
+            "#,
+            &xkb,
+        )
+        .unwrap();
+
+        assert_eq!(config.gesture_bindings.len(), 2);
+        assert!(config.gesture_bindings.iter().any(|binding| {
+            binding.fingers == 3
+                && binding.direction == SwipeDirection::Left
+                && binding.action == CompositorAction::WorkspaceNext
+        }));
+        assert!(config.gesture_bindings.iter().any(|binding| {
+            binding.fingers == 4
+                && binding.direction == SwipeDirection::Up
+                && binding.action == CompositorAction::Spawn { command: "foo".to_string() }
+        }));
+    }
+
+    #[test]
+    fn rejects_pinch_and_hold_gesture_bindings() {
+        let xkb = Xkb::new();
+        for key in ["pinch:3:in", "hold:3:left"] {
+            let input = format!("[gestures]\n\"{key}\" = {{ action = \"quit\" }}\n");
+            let error = RuntimeConfig::parse_for_test(&input, &xkb).unwrap_err();
+            assert!(format!("{error:#}").contains("only swipe gestures can be bound"), "{key}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_gesture_binding_keys() {
+        let xkb = Xkb::new();
+        let cases = [
+            ("swipe:2:left", "finger count must be 3, 4 or 5"),
+            ("swipe:6:left", "finger count must be 3, 4 or 5"),
+            ("swipe:x:left", "finger count must be 3, 4 or 5"),
+            ("swipe:3:diagonal", "direction must be left, right, up or down"),
+            ("swipe:3", "must look like swipe:<fingers>:<direction>"),
+            ("swipe:3:left:extra", "must look like swipe:<fingers>:<direction>"),
+        ];
+        for (key, message) in cases {
+            let input = format!("[gestures]\n\"{key}\" = {{ action = \"quit\" }}\n");
+            let error = RuntimeConfig::parse_for_test(&input, &xkb).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{key}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_gesture_bindings() {
+        let xkb = Xkb::new();
+        let error = RuntimeConfig::parse_for_test(
+            r#"
+            [gestures]
+            "swipe:3:left" = { action = "quit" }
+            "swipe:3:LEFT" = { action = "close" }
+            "#,
+            &xkb,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate gesture binding"));
+    }
+
+    #[test]
+    fn example_config_ships_three_finger_workspace_swipes() {
+        let xkb = Xkb::new();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
+        let config = RuntimeConfig::load_from_path(&path, &xkb).unwrap();
+        let gestures: Vec<_> = config
+            .gesture_bindings
+            .iter()
+            .map(|binding| (binding.description.as_str(), binding.action.clone()))
+            .collect();
+        assert_eq!(
+            gestures,
+            vec![
+                ("swipe:3:left", CompositorAction::WorkspaceNext),
+                ("swipe:3:right", CompositorAction::WorkspacePrevious),
+            ]
+        );
+    }
+
+    #[test]
+    fn gesture_binding_lookups() {
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::parse_for_test(
+            r#"
+            [gestures]
+            "swipe:3:left" = { action = "workspace-next" }
+            "swipe:3:right" = { action = "workspace-previous" }
+            "#,
+            &xkb,
+        )
+        .unwrap();
+
+        assert!(config.swipe_fingers_bound(3));
+        assert!(!config.swipe_fingers_bound(4));
+        assert_eq!(
+            config.binding_for_swipe(3, SwipeDirection::Right),
+            Some(CompositorAction::WorkspacePrevious)
+        );
+        assert_eq!(config.binding_for_swipe(3, SwipeDirection::Up), None);
     }
 
     #[test]

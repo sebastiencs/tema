@@ -1376,9 +1376,9 @@ impl Client {
             log::debug!("client {:?} seat event {:?}", self.id, event);
         }
         // Surface-local pointer values are logical. A wire-scaled client
-        // receives them multiplied by S. wl_touch is not advertised. Tablet,
-        // gestures and wp_pointer_warp do not exist, so there is nothing else
-        // to scale on the way out.
+        // receives them multiplied by S: positions, relative motion and gesture
+        // deltas. Pinch scale and rotation are unitless. wl_touch is not
+        // advertised; tablet and wp_pointer_warp do not exist.
         let scale = dispatcher.wire_scale();
         match event {
             SeatClientEvent::PointerEnter { serial, surface, x, y } => {
@@ -1489,6 +1489,58 @@ impl Client {
                     relative.ref_mut(state).send_relative_motion(
                         utime_hi, utime_lo, dx, dy, dx_unaccel, dy_unaccel, dispatcher,
                     );
+                }
+            }
+            SeatClientEvent::PointerGestureBegin { kind, serial, time, surface, fingers } => {
+                if surface.exists(state) {
+                    let gestures = state.seat.pointer_gestures_for_client(self.id, kind);
+                    if !gestures.is_empty() {
+                        state.seat.record_client_serial(self.id, serial);
+                    }
+                    for gesture in gestures {
+                        gesture.send_begin(state, serial, time, surface, fingers, dispatcher);
+                    }
+                }
+            }
+            SeatClientEvent::PointerGestureSwipeUpdate { time, dx, dy } => {
+                let (dx, dy) = Self::wire_point(scale, dx, dy);
+                for gesture in state.seat.pointer_gestures_for_client(
+                    self.id,
+                    crate::input::gesture::PointerGestureKind::Swipe,
+                ) {
+                    if let crate::input::gesture::PointerGestureResource::Swipe(swipe) = gesture {
+                        if let Some(swipe) = swipe.try_ref(state) {
+                            swipe.send_update(time, dx, dy, dispatcher);
+                        }
+                    }
+                }
+            }
+            SeatClientEvent::PointerGesturePinchUpdate {
+                time,
+                dx,
+                dy,
+                scale: pinch_scale,
+                rotation,
+            } => {
+                let (dx, dy) = Self::wire_point(scale, dx, dy);
+                for gesture in state.seat.pointer_gestures_for_client(
+                    self.id,
+                    crate::input::gesture::PointerGestureKind::Pinch,
+                ) {
+                    if let crate::input::gesture::PointerGestureResource::Pinch(pinch) = gesture {
+                        if let Some(pinch) = pinch.try_ref(state) {
+                            pinch.send_update(time, dx, dy, pinch_scale, rotation, dispatcher);
+                        }
+                    }
+                }
+            }
+            SeatClientEvent::PointerGestureEnd { kind, serial, time, cancelled } => {
+                let gestures = state.seat.pointer_gestures_for_client(self.id, kind);
+                if !gestures.is_empty() {
+                    state.seat.record_client_serial(self.id, serial);
+                }
+                for gesture in gestures {
+                    gesture.send_end(state, serial, time, cancelled, dispatcher);
                 }
             }
             SeatClientEvent::PointerScroll(frame) => {

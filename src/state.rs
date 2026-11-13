@@ -29,7 +29,7 @@ use crate::{
     tiling::{self, SplitDragPair, SplitPair, WorkspaceLayout},
     visual_animation::{
         lifecycle_pose, resolve_window_visual, FocusVisualAnimation, GeometryTiming,
-        OpeningIntroduction, RetainedClosingSnapshot, WindowGeometryAnimation,
+        OpeningIntroduction, RetainedClosingSnapshot, UnitValue, WindowGeometryAnimation,
         WindowGeometryMotion, WindowLifecycleAnim, WindowLifecycleAnimation, WindowVisualBase,
         WorkspaceGroupTransition, WorkspaceMotion, WorkspaceTransitionAdvance,
         WorkspaceTransitionDirection,
@@ -570,6 +570,25 @@ pub struct WorkspaceGroup {
     pub workspaces: Vec<WorkspaceId>,
     pub active_workspace: Option<WorkspaceId>,
     pub transition: Option<WorkspaceGroupTransition>,
+}
+
+/// Where a tracked workspace swipe slides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceSwipeStart {
+    pub(crate) group_id: WorkspaceGroupId,
+    pub(crate) from: WorkspaceId,
+    pub(crate) to: WorkspaceId,
+}
+
+/// How a released tracking slide ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceSwipeSettle {
+    /// `to` is active; the slide continues to it.
+    Committed,
+    /// The slide animates back to `from`.
+    Returning,
+    /// The transition was dropped at once (already at 0, or the session is inactive).
+    Dropped,
 }
 
 #[derive(Debug)]
@@ -1841,6 +1860,102 @@ impl State {
         // keyboard focus is cleared here; a later focus change clears the window that receives it.
         self.clear_focused_window_urgency_on(workspace_id);
         true
+    }
+
+    /// Install a tracking slide from the active workspace of the active output's
+    /// group to its neighbor in `direction` (wrapping like `activate_adjacent_workspace`).
+    /// A running non-tracking slide is snapped to its end first.
+    pub(crate) fn begin_workspace_swipe(
+        &mut self,
+        direction: WorkspaceTransitionDirection,
+    ) -> Option<WorkspaceSwipeStart> {
+        if self.session_lock.input_gated() {
+            return None;
+        }
+        if self.config.animations.workspace_in().duration().is_zero()
+            && self.config.animations.workspace_out().duration().is_zero()
+        {
+            return None;
+        }
+        let output_id = self
+            .active_output_id()
+            .or_else(|| self.fallback_output_id())?;
+        let group_id = self.workspace_group_for_output(output_id)?;
+        let group = self.workspace_groups.try_get_mut(group_id)?;
+        let from = group.active_workspace?;
+        let len = group.workspaces.len();
+        if len <= 1 {
+            return None;
+        }
+        if let Some(transition) = group.transition {
+            if transition.is_tracking() {
+                return None;
+            }
+            // `active_workspace` already is the running slide's destination.
+            group.transition = None;
+        }
+        let index = group
+            .workspaces
+            .iter()
+            .position(|workspace| *workspace == from)?;
+        let to = group.workspaces[match direction {
+            WorkspaceTransitionDirection::Next => (index + 1) % len,
+            WorkspaceTransitionDirection::Previous => (index + len - 1) % len,
+        }];
+        group.transition = Some(WorkspaceGroupTransition::tracking(from, to, direction));
+        Some(WorkspaceSwipeStart { group_id, from, to })
+    }
+
+    /// The group's transition, when it is still the tracking slide `from → to`.
+    fn tracked_transition_mut(
+        &mut self,
+        group_id: WorkspaceGroupId,
+        from: WorkspaceId,
+        to: WorkspaceId,
+    ) -> Option<&mut WorkspaceGroupTransition> {
+        self.workspace_groups
+            .try_get_mut(group_id)?
+            .transition
+            .as_mut()
+            .filter(|transition| {
+                transition.is_tracking()
+                    && transition.from_workspace() == from
+                    && transition.to_workspace() == to
+            })
+    }
+
+    /// `None`: the slide is no longer ours. `Some(changed)` otherwise.
+    pub(crate) fn set_workspace_swipe_progress(
+        &mut self,
+        swipe: WorkspaceSwipeStart,
+        progress: UnitValue,
+    ) -> Option<bool> {
+        Some(
+            self.tracked_transition_mut(swipe.group_id, swipe.from, swipe.to)?
+                .set_tracked_progress(progress),
+        )
+    }
+
+    /// Release a tracking slide. `commit` activates `to`; otherwise the slide
+    /// returns to `from`. `None`: the slide was no longer ours and nothing was done.
+    pub(crate) fn settle_workspace_swipe(
+        &mut self,
+        swipe: WorkspaceSwipeStart,
+        commit: bool,
+    ) -> Option<WorkspaceSwipeSettle> {
+        self.tracked_transition_mut(swipe.group_id, swipe.from, swipe.to)?;
+        if commit && self.activate_workspace(swipe.to) {
+            return Some(WorkspaceSwipeSettle::Committed);
+        }
+        let session_active = self.session_active;
+        let transition = self.tracked_transition_mut(swipe.group_id, swipe.from, swipe.to)?;
+        if session_active && !transition.request_goal(UnitValue::ZERO) {
+            return Some(WorkspaceSwipeSettle::Returning);
+        }
+        if let Some(group) = self.workspace_groups.try_get_mut(swipe.group_id) {
+            group.transition = None;
+        }
+        Some(WorkspaceSwipeSettle::Dropped)
     }
 
     pub fn activate_adjacent_workspace(

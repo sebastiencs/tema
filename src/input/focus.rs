@@ -476,6 +476,11 @@ pub(crate) fn leave_destroyed_surface_focus(
         .pointer_focus
         .is_some_and(|focus| focus.target.surface == surface)
     {
+        crate::input::gesture::cancel_pointer_gesture(
+            state,
+            dispatcher,
+            crate::seat::monotonic_time_msec(),
+        );
         let serial = state.seat.next_serial();
         let client_id = surface.client_id();
         for pointer in state.seat.pointer_resources(client_id) {
@@ -735,6 +740,12 @@ pub(crate) fn refresh_pointer_focus(
     }
 
     if old_focus.map(|focus| focus.target) != new_focus.map(|focus| focus.target) {
+        crate::input::gesture::cancel_pointer_gesture_unless_client(
+            state,
+            dispatcher,
+            time,
+            new_focus.map(|focus| focus.target.client_id()),
+        );
         let serial = state.seat.next_serial();
 
         if let Some(old_focus) = old_focus {

@@ -197,6 +197,15 @@ style = "fade"
 "Ctrl+mouse:left" = { action = "move-window" }
 "Ctrl+mouse:right" = { action = "resize-window" }
 
+[gestures]
+# Touchpad swipes. Keys are swipe:<fingers>:<direction>, fingers 3 to 5,
+# direction left, right, up or down. A finger count with any binding here is
+# reserved: those swipes never reach applications. Pinch and hold always do.
+# Horizontal swipes bound to workspace-next / workspace-previous follow the
+# fingers; every other binding runs when the fingers lift.
+"swipe:3:left" = { action = "workspace-next" }
+"swipe:3:right" = { action = "workspace-previous" }
+
 # Optional: fixed scale per DRM output name, or "auto".
 # [output.scales]
 # "DP-1" = "auto"

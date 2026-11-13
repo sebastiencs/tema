@@ -4,7 +4,8 @@
 //! draw modifiers; it does not arm timers, choose refresh cadence, or mutate workspace layout.
 //! `FocusVisualAnimation` owns the focus fade and `WindowLifecycleAnimation` owns opening.
 //! `VisualAnimationPump::{advance_and_schedule, advance_and_schedule_output}` is the sole phase
-//! that mutates that progress. Render resolution reads the cached samples and calls the pure
+//! that mutates that progress. A workspace transition in its tracking phase is the exception: a
+//! touchpad swipe sets its progress. Render resolution reads the cached samples and calls the pure
 //! helpers here.
 //!
 //! Visibility stays in the scene participation policy. Input, protocol, and render eligibility are
