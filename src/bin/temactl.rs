@@ -358,6 +358,15 @@ fn format_focused_window(window: Option<&proto::Window>) -> String {
     if let Some(description) = &window.description {
         text.push_str(&format!("  Description: {description}\n"));
     }
+    if let Some(sandbox) = &window.sandbox {
+        let field = |value: &Option<String>| value.clone().unwrap_or_else(|| "-".to_string());
+        text.push_str(&format!(
+            "  Sandbox: {} app={} instance={}\n",
+            field(&sandbox.engine),
+            field(&sandbox.app_id),
+            field(&sandbox.instance_id)
+        ));
+    }
     text
 }
 
@@ -915,7 +924,21 @@ mod tests {
             description: None,
             icon: None,
             modal: false,
+            sandbox: None,
         }
+    }
+
+    #[test]
+    fn focused_window_prints_the_sandbox_line() {
+        let mut sandboxed = window();
+        sandboxed.sandbox = Some(proto::WindowSandbox {
+            engine: Some("org.flatpak".to_string()),
+            app_id: Some("org.example.App".to_string()),
+            instance_id: None,
+        });
+        assert!(format_focused_window(Some(&sandboxed))
+            .contains("  Sandbox: org.flatpak app=org.example.App instance=-\n"));
+        assert!(!format_focused_window(Some(&window())).contains("Sandbox:"));
     }
 
     fn workspace(active: bool, focused: bool) -> proto::Workspace {

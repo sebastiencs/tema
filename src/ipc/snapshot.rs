@@ -65,6 +65,14 @@ fn focused_window(state: &State) -> Option<proto::Window> {
             .toplevel(window)
             .and_then(|toplevel| toplevel.modal_parent())
             .is_some_and(|parent| state.windows.contains_key(&parent)),
+        sandbox: state
+            .window_root_surface(window)
+            .and_then(|root| state.client_security_context(root.client_id()))
+            .map(|metadata| proto::WindowSandbox {
+                engine: metadata.sandbox_engine.clone(),
+                app_id: metadata.app_id.clone(),
+                instance_id: metadata.instance_id.clone(),
+            }),
     })
 }
 
@@ -403,6 +411,33 @@ mod tests {
             .workspaces
             .iter()
             .any(|workspace| workspace.focused));
+    }
+
+    #[test]
+    fn focused_window_reports_the_sandbox_of_its_client() {
+        let mut fixture = mapped_window("nvim — ~/src", "Alacritty");
+        assert!(build(&fixture.state)
+            .focused_window
+            .expect("focused window")
+            .sandbox
+            .is_none());
+
+        let metadata = std::rc::Rc::new(crate::security_context::SecurityContextMetadata {
+            sandbox_engine: Some("org.flatpak".to_string()),
+            app_id: Some("org.example.App".to_string()),
+            instance_id: None,
+        });
+        fixture
+            .state
+            .set_client_security_context(crate::clients::ClientId::from_raw(1), Some(metadata));
+        let sandbox = build(&fixture.state)
+            .focused_window
+            .expect("focused window")
+            .sandbox
+            .expect("sandbox of the focused window");
+        assert_eq!(sandbox.engine.as_deref(), Some("org.flatpak"));
+        assert_eq!(sandbox.app_id.as_deref(), Some("org.example.App"));
+        assert_eq!(sandbox.instance_id, None);
     }
 
     struct Fixture {

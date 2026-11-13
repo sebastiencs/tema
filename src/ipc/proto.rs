@@ -114,6 +114,16 @@ pub struct Window {
     /// Modal xdg dialog (`xdg_dialog_v1.set_modal` with a live parent). Absent on older clients.
     #[serde(default)]
     pub modal: bool,
+    /// Absent on older clients. `None` unless the window's client is sandboxed.
+    #[serde(default)]
+    pub sandbox: Option<WindowSandbox>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowSandbox {
+    pub engine: Option<String>,
+    pub app_id: Option<String>,
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -358,6 +368,7 @@ mod tests {
             description: None,
             icon: None,
             modal: false,
+            sandbox: None,
         }
     }
 
@@ -434,7 +445,7 @@ mod tests {
         );
         assert_json(
             &Reply::Ok(Response::FocusedWindow(Some(window()))),
-            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false}}}"#,
+            r#"{"ok":{"focused_window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false,"sandbox":null}}}"#,
         );
         assert_json(&Reply::Ok(Response::FocusedWindow(None)), r#"{"ok":{"focused_window":null}}"#);
         assert_json(&Reply::Ok(Response::Subscribed), r#"{"ok":"subscribed"}"#);
@@ -456,7 +467,7 @@ mod tests {
 
         assert_json(
             &Event::FocusedWindow { window: Some(window()) },
-            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false}}"#,
+            r#"{"event":"focused_window","window":{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":"ws-1-2","output":"DP-1","floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false,"sandbox":null}}"#,
         );
         assert_json(
             &Event::FocusedWindow { window: None },
@@ -484,8 +495,10 @@ mod tests {
         nulls.output = None;
         assert_json(
             &nulls,
-            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false}"#,
+            r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false,"tag":null,"description":null,"icon":null,"modal":false,"sandbox":null}"#,
         );
+        let older = r#"{"id":12,"title":"nvim — ~/src","app_id":"Alacritty","workspace":null,"output":null,"floating":false,"fullscreen":false}"#;
+        assert_eq!(serde_json::from_str::<Window>(older).unwrap().sandbox, None);
         let mut disabled = output();
         disabled.active_workspace = None;
         assert_json(
