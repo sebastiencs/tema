@@ -38,6 +38,10 @@ pub(crate) enum RoleUpdate {
         xdg_surface: Resolved<XdgSurfaceId>,
         capture: crate::wayland_objects::xdg_surface::XdgCommitCapture,
     },
+    Layer {
+        layer_surface: Resolved<ZwlrLayerSurfaceV1Id>,
+        capture: crate::wayland_objects::zwlr_layer_surface_v1::LayerCommitCapture,
+    },
 }
 
 impl ContentUpdate {

@@ -94,8 +94,46 @@ impl LayerSurfaceState {
     }
 }
 
+/// Assigns every field the pending state sets onto `target`. Returns whether
+/// anything was set. Does not take the pending state.
+fn merge_pending(target: &mut LayerSurfaceState, pending: &PendingLayerSurfaceState) -> bool {
+    let mut changed = false;
+    if let Some(width) = pending.desired_width {
+        target.desired_width = width;
+        changed = true;
+    }
+    if let Some(height) = pending.desired_height {
+        target.desired_height = height;
+        changed = true;
+    }
+    if let Some(anchor) = pending.anchor {
+        target.anchor = anchor;
+        changed = true;
+    }
+    if let Some(exclusive_zone) = pending.exclusive_zone {
+        target.exclusive_zone = exclusive_zone;
+        changed = true;
+    }
+    if let Some(margin) = pending.margin {
+        target.margin = margin;
+        changed = true;
+    }
+    if let Some(keyboard_interactivity) = pending.keyboard_interactivity {
+        target.keyboard_interactivity = keyboard_interactivity;
+        changed = true;
+    }
+    if let Some(layer) = pending.layer {
+        target.layer = layer;
+        changed = true;
+    }
+    if let Some(exclusive_edge) = pending.exclusive_edge {
+        target.exclusive_edge = exclusive_edge;
+        changed = true;
+    }
+    changed
+}
 #[derive(Clone, Debug, Default)]
-struct PendingLayerSurfaceState {
+pub(crate) struct PendingLayerSurfaceState {
     desired_width: Option<i32>,
     desired_height: Option<i32>,
     anchor: Option<u32>,
@@ -104,6 +142,30 @@ struct PendingLayerSurfaceState {
     keyboard_interactivity: Option<u32>,
     layer: Option<LayerShellLayer>,
     exclusive_edge: Option<Option<u32>>,
+}
+
+/// The request-time outcome of checking one layer-surface commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LayerCommitKind {
+    /// The layer surface was closed; the commit is accepted and does nothing.
+    Closed,
+    /// The initial commit, which attaches no buffer.
+    Initial,
+    /// A commit attaching a buffer.
+    Map,
+    /// A null-buffer commit.
+    Unmap,
+    /// Any other commit.
+    Other,
+}
+
+/// The layer part of one content update.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LayerCommitCapture {
+    pub(crate) initial: bool,
+    pub(crate) pending: PendingLayerSurfaceState,
+    pub(crate) map: bool,
+    pub(crate) unmap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,8 +268,13 @@ pub struct ZwlrLayerSurfaceV1 {
     namespace: String,
     initial_layer: LayerShellLayer,
     current: LayerSurfaceState,
+    /// The state as the client has committed it so far: `current` once every
+    /// captured commit is applied. Request-time checks read this.
+    committed: LayerSurfaceState,
     pending: PendingLayerSurfaceState,
     initial_commit_complete: bool,
+    /// Set when the initial commit is captured (request time).
+    initial_commit_requested: bool,
     mapped: bool,
     closed: bool,
     needs_layout_refresh: bool,
@@ -238,8 +305,10 @@ impl ZwlrLayerSurfaceV1 {
             namespace,
             initial_layer: layer,
             current: LayerSurfaceState::new(layer),
+            committed: LayerSurfaceState::new(layer),
             pending: PendingLayerSurfaceState::default(),
             initial_commit_complete: false,
+            initial_commit_requested: false,
             mapped: false,
             closed: false,
             needs_layout_refresh: false,
@@ -377,21 +446,23 @@ impl ZwlrLayerSurfaceV1 {
     fn reset_after_unmap(&mut self) {
         // Keep the configure queue so in-flight configures stay distinguishable
         // after an unmap/remap cycle. Smithay carries this for clients like waybar.
+        // `pending`, `last_acked` and `committed` are request-time state: the
+        // unmap capture resets them, so this apply-time reset leaves them alone.
         let pending_configures = std::mem::take(&mut self.pending_configures);
         self.current = LayerSurfaceState::new(self.initial_layer);
-        self.pending = PendingLayerSurfaceState::default();
         self.initial_commit_complete = false;
         self.mapped = false;
         self.pending_configures = pending_configures;
-        self.last_acked = None;
         self.last_sent_configure_size = None;
         self.needs_layout_refresh = true;
     }
 
     fn make_inert_after_close(&mut self) {
         self.current = LayerSurfaceState::new(self.initial_layer);
+        self.committed = LayerSurfaceState::new(self.initial_layer);
         self.pending = PendingLayerSurfaceState::default();
         self.initial_commit_complete = false;
+        self.initial_commit_requested = false;
         self.mapped = false;
         self.pending_configures.clear();
         self.last_acked = None;
@@ -422,46 +493,15 @@ impl ZwlrLayerSurfaceV1 {
         manager.unregister_surface(self.id);
     }
 
-    fn apply_pending_state(
-        &mut self,
+    /// The error checks of a layer state; sends the protocol error and returns
+    /// `Err` on the first failure. Changes nothing.
+    fn validate_state(
+        &self,
+        state: &LayerSurfaceState,
         client: &Client,
         dispatcher: &mut ClientDispatcher,
     ) -> Result<(), ()> {
-        let mut changed = false;
-        if let Some(width) = self.pending.desired_width.take() {
-            self.current.desired_width = width;
-            changed = true;
-        }
-        if let Some(height) = self.pending.desired_height.take() {
-            self.current.desired_height = height;
-            changed = true;
-        }
-        if let Some(anchor) = self.pending.anchor.take() {
-            self.current.anchor = anchor;
-            changed = true;
-        }
-        if let Some(exclusive_zone) = self.pending.exclusive_zone.take() {
-            self.current.exclusive_zone = exclusive_zone;
-            changed = true;
-        }
-        if let Some(margin) = self.pending.margin.take() {
-            self.current.margin = margin;
-            changed = true;
-        }
-        if let Some(keyboard_interactivity) = self.pending.keyboard_interactivity.take() {
-            self.current.keyboard_interactivity = keyboard_interactivity;
-            changed = true;
-        }
-        if let Some(layer) = self.pending.layer.take() {
-            self.current.layer = layer;
-            changed = true;
-        }
-        if let Some(exclusive_edge) = self.pending.exclusive_edge.take() {
-            self.current.exclusive_edge = exclusive_edge;
-            changed = true;
-        }
-
-        if self.current.anchor & !ANCHOR_MASK != 0 {
+        if state.anchor & !ANCHOR_MASK != 0 {
             self.send_error(
                 client,
                 dispatcher,
@@ -472,7 +512,7 @@ impl ZwlrLayerSurfaceV1 {
         }
 
         let max_keyboard = max_keyboard_interactivity_for_version(self.version);
-        if self.current.keyboard_interactivity > max_keyboard {
+        if state.keyboard_interactivity > max_keyboard {
             self.send_error(
                 client,
                 dispatcher,
@@ -482,8 +522,8 @@ impl ZwlrLayerSurfaceV1 {
             return Err(());
         }
 
-        if self.current.desired_width == 0
-            && (self.current.anchor & (ANCHOR_LEFT | ANCHOR_RIGHT)) != (ANCHOR_LEFT | ANCHOR_RIGHT)
+        if state.desired_width == 0
+            && (state.anchor & (ANCHOR_LEFT | ANCHOR_RIGHT)) != (ANCHOR_LEFT | ANCHOR_RIGHT)
         {
             self.send_error(
                 client,
@@ -494,8 +534,8 @@ impl ZwlrLayerSurfaceV1 {
             return Err(());
         }
 
-        if self.current.desired_height == 0
-            && (self.current.anchor & (ANCHOR_TOP | ANCHOR_BOTTOM)) != (ANCHOR_TOP | ANCHOR_BOTTOM)
+        if state.desired_height == 0
+            && (state.anchor & (ANCHOR_TOP | ANCHOR_BOTTOM)) != (ANCHOR_TOP | ANCHOR_BOTTOM)
         {
             self.send_error(
                 client,
@@ -506,7 +546,7 @@ impl ZwlrLayerSurfaceV1 {
             return Err(());
         }
 
-        if let Some(edge) = self.current.exclusive_edge {
+        if let Some(edge) = state.exclusive_edge {
             if self.version < zwlr_layer_surface_v1::SET_EXCLUSIVE_EDGE_SINCE {
                 self.send_error(
                     client,
@@ -516,10 +556,7 @@ impl ZwlrLayerSurfaceV1 {
                 );
                 return Err(());
             }
-            if edge & !ANCHOR_MASK != 0
-                || edge.count_ones() != 1
-                || self.current.anchor & edge != edge
-            {
+            if edge & !ANCHOR_MASK != 0 || edge.count_ones() != 1 || state.anchor & edge != edge {
                 self.send_error(
                     client,
                     dispatcher,
@@ -530,34 +567,27 @@ impl ZwlrLayerSurfaceV1 {
             }
         }
 
-        if changed {
-            self.needs_layout_refresh = true;
-        }
-
         Ok(())
     }
 
-    pub fn on_commit(
-        &mut self,
-        client: &mut Client,
-        state: &mut State,
+    /// Request-time check of a commit: read-only apart from the protocol errors
+    /// it sends. `None` means the commit is rejected.
+    pub(crate) fn check_commit(
+        &self,
+        client: &Client,
         dispatcher: &mut ClientDispatcher,
         has_pending_buffer_attach: bool,
         is_null_buffer_commit: bool,
-    ) -> bool {
+    ) -> Option<LayerCommitKind> {
         if self.closed {
-            return true;
+            return Some(LayerCommitKind::Closed);
         }
 
-        let was_mapped = self.mapped;
-        let was_keyboard_interactivity = self.current.keyboard_interactivity;
-        let was_layer = self.current.layer;
+        let mut next = self.committed;
+        merge_pending(&mut next, &self.pending);
+        self.validate_state(&next, client, dispatcher).ok()?;
 
-        if self.apply_pending_state(client, dispatcher).is_err() {
-            return false;
-        }
-
-        if !self.initial_commit_complete {
+        if !self.initial_commit_requested {
             if has_pending_buffer_attach {
                 self.send_error(
                     client,
@@ -565,8 +595,77 @@ impl ZwlrLayerSurfaceV1 {
                     zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                     "initial layer-surface commit must not attach a buffer",
                 );
-                return false;
+                return None;
             }
+            return Some(LayerCommitKind::Initial);
+        }
+
+        if has_pending_buffer_attach && self.last_acked.is_none() {
+            self.send_error(
+                client,
+                dispatcher,
+                zwlr_layer_surface_v1::Error::InvalidSurfaceState,
+                "layer-surface must ack the latest configure before attaching a buffer",
+            );
+            return None;
+        }
+
+        Some(if is_null_buffer_commit {
+            LayerCommitKind::Unmap
+        } else if has_pending_buffer_attach {
+            LayerCommitKind::Map
+        } else {
+            LayerCommitKind::Other
+        })
+    }
+
+    /// Request-time capture of a checked commit: moves the pending state into the
+    /// committed state and records what the apply step must do.
+    pub(crate) fn take_commit_capture(&mut self, kind: LayerCommitKind) -> LayerCommitCapture {
+        if kind == LayerCommitKind::Closed {
+            return LayerCommitCapture::default();
+        }
+        let pending = std::mem::take(&mut self.pending);
+        merge_pending(&mut self.committed, &pending);
+        match kind {
+            LayerCommitKind::Initial => self.initial_commit_requested = true,
+            LayerCommitKind::Unmap => {
+                self.initial_commit_requested = false;
+                self.last_acked = None;
+                self.committed = LayerSurfaceState::new(self.initial_layer);
+            }
+            LayerCommitKind::Map | LayerCommitKind::Other | LayerCommitKind::Closed => {}
+        }
+        LayerCommitCapture {
+            initial: kind == LayerCommitKind::Initial,
+            pending,
+            map: kind == LayerCommitKind::Map,
+            unmap: kind == LayerCommitKind::Unmap,
+        }
+    }
+
+    /// Applies a captured commit: the layer state, then the map / unmap / initial
+    /// effects. It sends no protocol error; the check already did.
+    pub(crate) fn apply_commit(
+        &mut self,
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut ClientDispatcher,
+        capture: &LayerCommitCapture,
+    ) {
+        if self.closed {
+            return;
+        }
+
+        let was_mapped = self.mapped;
+        let was_keyboard_interactivity = self.current.keyboard_interactivity;
+        let was_layer = self.current.layer;
+
+        if merge_pending(&mut self.current, &capture.pending) {
+            self.needs_layout_refresh = true;
+        }
+
+        if capture.initial {
             self.initial_commit_complete = true;
             self.needs_layout_refresh = true;
             if should_refresh_focus_after_commit(
@@ -582,24 +681,14 @@ impl ZwlrLayerSurfaceV1 {
                     );
                 refresh_keyboard_focus_with_snapshot(state, dispatcher, Some(layout_snapshot));
             }
-            return true;
+            return;
         }
 
-        if has_pending_buffer_attach && self.last_acked.is_none() {
-            self.send_error(
-                client,
-                dispatcher,
-                zwlr_layer_surface_v1::Error::InvalidSurfaceState,
-                "layer-surface must ack the latest configure before attaching a buffer",
-            );
-            return false;
-        }
-
-        if has_pending_buffer_attach {
+        if capture.map {
             self.mapped = true;
         }
 
-        if is_null_buffer_commit {
+        if capture.unmap {
             self.dismiss_popup_children(client, state, dispatcher);
             self.reset_after_unmap();
         }
@@ -617,8 +706,6 @@ impl ZwlrLayerSurfaceV1 {
                 );
             refresh_keyboard_focus_with_snapshot(state, dispatcher, Some(layout_snapshot));
         }
-
-        true
     }
 
     fn send_configure(&mut self, size: (u32, u32), dispatcher: &mut ClientDispatcher) {
@@ -1625,6 +1712,8 @@ mod tests {
         });
         layer_surface.last_acked = Some(LayerConfigure { serial: 7, width: 800, height: 30 });
         layer_surface.initial_commit_complete = true;
+        layer_surface.initial_commit_requested = true;
+        layer_surface.committed = layer_surface.current;
         layer_surface.mapped = true;
 
         layer_surface.reset_after_unmap();
@@ -1632,7 +1721,8 @@ mod tests {
         assert_eq!(layer_surface.pending_configures.len(), 1);
         assert_eq!(layer_surface.pending_configures[0].serial, 7);
         assert!(!layer_surface.mapped);
-        assert!(layer_surface.last_acked.is_none());
+        // `last_acked` is request-time state, reset at the unmap capture, not here.
+        assert!(layer_surface.last_acked.is_some());
         assert!(!layer_surface.initial_commit_complete);
     }
 
@@ -1651,9 +1741,11 @@ mod tests {
             height: 1080,
         });
         layer_surface.initial_commit_complete = true;
+        layer_surface.initial_commit_requested = true;
         layer_surface.mapped = true;
         layer_surface.current.keyboard_interactivity =
             zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+        layer_surface.committed = layer_surface.current;
         let mut dispatcher = crate::runner::Dispatcher::default();
         let mut client = crate::clients::Client::new_for_tests(ClientId::from_raw(9));
         let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
@@ -1804,9 +1896,11 @@ mod tests {
         );
         top_layer_surface.assigned_output_id = Some(output_id);
         top_layer_surface.initial_commit_complete = true;
+        top_layer_surface.initial_commit_requested = true;
         top_layer_surface.mapped = true;
         top_layer_surface.current.keyboard_interactivity =
             zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+        top_layer_surface.committed = top_layer_surface.current;
         let (_, top_layer_oid) = state.insert_object(top_layer_surface);
         let top_layer_resolved =
             Resolved::new(ClientId::from_raw(1), ZwlrLayerSurfaceV1Id::from(61u32), top_layer_oid);
@@ -1822,9 +1916,11 @@ mod tests {
         );
         overlay_layer_surface.assigned_output_id = Some(output_id);
         overlay_layer_surface.initial_commit_complete = true;
+        overlay_layer_surface.initial_commit_requested = true;
         overlay_layer_surface.mapped = true;
         overlay_layer_surface.current.keyboard_interactivity =
             zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+        overlay_layer_surface.committed = overlay_layer_surface.current;
         let (_, overlay_layer_oid) = state.insert_object(overlay_layer_surface);
         let overlay_layer_resolved = Resolved::new(
             ClientId::from_raw(1),
@@ -1875,9 +1971,11 @@ mod tests {
         );
         overlay_snapshot_layer.assigned_output_id = Some(output_id);
         overlay_snapshot_layer.initial_commit_complete = true;
+        overlay_snapshot_layer.initial_commit_requested = true;
         overlay_snapshot_layer.mapped = true;
         overlay_snapshot_layer.current.keyboard_interactivity =
             zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+        overlay_snapshot_layer.committed = overlay_snapshot_layer.current;
 
         let snapshot = LayerLayoutObjectSnapshot::for_surface(overlay_root)
             .with_layer_surface(overlay_layer_resolved, &overlay_snapshot_layer);
@@ -1918,10 +2016,12 @@ mod tests {
         );
         layer.assigned_output_id = Some(output_id);
         layer.initial_commit_complete = true;
+        layer.initial_commit_requested = true;
         layer.current.anchor = ANCHOR_MASK;
         layer.current.keyboard_interactivity =
             zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
         layer.current.exclusive_zone = -1;
+        layer.committed = layer.current;
         layer.last_acked = Some(LayerConfigure { serial: 1, width: 1280, height: 800 });
         let (layer_resolved, _) = client.insert_object(&mut state, layer);
         state.register_layer_surface_object(layer_resolved);
@@ -2046,9 +2146,11 @@ mod tests {
         );
         layer.assigned_output_id = Some(output_id);
         layer.initial_commit_complete = true;
+        layer.initial_commit_requested = true;
         layer.mapped = true;
         layer.current.keyboard_interactivity =
             zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+        layer.committed = layer.current;
         let (layer_resolved, _) = client.insert_object(&mut state, layer);
         state.register_layer_surface_object(layer_resolved);
         {
@@ -2352,5 +2454,97 @@ mod tests {
             action,
             IoUringAction::Sendmsg { .. }
         )));
+    }
+
+    #[test]
+    fn invalid_anchor_is_rejected_before_any_state_changes() {
+        let mut layer_surface = make_test_layer_surface(
+            ZwlrLayerSurfaceV1Id::from(1u32),
+            5,
+            None,
+            LayerShellLayer::Top,
+            "panel",
+        );
+        layer_surface.initial_commit_complete = true;
+        layer_surface.initial_commit_requested = true;
+        layer_surface.committed = layer_surface.current;
+        let before = layer_surface.current;
+        // A width of 0 needs left and right anchors; none are set.
+        layer_surface.pending.desired_width = Some(0);
+        let client = Client::new_for_tests(ClientId::from_raw(3));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+
+        assert!(layer_surface
+            .check_commit(&client, &mut client_dispatcher, false, false)
+            .is_none());
+
+        assert_eq!(layer_surface.current, before);
+        assert_eq!(layer_surface.committed, before);
+        assert!(dispatcher.test_has_queued_action::<IoUringAction>(|action| matches!(
+            action,
+            IoUringAction::Sendmsg { .. }
+        )));
+    }
+
+    #[test]
+    fn pending_layer_state_applies_with_its_update() {
+        let mut state = state_for_tests();
+        let mut layer_surface = make_test_layer_surface(
+            ZwlrLayerSurfaceV1Id::from(1u32),
+            5,
+            None,
+            LayerShellLayer::Top,
+            "panel",
+        );
+        layer_surface.initial_commit_complete = true;
+        layer_surface.initial_commit_requested = true;
+        layer_surface.current.desired_width = 10;
+        layer_surface.committed = layer_surface.current;
+        layer_surface.last_acked = Some(LayerConfigure { serial: 1, width: 800, height: 30 });
+        layer_surface.pending.desired_height = Some(42);
+        let mut client = Client::new_for_tests(ClientId::from_raw(3));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+
+        let kind = layer_surface
+            .check_commit(&client, &mut client_dispatcher, false, false)
+            .expect("the commit is valid");
+        let capture = layer_surface.take_commit_capture(kind);
+
+        assert_eq!(layer_surface.current.desired_height, 0);
+        assert_eq!(layer_surface.committed.desired_height, 42);
+        layer_surface.apply_commit(&mut client, &mut state, &mut client_dispatcher, &capture);
+        assert_eq!(layer_surface.current.desired_height, 42);
+    }
+
+    #[test]
+    fn unmap_capture_resets_initial_commit_requested_and_last_acked() {
+        let mut layer_surface = make_test_layer_surface(
+            ZwlrLayerSurfaceV1Id::from(1u32),
+            5,
+            None,
+            LayerShellLayer::Top,
+            "panel",
+        );
+        layer_surface.initial_commit_complete = true;
+        layer_surface.initial_commit_requested = true;
+        layer_surface.current.desired_width = 10;
+        layer_surface.current.desired_height = 10;
+        layer_surface.committed = layer_surface.current;
+        layer_surface.last_acked = Some(LayerConfigure { serial: 1, width: 800, height: 30 });
+        let client = Client::new_for_tests(ClientId::from_raw(3));
+        let mut dispatcher = Dispatcher::default();
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+
+        let kind = layer_surface
+            .check_commit(&client, &mut client_dispatcher, false, true)
+            .expect("a null-buffer commit is valid");
+        let capture = layer_surface.take_commit_capture(kind);
+
+        assert!(capture.unmap);
+        assert!(!layer_surface.initial_commit_requested);
+        assert!(layer_surface.last_acked.is_none());
+        assert_eq!(layer_surface.committed, LayerSurfaceState::new(LayerShellLayer::Top));
     }
 }

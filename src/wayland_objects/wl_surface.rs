@@ -2881,6 +2881,7 @@ impl WlSurface {
         );
         let resolved_surface = client.resolve_this(&self, state);
         let mut pending_xdg_check = None;
+        let mut pending_layer_check = None;
         let mut this = if let Some(shell_surface) = self.shell_surface {
             let (mut this, preferred_output_id) = client.with_ungrabbed(self, state, |state| {
                 let this = resolved_surface.rref(state);
@@ -2911,21 +2912,20 @@ impl WlSurface {
                 ShellSurfaceObject::LayerSurface(layer_surface_id) => {
                     let has_pending_buffer_attach = this.has_pending_buffer_attach();
                     let is_null_buffer_commit = matches!(this.pending.buffer, Some(None));
-                    let (mut this, accepted) =
-                        client.with_ungrabbed_mut(this, state, |state, client| {
-                            let mut layer_surface = layer_surface_id.grab(state);
-                            layer_surface.on_commit(
-                                client,
-                                state,
-                                dispatcher,
-                                has_pending_buffer_attach,
-                                is_null_buffer_commit,
-                            )
-                        });
-                    if !accepted {
+                    let (this, kind) = client.with_ungrabbed_mut(this, state, |state, client| {
+                        layer_surface_id.rref(state).check_commit(
+                            client,
+                            dispatcher,
+                            has_pending_buffer_attach,
+                            is_null_buffer_commit,
+                        )
+                    });
+                    let Some(kind) = kind else {
+                        let mut this = this;
                         this.clear_failed_surface_commit();
                         return;
-                    }
+                    };
+                    pending_layer_check = Some((layer_surface_id, kind));
                     this
                 }
             }
@@ -2950,15 +2950,22 @@ impl WlSurface {
             return;
         }
 
-        let role = match pending_xdg_check {
-            Some((xdg_surface_id, kind)) => {
+        let role = match (pending_xdg_check, pending_layer_check) {
+            (Some((xdg_surface_id, kind)), _) => {
                 let capture = {
                     let mut xdg_surface = xdg_surface_id.grab(state);
                     xdg_surface.take_commit_capture(state, kind)
                 };
                 RoleUpdate::Xdg { xdg_surface: xdg_surface_id, capture }
             }
-            None => RoleUpdate::None,
+            (None, Some((layer_surface_id, kind))) => {
+                let capture = {
+                    let mut layer_surface = layer_surface_id.grab(state);
+                    layer_surface.take_commit_capture(kind)
+                };
+                RoleUpdate::Layer { layer_surface: layer_surface_id, capture }
+            }
+            (None, None) => RoleUpdate::None,
         };
 
         let mut update = this.capture_commit(dispatcher);
@@ -3030,6 +3037,17 @@ impl WlSurface {
             crate::root_geometry::effective_decoration_insets_for_surface(state, resolved_surface)
         });
         let role_current = update.role_epoch == this.role_epoch;
+        if let RoleUpdate::Layer { layer_surface, capture } = &update.role {
+            // A role object destroyed since the capture leaves its part unapplied.
+            if role_current {
+                let layer_surface = *layer_surface;
+                let (ungrabbed, ()) = client.with_ungrabbed_mut(this, state, |state, client| {
+                    let mut layer = layer_surface.grab(state);
+                    layer.apply_commit(client, state, dispatcher, capture);
+                });
+                this = ungrabbed;
+            }
+        }
         let mut pending_xdg_role_changes = None;
         if let RoleUpdate::Xdg { xdg_surface: xdg_surface_id, capture } =
             std::mem::take(&mut update.role)
