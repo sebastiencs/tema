@@ -1744,3 +1744,41 @@ The queue regression tests are in `wl_surface.rs` `mod tests`. They keep an upda
 ### Manual check
 
 1. Run a Vulkan application with explicit sync, such as `vkcube`, and resize its window while it runs. Frames are neither dropped nor shown out of order, and the log has no new warnings.
+
+## 29. Frame pacing: fifo and commit timing
+
+`wp_fifo_v1` and `wp_commit_timer_v1` add two reasons for an update to wait in its surface's queue (section 28). `Readiness::WaitFifo` holds an update that waits for a barrier. `Readiness::WaitTime` holds an update that has a target time. Nothing holds a whole client. The gate state, the timerfd model and the latch hooks are in `src/commit_gate.rs`. The objects are `src/wayland_objects/wp_fifo_v1.rs`, `wp_fifo_manager_v1.rs`, `wp_commit_timer_v1.rs` and `wp_commit_timing_manager_v1.rs`. Both managers are advertised to every client, Xwayland included.
+
+### Barrier lifetime
+
+`wp_fifo_v1.set_barrier` sets a barrier on the surface when its update applies. The barrier is replaced by a newer one on the same surface. Each barrier has a sequence number, and a latch acts only on the barrier it saw. An update with `wait_barrier` waits in the queue while its surface holds a barrier.
+
+A hard latch clears the barrier. A hard latch is a frame submitted to KMS without async flip on the surface's active output (or on any output when the surface has none), with the surface in the frame's callback surfaces. A soft latch shortens the barrier's deadline to `min(deadline, now + one period of that output)`. A soft latch is one of three things: an async (tearing) submission with the surface in the frame; a `NoPresent` frame with the surface in its frame callback surfaces; or any latch of the surface's active output while the surface is not in that frame (occluded). A tearing frame never clears a barrier. A surface that is grabbed when a latch is noted is skipped for that latch, because it cannot be read. Its barrier then clears at its fallback deadline. The DRM submit paths do not run with a surface grabbed.
+
+A barrier also has a fallback deadline, set when the barrier is set. It is 25 ms when the surface has no active output, when that output has no frame scheduler snapshot, when the session is inactive, or when the snapshot's clock mode is `Passive`. Otherwise it is `max(100 ms, 4 × period)`. The long fallback never ends a barrier before a real latch of a visible surface. An occluded surface on the output gets soft latches instead.
+
+Clearing or expiring a barrier sends `ClientAction::FlushCommitQueues` to the surface's client. The commit gate timerfd wakes at the earliest barrier or timed-wait deadline. A destroyed surface, or a closed client, loses its barrier and its timed wait.
+
+### Ready time
+
+A commit with a target time (`wp_commit_timer_v1.set_timestamp`) is ready at `ready_at_with_now`. The target is used as is unless the output's frame clock can predict its vblanks. Prediction needs all of these: the surface is on one output or none, its clock mode is `Fixed` and it is not tearing, the last present has `refresh_is_constant`, is not an async flip and has a kernel timestamp, and that present is no more than 8 periods old. Any other case uses the target.
+
+When prediction applies, the period comes from the nominal refresh and the margin is `min(period / 4, 2 ms)`. Let `base` be the last present's time. If `target + margin <= base`, the update is ready at `base`. Otherwise `k` is the smallest count that makes `base + k × period` at least `target + margin`, and the update is ready at `base + (k − 1) × period + margin`. So the ready time is one margin after the vblank before the target vblank. This holds even when that vblank is the last present. A grid that is late by less than the margin cannot show the update early. Late is allowed, and early is not. No lead is subtracted from the target.
+
+Timestamps are `CLOCK_MONOTONIC` values converted to `Instant`. A timestamp more than 24 h ahead is clamped to 24 h from now, including one that converts successfully. A timestamp that cannot be converted is clamped the same way when it is in the future, and to now when it is in the past. `tv_nsec` above 999 999 999, or `tv_sec_hi` above `0x7fffffff`, is an `invalid_timestamp` error.
+
+The frame clock records what the ready time needs. `PresentFlags` carries `async_flip` and `kernel_timestamp`. `FrameClock::update_mode` forgets the last present when the clock mode or the nominal refresh changes.
+
+### Children's targets
+
+A synchronized child's target time is folded into its parent's update with `max`, and so is each carried child's. The parent update is ready only when the latest of these targets is ready. A child's barrier set flag is carried too: when the parent's update applies, the barrier is set on the child. A synchronized child's wait-barrier flag is cleared before its commit is cached, so the child never waits for a barrier while it is synchronized. The flag stays cleared if the child later becomes desynchronized and its cached state is submitted on its own.
+
+Merging two commits keeps the stronger constraints: set and wait flags are OR-ed, and the later target time wins.
+
+### Xwayland
+
+The two managers are ordinary globals at version 1, advertised to every client, Xwayland included. Xwayland surfaces use the same barrier and target-time paths as other surfaces. Their latches come from the same DRM submit paths.
+
+### Non-goals
+
+tema does not move a variable-refresh output toward the target time. For a variable-refresh output, the target is used as is. Targets are not predicted across more than one output: with two or more outputs the target is used as is. The fallback deadlines are not configurable, and there is no config option for either protocol. A barrier does not make a surface wait for another surface's barrier.
