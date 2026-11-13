@@ -495,6 +495,28 @@ pub fn build_committed_root_geometry(
                 })
                 .unwrap_or((content_rect_global.x, content_rect_global.y));
             (layout_rect_global, content_rect_global, computed_root_pos, allocation.tiled_edges)
+        } else if let Some((origin, window_geometry)) =
+            floating_frame_origin(state, surface_id).zip(effective_window_geometry)
+        {
+            // A floating xdg window is positioned by its frame. The root is derived,
+            // so a window-geometry offset change does not move the frame.
+            let insets = if compositor_decorations_enabled(fullscreen) {
+                decoration_insets
+            } else {
+                DecorationInsets::default()
+            };
+            let content_rect_global = RectI {
+                x: origin.0.saturating_add(insets.left.max(0)),
+                y: origin.1.saturating_add(insets.top.max(0)),
+                width: window_geometry.width,
+                height: window_geometry.height,
+            };
+            let layout_rect_global = inflate_rect_with_insets(content_rect_global, insets);
+            let computed_root_pos = (
+                content_rect_global.x.saturating_sub(window_geometry.x),
+                content_rect_global.y.saturating_sub(window_geometry.y),
+            );
+            (layout_rect_global, content_rect_global, computed_root_pos, 0)
         } else {
             let translated_surface_bounds =
                 translated_surface_tree_bounds(local_surface_bounds, root_pos);
@@ -626,6 +648,14 @@ fn non_ssd_binding_rect(
 /// Whether the compositor frame is reserved around this snapshot.
 fn compositor_decorations_enabled(fullscreen: bool) -> bool {
     !fullscreen
+}
+
+/// Frame origin of a floating, non-fullscreen managed window, when it has one.
+fn floating_frame_origin(state: &State, surface_id: Resolved<WlSurfaceId>) -> Option<(i32, i32)> {
+    let managed = state.managed_window(surface_id)?;
+    (managed.mode == crate::state::ManagedWindowMode::Floating && !managed.fullscreen)
+        .then_some(managed.floating_frame_origin)
+        .flatten()
 }
 
 /// Build the compositor frame when it is larger than the content rect.

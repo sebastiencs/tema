@@ -606,6 +606,14 @@ pub struct ManagedWindowState {
     /// Fixed edges of a floating resize, in root-position space, kept until
     /// the client commits the final size.
     pub resize_anchor: Option<ResizeAnchor>,
+    /// Global origin of the outer frame of a floating xdg window.
+    ///
+    /// The root surface origin is derived from it on every geometry build, so a
+    /// commit that only moves the client's window geometry inside its buffer
+    /// keeps the frame in place. `None` until the window has been mapped while
+    /// floating, and cleared when it leaves floating or becomes fullscreen.
+    /// X11 windows never set it.
+    pub floating_frame_origin: Option<(i32, i32)>,
     /// Tile content rect the client's current buffer size was produced for.
     ///
     /// Updated whenever the committed window-geometry size equals the tile
@@ -1482,6 +1490,7 @@ impl State {
             restore_floating_state_on_next_configure: false,
             hold_floating_layout: false,
             resize_anchor: None,
+            floating_frame_origin: None,
             tiled_content_basis: None,
             urgent: false,
             focus_animation: FocusVisualAnimation::settled(self.focus_visual_base(root)),
@@ -3775,6 +3784,7 @@ impl State {
         managed.mode = new_mode;
         if !floating {
             managed.resize_anchor = None;
+            managed.floating_frame_origin = None;
         }
         managed.awaiting_initial_layout = !floating && !managed.mapped;
         let restore_state = floating
@@ -3840,6 +3850,7 @@ impl State {
         managed.mode = ManagedWindowMode::Floating;
         managed.fullscreen = false;
         managed.tiled_content_basis = None;
+        managed.floating_frame_origin = None;
         managed.restore_floating_state_on_next_configure = false;
         managed.hold_floating_layout = false;
         if let Some(workspace) = self.workspaces.try_get_mut(workspace_id) {
@@ -3866,6 +3877,7 @@ impl State {
         managed.mode = ManagedWindowMode::Tiled;
         managed.resize_anchor = None;
         managed.tiled_content_basis = None;
+        managed.floating_frame_origin = None;
         managed.restore_floating_state_on_next_configure = false;
         managed.hold_floating_layout = false;
         tiling::mark_workspace_dirty(self, workspace_id);
@@ -3926,6 +3938,7 @@ impl State {
             managed.hold_floating_layout = false;
             managed.fullscreen = true;
             managed.resize_anchor = None;
+            managed.floating_frame_origin = None;
             managed.tiled_content_basis = None;
         } else {
             {
@@ -6872,6 +6885,124 @@ mod tests {
                 configure_size: (120, 90),
                 layout_rect: RectI { x: 40, y: 50, width: 120, height: 90 },
             })
+        );
+    }
+
+    fn floating_frame_fixture() -> (State, Resolved<WlSurfaceId>, WindowId) {
+        let mut state = state_for_tests();
+        let backend = BackendOutputRef::new(DrmId::from(0usize));
+        let _output_id =
+            state.insert_output(test_output_with_crtc_name(backend, 1, 0, 0, 1280, 720));
+        let (_, object_id) = state.insert_object(WlSurface::new(
+            WlSurfaceId::from(19u32),
+            ClientId::from_raw(10),
+            6,
+        ));
+        {
+            let mut surface = state.objects.grab_object::<WlSurface>(object_id);
+            surface.test_map(ObjectId::from(1usize), 0, 0, 120, 100);
+        }
+        state.register_root_surface(root(&state, object_id));
+        let root_surface = root(&state, object_id);
+        let window = crate::test_support::insert_window(&mut state, root_surface);
+        state.managed_window_mut(root_surface).unwrap().mode = ManagedWindowMode::Floating;
+        (state, root_surface, window)
+    }
+
+    fn build_floating_geometry(
+        state: &State,
+        root_surface: Resolved<WlSurfaceId>,
+        explicit_window_geometry: RectI,
+    ) -> crate::root_geometry::CommittedRootGeometry {
+        let overrides = crate::root_geometry::GeometryBuildOverrides {
+            explicit_window_geometry: Some(explicit_window_geometry),
+            decoration_insets: Some(DecorationInsets { top: 3, right: 2, bottom: 3, left: 2 }),
+            ..Default::default()
+        };
+        crate::root_geometry::build_committed_root_geometry(
+            state,
+            root_surface,
+            root_surface.try_ref(state).unwrap(),
+            None,
+            overrides,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_floating_frame_origin_places_the_frame_and_derives_the_root() {
+        let (mut state, root_surface, _window) = floating_frame_fixture();
+        state
+            .managed_window_mut(root_surface)
+            .unwrap()
+            .floating_frame_origin = Some((300, 200));
+
+        let geometry = build_floating_geometry(
+            &state,
+            root_surface,
+            RectI { x: 20, y: 20, width: 80, height: 60 },
+        );
+
+        assert_eq!(geometry.layout_rect_global, RectI { x: 300, y: 200, width: 84, height: 66 });
+        assert_eq!(geometry.root_pos, (282, 183));
+        assert_eq!(
+            geometry.logical_window_local,
+            Some(RectI { x: 20, y: 20, width: 80, height: 60 })
+        );
+    }
+
+    #[test]
+    fn the_frame_origin_survives_a_window_geometry_offset_change() {
+        let (mut state, root_surface, _window) = floating_frame_fixture();
+        state
+            .managed_window_mut(root_surface)
+            .unwrap()
+            .floating_frame_origin = Some((300, 200));
+
+        let shadowed = build_floating_geometry(
+            &state,
+            root_surface,
+            RectI { x: 20, y: 20, width: 80, height: 60 },
+        );
+        let shadow_dropped = build_floating_geometry(
+            &state,
+            root_surface,
+            RectI { x: 0, y: 0, width: 80, height: 60 },
+        );
+
+        assert_eq!(shadowed.layout_rect_global, shadow_dropped.layout_rect_global);
+        assert_eq!(shadow_dropped.root_pos, (302, 203));
+    }
+
+    #[test]
+    fn without_a_frame_origin_the_root_position_is_kept() {
+        let (state, root_surface, _window) = floating_frame_fixture();
+
+        let geometry = build_floating_geometry(
+            &state,
+            root_surface,
+            RectI { x: 20, y: 20, width: 80, height: 60 },
+        );
+
+        assert_eq!(geometry.root_pos, root_surface.try_ref(&state).unwrap().root_position());
+    }
+
+    #[test]
+    fn leaving_floating_clears_the_frame_origin() {
+        let (mut state, root_surface, window) = floating_frame_fixture();
+        state
+            .managed_window_mut(root_surface)
+            .unwrap()
+            .floating_frame_origin = Some((1, 2));
+
+        assert!(state.set_window_floating(window, false));
+
+        assert_eq!(
+            state
+                .managed_window(root_surface)
+                .unwrap()
+                .floating_frame_origin,
+            None
         );
     }
 
