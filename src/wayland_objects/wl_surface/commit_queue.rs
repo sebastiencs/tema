@@ -84,11 +84,8 @@ impl CommitQueues {
 /// Inputs only the top-level update needs (fifo / commit timing).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TopLevel {
-    #[allow(dead_code)] // read by FIFO_COMMIT_TIMING_PLAN
     pub(super) active_output: Option<OutputId>,
-    #[allow(dead_code)] // read by FIFO_COMMIT_TIMING_PLAN
     pub(super) now: std::time::Instant,
-    #[allow(dead_code)] // read by FIFO_COMMIT_TIMING_PLAN
     pub(super) output_count: usize,
 }
 
@@ -98,6 +95,12 @@ pub(super) enum Readiness {
     WaitSequence,
     WaitAcquire {
         acquire: crate::sync::AcquireSync,
+    },
+    /// The surface holds a fifo barrier that the update waits for.
+    WaitFifo,
+    /// The update's target time is later than the time it could apply at.
+    WaitTime {
+        at: std::time::Instant,
     },
     #[cfg(test)]
     WaitTestHold,
@@ -129,6 +132,9 @@ pub(super) fn readiness(
             return Readiness::WaitTestHold;
         }
     }
+    if top.is_some() && update.fifo_wait_barrier && state.commit_gate.has_barrier(surface) {
+        return Readiness::WaitFifo;
+    }
     for child in &update.children {
         if !child.surface.exists(state) {
             continue; // destroyed: discarded at apply
@@ -147,14 +153,35 @@ pub(super) fn readiness(
             other => return other,
         }
     }
-    let _ = (surface, top); // used by FIFO_COMMIT_TIMING_PLAN
+    if let Some(t) = top {
+        if let Some(target) = max_target(update) {
+            let at = crate::commit_gate::ready_at_with_now(
+                state,
+                t.active_output,
+                t.output_count,
+                target,
+                t.now,
+            );
+            if at > t.now {
+                return Readiness::WaitTime { at };
+            }
+        }
+    }
     Readiness::Ready
 }
 
-fn top_level(surface: &WlSurface) -> TopLevel {
+/// The latest target time of `update` and of every carried child.
+fn max_target(update: &ContentUpdate) -> Option<std::time::Instant> {
+    update
+        .children
+        .iter()
+        .fold(update.commit_target, |latest, child| latest.max(max_target(&child.update)))
+}
+
+fn top_level(surface: &WlSurface, now: std::time::Instant) -> TopLevel {
     TopLevel {
         active_output: surface.active_output_id(),
-        now: std::time::Instant::now(),
+        now,
         output_count: surface.output_membership_ids().len(),
     }
 }
@@ -169,7 +196,7 @@ pub(super) fn submit(
     update: ContentUpdate,
 ) {
     let surface = client.resolve_this(&this, state);
-    let top = top_level(&this);
+    let top = top_level(&this, state.commit_gate.now());
     if this.queue.is_empty()
         && matches!(
             readiness(state, surface, this.applied_update_seq, &update, false, Some(top)),
@@ -249,7 +276,8 @@ fn try_apply_head(
             return false;
         };
         wl.queue.front().map(|head| {
-            readiness(state, surface, wl.applied_update_seq, head, false, Some(top_level(wl)))
+            let top = top_level(wl, state.commit_gate.now());
+            readiness(state, surface, wl.applied_update_seq, head, false, Some(top))
         })
     };
     let Some(next) = next else {
@@ -267,6 +295,10 @@ fn try_apply_head(
             state.commit_queues.note_dequeued(surface, now_empty);
             WlSurface::apply_update(this, client, state, dispatcher, update);
             true
+        }
+        Readiness::WaitTime { at } => {
+            crate::commit_gate::wait_until(state, dispatcher, surface, at);
+            false
         }
         Readiness::WaitAcquire { acquire } => {
             let mut this = surface.grab(state);

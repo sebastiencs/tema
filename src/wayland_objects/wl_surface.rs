@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     rc::Rc,
+    time::Instant,
 };
 
 use crate::{
@@ -415,6 +416,12 @@ struct Pending {
     blur_region: Option<Option<RegionValue>>,
     pointer_constraint_hint: Option<(f32, f32)>,
     xwayland_serial: Option<u64>,
+    /// `wp_fifo_v1.set_barrier` of this commit.
+    fifo_set_barrier: bool,
+    /// `wp_fifo_v1.wait_barrier` of this commit.
+    fifo_wait_barrier: bool,
+    /// `wp_commit_timer_v1.set_timestamp` of this commit.
+    commit_target: Option<Instant>,
 }
 
 impl Default for Pending {
@@ -438,6 +445,9 @@ impl Default for Pending {
             pointer_constraint_hint: None,
             blur_region: None,
             xwayland_serial: None,
+            fifo_set_barrier: false,
+            fifo_wait_barrier: false,
+            commit_target: None,
         }
     }
 }
@@ -1105,6 +1115,22 @@ impl WlSurface {
 
     pub(crate) fn set_pending_xwayland_serial(&mut self, serial: u64) {
         self.pending.xwayland_serial = Some(serial);
+    }
+
+    pub(crate) fn set_pending_fifo_barrier(&mut self) {
+        self.pending.fifo_set_barrier = true;
+    }
+
+    pub(crate) fn set_pending_fifo_wait(&mut self) {
+        self.pending.fifo_wait_barrier = true;
+    }
+
+    pub(crate) fn has_pending_commit_target(&self) -> bool {
+        self.pending.commit_target.is_some()
+    }
+
+    pub(crate) fn set_pending_commit_target(&mut self, at: Instant) {
+        self.pending.commit_target = Some(at);
     }
 
     pub(crate) fn pending_xwayland_serial(&self) -> Option<u64> {
@@ -2898,6 +2924,7 @@ impl WlSurface {
         update: ContentUpdate,
     ) -> (bool, bool) {
         let this = client.resolve(self.id, state).unwrap();
+        let set_barrier = update.fifo_set_barrier;
         self.apply_xwayland_serial(client, this, update.xwayland_serial, dispatcher);
         if let Some(pointer_constraint) = &update.pointer_constraint {
             apply_pointer_constraint_commit(
@@ -2925,6 +2952,9 @@ impl WlSurface {
         let (immediate_callbacks, needs_frame) = self.route_frame_callbacks(update.frame_callbacks);
         Self::complete_frame_callbacks(client, state, dispatcher, immediate_callbacks);
         self.applied_update_seq = self.applied_update_seq.max(last_seq);
+        if set_barrier {
+            crate::commit_gate::set_barrier(state, dispatcher, this, self.active_output_id());
+        }
         (changed, needs_frame || needs_presentation_frame)
     }
 
@@ -3035,6 +3065,9 @@ impl WlSurface {
         update.role = role;
 
         if this.behaves_synchronized(state) {
+            // The constraint is ignored while the commit is synchronized; it
+            // stays cleared if the child later applies the cache on its own.
+            update.fifo_wait_barrier = false;
             let discarded = this.merge_cached_update(update);
             Self::discard_feedbacks(client, state, dispatcher, discarded);
             return;
@@ -3100,6 +3133,9 @@ impl WlSurface {
             .pointer_constraint()
             .map(|constraint| PointerConstraintUpdate { constraint, region, hint });
         update.xwayland_serial = self.pending.xwayland_serial.take();
+        update.fifo_set_barrier = std::mem::take(&mut self.pending.fifo_set_barrier);
+        update.fifo_wait_barrier = std::mem::take(&mut self.pending.fifo_wait_barrier);
+        update.commit_target = self.pending.commit_target.take();
         if update.xwayland_serial.is_some() {
             self.latest_xwayland_serial = update.xwayland_serial;
         }
@@ -10323,12 +10359,12 @@ mod tests {
         let child_update = acquire_gated_update(&client, &mut state, 90, 1, read);
         let mut parent_update =
             ContentUpdate::test_new(WlSurface::test_payload(None), Vec::new(), Vec::new());
-        parent_update
-            .children
-            .push(super::content_update::ChildUpdate {
+        parent_update.children.push(
+            crate::wayland_objects::wl_surface::content_update::ChildUpdate {
                 surface: child,
                 update: Box::new(child_update),
-            });
+            },
+        );
         assert!(matches!(
             super::commit_queue::readiness(&state, parent, 0, &parent_update, false, None),
             super::commit_queue::Readiness::WaitAcquire { .. }
@@ -10902,5 +10938,220 @@ mod tests {
         assert!(buffer_release_was_sent(&dispatcher, 20));
         assert!(delete_id_was_sent(&dispatcher, 40));
         assert!(!feedback.exists(&state));
+    }
+
+    mod fifo_and_timing {
+        use {
+            super::*,
+            std::time::{Duration, Instant},
+        };
+
+        /// Queues `update` on `surface` and flushes the client, as a commit that
+        /// arrives behind nothing would.
+        fn queue_update_and_flush(
+            client: &mut Client,
+            state: &mut State,
+            dispatcher: &mut Dispatcher,
+            surface: Resolved<WlSurfaceId>,
+            update: ContentUpdate,
+        ) {
+            {
+                let mut grabbed = surface.grab(state);
+                WlSurface::test_enqueue(&mut grabbed, state, surface, update);
+            }
+            flush_queued_commits(client, state, dispatcher);
+        }
+
+        fn plain_update(seq: u64) -> ContentUpdate {
+            ContentUpdate::new(seq, 0, WlSurface::test_payload(None), Vec::new(), Vec::new())
+        }
+
+        #[test]
+        fn set_barrier_in_an_applied_update_creates_a_barrier() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let surface = insert_plain_root(&mut client, &mut state, 1);
+            let mut update = plain_update(1);
+            update.fifo_set_barrier = true;
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, surface, update);
+            assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+            assert!(state.commit_gate.has_barrier(surface));
+        }
+
+        #[test]
+        fn wait_barrier_without_a_barrier_applies_at_once() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let surface = insert_plain_root(&mut client, &mut state, 1);
+            let mut update = plain_update(1);
+            update.fifo_wait_barrier = true;
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, surface, update);
+            assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+            assert_eq!(surface.rref(&state).test_queue_len(), 0);
+        }
+
+        #[test]
+        fn wait_barrier_with_a_barrier_queues_until_the_barrier_clears() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let surface = insert_plain_root(&mut client, &mut state, 1);
+            let t0 = Instant::now();
+            let seq = state
+                .commit_gate
+                .insert_barrier(surface, t0 + Duration::from_secs(1));
+            let mut update = plain_update(1);
+            update.fifo_wait_barrier = true;
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, surface, update);
+            assert_eq!(surface.rref(&state).test_queue_len(), 1);
+            assert_eq!(surface.rref(&state).test_applied_update_seq(), 0);
+
+            assert!(state.commit_gate.remove_barrier(surface, seq));
+            flush_queued_commits(&mut client, &mut state, &mut dispatcher);
+            assert_eq!(surface.rref(&state).test_queue_len(), 0);
+            assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+        }
+
+        #[test]
+        fn other_surfaces_are_not_held_by_a_fifo_wait() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let held = insert_plain_root(&mut client, &mut state, 1);
+            let other = insert_plain_root(&mut client, &mut state, 2);
+            let t0 = Instant::now();
+            state
+                .commit_gate
+                .insert_barrier(held, t0 + Duration::from_secs(1));
+            let mut update = plain_update(1);
+            update.fifo_wait_barrier = true;
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, other, update);
+            assert_eq!(other.rref(&state).test_applied_update_seq(), 1);
+            assert_eq!(other.rref(&state).test_queue_len(), 0);
+        }
+
+        #[test]
+        fn wait_barrier_of_a_sync_commit_is_cleared_before_caching() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let (_parent, child) = synchronized_child_of_root_parent(&mut client, &mut state);
+            let t0 = Instant::now();
+            state
+                .commit_gate
+                .insert_barrier(child, t0 + Duration::from_secs(1));
+            child.grab(&mut state).set_pending_fifo_wait();
+            commit_surface(&mut client, &mut state, &mut dispatcher, child);
+            // Synchronized: the wait is ignored and cleared before the cache.
+            let cached = child.rref(&state).cached_update.as_ref().expect("cached");
+            assert!(!cached.fifo_wait_barrier);
+
+            // Desynchronized, the cache applies on its own although the child
+            // still holds its barrier.
+            subsurface_request(
+                &mut client,
+                &mut state,
+                &mut dispatcher,
+                WlSubsurfaceId::from(61),
+                5,
+            );
+            assert_eq!(child.rref(&state).test_applied_update_seq(), 1);
+            assert!(child.rref(&state).cached_update.is_none());
+        }
+
+        #[test]
+        fn set_barrier_on_a_carried_child_sets_the_childs_barrier_on_parent_apply() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let parent = insert_plain_root(&mut client, &mut state, 1);
+            let child = insert_plain_root(&mut client, &mut state, 2);
+            let mut child_update = plain_update(1);
+            child_update.fifo_set_barrier = true;
+            let mut parent_update = plain_update(1);
+            parent_update.children.push(
+                crate::wayland_objects::wl_surface::content_update::ChildUpdate {
+                    surface: child,
+                    update: Box::new(child_update),
+                },
+            );
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, parent, parent_update);
+            assert_eq!(parent.rref(&state).test_applied_update_seq(), 1);
+            assert!(state.commit_gate.has_barrier(child));
+        }
+
+        #[test]
+        fn future_target_queues_with_a_timed_wait() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let surface = insert_plain_root(&mut client, &mut state, 1);
+            let t0 = Instant::now();
+            state.commit_gate.test_now = Some(t0);
+            let mut update = plain_update(1);
+            update.commit_target = Some(t0 + Duration::from_millis(50));
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, surface, update);
+            assert_eq!(surface.rref(&state).test_queue_len(), 1);
+            assert_eq!(surface.rref(&state).test_applied_update_seq(), 0);
+            assert_eq!(state.commit_gate.next_deadline(), Some(t0 + Duration::from_millis(50)));
+
+            let due = t0 + Duration::from_millis(50);
+            state.commit_gate.test_now = Some(due);
+            assert_eq!(state.commit_gate.take_due(due), vec![surface]);
+            flush_queued_commits(&mut client, &mut state, &mut dispatcher);
+            assert_eq!(surface.rref(&state).test_queue_len(), 0);
+            assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+        }
+
+        #[test]
+        fn past_target_applies_at_once() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let surface = insert_plain_root(&mut client, &mut state, 1);
+            let t0 = Instant::now();
+            state.commit_gate.test_now = Some(t0);
+            let mut update = plain_update(1);
+            update.commit_target = Some(t0.checked_sub(Duration::from_millis(1)).unwrap());
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, surface, update);
+            assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+            assert_eq!(surface.rref(&state).test_queue_len(), 0);
+            assert!(state.commit_gate.next_deadline().is_none());
+        }
+
+        #[test]
+        fn child_target_holds_the_parent_update() {
+            let mut state = state_for_tests();
+            let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+            let parent = insert_plain_root(&mut client, &mut state, 1);
+            let child = insert_plain_root(&mut client, &mut state, 2);
+            let t0 = Instant::now();
+            state.commit_gate.test_now = Some(t0);
+            let mut child_update = plain_update(1);
+            child_update.commit_target = Some(t0 + Duration::from_millis(50));
+            let mut parent_update = plain_update(1);
+            parent_update.children.push(
+                crate::wayland_objects::wl_surface::content_update::ChildUpdate {
+                    surface: child,
+                    update: Box::new(child_update),
+                },
+            );
+            queue_update_and_flush(&mut client, &mut state, &mut dispatcher, parent, parent_update);
+            assert_eq!(parent.rref(&state).test_applied_update_seq(), 0);
+            assert_eq!(state.commit_gate.next_deadline(), Some(t0 + Duration::from_millis(50)));
+        }
+
+        #[test]
+        fn merged_targets_keep_the_latest() {
+            let t0 = Instant::now();
+            let mut update = plain_update(1);
+            update.commit_target = Some(t0 + Duration::from_millis(50));
+            let mut earlier = plain_update(2);
+            earlier.commit_target = Some(t0 + Duration::from_millis(20));
+            update.merge(earlier, &mut Vec::new());
+            assert_eq!(update.commit_target, Some(t0 + Duration::from_millis(50)));
+
+            update.merge(plain_update(3), &mut Vec::new());
+            assert_eq!(update.commit_target, Some(t0 + Duration::from_millis(50)));
+
+            let mut later = plain_update(4);
+            later.commit_target = Some(t0 + Duration::from_millis(80));
+            update.merge(later, &mut Vec::new());
+            assert_eq!(update.commit_target, Some(t0 + Duration::from_millis(80)));
+        }
     }
 }

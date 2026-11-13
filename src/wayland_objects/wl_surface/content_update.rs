@@ -24,6 +24,12 @@ pub(crate) struct ContentUpdate {
     pub(super) tree: TreeUpdate,
     /// The cached updates of synchronized children, taken at capture.
     pub(super) children: Vec<ChildUpdate>,
+    /// The commit set a fifo barrier: applying it sets the surface's barrier.
+    pub(super) fifo_set_barrier: bool,
+    /// The commit waits while its surface holds a fifo barrier.
+    pub(super) fifo_wait_barrier: bool,
+    /// The commit may not apply before this time (commit timing).
+    pub(super) commit_target: Option<Instant>,
     /// Test-only: the readiness check holds this update until it is released.
     #[cfg(test)]
     pub(super) test_hold: bool,
@@ -87,6 +93,9 @@ impl ContentUpdate {
             role: RoleUpdate::None,
             tree: TreeUpdate::default(),
             children: Vec::new(),
+            fifo_set_barrier: false,
+            fifo_wait_barrier: false,
+            commit_target: None,
             #[cfg(test)]
             test_hold: false,
         }
@@ -161,6 +170,9 @@ impl ContentUpdate {
             }
         }
         self.acquire_forced |= next.acquire_forced;
+        self.fifo_set_barrier |= next.fifo_set_barrier;
+        self.fifo_wait_barrier |= next.fifo_wait_barrier;
+        self.commit_target = self.commit_target.max(next.commit_target);
         #[cfg(test)]
         {
             self.test_hold |= next.test_hold;

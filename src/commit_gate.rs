@@ -210,6 +210,18 @@ pub(crate) fn set_barrier(
     dispatcher.dispatch(CommitGateAction::Arm);
 }
 
+/// The time at which an update with `target` may apply. Until the prediction
+/// lands, it is the target itself.
+pub(crate) fn ready_at_with_now(
+    _state: &State,
+    _output: Option<OutputId>,
+    _output_count: usize,
+    target: Instant,
+    _now: Instant,
+) -> Instant {
+    target
+}
+
 pub(crate) fn wait_until(
     state: &mut State,
     dispatcher: &mut Dispatcher,
