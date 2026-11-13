@@ -993,7 +993,6 @@ mod tests {
     /// larger buffer), then drops the shadow on the next commit (geometry 0,0).
     /// The frame tema centered must not move.
     #[test]
-    #[ignore = "passes once floating windows are frame-positioned"]
     fn dropping_the_csd_shadow_after_map_keeps_the_dialog_frame_in_place() {
         let mut fixture = MapFixture::new();
         let (parent, parent_window) = fixture.setup();
@@ -1052,6 +1051,55 @@ mod tests {
 
         assert_eq!(fixture.child_geometry(), centered);
         assert_eq!(fixture.root_pos(), (root_with_shadow.0 + 20, root_with_shadow.1 + 20));
+    }
+
+    #[test]
+    fn a_mapped_floating_dialog_adopts_its_frame_origin() {
+        let mut fixture = MapFixture::new();
+        fixture.setup();
+        fixture.set_parent(41);
+        fixture.make_dialog();
+        fixture.initial_configure_size();
+        fixture.map_child();
+
+        let g = fixture.child_geometry();
+        assert_eq!(
+            fixture
+                .state
+                .managed_window_state(fixture.window)
+                .unwrap()
+                .floating_frame_origin,
+            Some((g.x, g.y))
+        );
+    }
+
+    #[test]
+    fn a_restored_floating_window_takes_its_remembered_frame_origin() {
+        let mut fixture = MapFixture::new();
+        fixture.setup();
+        fixture.set_parent(41);
+        fixture.make_dialog();
+        fixture.initial_configure_size();
+        fixture.map_child();
+
+        fixture.state.set_window_floating(fixture.window, false);
+        let r = fixture
+            .state
+            .managed_window_state(fixture.window)
+            .unwrap()
+            .remembered_floating_state
+            .unwrap()
+            .layout_rect;
+        fixture.state.set_window_floating(fixture.window, true);
+
+        assert_eq!(
+            fixture
+                .state
+                .managed_window_state(fixture.window)
+                .unwrap()
+                .floating_frame_origin,
+            Some((r.x, r.y))
+        );
     }
 
     #[test]

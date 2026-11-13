@@ -2629,6 +2629,48 @@ impl State {
         true
     }
 
+    /// Keep a frame-positioned window's root surface at its derived origin.
+    ///
+    /// The first call for a mapped window without a frame origin adopts the
+    /// frame of the geometry built from the current root, so nothing moves.
+    /// Returns true when the root surface moved.
+    pub(crate) fn sync_floating_root_position(&mut self, root: Resolved<WlSurfaceId>) -> bool {
+        if !self.is_frame_positioned_root(root) {
+            return false;
+        }
+        let mapped = root
+            .try_ref(self)
+            .is_some_and(|surface| surface.logical_size().is_some());
+        if !mapped {
+            return false;
+        }
+        let Some(geometry) = self.ensure_root_geometry_fresh(root) else {
+            return false;
+        };
+        if geometry.logical_window_local.is_none() {
+            return false;
+        }
+        let Some(managed) = self.managed_window_mut(root) else {
+            return false;
+        };
+        if managed.floating_frame_origin.is_none() {
+            managed.floating_frame_origin =
+                Some((geometry.layout_rect_global.x, geometry.layout_rect_global.y));
+            self.mark_root_geometry_dirty(root);
+            return false;
+        }
+        let Some(mut surface) = root.try_grab(self) else {
+            return false;
+        };
+        if surface.root_position() == geometry.root_pos {
+            return false;
+        }
+        surface.set_root_position(geometry.root_pos.0, geometry.root_pos.1);
+        drop(surface);
+        self.mark_root_geometry_dirty(root);
+        true
+    }
+
     /// Saved floating frame while the attached buffer is still a different size.
     fn held_floating_layout(&mut self, window: WindowId) -> Option<RectI> {
         let surface = self.window_root_surface(window)?;
@@ -4224,6 +4266,10 @@ impl State {
     ) -> bool {
         if !self.set_root_surface_position(surface, remembered_state.root_pos) {
             return false;
+        }
+        if self.is_frame_positioned_root(surface) {
+            let frame = remembered_state.layout_rect;
+            self.apply_floating_frame_origin(surface, (frame.x, frame.y));
         }
         // The attached buffer is still the fullscreen frame. Sampling it would aim the
         // animation at that size, parked on the restored floating origin.
@@ -7065,6 +7111,20 @@ mod tests {
         );
 
         assert_eq!(geometry.root_pos, root_surface.try_ref(&state).unwrap().root_position());
+    }
+
+    #[test]
+    fn a_root_without_an_xdg_role_never_adopts_a_frame_origin() {
+        let (mut state, root_surface, _window) = floating_frame_fixture();
+
+        assert!(!state.sync_floating_root_position(root_surface));
+        assert_eq!(
+            state
+                .managed_window(root_surface)
+                .unwrap()
+                .floating_frame_origin,
+            None
+        );
     }
 
     #[test]

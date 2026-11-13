@@ -702,10 +702,10 @@ mod tests {
             y: 50,
             width: 200,
             height: 100,
-            frame_x: 30,
-            frame_y: 40,
-            frame_width: 220,
-            frame_height: 120,
+            frame_x: 40,
+            frame_y: 50,
+            frame_width: 200,
+            frame_height: 100,
         }
     }
 

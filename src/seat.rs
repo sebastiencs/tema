@@ -4939,12 +4939,10 @@ mod xdg_seat_tests {
             .unwrap()
             .frame_rect_global();
         let gap = gap_midpoint(left_frame, right_frame);
-        state
-            .objects
-            .get_mut(floating)
-            .downcast_mut::<WlSurface>()
-            .unwrap()
-            .set_root_position(gap.0.round() as i32 - 40, gap.1.round() as i32 - 40);
+        state.set_root_surface_position(
+            floating_root,
+            (gap.0.round() as i32 - 40, gap.1.round() as i32 - 40),
+        );
         ensure_test_root_geometry(&mut state, floating);
         let covered = scene_pick_at(&state, gap);
         assert!(covered.zone.is_none());
@@ -5345,10 +5343,7 @@ mod xdg_seat_tests {
         }
 
         assert!(state.set_root_surface_floating(root(&state, wl_surface_object_id), true));
-        {
-            let mut surface = state.objects.grab_object::<WlSurface>(wl_surface_object_id);
-            surface.set_root_position(250, 180);
-        }
+        state.set_root_surface_position(root(&state, wl_surface_object_id), (250, 180));
         state.mark_root_geometry_dirty(root(&state, wl_surface_object_id));
         let _ = state.committed_root_geometry(root(&state, wl_surface_object_id));
         assert!(state.set_root_surface_floating(root(&state, wl_surface_object_id), false));
@@ -6496,10 +6491,7 @@ mod xdg_seat_tests {
             80,
         );
         assert!(state.set_root_surface_floating(root(&state, wl_surface_object_id), true));
-        {
-            let mut surface = state.objects.grab_object::<WlSurface>(wl_surface_object_id);
-            surface.set_root_position(40, 50);
-        }
+        state.set_root_surface_position(root(&state, wl_surface_object_id), (40, 50));
         state.mark_root_geometry_dirty(root(&state, wl_surface_object_id));
         let _ = state.committed_root_geometry(root(&state, wl_surface_object_id));
         enable_move_window_binding(&mut state);

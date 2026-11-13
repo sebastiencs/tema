@@ -3064,7 +3064,12 @@ impl WlSurface {
             (this, _) = client.with_ungrabbed(this, state, |state| {
                 state.mark_root_geometry_dirty_for_surface(resolved_surface);
             });
-            if changed {
+            // A commit that only changes the window geometry still has to re-derive a
+            // floating window's root from its frame origin.
+            let floating_frame = state
+                .managed_window(resolved_surface)
+                .is_some_and(|managed| managed.floating_frame_origin.is_some());
+            if changed || floating_frame {
                 let (regrabbed, (moved, old_bounds, new_bounds, snapped, old_blur, new_blur)) =
                     client.with_ungrabbed(this, state, |state| {
                         // Tiled root_pos is computed, so a rebuild already sits at
@@ -3075,8 +3080,11 @@ impl WlSurface {
                             .try_ref(state)
                             .map(|surface| surface.root_position());
                         state.refresh_tiled_content_basis(resolved_surface);
-                        let anchored = state.is_tiled_root_surface(resolved_surface)
-                            && !state.root_surface_is_fullscreen(resolved_surface);
+                        let anchored = (state.is_tiled_root_surface(resolved_surface)
+                            && !state.root_surface_is_fullscreen(resolved_surface))
+                            || state
+                                .managed_window(resolved_surface)
+                                .is_some_and(|managed| managed.floating_frame_origin.is_some());
                         let old_bounds = if anchored {
                             previous_root_pos.and_then(|root_pos| {
                                 state
@@ -3088,7 +3096,8 @@ impl WlSurface {
                         }
                         .or_else(|| state.root_surface_content_rect_global(resolved_surface));
                         let moved = state.apply_resize_anchor(resolved_surface)
-                            || state.sync_anchored_root_position(resolved_surface);
+                            || state.sync_anchored_root_position(resolved_surface)
+                            || state.sync_floating_root_position(resolved_surface);
                         let new_bounds = state
                             .root_surface_surface_bounds_global(resolved_surface)
                             .or_else(|| state.root_surface_content_rect_global(resolved_surface));

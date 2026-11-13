@@ -1532,6 +1532,7 @@ pub fn relayout_dirty_workspaces_with_motion(
             if !state.is_tiled_root_surface(*surface) && !state.root_surface_is_fullscreen(*surface)
             {
                 state.mark_root_geometry_dirty(*surface);
+                state.sync_floating_root_position(*surface);
             }
         }
         for surface in workspace_surface_ids {
@@ -4026,6 +4027,7 @@ mod tests {
             let mut wl_surface = surface.try_grab(&mut state).unwrap();
             wl_surface.test_map(ObjectId::from(901usize), 40, 50, 100, 80);
         }
+        state.set_root_surface_position(surface, (40, 50));
         state.mark_root_geometry_dirty(surface);
         let window = state.window_for_root(surface).unwrap();
         state
