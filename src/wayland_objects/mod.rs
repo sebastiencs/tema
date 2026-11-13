@@ -101,6 +101,8 @@ pub mod zwp_input_method_keyboard_grab_v2;
 pub mod zwp_input_method_manager_v2;
 pub mod zwp_input_method_v2;
 pub mod zwp_input_popup_surface_v2;
+pub mod zwp_keyboard_shortcuts_inhibit_manager_v1;
+pub mod zwp_keyboard_shortcuts_inhibitor_v1;
 pub mod zwp_linux_buffer_params_v1;
 pub mod zwp_linux_dmabuf_feedback_v1;
 pub mod zwp_linux_dmabuf_v1;
@@ -218,8 +220,6 @@ fake_obj! {
     { zwp_pointer_gesture_swipe_v1, ZwpPointerGestureSwipeV1 },
     { zwp_pointer_gesture_pinch_v1, ZwpPointerGesturePinchV1 },
     { zwp_pointer_gesture_hold_v1, ZwpPointerGestureHoldV1 },
-    { zwp_keyboard_shortcuts_inhibit_manager_v1, ZwpKeyboardShortcutsInhibitManagerV1 },
-    { zwp_keyboard_shortcuts_inhibitor_v1, ZwpKeyboardShortcutsInhibitorV1 },
     { wp_fifo_manager_v1, WpFifoManagerV1 },
     { wp_fifo_v1, WpFifoV1 },
     { wp_commit_timing_manager_v1, WpCommitTimingManagerV1 },

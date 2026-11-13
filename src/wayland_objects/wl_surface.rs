@@ -22,7 +22,7 @@ use crate::{
         WpColorManagementSurfaceV1Id, WpColorRepresentationSurfaceV1Id, WpFractionalScaleV1Id,
         WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpTearingControlV1Id, WpViewportId,
         XdgSurfaceId, XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
-        ZwpInputPopupSurfaceV2Id,
+        ZwpInputPopupSurfaceV2Id, ZwpKeyboardShortcutsInhibitorV1Id,
     },
     region::{DamageRegion, RectI, RegionValue},
     scene::visibility::root_participates_in_input,
@@ -278,6 +278,10 @@ pub struct WlSurface {
     preferred_buffer_transform_sent: Option<u32>,
     pointer_constraint: Option<SurfacePointerConstraint>,
     idle_inhibitors: Vec<Resolved<ZwpIdleInhibitorV1Id>>,
+    shortcuts_inhibitor: Option<Resolved<ZwpKeyboardShortcutsInhibitorV1Id>>,
+    /// The user toggled shortcuts back on for this surface; a re-created inhibitor
+    /// starts disabled until the user grants it again.
+    shortcuts_inhibit_denied: bool,
     lock_surface: Option<Resolved<ExtSessionLockSurfaceV1Id>>,
     xwayland_surface_object: Option<Resolved<XwaylandSurfaceV1Id>>,
     /// Serial applied by a successful commit. `None` until then.
@@ -696,6 +700,8 @@ impl WlSurface {
             preferred_buffer_transform_sent: None,
             pointer_constraint: None,
             idle_inhibitors: Vec::new(),
+            shortcuts_inhibitor: None,
+            shortcuts_inhibit_denied: false,
             lock_surface: None,
             xwayland_surface_object: None,
             xwayland_serial: None,
@@ -729,6 +735,47 @@ impl WlSurface {
 
     fn release_idle_inhibitors(&mut self, state: &mut State) {
         detach_destroyed_surface(std::mem::take(&mut self.idle_inhibitors), state);
+    }
+
+    pub(crate) fn shortcuts_inhibitor(
+        &self,
+    ) -> Option<Resolved<ZwpKeyboardShortcutsInhibitorV1Id>> {
+        self.shortcuts_inhibitor
+    }
+
+    pub(crate) fn shortcuts_inhibit_denied(&self) -> bool {
+        self.shortcuts_inhibit_denied
+    }
+
+    // Phase 3 uses it in production; remove this attribute in Phase 3.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_shortcuts_inhibit_denied(&mut self, denied: bool) {
+        self.shortcuts_inhibit_denied = denied;
+    }
+
+    pub(crate) fn set_shortcuts_inhibitor(
+        &mut self,
+        inhibitor: Resolved<ZwpKeyboardShortcutsInhibitorV1Id>,
+    ) {
+        debug_assert!(self.shortcuts_inhibitor.is_none());
+        self.shortcuts_inhibitor = Some(inhibitor);
+    }
+
+    /// Only clears when `inhibitor` is the attached one.
+    pub(crate) fn clear_shortcuts_inhibitor(
+        &mut self,
+        inhibitor: Resolved<ZwpKeyboardShortcutsInhibitorV1Id>,
+    ) {
+        if self.shortcuts_inhibitor == Some(inhibitor) {
+            self.shortcuts_inhibitor = None;
+        }
+    }
+
+    fn release_shortcuts_inhibitor(&mut self, state: &mut State) {
+        crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::detach_destroyed_surface(
+            self.shortcuts_inhibitor.take(),
+            state,
+        );
     }
 
     pub(crate) fn pointer_constraint(&self) -> Option<SurfacePointerConstraint> {
@@ -3968,6 +4015,7 @@ impl WlSurface {
         let constraint = self.pointer_constraint.take();
         defunct_pointer_constraint(constraint, state, dispatcher, true, Some(geometry));
         self.release_idle_inhibitors(state);
+        self.release_shortcuts_inhibitor(state);
         crate::wayland_objects::zwp_linux_dmabuf_feedback_v1::retire_surface(state, object);
         self.discard_all_presentation_feedbacks(client, state, dispatcher);
         for child_surface in self.child_surface_ids() {
@@ -4185,6 +4233,7 @@ impl Object for WlSurface {
         let constraint = self.pointer_constraint.take();
         defunct_pointer_constraint(constraint, state, dispatcher, false, None);
         self.release_idle_inhibitors(state);
+        self.release_shortcuts_inhibitor(state);
         if let Some(waiter_id) = self.blocked_waiter_id.take() {
             dispatcher.stop_model(waiter_id);
         }
