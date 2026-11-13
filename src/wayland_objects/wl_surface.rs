@@ -233,6 +233,32 @@ impl Default for SurfaceTreeState {
     }
 }
 
+/// What the client has committed so far, updated when a commit is captured.
+/// Request-time checks and payload fallbacks read this, never `on_screen`.
+#[derive(Clone, Debug)]
+struct LatestCommitted {
+    /// Newest committed buffer. `None` after a null attach, before any, and
+    /// after an unmap that did not come from a commit.
+    buffer: Option<crate::buffer_content::AttachedBuffer>,
+    representation: ColorRepresentation,
+    /// Regions in the client's own (wire) units, before normalization.
+    input_region: RegionValue,
+    opaque_region: RegionValue,
+    blur_region: Option<RegionValue>,
+}
+
+impl Default for LatestCommitted {
+    fn default() -> Self {
+        Self {
+            buffer: None,
+            representation: ColorRepresentation::default(),
+            input_region: RegionValue::infinite(),
+            opaque_region: RegionValue::empty(),
+            blur_region: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct WlSurface {
     id: WlSurfaceId,
@@ -245,6 +271,7 @@ pub struct WlSurface {
     pending: Pending,
     /// front buffer
     on_screen: OnScreen,
+    latest: LatestCommitted,
     blocked: Option<BlockedSurfaceState>,
     blocked_waiter_id: Option<crate::sync::AcquireReadyWaiterId>,
     syncobj_surface_object: Option<Resolved<WpLinuxDrmSyncobjSurfaceV1Id>>,
@@ -669,6 +696,7 @@ impl WlSurface {
             version,
             pending: Pending::default(),
             on_screen: OnScreen::default(),
+            latest: LatestCommitted::default(),
             blocked: None,
             blocked_waiter_id: None,
             syncobj_surface_object: None,
@@ -989,7 +1017,7 @@ impl WlSurface {
     }
 
     pub fn has_attached_or_committed_buffer(&self) -> bool {
-        self.has_pending_buffer_attach() || self.has_committed_buffer()
+        self.has_pending_buffer_attach() || self.latest.buffer.is_some()
     }
 
     pub fn xdg_surface(&self) -> Option<Resolved<XdgSurfaceId>> {
@@ -1853,36 +1881,29 @@ impl WlSurface {
             release_callbacks: Vec::new(),
             wire_inputs: self.on_screen.wire_inputs.clone(),
         };
+        self.latest.buffer = None;
     }
 
-    /// Build the payload from the pending state. A wire-scaled client's
-    /// payload always carries raw (wire-unit) regions: without a new region
-    /// request this commit, the fallback reads the raw regions that produced
-    /// the on-screen ones (`WireInputs`) instead of the already-normalized
-    /// on-screen regions, which would be scaled a second time. Before the
-    /// first region-carrying commit the on-screen regions are the
-    /// scale-invariant defaults. Normal clients keep today's fallback.
-    fn build_commit_payload(&mut self, wire_scale: WireScale) -> SurfaceCommitPayload {
-        let raw_regions = (!wire_scale.is_one())
-            .then(|| self.on_screen.wire_inputs.as_ref())
-            .flatten();
+    /// Build the payload from the pending state. A region this commit does not
+    /// set falls back to the latest committed region, in the client's own
+    /// (wire) units: the payload is built before normalization, so a
+    /// wire-scaled client's fallback is never scaled a second time.
+    fn build_commit_payload(&mut self, _wire_scale: WireScale) -> SurfaceCommitPayload {
         let input_region = self
             .pending
             .input_region
             .take()
-            .or_else(|| raw_regions.map(|raw| raw.input_region.clone()))
-            .unwrap_or_else(|| self.on_screen.input_region.clone());
+            .unwrap_or_else(|| self.latest.input_region.clone());
         let opaque_region = self
             .pending
             .opaque_region
             .take()
-            .or_else(|| raw_regions.map(|raw| raw.opaque_region.clone()))
-            .unwrap_or_else(|| self.on_screen.opaque_region.clone());
+            .unwrap_or_else(|| self.latest.opaque_region.clone());
         let blur_region = match self.pending.blur_region.take() {
-            None => self.on_screen.blur_region.clone(),
+            None => self.latest.blur_region.clone(),
             Some(next) => next,
         };
-        SurfaceCommitPayload {
+        let payload = SurfaceCommitPayload {
             buffer: self.pending.buffer.take(),
             offset: std::mem::take(&mut self.pending.offset),
             sync: std::mem::take(&mut self.pending.sync),
@@ -1900,7 +1921,17 @@ impl WlSurface {
             opaque_region,
             release_callbacks: std::mem::take(&mut self.pending_release_callbacks),
             wire_inputs: None,
+        };
+        self.latest.input_region = payload.input_region.clone();
+        self.latest.opaque_region = payload.opaque_region.clone();
+        self.latest.blur_region = payload.blur_region.clone();
+        match &payload.buffer {
+            Some(Some(buffer)) => self.latest.buffer = Some(buffer.clone()),
+            Some(None) => self.latest.buffer = None,
+            None => {}
         }
+        self.latest.representation = payload.representation.apply(self.latest.representation);
+        payload
     }
 
     /// Normalize a payload built for a wire-scaled client from wire units to
@@ -2135,7 +2166,7 @@ impl WlSurface {
         let attached = match self.pending.buffer.as_ref() {
             Some(None) => return None,
             Some(Some(attached)) => attached,
-            None => self.on_screen.buffer.as_ref()?,
+            None => self.latest.buffer.as_ref()?,
         };
         let (width, height) = attached.content.dimensions();
         Some(transform::derive_logical_size(
@@ -2191,14 +2222,14 @@ impl WlSurface {
         let next = self
             .pending
             .representation
-            .apply(self.on_screen.representation);
+            .apply(self.latest.representation);
         if next.coefficients.is_none() && next.chroma.is_none() {
             return true;
         }
         let attached = match &self.pending.buffer {
             Some(None) => return true,
             Some(Some(buffer)) => buffer,
-            None => match &self.on_screen.buffer {
+            None => match &self.latest.buffer {
                 Some(buffer) => buffer,
                 None => return true,
             },
@@ -2257,7 +2288,7 @@ impl WlSurface {
         buffer_scale: i32,
         viewport: SurfaceViewport,
     ) -> bool {
-        let Some(attached) = buffer.flatten().or(self.on_screen.buffer.clone()) else {
+        let Some(attached) = buffer.flatten().or(self.latest.buffer.clone()) else {
             return true;
         };
         let buffer_size = attached.content.dimensions();
@@ -3649,6 +3680,7 @@ impl WlSurface {
         }
         dispatcher
             .dispatch_to(client.client_id(), crate::clients::ClientAction::RefreshSurfaceOutputs);
+        self.latest.buffer = None;
     }
 
     pub fn take_retired_buffers(&mut self) -> Vec<RetiredBufferCandidate> {
@@ -3725,6 +3757,7 @@ impl WlSurface {
         // pixels are a blank buffer of the mapped size. A test that must show a real
         // wl_buffer replaces this with `test_show_buffer`.
         let attached = crate::buffer_content::AttachedBuffer::placeholder(object, width, height);
+        self.latest.buffer = Some(attached.clone());
         self.on_screen = OnScreen {
             buffer: Some(attached),
             content_revision: 1,
@@ -3754,13 +3787,20 @@ impl WlSurface {
     /// Replace the buffer `test_map` installed with one that carries real pixels.
     #[cfg(test)]
     pub(crate) fn test_show_buffer(&mut self, attached: crate::buffer_content::AttachedBuffer) {
+        self.latest.buffer = Some(attached.clone());
         self.on_screen.buffer = Some(attached);
     }
 
     #[cfg(test)]
     pub(crate) fn test_clear_committed_buffer(&mut self) {
+        self.latest.buffer = None;
         self.on_screen.buffer = None;
         self.on_screen.logical_size = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_latest_buffer_is_some(&self) -> bool {
+        self.latest.buffer.is_some()
     }
 
     #[cfg(test)]
@@ -4336,6 +4376,7 @@ mod tests {
             release_callbacks: Vec::new(),
             wire_inputs: None,
         };
+        surface.latest.buffer = surface.on_screen.buffer.clone();
         surface
     }
 
@@ -8742,5 +8783,115 @@ mod tests {
         assert!(life
             .client
             .contains_object(WlBufferId::from(20), &life.state));
+    }
+
+    fn insert_request_buffer(client: &mut Client, state: &mut State, id: u32) {
+        let bytes = vec![0u8; 16];
+        client.insert_object(
+            state,
+            WlBuffer::new(crate::wayland_objects::wl_buffer::NewWlBufferParams {
+                id: WlBufferId::from(id),
+                offset: 0,
+                width: 2,
+                height: 2,
+                stride: 8,
+                format: &crate::drm::ARGB8888,
+                mem: crate::wayland_objects::wl_shm_pool::shared_memory_from_bytes(&bytes),
+            })
+            .unwrap(),
+        );
+    }
+
+    /// Send one request to a surface through its object dispatch, as a client would.
+    fn surface_request(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        surface: WlSurfaceId,
+        opcode: u16,
+        args: &[u32],
+    ) {
+        let mut event = RawEvent::new(surface.into(), opcode, args.len());
+        for arg in args {
+            event.uint(*arg);
+        }
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        client_dispatcher.set_requester_object_id_for_tests(surface.into());
+        let mut object = client.grab_object(surface, state);
+        object
+            .on(client, state, raw_request_from_event(event), &mut client_dispatcher)
+            .unwrap();
+    }
+
+    fn commit_surface(
+        client: &mut Client,
+        state: &mut State,
+        dispatcher: &mut Dispatcher,
+        surface: Resolved<WlSurfaceId>,
+    ) {
+        let mut client_dispatcher = client.test_dispatcher(dispatcher);
+        surface
+            .grab(state)
+            .on_commit(client, state, &mut client_dispatcher);
+        client_dispatcher.drain_post_actions(client, state);
+    }
+
+    #[test]
+    fn latest_tracks_attach_and_null_attach() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        let surface = WlSurfaceId::from(4);
+        client.insert_object(&mut state, WlSurface::new(surface, client.client_id(), 6));
+        insert_request_buffer(&mut client, &mut state, 20);
+
+        surface_request(&mut client, &mut state, &mut dispatcher, surface, 1, &[20, 0, 0]);
+        surface_request(&mut client, &mut state, &mut dispatcher, surface, 6, &[]);
+        assert!(client
+            .resolve(surface, &state)
+            .unwrap()
+            .rref(&state)
+            .test_latest_buffer_is_some());
+
+        surface_request(&mut client, &mut state, &mut dispatcher, surface, 1, &[0, 0, 0]);
+        surface_request(&mut client, &mut state, &mut dispatcher, surface, 6, &[]);
+        assert!(!client
+            .resolve(surface, &state)
+            .unwrap()
+            .rref(&state)
+            .test_latest_buffer_is_some());
+    }
+
+    #[test]
+    fn latest_keeps_regions_without_a_new_region_request() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(8);
+        let (surface, _) = client
+            .insert_object(&mut state, WlSurface::new(WlSurfaceId::from(4), client.client_id(), 6));
+        surface.grab(&mut state).pending.input_region = Some(region_value(0, 0, 10, 10));
+        commit_surface(&mut client, &mut state, &mut dispatcher, surface);
+        assert_eq!(surface.rref(&state).committed_input_region(), &region_value(0, 0, 10, 10));
+
+        commit_surface(&mut client, &mut state, &mut dispatcher, surface);
+        assert_eq!(surface.rref(&state).committed_input_region(), &region_value(0, 0, 10, 10));
+    }
+
+    #[test]
+    fn role_dismissal_clears_latest_buffer() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let (surface, _) = client
+            .insert_object(&mut state, WlSurface::new(WlSurfaceId::from(4), client.client_id(), 6));
+        surface
+            .grab(&mut state)
+            .test_map(ObjectId::from(20usize), 0, 0, 2, 2);
+        assert!(surface.rref(&state).test_latest_buffer_is_some());
+
+        let mut client_dispatcher = client.test_dispatcher(&mut dispatcher);
+        surface.grab(&mut state).force_unmap_for_role_dismissal(
+            &mut client,
+            &mut state,
+            &mut client_dispatcher,
+        );
+        assert!(!surface.rref(&state).test_latest_buffer_is_some());
     }
 }
