@@ -989,6 +989,71 @@ mod tests {
         assert!(!fixture.center_pending());
     }
 
+    /// GTK maps a dialog with its 20 px CSD shadow (window geometry at 20,20 in a
+    /// larger buffer), then drops the shadow on the next commit (geometry 0,0).
+    /// The frame tema centered must not move.
+    #[test]
+    #[ignore = "passes once floating windows are frame-positioned"]
+    fn dropping_the_csd_shadow_after_map_keeps_the_dialog_frame_in_place() {
+        let mut fixture = MapFixture::new();
+        let (parent, parent_window) = fixture.setup();
+        fixture.state.set_window_floating(parent_window, true);
+        crate::input::grab::place_grabbed_root(
+            &mut fixture.state,
+            &mut fixture.dispatcher,
+            parent,
+            (40, 50),
+        );
+        fixture.refresh_geometry(parent);
+        fixture.set_parent(41);
+        fixture.make_dialog();
+        fixture.initial_configure_size();
+
+        let set_geometry = |fixture: &mut MapFixture, x: i32, y: i32| {
+            let xdg = fixture.xdg();
+            let mut request = RawEvent::new(WaylandId::from(80), 3, 4);
+            request.int(x);
+            request.int(y);
+            request.int(80);
+            request.int(60);
+            fixture
+                .dispatch(xdg.object_id(), 80, raw_request_from_event(request))
+                .unwrap();
+        };
+        let xdg = fixture.xdg();
+        let mut ack = RawEvent::new(WaylandId::from(80), 4, 1);
+        ack.uint(1);
+        fixture
+            .dispatch(xdg.object_id(), 80, raw_request_from_event(ack))
+            .unwrap();
+        set_geometry(&mut fixture, 20, 20);
+        crate::wayland_objects::wl_surface::test_commit_new_buffer(
+            &mut fixture.client,
+            &mut fixture.state,
+            &mut fixture.dispatcher,
+            fixture.surface,
+            120,
+            100,
+        );
+        fixture.refresh_geometry(fixture.surface);
+        let centered = fixture.child_geometry();
+        let root_with_shadow = fixture.root_pos();
+
+        set_geometry(&mut fixture, 0, 0);
+        crate::wayland_objects::wl_surface::test_commit_new_buffer(
+            &mut fixture.client,
+            &mut fixture.state,
+            &mut fixture.dispatcher,
+            fixture.surface,
+            80,
+            60,
+        );
+        fixture.refresh_geometry(fixture.surface);
+
+        assert_eq!(fixture.child_geometry(), centered);
+        assert_eq!(fixture.root_pos(), (root_with_shadow.0 + 20, root_with_shadow.1 + 20));
+    }
+
     #[test]
     fn a_dialog_whose_parent_is_elsewhere_is_centered_on_the_output() {
         let mut fixture = MapFixture::new();
