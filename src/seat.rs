@@ -108,6 +108,34 @@ pub enum SeatClientEvent {
         dx_unaccel: f32,
         dy_unaccel: f32,
     },
+    /// `begin` for the focused client's gesture objects of `kind`.
+    PointerGestureBegin {
+        kind: crate::input::gesture::PointerGestureKind,
+        serial: u32,
+        time: u32,
+        surface: Resolved<WlSurfaceId>,
+        fingers: u32,
+    },
+    /// Logical deltas; the client applies its wire scale.
+    PointerGestureSwipeUpdate {
+        time: u32,
+        dx: f32,
+        dy: f32,
+    },
+    /// `scale` is absolute since `begin`; `rotation` is degrees clockwise since the previous event.
+    PointerGesturePinchUpdate {
+        time: u32,
+        dx: f32,
+        dy: f32,
+        scale: f32,
+        rotation: f32,
+    },
+    PointerGestureEnd {
+        kind: crate::input::gesture::PointerGestureKind,
+        serial: u32,
+        time: u32,
+        cancelled: bool,
+    },
     KeyboardEnter {
         serial: u32,
         surface: Resolved<WlSurfaceId>,
@@ -359,6 +387,8 @@ pub struct SeatState {
     /// `zwp_pointer_gesture_*_v1` objects, per `wl_pointer` they were created for.
     pointer_gestures:
         BTreeMap<Resolved<WlPointerId>, Vec<crate::input::gesture::PointerGestureResource>>,
+    /// The libinput gesture in progress, if any. `target` is the client that got `begin`.
+    pub(crate) active_pointer_gesture: Option<crate::input::gesture::ActivePointerGesture>,
     pub(crate) active_pointer_lock: Option<Resolved<ZwpLockedPointerV1Id>>,
     pub(crate) active_pointer_confine: Option<Resolved<ZwpConfinedPointerV1Id>>,
     keyboard_resources: BTreeMap<ClientId, Vec<Resolved<WlKeyboardId>>>,
@@ -411,6 +441,7 @@ impl Default for SeatState {
             pointer_resources: BTreeMap::default(),
             relative_pointers: BTreeMap::default(),
             pointer_gestures: BTreeMap::default(),
+            active_pointer_gesture: None,
             active_pointer_lock: None,
             active_pointer_confine: None,
             keyboard_resources: BTreeMap::default(),
@@ -493,6 +524,7 @@ impl SeatState {
         self.keyboard_focus_history.clear();
         self.last_pointer_enter = None;
         self.active_drag = None;
+        self.active_pointer_gesture = None;
     }
 
     pub fn register_pointer(&mut self, pointer: Resolved<WlPointerId>) {
@@ -580,6 +612,19 @@ impl SeatState {
         if resources.is_empty() {
             self.pointer_gestures.remove(&pointer);
         }
+    }
+
+    pub(crate) fn pointer_gestures_for_client(
+        &self,
+        client_id: ClientId,
+        kind: crate::input::gesture::PointerGestureKind,
+    ) -> Vec<crate::input::gesture::PointerGestureResource> {
+        self.pointer_gestures
+            .iter()
+            .filter(|(pointer, _)| pointer.client_id() == client_id)
+            .flat_map(|(_, gestures)| gestures.iter().copied())
+            .filter(|gesture| gesture.kind() == kind)
+            .collect()
     }
 
     #[cfg(test)]
@@ -1111,6 +1156,14 @@ impl SeatState {
             .retain(|pointer, _| pointer.client_id() != client_id);
         self.pointer_gestures
             .retain(|pointer, _| pointer.client_id() != client_id);
+        if let Some(gesture) = self.active_pointer_gesture.as_mut() {
+            if gesture
+                .target
+                .is_some_and(|surface| surface.client_id() == client_id)
+            {
+                gesture.target = None;
+            }
+        }
         if self
             .active_pointer_lock
             .is_some_and(|lock| lock.client_id() == client_id)
@@ -1883,6 +1936,7 @@ pub fn quiesce_for_session_pause(state: &mut State, dispatcher: &mut Dispatcher)
 }
 
 fn clear_pointer_focus(state: &mut State, dispatcher: &mut Dispatcher) {
+    crate::input::gesture::cancel_pointer_gesture(state, dispatcher, monotonic_time_msec());
     crate::input::pointer_lock::release_pointer_lock_unless_surface(state, dispatcher, None);
     crate::input::pointer_confine::release_pointer_confine_unless_surface(state, dispatcher, None);
     let Some(old_focus) = state.seat.pointer_focus.take() else {

@@ -8,6 +8,10 @@ use std::{
 
 use input::{
     event::{
+        gesture::{
+            GestureEndEvent, GestureEvent, GestureEventCoordinates, GestureEventTrait,
+            GestureHoldEvent, GesturePinchEvent, GesturePinchEventTrait, GestureSwipeEvent,
+        },
         keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
         pointer::{Axis, ButtonState, PointerEvent, PointerEventTrait, PointerScrollEvent},
         EventTrait,
@@ -372,6 +376,10 @@ impl Model for Libinput {
                             }
                             _ => {}
                         },
+                        input::Event::Gesture(gesture) => {
+                            record_real_input(state, dispatcher);
+                            deliver_gesture(state, dispatcher, gesture);
+                        }
                         _ => {}
                     }
                 }
@@ -390,7 +398,14 @@ impl Model for Libinput {
                 self.insert_device_fd(fd, devnum);
                 self.add_device(state, dispatcher, devnode, devnum);
             }
-            Quiesce { devnum } => self.quiesce_device(state, devnum),
+            Quiesce { devnum } => {
+                crate::input::gesture::cancel_pointer_gesture(
+                    state,
+                    dispatcher,
+                    crate::seat::monotonic_time_msec(),
+                );
+                self.quiesce_device(state, devnum);
+            }
             SessionActive => {
                 if dispatcher.shutdown_requested() || !state.session_active {
                     return Ok(());
@@ -554,6 +569,76 @@ fn pointer_axis_change(natural_scroll: bool, axis: LibinputScrollAxis) -> Pointe
 fn nonzero_value120(value: f64) -> Option<i32> {
     let value = value.round() as i32;
     (value != 0).then_some(value)
+}
+
+fn gesture_fingers(count: i32) -> u32 {
+    u32::try_from(count).unwrap_or(0)
+}
+
+fn deliver_gesture(state: &mut State, dispatcher: &mut Dispatcher, event: GestureEvent) {
+    use crate::input::gesture::{
+        handle_pointer_gesture_begin, handle_pointer_gesture_end,
+        handle_pointer_gesture_pinch_update, handle_pointer_gesture_swipe_update,
+        PointerGestureKind::{Hold, Pinch, Swipe},
+    };
+    match event {
+        GestureEvent::Swipe(swipe) => match swipe {
+            GestureSwipeEvent::Begin(begin) => handle_pointer_gesture_begin(
+                state,
+                dispatcher,
+                Swipe,
+                begin.time(),
+                gesture_fingers(begin.finger_count()),
+            ),
+            GestureSwipeEvent::Update(update) => handle_pointer_gesture_swipe_update(
+                state,
+                dispatcher,
+                update.time(),
+                update.dx(),
+                update.dy(),
+            ),
+            GestureSwipeEvent::End(end) => {
+                handle_pointer_gesture_end(state, dispatcher, Swipe, end.time(), end.cancelled())
+            }
+            _ => {}
+        },
+        GestureEvent::Pinch(pinch) => match pinch {
+            GesturePinchEvent::Begin(begin) => handle_pointer_gesture_begin(
+                state,
+                dispatcher,
+                Pinch,
+                begin.time(),
+                gesture_fingers(begin.finger_count()),
+            ),
+            GesturePinchEvent::Update(update) => handle_pointer_gesture_pinch_update(
+                state,
+                dispatcher,
+                update.time(),
+                update.dx(),
+                update.dy(),
+                update.scale(),
+                update.angle_delta(),
+            ),
+            GesturePinchEvent::End(end) => {
+                handle_pointer_gesture_end(state, dispatcher, Pinch, end.time(), end.cancelled())
+            }
+            _ => {}
+        },
+        GestureEvent::Hold(hold) => match hold {
+            GestureHoldEvent::Begin(begin) => handle_pointer_gesture_begin(
+                state,
+                dispatcher,
+                Hold,
+                begin.time(),
+                gesture_fingers(begin.finger_count()),
+            ),
+            GestureHoldEvent::End(end) => {
+                handle_pointer_gesture_end(state, dispatcher, Hold, end.time(), end.cancelled())
+            }
+            _ => {}
+        },
+        _ => {}
+    }
 }
 
 fn deliver_wheel_scroll(

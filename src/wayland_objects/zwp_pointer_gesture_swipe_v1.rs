@@ -1,8 +1,9 @@
 use crate::{
-    clients::{Client, ClientDispatcher, RawRequest, Resolved},
+    clients::{Client, ClientDispatcher, EventWriter, RawRequest, Resolved},
     object::{Object, Parser, RequestResult},
     protocol_generated::{
-        zwp_pointer_gesture_swipe_v1, WaylandId, WlPointerId, ZwpPointerGestureSwipeV1Id,
+        zwp_pointer_gesture_swipe_v1, WaylandId, WlPointerId, WlSurfaceId,
+        ZwpPointerGestureSwipeV1Id,
     },
     state::{GrabbedObject, State},
     wayland_objects::wl_display::WlDisplay,
@@ -23,6 +24,52 @@ impl ZwpPointerGestureSwipeV1 {
         state
             .seat
             .unregister_pointer_gesture(self.pointer, self.id.into());
+    }
+
+    pub(crate) fn send_begin(
+        &self,
+        serial: u32,
+        time: u32,
+        surface: Resolved<WlSurfaceId>,
+        fingers: u32,
+        dispatcher: &mut ClientDispatcher,
+    ) {
+        self.send_event(
+            zwp_pointer_gesture_swipe_v1::Event::Begin {
+                serial,
+                time,
+                surface: surface.wayland_id(),
+                fingers,
+            },
+            dispatcher,
+        );
+    }
+
+    pub(crate) fn send_update(
+        &self,
+        time: u32,
+        dx: f32,
+        dy: f32,
+        dispatcher: &mut ClientDispatcher,
+    ) {
+        self.send_event(zwp_pointer_gesture_swipe_v1::Event::Update { time, dx, dy }, dispatcher);
+    }
+
+    pub(crate) fn send_end(
+        &self,
+        serial: u32,
+        time: u32,
+        cancelled: bool,
+        dispatcher: &mut ClientDispatcher,
+    ) {
+        self.send_event(
+            zwp_pointer_gesture_swipe_v1::Event::End {
+                serial,
+                time,
+                cancelled: i32::from(cancelled),
+            },
+            dispatcher,
+        );
     }
 }
 
