@@ -17,6 +17,7 @@ use crate::{
         wp_alpha_modifier_v1::WpAlphaModifierV1Global, wp_color_manager_v1::WpColorManagerV1Global,
         wp_color_representation_manager_v1::WpColorRepresentationManagerV1Global,
         wp_cursor_shape_manager_v1::WpCursorShapeManagerV1Global,
+        wp_fifo_manager_v1::WpFifoManagerV1Global,
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1Global,
         wp_presentation::WpPresentationGlobal,
         wp_tearing_control_manager_v1::WpTearingControlManagerV1Global,
@@ -123,6 +124,7 @@ impl Globals {
             WlSubcompositorGlobal::new,
             WlSeatGlobal::new, // TODO: `WlSeatGlobal` should be added dynamically
             WpPresentationGlobal::new,
+            WpFifoManagerV1Global::new,
             WpFractionalScaleManagerV1Global::new,
             WpAlphaModifierV1Global::new,
             WpColorManagerV1Global::new,

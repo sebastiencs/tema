@@ -23,10 +23,10 @@ use crate::{
         wp_viewport, xdg_wm_base, ExtBackgroundEffectSurfaceV1Id, ExtSessionLockSurfaceV1Id,
         WaylandId, WlBufferId, WlCallbackId, WlOutputId, WlRegionId, WlSubsurfaceId, WlSurfaceId,
         WpAlphaModifierSurfaceV1Id, WpColorManagementSurfaceFeedbackV1Id,
-        WpColorManagementSurfaceV1Id, WpColorRepresentationSurfaceV1Id, WpFractionalScaleV1Id,
-        WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId, WpTearingControlV1Id, WpViewportId,
-        XdgSurfaceId, XwaylandSurfaceV1Id, ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id,
-        ZwpInputPopupSurfaceV2Id,
+        WpColorManagementSurfaceV1Id, WpColorRepresentationSurfaceV1Id, WpFifoV1Id,
+        WpFractionalScaleV1Id, WpLinuxDrmSyncobjSurfaceV1Id, WpPresentationFeedbackId,
+        WpTearingControlV1Id, WpViewportId, XdgSurfaceId, XwaylandSurfaceV1Id,
+        ZwlrLayerSurfaceV1Id, ZwpIdleInhibitorV1Id, ZwpInputPopupSurfaceV2Id,
     },
     region::{DamageRegion, RectI, RegionValue},
     scene::visibility::root_participates_in_input,
@@ -285,6 +285,7 @@ pub struct WlSurface {
     syncobj_surface_object: Option<Resolved<WpLinuxDrmSyncobjSurfaceV1Id>>,
     fractional_scale_object: Option<Resolved<WpFractionalScaleV1Id>>,
     tearing_control_object: Option<Resolved<WpTearingControlV1Id>>,
+    fifo_object: Option<Resolved<WpFifoV1Id>>,
     alpha_modifier_object: Option<Resolved<WpAlphaModifierSurfaceV1Id>>,
     background_effect_object: Option<Resolved<ExtBackgroundEffectSurfaceV1Id>>,
     color_management_surface: Option<Resolved<WpColorManagementSurfaceV1Id>>,
@@ -752,6 +753,7 @@ impl WlSurface {
             syncobj_surface_object: None,
             fractional_scale_object: None,
             tearing_control_object: None,
+            fifo_object: None,
             alpha_modifier_object: None,
             background_effect_object: None,
             color_management_surface: None,
@@ -878,6 +880,20 @@ impl WlSurface {
 
     pub fn has_fractional_scale_object(&self) -> bool {
         self.fractional_scale_object.is_some()
+    }
+
+    /// Detaches the `wp_fifo_v1` object from this surface, which is being deleted.
+    /// The object stays alive and reports `surface_destroyed` on its requests.
+    fn detach_timing_objects(&mut self, state: &mut State) {
+        let Some(fifo) = self.fifo_object.take() else {
+            return;
+        };
+        if state.objects.is_grabbed(fifo.object_id()) {
+            return;
+        }
+        if let Some(fifo) = fifo.try_ref_mut(state) {
+            fifo.mark_surface_destroyed();
+        }
     }
 
     fn cleanup_extension_objects(&mut self) {
@@ -1603,6 +1619,20 @@ impl WlSurface {
 
     pub fn has_tearing_control_object(&self) -> bool {
         self.tearing_control_object.is_some()
+    }
+
+    pub(crate) fn set_fifo_object(&mut self, object: Resolved<WpFifoV1Id>) {
+        self.fifo_object = Some(object);
+    }
+
+    pub(crate) fn clear_fifo_object(&mut self, object: Resolved<WpFifoV1Id>) {
+        if self.fifo_object == Some(object) {
+            self.fifo_object = None;
+        }
+    }
+
+    pub(crate) fn has_fifo_object(&self) -> bool {
+        self.fifo_object.is_some()
     }
 
     pub fn set_alpha_modifier_object(
@@ -4203,6 +4233,7 @@ impl WlSurface {
         self.drop_queued_updates(client, state, dispatcher);
         state.commit_gate.forget_surface(object);
         self.cleanup_extension_objects();
+        self.detach_timing_objects(state);
         // A role destroy records the close before `destroy_window`. By the time
         // this surface goes away the window is no longer managed, so that record
         // is the only one that still names the focused close. It is used only
