@@ -462,14 +462,10 @@ fn anchored_grab_target(
     let dx = (pointer.0 - logical_point.0).round() as i32;
     let dy = (pointer.1 - logical_point.1).round() as i32;
     if dx != 0 || dy != 0 {
-        let Some(mut surface) = target.root_surface.try_grab(state) else {
+        if !state.translate_root_surface(target.root_surface, dx, dy) {
             return target;
-        };
-        let position = surface.root_position();
-        surface.set_root_position(position.0 + dx, position.1 + dy);
-        drop(surface);
+        }
         note_root_position(state, dispatcher, target.root_surface);
-        state.mark_root_geometry_dirty(target.root_surface);
         target.geometry.root_pos.0 += dx;
         target.geometry.root_pos.1 += dy;
         target.geometry.target_rect.x += dx;
@@ -679,15 +675,12 @@ pub(crate) fn tiled_drag_pickup(
     session.preview_size = preview_size;
     session.frame_from_root = frame_from_root;
     let old_bounds = interactive_damage_rect(state, root_surface);
-    let Some(mut surface) = root_surface.try_grab(state) else {
+    if !state.set_root_surface_position(root_surface, root_pos) {
         tiled_drag_settle(state, dispatcher, *session, origin, TiledDragEnd::Cancel);
         session.picked_up = false;
         return Err(());
-    };
-    surface.set_root_position(root_pos.0, root_pos.1);
-    drop(surface);
+    }
     note_root_position(state, dispatcher, root_surface);
-    state.mark_root_geometry_dirty(root_surface);
     // Tile to preview uses the windows animation. Hyprland does the same by assigning
     // m_realPosition and m_realSize when the tiled window becomes floating.
     state.sync_window_geometry_goal(window, crate::visual_animation::WindowGeometryMotion::Layout);
@@ -824,13 +817,10 @@ pub(crate) fn place_grabbed_root(
     root_pos: (i32, i32),
 ) -> bool {
     let old_bounds = interactive_damage_rect(state, root_surface);
-    let Some(mut surface) = root_surface.try_grab(state) else {
+    if !state.set_root_surface_position(root_surface, root_pos) {
         return false;
-    };
-    surface.set_root_position(root_pos.0, root_pos.1);
-    drop(surface);
+    }
     note_root_position(state, dispatcher, root_surface);
-    state.mark_root_geometry_dirty(root_surface);
     if let Some(window) = state.window_for_root(root_surface) {
         state
             .sync_window_geometry_goal(window, crate::visual_animation::WindowGeometryMotion::Warp);

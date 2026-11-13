@@ -2450,10 +2450,99 @@ impl State {
         if (x, y) == geometry.root_pos {
             return false;
         }
+        self.set_root_surface_position(root, (x, y))
+    }
+
+    /// Floating, non-fullscreen window with an xdg role: positioned by
+    /// `floating_frame_origin`. X11 windows keep root-origin positioning.
+    /// False while the root is grabbed.
+    pub(crate) fn is_frame_positioned_root(&self, root: Resolved<WlSurfaceId>) -> bool {
+        if self.objects.is_grabbed(root.object_id()) {
+            return false;
+        }
+        let floating = self.managed_window(root).is_some_and(|managed| {
+            managed.mode == ManagedWindowMode::Floating && !managed.fullscreen
+        });
+        floating
+            && root
+                .try_ref(self)
+                .is_some_and(|surface| surface.xdg_surface().is_some())
+    }
+
+    /// Store a frame origin and move the root surface to the derived origin.
+    fn apply_floating_frame_origin(
+        &mut self,
+        root: Resolved<WlSurfaceId>,
+        origin: (i32, i32),
+    ) -> bool {
+        let Some(managed) = self.managed_window_mut(root) else {
+            return false;
+        };
+        managed.floating_frame_origin = Some(origin);
+        self.mark_root_geometry_dirty(root);
+        let Some(geometry) = self.ensure_root_geometry_fresh(root) else {
+            return false;
+        };
         let Some(mut surface) = root.try_grab(self) else {
             return false;
         };
-        surface.set_root_position(x, y);
+        surface.set_root_position(geometry.root_pos.0, geometry.root_pos.1);
+        drop(surface);
+        self.mark_root_geometry_dirty(root);
+        true
+    }
+
+    /// Put `root`'s surface origin at `root_pos`. A frame-positioned window with
+    /// a frame origin moves that origin by the same amount, measured against
+    /// its current derived root. Returns false when the root is grabbed.
+    pub(crate) fn set_root_surface_position(
+        &mut self,
+        root: Resolved<WlSurfaceId>,
+        root_pos: (i32, i32),
+    ) -> bool {
+        if self.is_frame_positioned_root(root) {
+            let origin = self
+                .managed_window(root)
+                .and_then(|managed| managed.floating_frame_origin);
+            if let (Some(_), Some(geometry)) = (origin, self.ensure_root_geometry_fresh(root)) {
+                let frame = geometry.layout_rect_global;
+                let new_origin = (
+                    root_pos.0 + frame.x - geometry.root_pos.0,
+                    root_pos.1 + frame.y - geometry.root_pos.1,
+                );
+                return self.apply_floating_frame_origin(root, new_origin);
+            }
+        }
+        let Some(mut surface) = root.try_grab(self) else {
+            return false;
+        };
+        surface.set_root_position(root_pos.0, root_pos.1);
+        drop(surface);
+        self.mark_root_geometry_dirty(root);
+        true
+    }
+
+    /// Move `root` by `(dx, dy)`: its frame origin when it has one, its surface
+    /// origin otherwise. Returns false when the root is grabbed.
+    pub(crate) fn translate_root_surface(
+        &mut self,
+        root: Resolved<WlSurfaceId>,
+        dx: i32,
+        dy: i32,
+    ) -> bool {
+        if self.is_frame_positioned_root(root) {
+            if let Some(origin) = self
+                .managed_window(root)
+                .and_then(|managed| managed.floating_frame_origin)
+            {
+                return self.apply_floating_frame_origin(root, (origin.0 + dx, origin.1 + dy));
+            }
+        }
+        let Some(mut surface) = root.try_grab(self) else {
+            return false;
+        };
+        let (x, y) = surface.root_position();
+        surface.set_root_position(x + dx, y + dy);
         drop(surface);
         self.mark_root_geometry_dirty(root);
         true
@@ -4122,13 +4211,7 @@ impl State {
             if self.is_tiled_root_surface(surface) {
                 continue;
             }
-            let Some(mut wl_surface) = surface.try_grab(self) else {
-                continue;
-            };
-            let (x, y) = wl_surface.root_position();
-            wl_surface.set_root_position(x + dx, y + dy);
-            drop(wl_surface);
-            self.mark_root_geometry_dirty(surface);
+            self.translate_root_surface(surface, dx, dy);
         }
         tiling::mark_workspace_dirty(self, workspace_id);
         tiling::relayout_dirty_workspaces_with_motion(self, WindowGeometryMotion::Relocation);
@@ -4139,12 +4222,9 @@ impl State {
         surface: Resolved<WlSurfaceId>,
         remembered_state: RememberedFloatingState,
     ) -> bool {
-        let Some(mut wl_surface) = surface.try_grab(self) else {
+        if !self.set_root_surface_position(surface, remembered_state.root_pos) {
             return false;
-        };
-        wl_surface.set_root_position(remembered_state.root_pos.0, remembered_state.root_pos.1);
-        drop(wl_surface);
-        self.mark_root_geometry_dirty(surface);
+        }
         // The attached buffer is still the fullscreen frame. Sampling it would aim the
         // animation at that size, parked on the restored floating origin.
         let Some(window) = self.window_for_root(surface) else {
@@ -7004,6 +7084,33 @@ mod tests {
                 .floating_frame_origin,
             None
         );
+    }
+
+    #[test]
+    fn translating_a_root_without_a_frame_origin_moves_the_surface() {
+        let (mut state, root_surface, _window) = floating_frame_fixture();
+        {
+            let mut surface = root_surface.try_grab(&mut state).unwrap();
+            surface.set_root_position(10, 20);
+        }
+
+        assert!(state.translate_root_surface(root_surface, 5, -3));
+
+        assert_eq!(root_surface.try_ref(&state).unwrap().root_position(), (15, 17));
+    }
+
+    #[test]
+    fn a_surface_without_an_xdg_role_is_not_frame_positioned() {
+        let (mut state, root_surface, _window) = floating_frame_fixture();
+        state
+            .managed_window_mut(root_surface)
+            .unwrap()
+            .floating_frame_origin = Some((0, 0));
+
+        assert!(!state.is_frame_positioned_root(root_surface));
+        assert!(state.set_root_surface_position(root_surface, (40, 50)));
+
+        assert_eq!(root_surface.try_ref(&state).unwrap().root_position(), (40, 50));
     }
 
     #[test]
