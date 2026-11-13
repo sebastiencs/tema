@@ -747,8 +747,6 @@ impl WlSurface {
         self.shortcuts_inhibit_denied
     }
 
-    // Phase 3 uses it in production; remove this attribute in Phase 3.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_shortcuts_inhibit_denied(&mut self, denied: bool) {
         self.shortcuts_inhibit_denied = denied;
     }

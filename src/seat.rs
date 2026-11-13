@@ -1888,8 +1888,8 @@ pub fn handle_keyboard_key(
 
     if key_state == 1 && !state.session_lock.input_gated() {
         if let Some(action) = state.config.binding_for_key(&state.keyboard, key) {
-            // Phase 3: the toggle-shortcuts-inhibit action bypasses inhibition.
-            let bypasses_inhibit = false;
+            let bypasses_inhibit =
+                matches!(action, config::CompositorAction::ToggleShortcutsInhibit);
             if !bypasses_inhibit
                 && crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::shortcuts_inhibited(
                     state,
@@ -7114,6 +7114,160 @@ mod xdg_seat_tests {
         handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 20);
 
         assert!(dispatcher.shutdown_requested());
+    }
+
+    fn toggle_binding_state(state: &mut State) {
+        state.config = RuntimeConfig::parse_for_test(
+            r#"
+            [bindings]
+            "Super+Return" = { action = "quit" }
+            "Super+Shift+Escape" = { action = "toggle-shortcuts-inhibit" }
+            "#,
+            &state.xkb,
+        )
+        .unwrap();
+    }
+
+    /// `active` values of every queued `ShortcutsInhibitorState` for client 7, in order.
+    fn queued_inhibitor_states(dispatcher: &Dispatcher) -> Vec<bool> {
+        let mut states = Vec::new();
+        dispatcher.test_matching_actions_for::<ClientAction, ClientId>(
+            ClientId::from_raw(7),
+            |action| {
+                if let ClientAction::ShortcutsInhibitorState { active, .. } = action {
+                    states.push(*active);
+                }
+            },
+        );
+        states
+    }
+
+    fn toggle_chord(state: &mut State, dispatcher: &mut Dispatcher, time: u32) {
+        handle_keyboard_key(state, dispatcher, 125, 1, time); // Super down
+        handle_keyboard_key(state, dispatcher, 42, 1, time + 1); // Shift down
+        handle_keyboard_key(state, dispatcher, 1, 1, time + 2); // Escape down: toggle
+        handle_keyboard_key(state, dispatcher, 1, 0, time + 3); // Escape up (swallowed)
+        handle_keyboard_key(state, dispatcher, 42, 0, time + 4); // Shift up
+        handle_keyboard_key(state, dispatcher, 125, 0, time + 5); // Super up
+    }
+
+    #[test]
+    fn the_toggle_runs_while_inhibited_and_restores_bindings() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        toggle_binding_state(&mut state);
+        let (surface, inhibitor) = inhibited_focus(&mut state, &mut client, true);
+
+        toggle_chord(&mut state, &mut dispatcher, 10);
+
+        assert!(!inhibitor.rref(&state).user_enabled());
+        assert!(surface.rref(&state).shortcuts_inhibit_denied());
+        assert_eq!(queued_inhibitor_states(&dispatcher), vec![false]);
+        assert!(!client_saw_key(&dispatcher, 1));
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 20);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 21);
+        assert!(dispatcher.shutdown_requested());
+    }
+
+    #[test]
+    fn toggling_twice_reactivates() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        toggle_binding_state(&mut state);
+        let (surface, inhibitor) = inhibited_focus(&mut state, &mut client, true);
+
+        toggle_chord(&mut state, &mut dispatcher, 10);
+        toggle_chord(&mut state, &mut dispatcher, 20);
+
+        assert!(inhibitor.rref(&state).user_enabled());
+        assert!(!surface.rref(&state).shortcuts_inhibit_denied());
+        assert_eq!(queued_inhibitor_states(&dispatcher), vec![false, true]);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 30);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 31);
+        assert!(!dispatcher.shutdown_requested());
+        assert!(client_saw_key(&dispatcher, 28));
+    }
+
+    #[test]
+    fn the_toggle_without_an_inhibitor_does_nothing() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        toggle_binding_state(&mut state);
+        let surface = focused_window_surface(&mut state, &mut client, 10);
+
+        toggle_chord(&mut state, &mut dispatcher, 10);
+
+        assert!(queued_inhibitor_states(&dispatcher).is_empty());
+        assert!(!client_saw_key(&dispatcher, 1));
+        assert!(!surface.rref(&state).shortcuts_inhibit_denied());
+    }
+
+    #[test]
+    fn a_recreated_inhibitor_stays_denied() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        toggle_binding_state(&mut state);
+        let (surface, inhibitor11) = inhibited_focus(&mut state, &mut client, true);
+        toggle_chord(&mut state, &mut dispatcher, 10);
+
+        // The client destroys inhibitor 11 and creates 12, as the manager does.
+        surface
+            .ref_mut(&mut state)
+            .clear_shortcuts_inhibitor(inhibitor11);
+        let granted = !surface.rref(&state).shortcuts_inhibit_denied();
+        assert!(!granted);
+        let (inhibitor12, _) = client.insert_object(
+            &mut state,
+            ZwpKeyboardShortcutsInhibitorV1::new(
+                ZwpKeyboardShortcutsInhibitorV1Id::from(12),
+                surface,
+                granted,
+            ),
+        );
+        surface
+            .ref_mut(&mut state)
+            .set_shortcuts_inhibitor(inhibitor12);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 20);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 21);
+        assert!(dispatcher.shutdown_requested());
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 0, 22);
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 0, 23);
+
+        toggle_chord(&mut state, &mut dispatcher, 30);
+        assert!(inhibitor12.rref(&state).user_enabled());
+        assert_eq!(queued_inhibitor_states(&dispatcher), vec![false, true]);
+    }
+
+    #[test]
+    fn a_release_after_toggling_off_reaches_the_client() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        toggle_binding_state(&mut state);
+        inhibited_focus(&mut state, &mut client, true);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 10);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 11);
+        assert!(client_saw_key(&dispatcher, 28));
+        assert!(!dispatcher.shutdown_requested());
+
+        // Shift and Escape toggle the inhibitor off while Super and Return are held.
+        handle_keyboard_key(&mut state, &mut dispatcher, 42, 1, 12);
+        handle_keyboard_key(&mut state, &mut dispatcher, 1, 1, 13);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 0, 14);
+
+        assert_eq!(
+            dispatcher.test_count_queued_action::<ClientAction>(|action| {
+                matches!(
+                    action,
+                    ClientAction::SeatEvent { event: SeatClientEvent::KeyboardKey { key: 28, .. } }
+                )
+            }),
+            2
+        );
+        assert!(!dispatcher.shutdown_requested());
     }
 
     #[test]

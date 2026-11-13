@@ -40,8 +40,6 @@ impl ZwpKeyboardShortcutsInhibitorV1 {
         self.user_enabled
     }
 
-    // Phase 3 uses it in production; remove this attribute in Phase 3.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_user_enabled(&mut self, enabled: bool) {
         self.user_enabled = enabled;
     }
@@ -90,6 +88,30 @@ pub(crate) fn shortcuts_inhibited(state: &State) -> bool {
     focused_inhibitor(state)
         .and_then(|inhibitor| inhibitor.try_ref(state))
         .is_some_and(|inhibitor| inhibitor.user_enabled())
+}
+
+/// `toggle-shortcuts-inhibit`: flip the focused surface's inhibitor. The state
+/// flips now, so the next key already uses it; the client gets the event when
+/// it processes the queued `ClientAction`.
+pub(crate) fn toggle_focused(state: &mut State, dispatcher: &mut crate::runner::Dispatcher) {
+    let Some(resolved) = focused_inhibitor(state) else {
+        log::debug!("toggle-shortcuts-inhibit ignored; focused surface has no inhibitor");
+        return;
+    };
+    let Some(inhibitor) = resolved.try_ref_mut(state) else { return };
+    let active = !inhibitor.user_enabled();
+    inhibitor.set_user_enabled(active);
+    // `focused_inhibitor` returned Some, so the focus surface exists.
+    if let Some(focus) = state.seat.keyboard_focus {
+        if let Some(surface) = focus.surface.try_ref_mut(state) {
+            surface.set_shortcuts_inhibit_denied(!active);
+        }
+    }
+    log::info!("keyboard shortcuts inhibitor {:?} active={}", resolved, active);
+    dispatcher.dispatch_to(
+        resolved.client_id(),
+        crate::clients::ClientAction::ShortcutsInhibitorState { inhibitor: resolved, active },
+    );
 }
 
 impl Object for ZwpKeyboardShortcutsInhibitorV1 {

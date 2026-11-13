@@ -482,6 +482,8 @@ pub enum CompositorAction {
     FocusPrevious,
     ToggleFloating,
     ToggleFullscreen,
+    /// Flip the keyboard-shortcuts inhibitor of the focused surface. Never inhibited.
+    ToggleShortcutsInhibit,
     /// One-based workspace on the active output's group.
     WorkspaceIndex {
         index: u32,
@@ -1725,6 +1727,11 @@ pub fn execute_action(state: &mut State, dispatcher: &mut Dispatcher, action: Co
                 }
             }
         }
+        CompositorAction::ToggleShortcutsInhibit => {
+            crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::toggle_focused(
+                state, dispatcher,
+            );
+        }
         CompositorAction::WorkspaceIndex { index } => {
             select_workspace_index(state, dispatcher, index);
         }
@@ -1770,6 +1777,13 @@ fn compositor_action_from_file(
         "toggle-fullscreen" => {
             unit_action(description, &action, command, index, CompositorAction::ToggleFullscreen)
         }
+        "toggle-shortcuts-inhibit" => unit_action(
+            description,
+            &action,
+            command,
+            index,
+            CompositorAction::ToggleShortcutsInhibit,
+        ),
         "workspace-index" => indexed_action(description, &action, command, index, |index| {
             CompositorAction::WorkspaceIndex { index }
         }),
@@ -3816,6 +3830,7 @@ mod tests {
                 ("Super+Shift+3", CompositorAction::MoveToWorkspace { index: 3 }),
                 ("Super+Shift+4", CompositorAction::MoveToWorkspace { index: 4 }),
                 ("Super+Shift+C", CompositorAction::ReloadConfig),
+                ("Super+Shift+Escape", CompositorAction::ToggleShortcutsInhibit),
                 ("Super+Space", CompositorAction::ToggleFloating),
             ]
         );
@@ -3915,6 +3930,38 @@ mod tests {
                 CompositorAction::ToggleFloating,
             ]
         );
+    }
+
+    #[test]
+    fn toggle_shortcuts_inhibit_parses() {
+        let xkb = Xkb::new();
+        let config = RuntimeConfig::parse_for_test(
+            r#"
+            [bindings]
+            "Super+X" = { action = "toggle-shortcuts-inhibit" }
+            "#,
+            &xkb,
+        )
+        .unwrap();
+        let actions: Vec<_> = config
+            .bindings
+            .into_iter()
+            .map(|binding| binding.action)
+            .collect();
+        assert_eq!(actions, vec![CompositorAction::ToggleShortcutsInhibit]);
+
+        for extra in ["command = \"x\"", "index = 1"] {
+            let error = RuntimeConfig::parse_for_test(
+                &format!(
+                    r#"
+                    [bindings]
+                    "Super+X" = {{ action = "toggle-shortcuts-inhibit", {extra} }}
+                    "#
+                ),
+                &xkb,
+            );
+            assert!(error.is_err(), "toggle-shortcuts-inhibit accepted `{extra}`");
+        }
     }
 
     #[test]

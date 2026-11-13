@@ -117,7 +117,9 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::{
-        clients::{Arguments, Client, ClientId, ClientManagerAction, RawRequest, Resolved},
+        clients::{
+            Arguments, Client, ClientAction, ClientId, ClientManagerAction, RawRequest, Resolved,
+        },
         globals::{Global, Globals},
         io_uring::model::IoUringAction,
         object::{Object, RequestResult},
@@ -428,6 +430,56 @@ mod tests {
             .unwrap();
         assert_eq!(fixture.surface.rref(&fixture.state).shortcuts_inhibitor(), Some(inhibitor));
         assert!(!inhibitor.rref(&fixture.state).user_enabled());
+        assert!(sent(&fixture.dispatcher).is_empty());
+    }
+
+    #[test]
+    fn the_state_action_sends_inactive_then_active() {
+        let mut fixture = new_fixture();
+        inhibit(&mut fixture, 7).unwrap();
+        let inhibitor = fixture
+            .client
+            .resolve(ZwpKeyboardShortcutsInhibitorV1Id::from(7), &fixture.state)
+            .unwrap();
+        fixture
+            .dispatcher
+            .test_take_queued_actions::<IoUringAction>();
+
+        for active in [false, true] {
+            fixture
+                .client
+                .process(
+                    &mut fixture.state,
+                    ClientAction::ShortcutsInhibitorState { inhibitor, active },
+                    &mut fixture.dispatcher,
+                )
+                .unwrap();
+        }
+        assert_eq!(sent(&fixture.dispatcher), vec![(7, 1, 0, 0), (7, 0, 0, 0)]);
+    }
+
+    #[test]
+    fn the_state_action_for_a_destroyed_inhibitor_sends_nothing() {
+        let mut fixture = new_fixture();
+        inhibit(&mut fixture, 7).unwrap();
+        let inhibitor = fixture
+            .client
+            .resolve(ZwpKeyboardShortcutsInhibitorV1Id::from(7), &fixture.state)
+            .unwrap();
+        let object = inhibitor.object_id();
+        dispatch(&mut fixture, object, 7, 0, &[]).unwrap();
+        fixture
+            .dispatcher
+            .test_take_queued_actions::<IoUringAction>();
+
+        fixture
+            .client
+            .process(
+                &mut fixture.state,
+                ClientAction::ShortcutsInhibitorState { inhibitor, active: false },
+                &mut fixture.dispatcher,
+            )
+            .unwrap();
         assert!(sent(&fixture.dispatcher).is_empty());
     }
 }
