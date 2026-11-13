@@ -699,6 +699,29 @@ impl XdgSurface {
                             .then_some(session)
                             .flatten()
                         });
+                    // xdg-dialog: a never-mapped dialog with a parent floats. This branch runs
+                    // again after every unmap; `has_mapped_once` keeps the decision to the first
+                    // map. A session restore or toplevel drag that already placed it wins.
+                    let dialog_window = id
+                        .try_ref(state)
+                        .filter(|toplevel| {
+                            toplevel.floats_as_dialog()
+                                && !toplevel.has_mapped_once()
+                                && !toplevel.is_fullscreen()
+                        })
+                        .map(|toplevel| toplevel.window())
+                        .filter(|window| {
+                            state.managed_window_state(*window).is_some_and(|managed| {
+                                managed.mode == crate::state::ManagedWindowMode::Tiled
+                                    && !managed.fullscreen
+                            })
+                        });
+                    if let Some(window) = dialog_window {
+                        state.set_window_floating(window, true);
+                        if let Some(toplevel) = id.try_ref_mut(state) {
+                            toplevel.set_center_on_map(true);
+                        }
+                    }
                     let initial_tiled_geometry = crate::tiling::initial_root_geometry_for_surface(
                         state,
                         surface_id,
@@ -1023,6 +1046,8 @@ pub mod xdg_toplevel {
         dialog: Option<Resolved<XdgDialogV1Id>>,
         /// The last request on that dialog was `set_modal`.
         dialog_modal: bool,
+        /// Floated as a dialog; center on the next map.
+        center_on_map: bool,
         parent: Option<Resolved<XdgToplevelId>>,
         parent_window: Option<WindowId>,
         min_size: Option<(i32, i32)>,
@@ -1097,6 +1122,7 @@ pub mod xdg_toplevel {
                 toplevel_drag: None,
                 dialog: None,
                 dialog_modal: false,
+                center_on_map: false,
                 parent: None,
                 parent_window: None,
                 min_size: None,
@@ -1636,6 +1662,33 @@ pub mod xdg_toplevel {
             } else {
                 None
             }
+        }
+
+        /// A live `xdg_dialog_v1` and a parent: floats at the first initial commit.
+        pub(crate) fn floats_as_dialog(&self) -> bool {
+            self.dialog.is_some() && self.parent.is_some() && self.parent_window.is_some()
+        }
+
+        /// Parent window, `None` once `set_parent(null)` or an unmap cleared `parent`.
+        pub(crate) fn dialog_parent_window(&self) -> Option<WindowId> {
+            self.parent.and(self.parent_window)
+        }
+
+        pub(crate) fn has_mapped_once(&self) -> bool {
+            self.mapped_once
+        }
+
+        pub(crate) fn set_center_on_map(&mut self, center: bool) {
+            self.center_on_map = center;
+        }
+
+        pub(crate) fn take_center_on_map(&mut self) -> bool {
+            std::mem::take(&mut self.center_on_map)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn test_center_on_map(&self) -> bool {
+            self.center_on_map
         }
 
         pub(crate) fn set_description(&mut self, description: Option<String>) -> bool {

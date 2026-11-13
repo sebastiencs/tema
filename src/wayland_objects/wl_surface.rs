@@ -102,6 +102,9 @@ enum PostWlSurface {
     ToplevelDragMapped {
         root: Resolved<WlSurfaceId>,
     },
+    PlaceDialog {
+        root: Resolved<WlSurfaceId>,
+    },
 }
 
 impl PostAction for PostWlSurface {
@@ -147,6 +150,9 @@ impl PostAction for PostWlSurface {
             }
             PostWlSurface::ToplevelDragMapped { root } => {
                 crate::input::toplevel_drag::on_mapped(state, dispatcher, root);
+            }
+            PostWlSurface::PlaceDialog { root } => {
+                crate::wayland_objects::xdg_dialog_v1::place_on_map(state, dispatcher, root);
             }
         }
     }
@@ -3160,6 +3166,9 @@ impl WlSurface {
                                 kick_visual_animation_pump(dispatcher);
                             }
                         }
+                        dispatcher.dispatch_post_action(PostWlSurface::PlaceDialog {
+                            root: resolved_surface,
+                        });
                         dispatcher.dispatch_post_action(PostWlSurface::FocusNewToplevel {
                             root_surface: resolved_surface,
                         });
@@ -4180,6 +4189,26 @@ impl Object for WlSurface {
             dispatcher.stop_model(waiter_id);
         }
     }
+}
+
+/// Commit a null buffer on a root surface: it unmaps. Test-only, like `test_commit_new_buffer`.
+#[cfg(test)]
+pub(crate) fn test_commit_null_buffer(
+    client: &mut Client,
+    state: &mut State,
+    dispatcher: &mut crate::runner::Dispatcher,
+    surface: Resolved<WlSurfaceId>,
+) {
+    {
+        let mut wl_surface = surface.grab(state);
+        wl_surface.pending.buffer = Some(None);
+    }
+    let mut client_dispatcher = client.test_dispatcher(dispatcher);
+    {
+        let mut wl_surface = surface.grab(state);
+        wl_surface.on_commit(client, state, &mut client_dispatcher);
+    }
+    client_dispatcher.drain_post_actions(client, state);
 }
 
 /// Commit one new buffer on an X root and run the map-time focus action.
