@@ -1888,10 +1888,24 @@ pub fn handle_keyboard_key(
 
     if key_state == 1 && !state.session_lock.input_gated() {
         if let Some(action) = state.config.binding_for_key(&state.keyboard, key) {
-            log::info!("seat executing compositor binding key={} action={:?}", key, action);
-            state.seat.intercept_keyboard_key(key);
-            config::execute_action(state, dispatcher, action);
-            return;
+            // Phase 3: the toggle-shortcuts-inhibit action bypasses inhibition.
+            let bypasses_inhibit = false;
+            if !bypasses_inhibit
+                && crate::wayland_objects::zwp_keyboard_shortcuts_inhibitor_v1::shortcuts_inhibited(
+                    state,
+                )
+            {
+                log::debug!(
+                    "seat binding inhibited by the focused surface key={} action={:?}",
+                    key,
+                    action
+                );
+            } else {
+                log::info!("seat executing compositor binding key={} action={:?}", key, action);
+                state.seat.intercept_keyboard_key(key);
+                config::execute_action(state, dispatcher, action);
+                return;
+            }
         }
     }
 
@@ -2762,12 +2776,13 @@ mod xdg_seat_tests {
             },
             config::RuntimeConfig,
             cursor::CursorSourceRef,
+            input::SurfaceFocus,
             object::Object,
             protocol_generated::{
                 xdg_toplevel, zwlr_layer_surface_v1, Constants, WlPointerId, WlSeatId,
                 WlSubsurfaceId, WlSurfaceId, XdgPopupId, XdgPositionerId, XdgSurfaceId,
                 XdgToplevelId, XdgWmBaseId, ZwlrLayerShellV1Id, ZwlrLayerSurfaceV1Id,
-                ZwpRelativePointerV1Id,
+                ZwpKeyboardShortcutsInhibitorV1Id, ZwpRelativePointerV1Id,
             },
             region::{RectI, RegionValue},
             runner::Dispatcher,
@@ -2776,9 +2791,10 @@ mod xdg_seat_tests {
                 ObjectId, State, WorkspaceGroup,
             },
             test_support::{
-                fake_focus, focus_for_surface, get_toplevel_request, insert_wl_subsurface,
-                raw_request_from_event, resolved_wl_surface as root, state_for_tests,
-                test_client_and_dispatcher, test_output_drm1, test_output_with_crtc_name,
+                fake_focus, focus_for_surface, get_toplevel_request, insert_window,
+                insert_wl_subsurface, raw_request_from_event, resolved_wl_surface as root,
+                state_for_tests, test_client_and_dispatcher, test_output_drm1,
+                test_output_with_crtc_name,
             },
             wayland_objects::{
                 wl_pointer::WlPointer,
@@ -2792,6 +2808,7 @@ mod xdg_seat_tests {
                 },
                 xdg_wm_base::XdgWmBase,
                 zwlr_layer_surface_v1::{LayerShellLayer, ZwlrLayerSurfaceV1},
+                zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
                 zwp_relative_pointer_v1::ZwpRelativePointerV1,
             },
         },
@@ -6955,6 +6972,148 @@ mod xdg_seat_tests {
     fn press_ctrl_alt(state: &mut State, dispatcher: &mut Dispatcher) {
         handle_keyboard_key(state, dispatcher, 29, 1, 10);
         handle_keyboard_key(state, dispatcher, 56, 1, 11);
+    }
+
+    /// Real surface `surface_id` of `client`, registered as a window root, focused.
+    fn focused_window_surface(
+        state: &mut State,
+        client: &mut Client,
+        surface_id: u32,
+    ) -> Resolved<WlSurfaceId> {
+        let (surface, _) = client.insert_object(
+            state,
+            WlSurface::new(WlSurfaceId::from(surface_id), client.client_id(), 6),
+        );
+        insert_window(state, surface);
+        state.seat.keyboard_focus = Some(SurfaceFocus::new(surface));
+        surface
+    }
+
+    /// Focused window surface 10 with inhibitor 11 attached, `user_enabled = enabled`.
+    fn inhibited_focus(
+        state: &mut State,
+        client: &mut Client,
+        enabled: bool,
+    ) -> (Resolved<WlSurfaceId>, Resolved<ZwpKeyboardShortcutsInhibitorV1Id>) {
+        let surface = focused_window_surface(state, client, 10);
+        let (inhibitor, _) = client.insert_object(
+            state,
+            ZwpKeyboardShortcutsInhibitorV1::new(
+                ZwpKeyboardShortcutsInhibitorV1Id::from(11),
+                surface,
+                enabled,
+            ),
+        );
+        surface.ref_mut(state).set_shortcuts_inhibitor(inhibitor);
+        (surface, inhibitor)
+    }
+
+    fn quit_binding_state(state: &mut State) {
+        state.config = RuntimeConfig::parse_for_test(
+            r#"
+            [bindings]
+            "Super+Return" = { action = "quit" }
+            "#,
+            &state.xkb,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_inhibited_surface_receives_a_bound_chord() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        quit_binding_state(&mut state);
+        inhibited_focus(&mut state, &mut client, true);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 10);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 20);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 0, 30);
+
+        assert!(!dispatcher.shutdown_requested());
+        assert_eq!(
+            dispatcher.test_count_queued_action::<ClientAction>(|action| {
+                matches!(
+                    action,
+                    ClientAction::SeatEvent { event: SeatClientEvent::KeyboardKey { key: 28, .. } }
+                )
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn a_disabled_inhibitor_lets_the_binding_run() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        quit_binding_state(&mut state);
+        inhibited_focus(&mut state, &mut client, false);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 10);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 20);
+
+        assert!(dispatcher.shutdown_requested());
+        assert!(!client_saw_key(&dispatcher, 28));
+    }
+
+    #[test]
+    fn an_inhibitor_on_another_surface_does_not_inhibit() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        quit_binding_state(&mut state);
+        inhibited_focus(&mut state, &mut client, true);
+        focused_window_surface(&mut state, &mut client, 12);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 10);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 20);
+
+        assert!(dispatcher.shutdown_requested());
+    }
+
+    #[test]
+    fn vt_switch_still_works_while_inhibited() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        quit_binding_state(&mut state);
+        inhibited_focus(&mut state, &mut client, true);
+
+        press_ctrl_alt(&mut state, &mut dispatcher);
+        handle_keyboard_key(&mut state, &mut dispatcher, 59, 1, 20);
+
+        assert_eq!(queued_switch_vts(&dispatcher), vec![1]);
+        assert!(!client_saw_key(&dispatcher, 59));
+    }
+
+    #[test]
+    fn a_removed_inhibitor_no_longer_inhibits() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        quit_binding_state(&mut state);
+        let (surface, inhibitor) = inhibited_focus(&mut state, &mut client, true);
+        surface
+            .ref_mut(&mut state)
+            .clear_shortcuts_inhibitor(inhibitor);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 10);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 20);
+
+        assert!(dispatcher.shutdown_requested());
+        assert!(!client_saw_key(&dispatcher, 28));
+    }
+
+    #[test]
+    fn a_surface_without_a_window_does_not_inhibit() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(7);
+        quit_binding_state(&mut state);
+        let (surface, _) = inhibited_focus(&mut state, &mut client, true);
+        let window = state.window_for_root(surface).unwrap();
+        state.destroy_window(window);
+
+        handle_keyboard_key(&mut state, &mut dispatcher, 125, 1, 10);
+        handle_keyboard_key(&mut state, &mut dispatcher, 28, 1, 20);
+
+        assert!(dispatcher.shutdown_requested());
     }
 
     #[test]

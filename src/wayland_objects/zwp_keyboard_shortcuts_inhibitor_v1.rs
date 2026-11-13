@@ -36,8 +36,6 @@ impl ZwpKeyboardShortcutsInhibitorV1 {
         self.surface
     }
 
-    // Phase 2 uses it in production; remove this attribute in Phase 2.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn user_enabled(&self) -> bool {
         self.user_enabled
     }
@@ -74,6 +72,24 @@ pub(crate) fn detach_destroyed_surface(
     if let Some(inhibitor) = inhibitor.and_then(|i| i.try_ref_mut(state)) {
         inhibitor.surface = None;
     }
+}
+
+/// Inhibitor attached to the current keyboard-focus surface, enabled or not.
+/// The focus must be the root of a live window: after `xdg_toplevel.destroy`,
+/// focus can still sit on the role-less surface until the successor search runs.
+pub(crate) fn focused_inhibitor(
+    state: &State,
+) -> Option<Resolved<ZwpKeyboardShortcutsInhibitorV1Id>> {
+    let focus = state.seat.keyboard_focus?;
+    state.window_for_root(focus.surface)?;
+    focus.surface.try_ref(state)?.shortcuts_inhibitor()
+}
+
+/// True when compositor bindings must be skipped for the focused surface.
+pub(crate) fn shortcuts_inhibited(state: &State) -> bool {
+    focused_inhibitor(state)
+        .and_then(|inhibitor| inhibitor.try_ref(state))
+        .is_some_and(|inhibitor| inhibitor.user_enabled())
 }
 
 impl Object for ZwpKeyboardShortcutsInhibitorV1 {
