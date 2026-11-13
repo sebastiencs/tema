@@ -200,6 +200,7 @@ pub mod runner;
 mod scene;
 mod scheduler;
 mod seat;
+mod security_context;
 mod session;
 mod session_lock;
 mod session_store;

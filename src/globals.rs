@@ -99,6 +99,22 @@ pub trait Global {
     );
 }
 
+/// What decides which globals a client may see.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientClass {
+    /// The Xwayland client.
+    pub xwayland: bool,
+    /// Accepted on a security-context listener.
+    pub sandboxed: bool,
+}
+
+impl ClientClass {
+    pub fn may_see(self, global: &dyn Global) -> bool {
+        (self.xwayland || !global.xwayland_only())
+            && (!self.sandboxed || crate::security_context::sandbox_may_see(global.interface().0))
+    }
+}
+
 impl Globals {
     pub fn new() -> Self {
         Self {
@@ -173,19 +189,24 @@ impl Globals {
         })
     }
 
-    /// Globals this client may hear about. `xwayland` is the Xwayland client.
-    pub fn iter_for(&self, xwayland: bool) -> impl Iterator<Item = (GlobalName, &Box<dyn Global>)> {
+    /// Globals this client may hear about.
+    pub fn iter_for(
+        &self,
+        class: ClientClass,
+    ) -> impl Iterator<Item = (GlobalName, &Box<dyn Global>)> {
         self.iter()
-            .filter(move |(_, global)| xwayland || !global.xwayland_only())
+            .filter(move |(_, global)| class.may_see(&***global))
     }
 
-    pub fn is_xwayland_only(&self, name: GlobalName) -> bool {
+    /// `true` when `name` is a known global this client class may not see.
+    /// Unknown names return `false`, like `is_xwayland_only` did.
+    pub fn is_hidden_from(&self, name: GlobalName, class: ClientClass) -> bool {
         let Some(&slot_id) = self.slots_by_name.get(&name) else {
             return false;
         };
         self.map
             .try_get(slot_id)
-            .is_some_and(|global| global.xwayland_only())
+            .is_some_and(|global| !class.may_see(&**global))
     }
 
     pub fn insert(&mut self, global: Box<dyn Global>) -> GlobalName {

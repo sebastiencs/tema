@@ -15,6 +15,7 @@ use libc::getsockopt;
 use crate::{
     dbus::Dbus,
     drm::{kick_visual_animation_pump, request_active_output, request_output},
+    globals::ClientClass,
     input::ime::{ImEvent, KeyboardGrabClientEvent, TextInputClientEvent},
     io_uring::{
         model::IoUringAction,
@@ -34,6 +35,7 @@ use crate::{
     runner::{Dispatcher, Model, ModelInstanceId, Redispatcher},
     scene::visibility::root_has_protocol_visibility,
     seat::SeatClientEvent,
+    security_context::SecurityContextMetadata,
     state::{DataOfferRole, DrmId, GrabbedObject, ObjectId, OutputId, SelectionSourceState, State},
     sync::AcquireReadyWaiterId,
     udev::Udev,
@@ -619,6 +621,8 @@ pub struct Client {
     last_xwayland_serial: u64,
     /// Integer scale of the Xwayland wire. `ONE` for every normal client.
     wire_scale: WireScale,
+    /// Set when this client was accepted on a security-context listener.
+    security_context: Option<Rc<SecurityContextMetadata>>,
 }
 
 impl ModelInstanceId for ClientId {
@@ -844,6 +848,7 @@ impl Client {
             next_server_id: MIN_SERVER_ID,
             last_xwayland_serial: 0,
             wire_scale: WireScale::ONE,
+            security_context: None,
         }
     }
 
@@ -861,6 +866,31 @@ impl Client {
 
     pub fn is_xwayland(&self) -> bool {
         self.xwayland
+    }
+
+    /// Mark a freshly built client as sandboxed. Called before its model starts.
+    pub(crate) fn with_security_context(mut self, metadata: Rc<SecurityContextMetadata>) -> Self {
+        self.security_context = Some(metadata);
+        self
+    }
+
+    pub(crate) fn security_context(&self) -> Option<&Rc<SecurityContextMetadata>> {
+        self.security_context.as_ref()
+    }
+
+    pub(crate) fn global_class(&self) -> ClientClass {
+        ClientClass {
+            xwayland: self.xwayland,
+            sandboxed: self.security_context.is_some(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_sandboxed_for_tests(
+        client_id: ClientId,
+        metadata: SecurityContextMetadata,
+    ) -> Self {
+        Self::new_for_tests(client_id).with_security_context(Rc::new(metadata))
     }
 
     /// The scale of the Xwayland wire for this client. `ONE` for normal clients.
@@ -2327,7 +2357,10 @@ impl Client {
         version: u32,
     ) {
         let global_name = crate::globals::GlobalName::from_raw(name);
-        if state.globals.is_xwayland_only(global_name) && !self.is_xwayland() {
+        let class = self.global_class();
+        if state.globals.is_hidden_from(global_name, class)
+            || (class.sandboxed && !crate::security_context::sandbox_may_see(&interface))
+        {
             return;
         }
         let registries = self
@@ -2350,7 +2383,10 @@ impl Client {
         name: u32,
     ) {
         let global_name = crate::globals::GlobalName::from_raw(name);
-        if state.globals.is_xwayland_only(global_name) && !self.is_xwayland() {
+        if state
+            .globals
+            .is_hidden_from(global_name, self.global_class())
+        {
             return;
         }
         for registry in self.iter_resolved_of::<WlRegistryId>(state) {
