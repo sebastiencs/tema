@@ -10425,7 +10425,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_file_update_waits_without_a_waiter_and_applies_once_signaled() {
+    fn sync_file_update_starts_a_waiter_and_applies_once_signaled() {
         let mut state = state_for_tests();
         let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
         let surface = insert_plain_root(&mut client, &mut state, 1);
@@ -10437,12 +10437,22 @@ mod tests {
         }
         flush_queued_commits(&mut client, &mut state, &mut dispatcher);
         assert_eq!(surface.rref(&state).test_queue_len(), 1);
-        assert!(surface.rref(&state).acquire_waiter.is_none());
+        let waiter = surface
+            .rref(&state)
+            .acquire_waiter
+            .expect("a sync-file waiter");
 
         signal_acquire(&write);
-        flush_queued_commits(&mut client, &mut state, &mut dispatcher);
+        client
+            .process(
+                &mut state,
+                ClientAction::AcquireWaitDone { surface, waiter_id: waiter, failed: false },
+                &mut dispatcher,
+            )
+            .unwrap();
         assert_eq!(surface.rref(&state).test_queue_len(), 0);
         assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+        assert!(surface.rref(&state).acquire_waiter.is_none());
         assert!(surface.rref(&state).on_screen.buffer.is_some());
     }
 

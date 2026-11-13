@@ -1718,7 +1718,7 @@ The xwayland serial is not gated by the epoch. It applies with its update, and d
 
 ### Explicit sync
 
-An update waits while its acquire point (`payload.sync.acquire`, or that of a carried child) is not signaled. The xdg, layer and lock parts of that commit wait with it. Each surface has at most one acquire waiter, for the first unsignaled point of its queue head (`WlSurface.acquire_waiter`). When the waiter fires, it sends `ClientAction::AcquireWaitDone`. That clears the waiter and flushes the client. A `SyncFile` acquire has no waiter, so the queue head is checked again on every flush.
+An update waits while its acquire point (`payload.sync.acquire`, or that of a carried child) is not signaled. The xdg, layer and lock parts of that commit wait with it. Each surface has at most one acquire waiter, for the first unsignaled point of its queue head (`WlSurface.acquire_waiter`). When the waiter fires, it sends `ClientAction::AcquireWaitDone`. That clears the waiter and flushes the client. A timeline point is waited through an eventfd armed by `syncobj_eventfd`. A sync file is waited with an io_uring poll on a copy of its fd, which the waiter removes when it fires or stops.
 
 If the waiter cannot be created, or it reports a failure, the head update is applied with `acquire_forced` set, and a warning is logged. The renderer still waits on the fence before scanout. A newer commit never drops a queued update, so the single blocked-buffer slot of the earlier design is gone.
 

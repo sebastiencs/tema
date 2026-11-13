@@ -320,7 +320,7 @@ fn try_apply_head(
                             crate::sync::AcquireReadyWaiter::new(waiter_id, surface, fd),
                         );
                     }
-                    // A sync file is polled again on the next flush.
+                    // `AcquireSync::None` never makes an update wait.
                     Ok(None) => {}
                     Err(error) => {
                         log::warn!(
