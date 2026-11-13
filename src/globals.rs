@@ -19,6 +19,7 @@ use crate::{
         wp_cursor_shape_manager_v1::WpCursorShapeManagerV1Global,
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1Global,
         wp_presentation::WpPresentationGlobal,
+        wp_security_context_manager_v1::WpSecurityContextManagerV1Global,
         wp_tearing_control_manager_v1::WpTearingControlManagerV1Global,
         wp_viewporter::WpViewporterGlobal, xdg_activation_v1::XdgActivationV1Global,
         xdg_dialog_v1::XdgWmDialogV1Global, xdg_system_bell_v1::XdgSystemBellV1Global,
@@ -174,6 +175,7 @@ impl Globals {
             ExtBackgroundEffectManagerV1Global::new,
             ExtWorkspaceManagerV1Global::new,
             XwaylandShellV1Global::new,
+            WpSecurityContextManagerV1Global::new,
         ] {
             self.insert(fun());
         }

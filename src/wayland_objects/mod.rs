@@ -60,6 +60,8 @@ pub mod wp_linux_drm_syncobj_surface_v1;
 pub mod wp_linux_drm_syncobj_timeline_v1;
 pub mod wp_presentation;
 pub mod wp_presentation_feedback;
+pub mod wp_security_context_manager_v1;
+pub mod wp_security_context_v1;
 pub mod wp_tearing_control_manager_v1;
 pub mod wp_tearing_control_v1;
 pub mod wp_viewport;
@@ -224,8 +226,6 @@ fake_obj! {
     { wp_fifo_v1, WpFifoV1 },
     { wp_commit_timing_manager_v1, WpCommitTimingManagerV1 },
     { wp_commit_timer_v1, WpCommitTimerV1 },
-    { wp_security_context_manager_v1, WpSecurityContextManagerV1 },
-    { wp_security_context_v1, WpSecurityContextV1 },
 }
 
 pub mod xdg_wm_dialog_v1 {

@@ -67,6 +67,42 @@ pub(crate) fn sandbox_may_see(interface: &str) -> bool {
     SANDBOX_ALLOWED_INTERFACES.contains(&interface)
 }
 
+/// `listen_fd` must be a listening `AF_UNIX` socket.
+pub(crate) fn validate_listen_fd(fd: std::os::fd::RawFd) -> Result<(), &'static str> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err("invalid listen_fd");
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Err("listen_fd is not a socket");
+    }
+    let int_opt = |option: libc::c_int| -> Option<libc::c_int> {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        (result == 0).then_some(value)
+    };
+    match int_opt(libc::SO_DOMAIN) {
+        Some(libc::AF_UNIX) => {}
+        Some(_) => return Err("listen_fd is not a unix socket"),
+        None => return Err("invalid listen_fd"),
+    }
+    match int_opt(libc::SO_ACCEPTCONN) {
+        Some(0) => Err("listen_fd is not a listening socket"),
+        Some(_) => Ok(()),
+        None => Err("invalid listen_fd"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {super::*, crate::protocol_generated::Constants};
