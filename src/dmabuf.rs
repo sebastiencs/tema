@@ -65,6 +65,12 @@ pub fn export_sync_file(dmabuf: &impl AsFd, flags: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(data.fd) })
 }
 
+/// Whether `error` from `export_sync_file` means the kernel has no export
+/// ioctl (Linux before 5.20), rather than a failure of this buffer.
+pub fn sync_file_export_unsupported(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOTTY) | Some(libc::EINVAL))
+}
+
 /// Insert `sync_file` into the dma-buf. The ioctl does not take ownership of it,
 /// so one file can be imported onto every plane. wlroots does the same.
 pub fn import_sync_file(dmabuf: &impl AsFd, flags: u32, sync_file: &impl AsFd) -> io::Result<()> {

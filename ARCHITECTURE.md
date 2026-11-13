@@ -1722,9 +1722,17 @@ An update waits while its acquire point (`payload.sync.acquire`, or that of a ca
 
 If the waiter cannot be created, or it reports a failure, the head update is applied with `acquire_forced` set, and a warning is logged. The renderer still waits on the fence before scanout. A newer commit never drops a queued update, so the single blocked-buffer slot of the earlier design is gone.
 
+### Implicit sync
+
+A commit that attaches a dma-buf without explicit sync takes a snapshot of the buffer's write fences at capture (`content_update::implicit_fences`). Each plane's fences are exported with `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and the read flag, and fences that already signaled are dropped. The rest go into `ContentUpdate.implicit_fences`, not into `payload.sync.acquire`, so the renderer, direct scanout and buffer release see the same state as before.
+
+`readiness` treats an unsignaled implicit fence like an unsignaled acquire point: the update waits, through the same per-surface waiter, and a carried child's fence holds its parent. `acquire_forced` skips the fences too. A merged synchronized commit that attaches a new buffer replaces the fences; one without a buffer keeps them. jay and Hyprland wait the same way.
+
+While a client's fence is pending, its previous buffer stays on screen and tema's frame does not wait for the client. The renderer's own implicit wait is kept; by then the fence has signaled. On a kernel without the export ioctl (before 5.20), no fences are taken, a warning is logged once, and commits apply at once as before.
+
 ### Limits
 
-A client may have at most 256 updates queued across all its surfaces (`MAX_QUEUED_UPDATES_PER_CLIENT`). The 257th is discarded. The client receives `wl_display.error` with `no_memory` on that surface and is disconnected. Queued updates hold no file descriptors. A waiter exists only per surface whose queue head waits on a timeline point. `ClientAction::FlushCommitQueues` flushes one client's queues. Closing the client removes its queue index.
+A client may have at most 256 updates queued across all its surfaces (`MAX_QUEUED_UPDATES_PER_CLIENT`). The 257th is discarded. The client receives `wl_display.error` with `no_memory` on that surface and is disconnected. A queued update holds one file descriptor per unsignaled implicit fence of its buffer, and none otherwise. A waiter exists only per surface whose queue head waits on an acquire point or an implicit fence. `ClientAction::FlushCommitQueues` flushes one client's queues. Closing the client removes its queue index.
 
 ### Behavior changes
 
@@ -1736,6 +1744,7 @@ A client may have at most 256 updates queued across all its surfaces (`MAX_QUEUE
 6. A synchronized subsurface's pointer constraint region and hint apply when its cached state is applied with the parent, not at the child's commit.
 7. Unchanged: `xdg_surface.ack_configure` still applies its configure effects at request time. With a queued buffer, the configure can take effect before the buffer is shown.
 8. Merging synchronized commits always retires the replaced cached buffer. Before, only a buffer with release callbacks was retired.
+9. Implicit sync: a commit whose dma-buf is still being written waits in the queue instead of making the renderer wait. Until its fence signals, the previous buffer stays on screen.
 
 ### Tests
 
@@ -1744,6 +1753,7 @@ The queue regression tests are in `wl_surface.rs` `mod tests`. They keep an upda
 ### Manual check
 
 1. Run a Vulkan application with explicit sync, such as `vkcube`, and resize its window while it runs. Frames are neither dropped nor shown out of order, and the log has no new warnings.
+2. Run a GL client without explicit sync, such as `glxgears` under Xwayland or `weston-simple-egl`, next to a window that keeps tema busy. With `RUST_LOG=debug`, no frame of tema is late because of the client, and the log has no fence export warning on a current kernel.
 
 ## 29. Frame pacing: fifo and commit timing
 

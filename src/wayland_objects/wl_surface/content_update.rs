@@ -1,4 +1,4 @@
-use super::*;
+use {super::*, std::os::fd::OwnedFd};
 
 /// One `wl_surface.commit` (or several merged synchronized commits), captured
 /// at request time and applied when ready.
@@ -17,6 +17,10 @@ pub(crate) struct ContentUpdate {
     pub(super) xwayland_serial: Option<u64>,
     /// The acquire wait failed or could not be set up; apply without it.
     pub(super) acquire_forced: bool,
+    /// Write fences of the attached dma-buf, taken at capture when the commit
+    /// has no explicit sync. Only unsignaled ones are kept. The update waits
+    /// until all of them signal.
+    pub(super) implicit_fences: Vec<Rc<OwnedFd>>,
     /// The role part of the commit, applied only while the role object of
     /// `role_epoch` is still the surface's role.
     pub(super) role: RoleUpdate,
@@ -90,6 +94,7 @@ impl ContentUpdate {
             pointer_constraint: None,
             xwayland_serial: None,
             acquire_forced: false,
+            implicit_fences: Vec::new(),
             role: RoleUpdate::None,
             tree: TreeUpdate::default(),
             children: Vec::new(),
@@ -120,6 +125,7 @@ impl ContentUpdate {
         let payload = next.payload;
         let cached = &mut self.payload;
         if payload.buffer.is_some() {
+            self.implicit_fences = next.implicit_fences;
             if let Some(old_buffer) = cached.buffer.as_ref().and_then(|b| b.as_ref()) {
                 if payload.buffer.as_ref().and_then(|b| b.as_ref()) != Some(old_buffer) {
                     // Always retired, even without release callbacks, so the
@@ -231,4 +237,55 @@ pub(super) fn discard_update(
             owner.applied_update_seq = owner.applied_update_seq.max(seq);
         }
     }
+}
+
+/// The unsignaled write fences of the dma-buf `payload` attaches, when the
+/// commit has no explicit sync. Empty for SHM buffers, for commits without a
+/// buffer, for a rejected import, and when the kernel cannot export fences.
+pub(super) fn implicit_fences(payload: &SurfaceCommitPayload) -> Vec<Rc<OwnedFd>> {
+    if !payload.sync.acquire.is_none() {
+        return Vec::new();
+    }
+    let Some(Some(buffer)) = payload.buffer.as_ref() else {
+        return Vec::new();
+    };
+    if buffer.content.import_rejected() {
+        return Vec::new();
+    }
+    let Some(dmabuf) = buffer.content.dmabuf() else {
+        return Vec::new();
+    };
+    let mut fences = Vec::new();
+    for plane in dmabuf.planes.iter() {
+        match crate::dmabuf::export_sync_file(&plane.fd, crate::dmabuf::DMA_BUF_SYNC_READ) {
+            Ok(fence) => {
+                let fence = Rc::new(fence);
+                if !crate::sync::AcquireSync::SyncFile(Rc::clone(&fence)).is_ready_now() {
+                    fences.push(fence);
+                }
+            }
+            Err(error) if crate::dmabuf::sync_file_export_unsupported(&error) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        "dma-buf fence export unsupported ({error}); commits without explicit sync apply without waiting"
+                    );
+                }
+                return Vec::new();
+            }
+            Err(error) => {
+                // Warn once; later failures would repeat at frame rate.
+                static WARNED_FAILURE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED_FAILURE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!("dma-buf fence export failed: {error}; applying without waiting");
+                } else {
+                    log::debug!("dma-buf fence export failed: {error}; applying without waiting");
+                }
+                return Vec::new();
+            }
+        }
+    }
+    fences
 }

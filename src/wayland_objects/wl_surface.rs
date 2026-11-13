@@ -3186,6 +3186,7 @@ impl WlSurface {
         update.fifo_set_barrier = std::mem::take(&mut self.pending.fifo_set_barrier);
         update.fifo_wait_barrier = std::mem::take(&mut self.pending.fifo_wait_barrier);
         update.commit_target = self.pending.commit_target.take();
+        update.implicit_fences = content_update::implicit_fences(&update.payload);
         if update.xwayland_serial.is_some() {
             self.latest_xwayland_serial = update.xwayland_serial;
         }
@@ -10497,6 +10498,207 @@ mod tests {
             .unwrap();
         assert_eq!(surface.rref(&state).test_queue_len(), 0);
         assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+    }
+
+    /// A captured update that shows SHM buffer `buffer_id` and waits for the
+    /// implicit fence `fence`.
+    fn implicit_gated_update(
+        client: &Client,
+        state: &mut State,
+        buffer_id: u32,
+        seq: u64,
+        fence: std::os::fd::OwnedFd,
+    ) -> ContentUpdate {
+        let object =
+            insert_test_shm_buffer(state, client.client_id(), WlBufferId::from(buffer_id), 2, 2);
+        let buffer = crate::buffer_content::AttachedBuffer::resolve(
+            state,
+            Resolved::new(client.client_id(), WlBufferId::from(buffer_id), object),
+        )
+        .expect("test buffer is live");
+        let mut update = ContentUpdate::new(
+            seq,
+            0,
+            WlSurface::test_payload(Some(Some(buffer))),
+            Vec::new(),
+            Vec::new(),
+        );
+        update.implicit_fences.push(std::rc::Rc::new(fence));
+        update
+    }
+
+    #[test]
+    fn readiness_waits_for_an_unsignaled_implicit_fence() {
+        let mut state = state_for_tests();
+        let (mut client, _dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        let (read, write) = acquire_pipe();
+        let update = implicit_gated_update(&client, &mut state, 90, 1, read);
+        assert!(matches!(
+            super::commit_queue::readiness(&state, surface, 0, &update, false, None),
+            super::commit_queue::Readiness::WaitAcquire { .. }
+        ));
+        signal_acquire(&write);
+        assert!(matches!(
+            super::commit_queue::readiness(&state, surface, 0, &update, false, None),
+            super::commit_queue::Readiness::Ready
+        ));
+    }
+
+    #[test]
+    fn forced_update_ignores_its_implicit_fence() {
+        let mut state = state_for_tests();
+        let (mut client, _dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        let (read, _write) = acquire_pipe();
+        let mut update = implicit_gated_update(&client, &mut state, 90, 1, read);
+        assert!(matches!(
+            super::commit_queue::readiness(&state, surface, 0, &update, true, None),
+            super::commit_queue::Readiness::Ready
+        ));
+        update.acquire_forced = true;
+        assert!(matches!(
+            super::commit_queue::readiness(&state, surface, 0, &update, false, None),
+            super::commit_queue::Readiness::Ready
+        ));
+    }
+
+    #[test]
+    fn carried_child_implicit_fence_holds_the_parent() {
+        let mut state = state_for_tests();
+        let (mut client, _dispatcher) = test_client_and_dispatcher(9);
+        let parent = insert_plain_root(&mut client, &mut state, 1);
+        let child = insert_plain_root(&mut client, &mut state, 2);
+        let (read, write) = acquire_pipe();
+        let child_update = implicit_gated_update(&client, &mut state, 90, 1, read);
+        let mut parent_update =
+            ContentUpdate::test_new(WlSurface::test_payload(None), Vec::new(), Vec::new());
+        parent_update.children.push(
+            crate::wayland_objects::wl_surface::content_update::ChildUpdate {
+                surface: child,
+                update: Box::new(child_update),
+            },
+        );
+        assert!(matches!(
+            super::commit_queue::readiness(&state, parent, 0, &parent_update, false, None),
+            super::commit_queue::Readiness::WaitAcquire { .. }
+        ));
+        signal_acquire(&write);
+        assert!(matches!(
+            super::commit_queue::readiness(&state, parent, 0, &parent_update, false, None),
+            super::commit_queue::Readiness::Ready
+        ));
+    }
+
+    #[test]
+    fn implicit_fence_update_applies_after_its_waiter_fires() {
+        let mut state = state_for_tests();
+        let (mut client, mut dispatcher) = test_client_and_dispatcher(9);
+        let surface = insert_plain_root(&mut client, &mut state, 1);
+        let (read, write) = acquire_pipe();
+        let update = implicit_gated_update(&client, &mut state, 90, 1, read);
+        {
+            let mut grabbed = surface.grab(&mut state);
+            WlSurface::test_enqueue(&mut grabbed, &mut state, surface, update);
+        }
+        flush_queued_commits(&mut client, &mut state, &mut dispatcher);
+        assert_eq!(surface.rref(&state).test_queue_len(), 1);
+        let waiter = surface
+            .rref(&state)
+            .acquire_waiter
+            .expect("a waiter for the implicit fence");
+
+        signal_acquire(&write);
+        client
+            .process(
+                &mut state,
+                ClientAction::AcquireWaitDone { surface, waiter_id: waiter, failed: false },
+                &mut dispatcher,
+            )
+            .unwrap();
+        assert_eq!(surface.rref(&state).test_queue_len(), 0);
+        assert_eq!(surface.rref(&state).test_applied_update_seq(), 1);
+        assert!(surface.rref(&state).acquire_waiter.is_none());
+        assert!(surface.rref(&state).on_screen.buffer.is_some());
+    }
+
+    #[test]
+    fn merge_replaces_implicit_fences_only_with_a_buffer() {
+        let mut state = state_for_tests();
+        let (client, _dispatcher) = test_client_and_dispatcher(9);
+        let (read, _write) = acquire_pipe();
+        let mut cached = implicit_gated_update(&client, &mut state, 90, 1, read);
+        let mut retired = Vec::new();
+
+        let no_buffer =
+            ContentUpdate::new(2, 0, WlSurface::test_payload(None), Vec::new(), Vec::new());
+        cached.merge(no_buffer, &mut retired);
+        assert_eq!(cached.implicit_fences.len(), 1);
+
+        let object =
+            insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(91), 2, 2);
+        let buffer = crate::buffer_content::AttachedBuffer::resolve(
+            &state,
+            Resolved::new(client.client_id(), WlBufferId::from(91), object),
+        )
+        .expect("test buffer is live");
+        let with_buffer = ContentUpdate::new(
+            3,
+            0,
+            WlSurface::test_payload(Some(Some(buffer))),
+            Vec::new(),
+            Vec::new(),
+        );
+        cached.merge(with_buffer, &mut retired);
+        assert!(cached.implicit_fences.is_empty());
+    }
+
+    #[test]
+    fn implicit_fences_are_taken_only_from_dma_bufs_without_explicit_sync() {
+        let mut state = state_for_tests();
+        let (client, _dispatcher) = test_client_and_dispatcher(9);
+
+        // SHM: nothing.
+        let object =
+            insert_test_shm_buffer(&mut state, client.client_id(), WlBufferId::from(90), 2, 2);
+        let shm = crate::buffer_content::AttachedBuffer::resolve(
+            &state,
+            Resolved::new(client.client_id(), WlBufferId::from(90), object),
+        )
+        .expect("test buffer is live");
+        let payload = WlSurface::test_payload(Some(Some(shm)));
+        assert!(super::content_update::implicit_fences(&payload).is_empty());
+
+        // No buffer: nothing.
+        assert!(super::content_update::implicit_fences(&WlSurface::test_payload(None)).is_empty());
+
+        // A dma-buf whose fd cannot export fences: nothing, and no panic.
+        let (plane_fd, _other) = acquire_pipe();
+        let dmabuf = crate::dmabuf::DmaBuf {
+            id: crate::dmabuf::DmaBufId::next(),
+            width: 2,
+            height: 2,
+            format: crate::drm::ARGB8888,
+            modifier: crate::drm::Modifier(0),
+            planes: vec![crate::dmabuf::DmaBufPlane { offset: 0, stride: 8, fd: plane_fd }]
+                .into_boxed_slice(),
+            sampling_device: None,
+        };
+        let attached = crate::buffer_content::AttachedBuffer {
+            object: Resolved::new(
+                client.client_id(),
+                WlBufferId::from(92),
+                ObjectId::from(92usize),
+            ),
+            content: crate::buffer_content::BufferContent::new_dmabuf(dmabuf, false, false),
+        };
+        let mut payload = WlSurface::test_payload(Some(Some(attached)));
+        assert!(super::content_update::implicit_fences(&payload).is_empty());
+
+        // Explicit sync set: nothing, without trying an export.
+        let (acquire, _signal) = acquire_pipe();
+        payload.sync.acquire = crate::sync::AcquireSync::from_sync_file(acquire);
+        assert!(super::content_update::implicit_fences(&payload).is_empty());
     }
 
     #[test]

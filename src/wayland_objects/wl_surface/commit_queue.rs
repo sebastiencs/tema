@@ -127,6 +127,14 @@ pub(super) fn readiness(
     {
         return Readiness::WaitAcquire { acquire: update.payload.sync.acquire.clone() };
     }
+    if !forced {
+        for fence in &update.implicit_fences {
+            let acquire = crate::sync::AcquireSync::SyncFile(std::rc::Rc::clone(fence));
+            if !acquire.is_ready_now() {
+                return Readiness::WaitAcquire { acquire };
+            }
+        }
+    }
     #[cfg(test)]
     {
         if update.test_hold {
