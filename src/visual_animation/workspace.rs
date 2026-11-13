@@ -31,9 +31,15 @@ impl WorkspaceMotion {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransitionPhase {
-    Pending { goal: UnitValue },
+    Pending {
+        goal: UnitValue,
+    },
     Running,
-    Paused { goal: UnitValue },
+    Paused {
+        goal: UnitValue,
+    },
+    /// Progress follows a touchpad swipe. The clocks do not run until `request_goal`.
+    Tracking,
 }
 
 /// One live slide shared by every output in a workspace group.
@@ -116,7 +122,36 @@ impl WorkspaceGroupTransition {
     }
 
     pub fn needs_frames(self) -> bool {
-        !matches!(self.phase, TransitionPhase::Paused { .. })
+        !matches!(self.phase, TransitionPhase::Paused { .. } | TransitionPhase::Tracking)
+    }
+
+    /// A slide held by a touchpad swipe at progress 0, aimed at `to`.
+    pub fn tracking(
+        from: WorkspaceId,
+        to: WorkspaceId,
+        direction: WorkspaceTransitionDirection,
+    ) -> Self {
+        let mut transition = Self::pending(from, to, direction);
+        transition.phase = TransitionPhase::Tracking;
+        transition
+    }
+
+    pub fn is_tracking(self) -> bool {
+        self.phase == TransitionPhase::Tracking
+    }
+
+    /// Place both workspaces at `progress`. Only a tracking transition moves;
+    /// returns whether the sampled progress changed.
+    pub fn set_tracked_progress(&mut self, progress: UnitValue) -> bool {
+        if self.phase != TransitionPhase::Tracking {
+            return false;
+        }
+        let changed = self.outgoing != progress || self.incoming != progress;
+        self.outgoing = progress;
+        self.incoming = progress;
+        self.outgoing_track = RetargetableTrack::settled(progress);
+        self.incoming_track = RetargetableTrack::settled(progress);
+        changed
     }
 
     /// Aim both workspaces at `goal` without moving the sampled progress.
@@ -129,7 +164,7 @@ impl WorkspaceGroupTransition {
     }
 
     pub fn pause(&mut self) {
-        if matches!(self.phase, TransitionPhase::Paused { .. }) {
+        if matches!(self.phase, TransitionPhase::Paused { .. } | TransitionPhase::Tracking) {
             return;
         }
         self.phase = TransitionPhase::Paused { goal: self.goal };
@@ -190,12 +225,13 @@ impl WorkspaceGroupTransition {
         to_duration: Duration,
         to_easing: Easing,
     ) -> WorkspaceTransitionAdvance {
-        if matches!(self.phase, TransitionPhase::Paused { .. }) {
+        if matches!(self.phase, TransitionPhase::Paused { .. } | TransitionPhase::Tracking) {
             return WorkspaceTransitionAdvance::Unchanged;
         }
         let goal = match self.phase {
             TransitionPhase::Pending { goal } | TransitionPhase::Paused { goal } => goal,
             TransitionPhase::Running => self.goal,
+            TransitionPhase::Tracking => self.goal,
         };
         self.goal = goal;
         if matches!(self.phase, TransitionPhase::Pending { .. }) {
@@ -528,5 +564,54 @@ mod tests {
             ),
             WorkspaceTransitionAdvance::Finished
         );
+    }
+
+    #[test]
+    fn tracking_holds_progress_until_a_goal_is_requested() {
+        let (from, to) = pair();
+        let mut transition =
+            WorkspaceGroupTransition::tracking(from, to, WorkspaceTransitionDirection::Next);
+        let now = Instant::now();
+        assert!(!transition.needs_frames());
+        let half = UnitValue::saturating_from_ratio(1, 2);
+        assert!(transition.set_tracked_progress(half));
+        assert_eq!(transition.progress(), half);
+        assert_eq!(transition.motion_for(to, 200).translation_x, 100);
+        assert_eq!(
+            transition.advance(now + Duration::from_secs(10), Duration::from_millis(200)),
+            WorkspaceTransitionAdvance::Unchanged
+        );
+        transition.pause();
+        assert!(transition.is_tracking());
+        transition.resume();
+        assert!(transition.is_tracking());
+    }
+
+    #[test]
+    fn release_from_tracking_continues_from_the_finger_position() {
+        let (_, to) = pair();
+        let mut transition =
+            WorkspaceGroupTransition::tracking(pair().0, to, WorkspaceTransitionDirection::Next);
+        let half = UnitValue::saturating_from_ratio(1, 2);
+        let now = Instant::now();
+        transition.set_tracked_progress(half);
+        assert!(!transition.request_goal(UnitValue::ONE));
+        assert_eq!(
+            transition.advance(now, Duration::from_millis(200)),
+            WorkspaceTransitionAdvance::Started
+        );
+        assert_eq!(transition.progress(), half);
+        assert_eq!(
+            transition.advance(now + Duration::from_millis(100), Duration::from_millis(200)),
+            WorkspaceTransitionAdvance::Finished
+        );
+        assert_eq!(transition.progress(), UnitValue::ONE);
+    }
+
+    #[test]
+    fn set_tracked_progress_ignores_a_running_transition() {
+        let mut transition = pending(WorkspaceTransitionDirection::Next);
+        assert!(!transition.set_tracked_progress(UnitValue::saturating_from_ratio(1, 2)));
+        assert_eq!(transition.progress(), UnitValue::ZERO);
     }
 }

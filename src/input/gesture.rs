@@ -101,6 +101,16 @@ pub enum PointerGestureKind {
 
 /// Travel needed before a bound swipe runs its action, in logical px.
 pub(crate) const GESTURE_TRIGGER_DISTANCE: f64 = 64.0;
+/// Travel before a bound horizontal swipe decides whether to track, logical px.
+pub(crate) const WORKSPACE_SWIPE_START_DISTANCE: f64 = 16.0;
+/// Finger travel (logical px) for a full slide (Hyprland's `workspace_swipe_distance`).
+pub(crate) const WORKSPACE_SWIPE_DISTANCE: f64 = 300.0;
+/// Progress at or past which a slow release commits.
+pub(crate) const WORKSPACE_SWIPE_COMMIT_PROGRESS: f64 = 0.5;
+/// Release speed (logical px/ms along the binding direction) that decides by direction alone.
+pub(crate) const WORKSPACE_SWIPE_FLING_VELOCITY: f64 = 0.5;
+/// A release this long (ms) after the last update has no fling.
+pub(crate) const WORKSPACE_SWIPE_FLING_MAX_AGE_MS: u32 = 50;
 
 /// A swipe tema owns through `[gestures]`. It never reaches clients.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -113,9 +123,25 @@ pub(crate) struct OwnedSwipe {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WorkspaceSwipe {
+    pub(crate) start: crate::state::WorkspaceSwipeStart,
+    /// `-1.0` for a `left` binding, `+1.0` for `right`: travel = sign * dx.
+    pub(crate) sign: f64,
+    pub(crate) progress: f64,
+    pub(crate) travel: f64,
+    pub(crate) last_time: u32,
+    /// Logical px/ms along the travel, exponential moving average.
+    pub(crate) velocity: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum OwnedSwipeMode {
+    /// Travel is below the start distance; the direction is still open.
+    Undecided,
     /// The direction is decided when the fingers lift.
     Trigger,
+    /// Progress follows the fingers on a workspace slide.
+    Workspace(WorkspaceSwipe),
     /// The gesture ends without running anything.
     Aborted,
 }
@@ -156,7 +182,7 @@ pub(crate) fn handle_pointer_gesture_begin(
         state.seat.active_pointer_gesture = Some(ActivePointerGesture {
             kind,
             target: None,
-            owned: Some(OwnedSwipe { fingers, dx: 0.0, dy: 0.0, mode: OwnedSwipeMode::Trigger }),
+            owned: Some(OwnedSwipe { fingers, dx: 0.0, dy: 0.0, mode: OwnedSwipeMode::Undecided }),
         });
         return;
     }
@@ -200,15 +226,12 @@ pub(crate) fn handle_pointer_gesture_swipe_update(
     dx: f64,
     dy: f64,
 ) {
-    if let Some(owned) = state
+    if state
         .seat
         .active_pointer_gesture
-        .as_mut()
-        .filter(|active| active.kind == PointerGestureKind::Swipe)
-        .and_then(|active| active.owned.as_mut())
+        .is_some_and(|active| active.kind == PointerGestureKind::Swipe && active.owned.is_some())
     {
-        owned.dx += dx;
-        owned.dy += dy;
+        owned_swipe_update(state, dispatcher, time, dx, dy);
         return;
     }
     let Some(client_id) = live_target(state, dispatcher, PointerGestureKind::Swipe, time) else {
@@ -261,8 +284,14 @@ pub(crate) fn handle_pointer_gesture_end(
     }
     if let Some(owned) = active.owned {
         state.seat.active_pointer_gesture = None;
-        if !cancelled && owned.mode == OwnedSwipeMode::Trigger {
-            run_swipe_binding(state, dispatcher, owned);
+        match owned.mode {
+            OwnedSwipeMode::Workspace(swipe) => {
+                release_workspace_swipe(state, dispatcher, swipe, time, cancelled)
+            }
+            OwnedSwipeMode::Trigger | OwnedSwipeMode::Undecided if !cancelled => {
+                run_swipe_binding(state, dispatcher, owned)
+            }
+            _ => {}
         }
         return;
     }
@@ -329,17 +358,163 @@ fn run_swipe_binding(state: &mut State, dispatcher: &mut Dispatcher, owned: Owne
     crate::config::execute_action(state, dispatcher, action);
 }
 
-/// Stop an owned swipe: it ends without running anything. Phase 4 also
-/// cancels a tracked workspace slide here.
+fn owned_swipe(state: &mut State) -> Option<&mut OwnedSwipe> {
+    state.seat.active_pointer_gesture.as_mut()?.owned.as_mut()
+}
+
+fn owned_swipe_update(state: &mut State, dispatcher: &mut Dispatcher, time: u32, dx: f64, dy: f64) {
+    let Some(owned) = owned_swipe(state) else {
+        return;
+    };
+    owned.dx += dx;
+    owned.dy += dy;
+    let owned = *owned;
+    match owned.mode {
+        OwnedSwipeMode::Undecided => {
+            if owned.dx.abs().max(owned.dy.abs()) < WORKSPACE_SWIPE_START_DISTANCE {
+                return;
+            }
+            let mode = start_workspace_swipe(state, owned, time);
+            if let Some(current) = owned_swipe(state) {
+                current.mode = mode;
+            }
+            if let OwnedSwipeMode::Workspace(swipe) = mode {
+                let outputs = state.workspace_group_output_ids(swipe.start.group_id);
+                crate::wayland_objects::ext_workspace_manager_v1::publish_workspace_state_changed(
+                    state, dispatcher, outputs,
+                );
+                track_workspace_swipe(state, dispatcher, time);
+            }
+        }
+        OwnedSwipeMode::Workspace(_) => track_workspace_swipe(state, dispatcher, time),
+        OwnedSwipeMode::Trigger | OwnedSwipeMode::Aborted => {}
+    }
+}
+
+/// Decide, at the start distance, whether this swipe tracks a workspace slide.
+fn start_workspace_swipe(state: &mut State, owned: OwnedSwipe, time: u32) -> OwnedSwipeMode {
+    use crate::{
+        config::{CompositorAction, SwipeDirection},
+        visual_animation::WorkspaceTransitionDirection,
+    };
+    if owned.dx.abs() < owned.dy.abs() {
+        return OwnedSwipeMode::Trigger;
+    }
+    let (direction, sign) =
+        if owned.dx < 0.0 { (SwipeDirection::Left, -1.0) } else { (SwipeDirection::Right, 1.0) };
+    let transition_direction = match state.config.binding_for_swipe(owned.fingers, direction) {
+        Some(CompositorAction::WorkspaceNext) => WorkspaceTransitionDirection::Next,
+        Some(CompositorAction::WorkspacePrevious) => WorkspaceTransitionDirection::Previous,
+        _ => return OwnedSwipeMode::Trigger,
+    };
+    let Some(start) = state.begin_workspace_swipe(transition_direction) else {
+        return OwnedSwipeMode::Trigger;
+    };
+    OwnedSwipeMode::Workspace(WorkspaceSwipe {
+        start,
+        sign,
+        progress: 0.0,
+        travel: 0.0,
+        last_time: time,
+        velocity: 0.0,
+    })
+}
+
+/// Apply the accumulated travel to the tracked slide.
+fn track_workspace_swipe(state: &mut State, dispatcher: &mut Dispatcher, time: u32) {
+    let Some(owned) = owned_swipe(state).copied() else {
+        return;
+    };
+    let OwnedSwipeMode::Workspace(mut swipe) = owned.mode else {
+        return;
+    };
+    let travel = swipe.sign * owned.dx;
+    let dt = time.wrapping_sub(swipe.last_time);
+    if dt > 0 && dt < u32::MAX / 2 {
+        let instant = (travel - swipe.travel) / f64::from(dt);
+        swipe.velocity = 0.5 * swipe.velocity + 0.5 * instant;
+        swipe.last_time = time;
+    }
+    swipe.travel = travel;
+    swipe.progress = (travel / WORKSPACE_SWIPE_DISTANCE).clamp(0.0, 1.0);
+    let progress = crate::visual_animation::UnitValue::saturating_from_f64(swipe.progress);
+    let mode = match state.set_workspace_swipe_progress(swipe.start, progress) {
+        None => OwnedSwipeMode::Aborted,
+        Some(changed) => {
+            if changed {
+                let outputs = state.workspace_group_output_ids(swipe.start.group_id);
+                crate::drm::request_outputs(state, outputs, dispatcher);
+            }
+            OwnedSwipeMode::Workspace(swipe)
+        }
+    };
+    if let Some(current) = owned_swipe(state) {
+        current.mode = mode;
+    }
+}
+
+/// Fingers lifted on a tracked slide.
+fn release_workspace_swipe(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    swipe: WorkspaceSwipe,
+    time: u32,
+    cancelled: bool,
+) {
+    let velocity = if time.wrapping_sub(swipe.last_time) > WORKSPACE_SWIPE_FLING_MAX_AGE_MS {
+        0.0
+    } else {
+        swipe.velocity
+    };
+    let commit = !cancelled
+        && if velocity.abs() >= WORKSPACE_SWIPE_FLING_VELOCITY {
+            velocity > 0.0
+        } else {
+            swipe.progress >= WORKSPACE_SWIPE_COMMIT_PROGRESS
+        };
+    settle_tracked_swipe(state, dispatcher, swipe, commit);
+}
+
+fn settle_tracked_swipe(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    swipe: WorkspaceSwipe,
+    commit: bool,
+) {
+    use crate::state::WorkspaceSwipeSettle;
+    let group_id = swipe.start.group_id;
+    match state.settle_workspace_swipe(swipe.start, commit) {
+        None => {}
+        Some(WorkspaceSwipeSettle::Committed) => {
+            log::info!("workspace swipe committed on group {group_id:?}");
+            crate::config::finish_workspace_activation(state, dispatcher, group_id);
+        }
+        Some(WorkspaceSwipeSettle::Returning) => {
+            let outputs = state.workspace_group_output_ids(group_id);
+            crate::drm::request_outputs(state, outputs, dispatcher);
+            crate::drm::kick_visual_animation_pump(dispatcher);
+        }
+        Some(WorkspaceSwipeSettle::Dropped) => {
+            let outputs = state.workspace_group_output_ids(group_id);
+            crate::wayland_objects::ext_workspace_manager_v1::publish_workspace_state_changed(
+                state,
+                dispatcher,
+                outputs.iter().copied(),
+            );
+            crate::drm::request_outputs(state, outputs, dispatcher);
+        }
+    }
+}
+
+/// Stop an owned swipe: it ends without running anything. A tracked workspace
+/// slide is cancelled (it returns to its origin) unless it is already gone.
 pub(crate) fn abort_owned_swipe(state: &mut State, dispatcher: &mut Dispatcher) {
-    let _ = dispatcher;
-    if let Some(owned) = state
-        .seat
-        .active_pointer_gesture
-        .as_mut()
-        .and_then(|active| active.owned.as_mut())
-    {
-        owned.mode = OwnedSwipeMode::Aborted;
+    let Some(owned) = owned_swipe(state) else {
+        return;
+    };
+    let mode = std::mem::replace(&mut owned.mode, OwnedSwipeMode::Aborted);
+    if let OwnedSwipeMode::Workspace(swipe) = mode {
+        settle_tracked_swipe(state, dispatcher, swipe, false);
     }
 }
 
@@ -374,6 +549,7 @@ mod tests {
         session_lock::PreLockFocus,
         state::{DragPhase, DragSource, DragState, ObjectId, OutputId, State},
         test_support::{fake_focus, state_for_tests, test_client_and_dispatcher},
+        visual_animation::WorkspaceTransitionDirection,
         wayland_objects::wl_surface::WlSurface,
     };
 
@@ -866,5 +1042,353 @@ mod tests {
             gesture_events(&mut dispatcher, 7).as_slice(),
             [SeatClientEvent::PointerGestureBegin { .. }]
         ));
+    }
+
+    /// Output with a four-workspace group, bound to the example config's swipes.
+    fn workspace_setup(state: &mut State) -> OutputId {
+        state.config.animations.set_workspace_duration_msec(250);
+        let output = state.insert_output(crate::test_support::test_output_drm0_wh(200, 100));
+        state.config.gesture_bindings = vec![
+            GestureBinding {
+                description: "swipe:3:left".into(),
+                fingers: 3,
+                direction: SwipeDirection::Left,
+                action: CompositorAction::WorkspaceNext,
+            },
+            GestureBinding {
+                description: "swipe:3:right".into(),
+                fingers: 3,
+                direction: SwipeDirection::Right,
+                action: CompositorAction::WorkspacePrevious,
+            },
+        ];
+        output
+    }
+
+    fn group_of(state: &State, output: OutputId) -> crate::state::WorkspaceGroup {
+        let group_id = state.workspace_group_for_output(output).unwrap();
+        state.workspace_groups.try_get(group_id).unwrap().clone()
+    }
+
+    fn workspaces_of(state: &State, output: OutputId) -> Vec<crate::state::WorkspaceId> {
+        group_of(state, output).workspaces
+    }
+
+    fn active_of(state: &State, output: OutputId) -> crate::state::WorkspaceId {
+        group_of(state, output).active_workspace.unwrap()
+    }
+
+    fn transition_of(
+        state: &State,
+        output: OutputId,
+    ) -> Option<crate::visual_animation::WorkspaceGroupTransition> {
+        group_of(state, output).transition
+    }
+
+    fn owned_mode(state: &State) -> OwnedSwipeMode {
+        state
+            .seat
+            .active_pointer_gesture
+            .and_then(|active| active.owned)
+            .unwrap()
+            .mode
+    }
+
+    fn frame_requested(dispatcher: &Dispatcher, output: OutputId) -> bool {
+        dispatcher.test_has_queued_action_for(
+            crate::scheduler::output_scheduler::output_scheduler_id(output),
+            |action: &crate::scheduler::output_scheduler::OutputSchedulerAction| {
+                matches!(
+                    action,
+                    crate::scheduler::output_scheduler::OutputSchedulerAction::RequestFrame { .. }
+                )
+            },
+        )
+    }
+
+    fn release_at(state: &mut State, dispatcher: &mut Dispatcher, time: u32, cancelled: bool) {
+        handle_pointer_gesture_end(state, dispatcher, PointerGestureKind::Swipe, time, cancelled);
+    }
+
+    #[test]
+    fn small_travel_does_not_start_tracking() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -10.0);
+
+        assert_eq!(owned_mode(&state), OwnedSwipeMode::Undecided);
+        assert!(transition_of(&state, output).is_none());
+    }
+
+    #[test]
+    fn left_swipe_tracks_the_next_workspace() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+
+        let transition = transition_of(&state, output).unwrap();
+        assert!(transition.is_tracking());
+        assert_eq!(transition.to_workspace(), workspaces[1]);
+        assert_eq!(transition.direction(), WorkspaceTransitionDirection::Next);
+        let visible = crate::scene::visibility::output_workspace_ids(
+            &state,
+            output,
+            crate::scene::WorkspaceParticipationPolicy::Steady,
+        );
+        assert!(visible.contains(&workspaces[0]) && visible.contains(&workspaces[1]));
+
+        swipe_update(&mut state, &mut dispatcher, 10, -120.0);
+
+        let transition = transition_of(&state, output).unwrap();
+        assert_eq!(
+            transition.progress(),
+            crate::visual_animation::UnitValue::saturating_from_f64(0.5)
+        );
+        assert_eq!(active_of(&state, output), workspaces[0]);
+        assert!(frame_requested(&dispatcher, output));
+    }
+
+    #[test]
+    fn slow_release_past_half_commits() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        for time in [0, 10, 20, 30, 40, 50] {
+            swipe_update(&mut state, &mut dispatcher, time, -30.0);
+        }
+        release_at(&mut state, &mut dispatcher, 110, false);
+
+        assert_eq!(active_of(&state, output), workspaces[1]);
+        let transition = transition_of(&state, output).unwrap();
+        assert_eq!(transition.goal(), crate::visual_animation::UnitValue::ONE);
+        assert!(!transition.is_tracking());
+    }
+
+    #[test]
+    fn slow_release_before_half_cancels() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        swipe_update(&mut state, &mut dispatcher, 10, -60.0);
+        release_at(&mut state, &mut dispatcher, 70, false);
+
+        assert_eq!(active_of(&state, output), workspaces[0]);
+        if let Some(transition) = transition_of(&state, output) {
+            assert_eq!(transition.goal(), crate::visual_animation::UnitValue::ZERO);
+            assert!(!transition.is_tracking());
+        }
+    }
+
+    #[test]
+    fn fling_commits_below_half() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        swipe_update(&mut state, &mut dispatcher, 10, -45.0);
+        swipe_update(&mut state, &mut dispatcher, 20, -45.0);
+        release_at(&mut state, &mut dispatcher, 25, false);
+
+        assert_eq!(active_of(&state, output), workspaces[1]);
+    }
+
+    #[test]
+    fn fling_back_cancels_above_half() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        swipe_update(&mut state, &mut dispatcher, 100, -180.0);
+        swipe_update(&mut state, &mut dispatcher, 105, 15.0);
+        swipe_update(&mut state, &mut dispatcher, 110, 15.0);
+        release_at(&mut state, &mut dispatcher, 112, false);
+
+        assert_eq!(active_of(&state, output), workspaces[0]);
+        if let Some(transition) = transition_of(&state, output) {
+            assert_eq!(transition.goal(), crate::visual_animation::UnitValue::ZERO);
+        }
+    }
+
+    #[test]
+    fn reversing_past_zero_clamps_to_the_original_workspace() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -60.0);
+        swipe_update(&mut state, &mut dispatcher, 10, 150.0);
+
+        let transition = transition_of(&state, output).unwrap();
+        assert_eq!(transition.progress(), crate::visual_animation::UnitValue::ZERO);
+        assert!(transition.is_tracking());
+        assert_eq!(transition.from_workspace(), workspaces[0]);
+        assert_eq!(transition.to_workspace(), workspaces[1]);
+    }
+
+    #[test]
+    fn right_swipe_on_the_first_workspace_wraps_to_the_last() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, 30.0);
+
+        let transition = transition_of(&state, output).unwrap();
+        assert_eq!(transition.to_workspace(), *workspaces.last().unwrap());
+        assert_eq!(transition.direction(), WorkspaceTransitionDirection::Previous);
+    }
+
+    #[test]
+    fn keybinding_mid_swipe_aborts_tracking() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        crate::config::execute_action(
+            &mut state,
+            &mut dispatcher,
+            CompositorAction::WorkspaceIndex { index: 3 },
+        );
+        swipe_update(&mut state, &mut dispatcher, 10, -30.0);
+
+        assert_eq!(owned_mode(&state), OwnedSwipeMode::Aborted);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+        assert_eq!(active_of(&state, output), workspaces[2]);
+    }
+
+    #[test]
+    fn session_lock_mid_swipe_returns_the_slide() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        swipe_update(&mut state, &mut dispatcher, 10, -90.0);
+        crate::seat::gate_for_session_lock(&mut state, &mut dispatcher);
+
+        assert_eq!(owned_mode(&state), OwnedSwipeMode::Aborted);
+        let transition = transition_of(&state, output).unwrap();
+        assert_eq!(transition.goal(), crate::visual_animation::UnitValue::ZERO);
+        assert_eq!(active_of(&state, output), workspaces[0]);
+    }
+
+    #[test]
+    fn vertical_or_other_action_falls_back_to_trigger() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        state.config.gesture_bindings = vec![GestureBinding {
+            description: "swipe:3:left".into(),
+            fingers: 3,
+            direction: SwipeDirection::Left,
+            action: CompositorAction::Spawn { command: "true".to_string() },
+        }];
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        assert_eq!(owned_mode(&state), OwnedSwipeMode::Trigger);
+        assert!(transition_of(&state, output).is_none());
+        swipe_update(&mut state, &mut dispatcher, 10, -120.0);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+
+        assert!(spawned(&dispatcher));
+    }
+
+    #[test]
+    fn swipe_during_a_running_slide_snaps_and_tracks() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+        crate::config::execute_action(&mut state, &mut dispatcher, CompositorAction::WorkspaceNext);
+        assert_eq!(active_of(&state, output), workspaces[1]);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+
+        let transition = transition_of(&state, output).unwrap();
+        assert!(transition.is_tracking());
+        assert_eq!(transition.from_workspace(), workspaces[1]);
+        assert_eq!(transition.to_workspace(), workspaces[2]);
+    }
+
+    #[test]
+    fn disabled_workspace_animation_falls_back_to_trigger() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+        state.config.animations.set_workspace_duration_msec(0);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        assert_eq!(owned_mode(&state), OwnedSwipeMode::Trigger);
+        swipe_update(&mut state, &mut dispatcher, 10, -120.0);
+        end(&mut state, &mut dispatcher, PointerGestureKind::Swipe, false);
+
+        assert_eq!(active_of(&state, output), workspaces[1]);
+    }
+
+    #[test]
+    fn new_begin_mid_swipe_returns_the_slide() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        swipe_update(&mut state, &mut dispatcher, 10, -120.0);
+        handle_pointer_gesture_begin(&mut state, &mut dispatcher, PointerGestureKind::Pinch, 20, 2);
+
+        let transition = transition_of(&state, output).unwrap();
+        assert!(!transition.is_tracking());
+        assert_eq!(transition.goal(), crate::visual_animation::UnitValue::ZERO);
+        assert_eq!(active_of(&state, output), workspaces[0]);
+    }
+
+    #[test]
+    fn vt_switch_mid_swipe_drops_the_slide() {
+        let mut state = state_for_tests();
+        let mut dispatcher = Dispatcher::default();
+        let output = workspace_setup(&mut state);
+        let workspaces = workspaces_of(&state, output);
+
+        begin_swipe(&mut state, &mut dispatcher, 0, 3);
+        swipe_update(&mut state, &mut dispatcher, 0, -30.0);
+        state.session_active = false;
+        crate::seat::quiesce_for_session_pause(&mut state, &mut dispatcher);
+
+        assert!(transition_of(&state, output).is_none());
+        assert_eq!(active_of(&state, output), workspaces[0]);
     }
 }

@@ -2156,6 +2156,15 @@ fn activate_adjacent_workspace(
         return;
     };
     log::info!("workspace {direction:?} on group {group_id:?}");
+    finish_workspace_activation(state, dispatcher, group_id);
+}
+
+/// What a workspace switch by binding does after `active_workspace` changed.
+pub(crate) fn finish_workspace_activation(
+    state: &mut State,
+    dispatcher: &mut Dispatcher,
+    group_id: WorkspaceGroupId,
+) {
     crate::input::pointer_lock::release_pointer_capture(state, dispatcher);
     publish_workspace_group(state, dispatcher, group_id);
 }

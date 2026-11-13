@@ -199,7 +199,8 @@ style = "fade"
 # Touchpad swipes. Keys are swipe:<fingers>:<direction>, fingers 3 to 5,
 # direction left, right, up or down. A finger count with any binding here is
 # reserved: those swipes never reach applications. Pinch and hold always do.
-# A binding runs when the fingers lift.
+# Horizontal swipes bound to workspace-next / workspace-previous follow the
+# fingers; every other binding runs when the fingers lift.
 "swipe:3:left" = { action = "workspace-next" }
 "swipe:3:right" = { action = "workspace-previous" }
 
