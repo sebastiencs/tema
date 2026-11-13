@@ -106,6 +106,10 @@ pub mod zwp_linux_dmabuf_feedback_v1;
 pub mod zwp_linux_dmabuf_v1;
 pub mod zwp_locked_pointer_v1;
 pub mod zwp_pointer_constraints_v1;
+pub mod zwp_pointer_gesture_hold_v1;
+pub mod zwp_pointer_gesture_pinch_v1;
+pub mod zwp_pointer_gesture_swipe_v1;
+pub mod zwp_pointer_gestures_v1;
 pub mod zwp_primary_selection_device_manager_v1;
 pub mod zwp_primary_selection_device_v1;
 pub mod zwp_primary_selection_offer_v1;
@@ -214,10 +218,6 @@ fake_obj! {
     { zwp_tablet_v2, ZwpTabletV2 },
     { zwp_tablet_tool_v2, ZwpTabletToolV2 },
     { zwp_tablet_seat_v2, ZwpTabletSeatV2 },
-    { zwp_pointer_gestures_v1, ZwpPointerGesturesV1 },
-    { zwp_pointer_gesture_swipe_v1, ZwpPointerGestureSwipeV1 },
-    { zwp_pointer_gesture_pinch_v1, ZwpPointerGesturePinchV1 },
-    { zwp_pointer_gesture_hold_v1, ZwpPointerGestureHoldV1 },
     { zwp_keyboard_shortcuts_inhibit_manager_v1, ZwpKeyboardShortcutsInhibitManagerV1 },
     { zwp_keyboard_shortcuts_inhibitor_v1, ZwpKeyboardShortcutsInhibitorV1 },
     { wp_fifo_manager_v1, WpFifoManagerV1 },

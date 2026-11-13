@@ -19,7 +19,7 @@ use crate::{
         WindowHit,
     },
     protocol_generated::{
-        Array, ExtDataControlDeviceV1Id, WlDataDeviceId, WlDataOfferId, WlDataSourceId,
+        Array, ExtDataControlDeviceV1Id, WaylandId, WlDataDeviceId, WlDataOfferId, WlDataSourceId,
         WlKeyboardId, WlPointerId, WlSeatId, WlSurfaceId, XdgPopupId, XdgToplevelId,
         ZwlrDataControlDeviceV1Id, ZwpConfinedPointerV1Id, ZwpLockedPointerV1Id,
         ZwpPrimarySelectionDeviceV1Id, ZwpRelativePointerV1Id,
@@ -356,6 +356,9 @@ pub struct SeatState {
     pub(crate) toplevel_drag: Option<ToplevelDragState>,
     pointer_resources: BTreeMap<ClientId, Vec<Resolved<WlPointerId>>>,
     relative_pointers: BTreeMap<Resolved<WlPointerId>, Vec<Resolved<ZwpRelativePointerV1Id>>>,
+    /// `zwp_pointer_gesture_*_v1` objects, per `wl_pointer` they were created for.
+    pointer_gestures:
+        BTreeMap<Resolved<WlPointerId>, Vec<crate::input::gesture::PointerGestureResource>>,
     pub(crate) active_pointer_lock: Option<Resolved<ZwpLockedPointerV1Id>>,
     pub(crate) active_pointer_confine: Option<Resolved<ZwpConfinedPointerV1Id>>,
     keyboard_resources: BTreeMap<ClientId, Vec<Resolved<WlKeyboardId>>>,
@@ -407,6 +410,7 @@ impl Default for SeatState {
             toplevel_drag: None,
             pointer_resources: BTreeMap::default(),
             relative_pointers: BTreeMap::default(),
+            pointer_gestures: BTreeMap::default(),
             active_pointer_lock: None,
             active_pointer_confine: None,
             keyboard_resources: BTreeMap::default(),
@@ -504,6 +508,7 @@ impl SeatState {
     pub fn unregister_pointer(&mut self, pointer: Resolved<WlPointerId>) {
         remove_resource(&mut self.pointer_resources, pointer.client_id(), pointer);
         self.relative_pointers.remove(&pointer);
+        self.pointer_gestures.remove(&pointer);
     }
 
     pub fn register_relative_pointer(
@@ -550,6 +555,42 @@ impl SeatState {
             .filter(|(pointer, _)| pointer.client_id() == client_id)
             .flat_map(|(_, relatives)| relatives.iter().copied())
             .collect()
+    }
+
+    pub(crate) fn register_pointer_gesture(
+        &mut self,
+        pointer: Resolved<WlPointerId>,
+        gesture: crate::input::gesture::PointerGestureResource,
+    ) {
+        let resources = self.pointer_gestures.entry(pointer).or_default();
+        if !resources.contains(&gesture) {
+            resources.push(gesture);
+        }
+    }
+
+    pub(crate) fn unregister_pointer_gesture(
+        &mut self,
+        pointer: Resolved<WlPointerId>,
+        gesture: WaylandId,
+    ) {
+        let Some(resources) = self.pointer_gestures.get_mut(&pointer) else {
+            return;
+        };
+        resources.retain(|registered| registered.wayland_id() != gesture);
+        if resources.is_empty() {
+            self.pointer_gestures.remove(&pointer);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pointer_gestures(
+        &self,
+        pointer: Resolved<WlPointerId>,
+    ) -> &[crate::input::gesture::PointerGestureResource] {
+        self.pointer_gestures
+            .get(&pointer)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn register_keyboard(&mut self, keyboard: Resolved<WlKeyboardId>) {
@@ -1067,6 +1108,8 @@ impl SeatState {
         self.primary_selection_devices.remove(&client_id);
         self.pointer_resources.remove(&client_id);
         self.relative_pointers
+            .retain(|pointer, _| pointer.client_id() != client_id);
+        self.pointer_gestures
             .retain(|pointer, _| pointer.client_id() != client_id);
         if self
             .active_pointer_lock
