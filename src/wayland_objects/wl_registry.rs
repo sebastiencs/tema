@@ -34,11 +34,11 @@ impl WlRegistry {
         registry: crate::clients::Resolved<WlRegistryId>,
         state: &mut State,
         dispatcher: &mut ClientDispatcher,
-        xwayland: bool,
+        class: crate::globals::ClientClass,
     ) {
         let advertised = state
             .globals
-            .iter_for(xwayland)
+            .iter_for(class)
             .map(|(name, global)| {
                 let (interface_name, interface_version) = global.interface();
                 (name, interface_name.to_string(), interface_version)
@@ -79,7 +79,7 @@ impl Object for WlRegistry {
                     );
                     return Ok(());
                 };
-                if global.xwayland_only() && !client.is_xwayland() {
+                if !client.global_class().may_see(&**global) {
                     drop(global);
                     client.protocol_violation_disconnect(
                         dispatcher,
@@ -294,5 +294,187 @@ mod tests {
 
         assert!(!offered(&normal, &state, name));
         assert!(offered(&xwayland, &state, name));
+    }
+
+    struct HiddenGlobal;
+
+    impl Global for HiddenGlobal {
+        fn interface(&self) -> (&'static str, u32) {
+            ("zwlr_gamma_control_manager_v1", 1)
+        }
+
+        fn bind(
+            &mut self,
+            _client: &mut Client,
+            _state: &mut State,
+            _id: NewId,
+            _version: u32,
+            _dispatcher: &mut ClientDispatcher,
+        ) {
+        }
+    }
+
+    struct UnlistedGlobal;
+
+    impl Global for UnlistedGlobal {
+        fn interface(&self) -> (&'static str, u32) {
+            ("test-global", 1)
+        }
+
+        fn bind(
+            &mut self,
+            _client: &mut Client,
+            _state: &mut State,
+            _id: NewId,
+            _version: u32,
+            _dispatcher: &mut ClientDispatcher,
+        ) {
+        }
+    }
+
+    fn sandboxed_client(id: u64) -> Client {
+        Client::new_sandboxed_for_tests(
+            ClientId::from_raw(id),
+            crate::security_context::SecurityContextMetadata::default(),
+        )
+    }
+
+    #[test]
+    fn a_sandboxed_registry_hides_unlisted_globals() {
+        let mut state = state_for_tests();
+        let layer_shell = state
+            .globals
+            .name_for_interface("zwlr_layer_shell_v1")
+            .unwrap();
+        let mut sandboxed = sandboxed_client(1);
+        let mut normal = Client::new_for_tests(ClientId::from_raw(2));
+        let mut sandboxed_dispatcher = Dispatcher::default();
+        let mut normal_dispatcher = Dispatcher::default();
+
+        registry(&mut sandboxed, &mut state, &mut sandboxed_dispatcher);
+        registry(&mut normal, &mut state, &mut normal_dispatcher);
+
+        assert!(!sent(&sandboxed_dispatcher, "zwlr_layer_shell_v1"));
+        assert!(!sent(&sandboxed_dispatcher, "ext_session_lock_manager_v1"));
+        assert!(!sent(&sandboxed_dispatcher, "ext_idle_notifier_v1"));
+        assert!(sent(&sandboxed_dispatcher, "wl_compositor"));
+        assert!(sent(&sandboxed_dispatcher, "xdg_wm_base"));
+        assert!(sent(&sandboxed_dispatcher, "zxdg_output_manager_v1"));
+        assert!(!offered(&sandboxed, &state, layer_shell));
+        assert!(sent(&normal_dispatcher, "zwlr_layer_shell_v1"));
+    }
+
+    #[test]
+    fn a_sandboxed_client_binding_a_hidden_global_is_disconnected() {
+        let mut state = state_for_tests();
+        let layer_shell = state
+            .globals
+            .name_for_interface("zwlr_layer_shell_v1")
+            .unwrap();
+        let mut sandboxed = sandboxed_client(1);
+        let mut dispatcher = Dispatcher::default();
+        let registry_id = registry(&mut sandboxed, &mut state, &mut dispatcher);
+
+        let mut bind = request(u32::from(registry_id), 0);
+        bind.uint(layer_shell.as_u32());
+        bind.string("zwlr_layer_shell_v1");
+        bind.uint(1);
+        bind.id(9u32);
+        dispatch_request(&mut sandboxed, &mut state, &mut dispatcher, registry_id, bind);
+
+        assert!(dispatcher.test_has_queued_action(|action: &ClientManagerAction| {
+            matches!(action, ClientManagerAction::Close { id } if *id == sandboxed.client_id())
+        }));
+        assert!(state
+            .globals
+            .try_grab_global(layer_shell.as_u32())
+            .is_some());
+    }
+
+    #[test]
+    fn a_sandboxed_client_never_sees_an_xwayland_only_global() {
+        let mut state = state_for_tests();
+        let name = state.insert_global(Box::new(XwaylandOnlyGlobal));
+        let mut sandboxed = sandboxed_client(1);
+        let mut dispatcher = Dispatcher::default();
+
+        registry(&mut sandboxed, &mut state, &mut dispatcher);
+
+        assert!(!offered(&sandboxed, &state, name));
+        assert!(!sent(&dispatcher, "xwayland-only"));
+    }
+
+    #[test]
+    fn a_sandboxed_client_does_not_see_an_unknown_global() {
+        let mut state = state_for_tests();
+        let name = state.insert_global(Box::new(UnlistedGlobal));
+        let mut sandboxed = sandboxed_client(1);
+        let mut normal = Client::new_for_tests(ClientId::from_raw(2));
+        let mut sandboxed_dispatcher = Dispatcher::default();
+        let mut normal_dispatcher = Dispatcher::default();
+
+        registry(&mut sandboxed, &mut state, &mut sandboxed_dispatcher);
+        registry(&mut normal, &mut state, &mut normal_dispatcher);
+
+        assert!(!offered(&sandboxed, &state, name));
+        assert!(!sent(&sandboxed_dispatcher, "test-global"));
+        assert!(offered(&normal, &state, name));
+        assert!(sent(&normal_dispatcher, "test-global"));
+    }
+
+    #[test]
+    fn a_hidden_global_added_later_is_not_sent_to_a_sandboxed_client() {
+        let mut state = state_for_tests();
+        let mut sandboxed = sandboxed_client(1);
+        let mut normal = Client::new_for_tests(ClientId::from_raw(2));
+        let mut sandboxed_dispatcher = Dispatcher::default();
+        let mut normal_dispatcher = Dispatcher::default();
+        registry(&mut sandboxed, &mut state, &mut sandboxed_dispatcher);
+        registry(&mut normal, &mut state, &mut normal_dispatcher);
+        let name = state.insert_global(Box::new(HiddenGlobal));
+
+        let action = || ClientAction::RegistryGlobalAdded {
+            name: name.as_u32(),
+            interface: "zwlr_gamma_control_manager_v1".to_string(),
+            version: 1,
+        };
+        sandboxed
+            .process(&mut state, action(), &mut sandboxed_dispatcher)
+            .unwrap();
+        normal
+            .process(&mut state, action(), &mut normal_dispatcher)
+            .unwrap();
+
+        assert!(!offered(&sandboxed, &state, name));
+        assert!(!sent(&sandboxed_dispatcher, "zwlr_gamma_control_manager_v1"));
+        assert!(offered(&normal, &state, name));
+    }
+
+    #[test]
+    fn a_hidden_interface_announced_for_a_vanished_global_is_not_sent_to_a_sandboxed_client() {
+        let mut state = state_for_tests();
+        let name = state.insert_global(Box::new(HiddenGlobal));
+        assert!(state.globals.remove(name).is_some());
+        let action = || ClientAction::RegistryGlobalAdded {
+            name: name.as_u32(),
+            interface: "zwlr_gamma_control_manager_v1".to_string(),
+            version: 1,
+        };
+        let mut sandboxed = sandboxed_client(1);
+        let mut normal = Client::new_for_tests(ClientId::from_raw(2));
+        let mut sandboxed_dispatcher = Dispatcher::default();
+        let mut normal_dispatcher = Dispatcher::default();
+        registry(&mut sandboxed, &mut state, &mut sandboxed_dispatcher);
+        registry(&mut normal, &mut state, &mut normal_dispatcher);
+
+        sandboxed
+            .process(&mut state, action(), &mut sandboxed_dispatcher)
+            .unwrap();
+        normal
+            .process(&mut state, action(), &mut normal_dispatcher)
+            .unwrap();
+
+        assert!(!sent(&sandboxed_dispatcher, "zwlr_gamma_control_manager_v1"));
+        assert!(sent(&normal_dispatcher, "zwlr_gamma_control_manager_v1"));
     }
 }
