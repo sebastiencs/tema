@@ -4053,6 +4053,7 @@ impl WlSurface {
             dispatcher.stop_model(waiter);
         }
         let surface = client.resolve(self.id, state).unwrap();
+        state.commit_gate.forget_surface(surface);
         let count = self.queue.len();
         for update in std::mem::take(&mut self.queue) {
             content_update::discard_update(
@@ -4164,6 +4165,7 @@ impl WlSurface {
             }
         }
         self.drop_queued_updates(client, state, dispatcher);
+        state.commit_gate.forget_surface(object);
         self.cleanup_extension_objects();
         // A role destroy records the close before `destroy_window`. By the time
         // this surface goes away the window is no longer managed, so that record

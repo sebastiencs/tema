@@ -3707,6 +3707,7 @@ impl Model for Client {
             }
             Close => {
                 state.commit_queues.remove_client(self.id);
+                state.commit_gate.remove_client(self.id);
                 log::info!("client_id={:?} closed", self.id);
                 state.capture.drop_client(self.id);
                 if let Some(id) = self.reader_id.take() {

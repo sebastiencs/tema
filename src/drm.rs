@@ -6639,6 +6639,18 @@ impl DrmOutputModel {
                             frame_time_msec,
                             dispatcher,
                         );
+                        crate::commit_gate::note_latched(
+                            &state.commit_gate,
+                            &state.objects,
+                            self.output_id,
+                            &registration.callback_surfaces,
+                            if registration.async_flip {
+                                crate::commit_gate::LatchKind::Soft
+                            } else {
+                                crate::commit_gate::LatchKind::Hard
+                            },
+                            dispatcher,
+                        );
                         dispatcher.dispatch_to(
                             output_scheduler_id(self.output_id),
                             OutputSchedulerAction::PipelineBlocked { watchdog_deadline },
@@ -6702,6 +6714,14 @@ impl DrmOutputModel {
                 dispatch_submission_frame_callbacks(
                     &frame_callback_surfaces,
                     frame_time_msec,
+                    dispatcher,
+                );
+                crate::commit_gate::note_latched(
+                    &state.commit_gate,
+                    &state.objects,
+                    self.output_id,
+                    &frame_callback_surfaces,
+                    crate::commit_gate::LatchKind::Soft,
                     dispatcher,
                 );
                 dispatcher.dispatch_to(
@@ -6866,6 +6886,18 @@ impl DrmOutputModel {
                                     dispatch_submission_frame_callbacks(
                                         &registration.callback_surfaces,
                                         frame_time_msec,
+                                        dispatcher,
+                                    );
+                                    crate::commit_gate::note_latched(
+                                        &state.commit_gate,
+                                        &state.objects,
+                                        self.output_id,
+                                        &registration.callback_surfaces,
+                                        if registration.async_flip {
+                                            crate::commit_gate::LatchKind::Soft
+                                        } else {
+                                            crate::commit_gate::LatchKind::Hard
+                                        },
                                         dispatcher,
                                     );
                                     dispatcher.dispatch_to(
@@ -7039,6 +7071,18 @@ impl DrmOutputModel {
                     dispatch_submission_frame_callbacks(
                         &registration.callback_surfaces,
                         frame_time_msec,
+                        dispatcher,
+                    );
+                    crate::commit_gate::note_latched(
+                        &state.commit_gate,
+                        &state.objects,
+                        self.output_id,
+                        &registration.callback_surfaces,
+                        if registration.async_flip {
+                            crate::commit_gate::LatchKind::Soft
+                        } else {
+                            crate::commit_gate::LatchKind::Hard
+                        },
                         dispatcher,
                     );
                     dispatcher.dispatch_to(
