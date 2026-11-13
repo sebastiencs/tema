@@ -769,9 +769,11 @@ pub enum ClientAction {
     },
     /// Queued commits of this client may be ready.
     FlushCommitQueues,
-    CancelBlockedSurface {
+    /// The acquire wait of a queue head of one of this client's surfaces ended.
+    AcquireWaitDone {
         surface: Resolved<WlSurfaceId>,
         waiter_id: AcquireReadyWaiterId,
+        failed: bool,
     },
     DismissPopupGrab {
         popups: Vec<Resolved<XdgPopupId>>,
@@ -3559,11 +3561,14 @@ impl Model for Client {
                     action.execute(self, state, &mut dispatcher);
                 }
             }
-            CancelBlockedSurface { surface, waiter_id } => {
-                let Some(mut surface) = surface.try_grab(state) else {
-                    return Ok(());
-                };
-                surface.cancel_blocked_if_waiter_matches(waiter_id, self, state, &mut dispatcher);
+            AcquireWaitDone { surface, waiter_id, failed } => {
+                if let Some(mut surface) = surface.try_grab(state) {
+                    surface.acquire_wait_done(waiter_id, failed);
+                }
+                crate::wayland_objects::wl_surface::flush_client(self, state, &mut dispatcher);
+                while let Some(action) = dispatcher.post_actions.pop_front() {
+                    action.execute(self, state, &mut dispatcher);
+                }
             }
             DismissPopupGrab { popups } => {
                 self.dismiss_popup_ids(state, &mut dispatcher, popups, None);

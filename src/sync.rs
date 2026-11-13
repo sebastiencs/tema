@@ -12,7 +12,7 @@ use {
 
 use crate::{
     clients::{ClientDispatcher, Resolved},
-    drm::{request_active_output, request_outputs_for_rect, DrmFd},
+    drm::DrmFd,
     io_uring::{model::IoUringAction, ring::RingId},
     protocol_generated::{WlBufferId, WlSurfaceId},
     runner::{Dispatcher, Model, Redispatcher},
@@ -316,7 +316,7 @@ impl Model for AcquireReadyWaiter {
 
     fn process(
         &mut self,
-        state: &mut State,
+        _state: &mut State,
         action: Self::Action,
         dispatcher: &mut Dispatcher,
     ) -> std::result::Result<(), crate::runner::ModelFailure> {
@@ -340,41 +340,24 @@ impl Model for AcquireReadyWaiter {
             }
             AcquireReadyWaiterAction::Ready => {
                 self.read_op_id = None;
-                let became_active = {
-                    let Some(mut surface) = self.surface.try_grab(state) else {
-                        dispatcher.stop_model(self.waiter_id);
-                        return Ok(());
-                    };
-                    surface.activate_blocked_if_waiter_ready(self.waiter_id)
-                };
-
-                if became_active {
-                    log::debug!(
-                        "surface acquire waiter fired: waiter_id={:?} surface={:?}",
-                        self.waiter_id,
-                        self.surface
-                    );
-                    if let Some(bounds) =
-                        state
-                            .root_surface_for_surface(self.surface)
-                            .and_then(|root_surface| {
-                                state.root_surface_surface_bounds_global(root_surface)
-                            })
-                    {
-                        request_outputs_for_rect(state, bounds, dispatcher);
-                    } else {
-                        request_active_output(state, dispatcher);
-                    }
-                }
+                dispatcher.dispatch_to(
+                    self.surface.client_id(),
+                    crate::clients::ClientAction::AcquireWaitDone {
+                        surface: self.surface,
+                        waiter_id: self.waiter_id,
+                        failed: false,
+                    },
+                );
                 dispatcher.stop_model(self.waiter_id);
             }
             AcquireReadyWaiterAction::Failed => {
                 self.read_op_id = None;
                 dispatcher.dispatch_to(
                     self.surface.client_id(),
-                    crate::clients::ClientAction::CancelBlockedSurface {
+                    crate::clients::ClientAction::AcquireWaitDone {
                         surface: self.surface,
                         waiter_id: self.waiter_id,
+                        failed: true,
                     },
                 );
                 dispatcher.stop_model(self.waiter_id);

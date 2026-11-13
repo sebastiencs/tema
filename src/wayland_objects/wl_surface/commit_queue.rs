@@ -96,7 +96,6 @@ pub(super) struct TopLevel {
 pub(super) enum Readiness {
     Ready,
     WaitSequence,
-    #[allow(dead_code)] // returned by the acquire check of the explicit-sync phase
     WaitAcquire {
         acquire: crate::sync::AcquireSync,
     },
@@ -118,7 +117,12 @@ pub(super) fn readiness(
         return Readiness::WaitSequence;
     }
     let forced = forced || update.acquire_forced;
-    // Phase 10: acquire check here, skipped when `forced`.
+    if !forced
+        && !update.payload.sync.acquire.is_none()
+        && !update.payload.sync.acquire.is_ready_now()
+    {
+        return Readiness::WaitAcquire { acquire: update.payload.sync.acquire.clone() };
+    }
     #[cfg(test)]
     {
         if update.test_hold {
@@ -257,10 +261,47 @@ fn try_apply_head(
             let mut this = surface.grab(state);
             let update = this.queue.pop_front().unwrap();
             let now_empty = this.queue.is_empty();
+            if let Some(waiter) = this.acquire_waiter.take() {
+                dispatcher.stop_model(waiter);
+            }
             state.commit_queues.note_dequeued(surface, now_empty);
             WlSurface::apply_update(this, client, state, dispatcher, update);
             true
         }
-        _ => false, // Phase 10 handles WaitAcquire
+        Readiness::WaitAcquire { acquire } => {
+            let mut this = surface.grab(state);
+            if this.acquire_waiter.is_none() {
+                #[cfg(test)]
+                let forced_error = this.test_force_waiter_error;
+                #[cfg(not(test))]
+                let forced_error = false;
+                let prepared = if forced_error {
+                    Err(std::io::Error::other("test"))
+                } else {
+                    acquire.prepare_waiter_fd()
+                };
+                match prepared {
+                    Ok(Some(fd)) => {
+                        let waiter_id = crate::sync::fresh_waiter_id();
+                        this.acquire_waiter = Some(waiter_id);
+                        dispatcher.start_model(
+                            waiter_id,
+                            crate::sync::AcquireReadyWaiter::new(waiter_id, surface, fd),
+                        );
+                    }
+                    // A sync file is polled again on the next flush.
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!(
+                            "surface {surface:?}: cannot wait for its acquire point ({error}); applying without it"
+                        );
+                        this.queue.front_mut().unwrap().acquire_forced = true;
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
